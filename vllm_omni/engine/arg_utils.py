@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "IndexTTS2ForGeneration": "indextts2",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
     "VoxCPMForConditionalGeneration": "voxcpm",
@@ -36,6 +37,9 @@ def _register_omni_hf_configs() -> None:
         from transformers import AutoConfig
 
         from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
+        from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
+            IndexTTS2Config,
+        )
         from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
@@ -57,6 +61,7 @@ def _register_omni_hf_configs() -> None:
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
+        ("indextts2", IndexTTS2Config),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm", VoxCPMConfig),
         ("voxcpm2", VoxCPM2Config),
@@ -221,7 +226,11 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            return  # can't load config, let vLLM handle the error
+            # Some non-HF upstream checkpoints (IndexTTS2) ship config.yaml
+            # but no config.json. When the deploy pipeline provides
+            # model_arch, create a minimal config.json so AutoConfig can
+            # resolve the vLLM-Omni wrapper config.
+            config_dict = {}
 
         # Create a temp dir with a patched config.json
         temp_dir = tempfile.mkdtemp(prefix="omni_hf_config_")

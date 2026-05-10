@@ -68,6 +68,7 @@ _VOXCPM_TTS_MODEL_STAGES = {"latent_generator", "vae"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
+_INDEXTTS2_MODEL_STAGES = {"indextts2"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -78,6 +79,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
+    | _INDEXTTS2_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {"fish_tts", "qwen3_tts", "voxtral_tts", "cosyvoice3", "voxcpm2"}
 _TTS_LANGUAGES: set[str] = {
@@ -500,6 +502,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "ming_flash_omni_tts"
         if model_stage in _MOSS_TTS_MODEL_STAGES:
             return "moss_tts_nano"
+        if model_stage in _INDEXTTS2_MODEL_STAGES:
+            return "indextts2"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -530,6 +534,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return set()
         try:
             if self._tts_model_type == "voxcpm":
+                return set()
+            if self._tts_model_type == "indextts2":
                 return set()
             if self._tts_model_type == "voxcpm2":
                 return {"default"}
@@ -1142,6 +1148,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_ming_tts_request(request)
         if self._tts_model_type == "moss_tts_nano":
             return self._validate_moss_tts_request(request)
+        if self._tts_model_type == "indextts2":
+            return self._validate_indextts2_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
@@ -1425,6 +1433,124 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             params["max_new_frames"] = [request.max_new_tokens]
         wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
         params["prompt_audio_array"] = [[wav_list, sr]]
+        return params
+
+    def _validate_indextts2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate IndexTTS2 MVP request parameters."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        if request.ref_audio is None:
+            return (
+                "IndexTTS2 requires 'ref_audio' (speaker reference audio for zero-shot voice cloning); "
+                "the MVP has no built-in voice presets."
+            )
+        fmt_err = self._validate_ref_audio_format(request.ref_audio)
+        if fmt_err:
+            return fmt_err
+        if request.task_type is not None:
+            return "'task_type' is not supported for IndexTTS2"
+        if request.language is not None:
+            return "'language' is not supported for IndexTTS2 (language is inferred from input text)"
+        if request.x_vector_only_mode is not None:
+            return "'x_vector_only_mode' is not supported for IndexTTS2"
+        if request.speaker_embedding is not None:
+            return "'speaker_embedding' is not supported for IndexTTS2"
+        if request.initial_codec_chunk_frames is not None:
+            return "'initial_codec_chunk_frames' is not supported for IndexTTS2"
+
+        extra = request.extra_params or {}
+        allowed_extra = {
+            "emo_audio",
+            "emo_alpha",
+            "emo_vector",
+            "use_emo_text",
+            "emo_text",
+            "use_random",
+            "interval_silence",
+            "max_text_tokens_per_segment",
+            "verbose",
+            "top_p",
+            "top_k",
+            "temperature",
+            "num_beams",
+            "length_penalty",
+            "repetition_penalty",
+            "max_mel_tokens",
+        }
+        unknown = sorted(set(extra) - allowed_extra)
+        if unknown:
+            return f"Unsupported IndexTTS2 extra_params: {', '.join(unknown)}"
+
+        emo_alpha = extra.get("emo_alpha")
+        if emo_alpha is not None:
+            try:
+                emo_alpha = float(emo_alpha)
+            except (TypeError, ValueError):
+                return "'emo_alpha' must be a number"
+            if emo_alpha < 0.0 or emo_alpha > 1.0:
+                return "'emo_alpha' must be between 0 and 1"
+
+        emo_vector = extra.get("emo_vector")
+        if emo_vector is not None:
+            if not isinstance(emo_vector, list) or len(emo_vector) != 8:
+                return "'emo_vector' must be a list of 8 numbers"
+            try:
+                [float(v) for v in emo_vector]
+            except (TypeError, ValueError):
+                return "'emo_vector' must be a list of 8 numbers"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+        return None
+
+    async def _build_indextts2_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build additional_information for the IndexTTS2 single-stage wrapper."""
+        params: dict[str, Any] = {"text": [request.input]}
+        wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+        params["spk_audio_array"] = [[wav_list, sr]]
+
+        if request.max_new_tokens is not None:
+            params["max_mel_tokens"] = [request.max_new_tokens]
+        if request.seed is not None:
+            params["seed"] = [request.seed]
+
+        extra = request.extra_params or {}
+        emo_audio = extra.get("emo_audio")
+        if emo_audio is not None:
+            if not isinstance(emo_audio, str):
+                raise ValueError("'emo_audio' must be a URL, base64 data URL, or file URI")
+            fmt_err = self._validate_ref_audio_format(emo_audio)
+            if fmt_err:
+                raise ValueError(fmt_err)
+            emo_wav, emo_sr = await self._resolve_ref_audio(emo_audio)
+            params["emo_audio_array"] = [[emo_wav, emo_sr]]
+
+        if request.instructions and "emo_text" not in extra:
+            params["use_emo_text"] = [True]
+            params["emo_text"] = [request.instructions]
+
+        for key in (
+            "emo_alpha",
+            "emo_vector",
+            "use_emo_text",
+            "emo_text",
+            "use_random",
+            "interval_silence",
+            "max_text_tokens_per_segment",
+            "verbose",
+            "top_p",
+            "top_k",
+            "temperature",
+            "num_beams",
+            "length_penalty",
+            "repetition_penalty",
+            "max_mel_tokens",
+        ):
+            if key in extra:
+                params[key] = [extra[key]]
         return params
 
     def _validate_fish_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
@@ -1978,7 +2104,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Resolve uploaded voice for non-Qwen3 models.
         # Qwen3 TTS has its own uploaded voice handling in _build_tts_params().
-        if self._tts_model_type in ("fish_tts", "cosyvoice3", "moss_tts_nano"):
+        if self._tts_model_type in ("fish_tts", "cosyvoice3", "moss_tts_nano", "indextts2"):
             err = self._apply_uploaded_speaker(request)
             if err:
                 raise ValueError(err)
@@ -2060,6 +2186,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     tts_params["voice_created_at"] = [self._voice_created_at(voice_lower)]
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
+            elif self._tts_model_type == "indextts2":
+                tts_params = await self._build_indextts2_params(request)
+                if request.voice:
+                    voice_lower = request.voice.lower()
+                    tts_params["voice_name"] = [voice_lower]
+                    tts_params["voice_created_at"] = [self._voice_created_at(voice_lower)]
+                prompt = tokens_input(prompt_token_ids=[1])
+                prompt["additional_information"] = tts_params
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -2112,6 +2246,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "ming_flash_omni_tts"
         elif self._tts_model_type == "moss_tts_nano":
             model_type = "moss_tts_nano"
+        elif self._tts_model_type == "indextts2":
+            model_type = "indextts2"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
@@ -2204,18 +2340,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     ) -> tuple[bytes | str, str]:
         request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
 
-        # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
-        # async_chunk=false). The engine surfaces each yield as its own
-        # RequestOutput, so we need to accumulate across the async-for loop —
-        # final_output alone only carries the last (often empty) sentinel.
-        is_moss = self._tts_model_type == "moss_tts_nano"
-        moss_chunks: list[Any] = []
-        moss_sample_rate: int | None = None
+        # Single-stage generator TTS models emit delta chunks per yield
+        # (async_chunk=false). The engine may surface each yield as its own
+        # RequestOutput, so accumulate across the async-for loop; final_output
+        # can otherwise carry only the last empty sentinel.
+        is_single_stage_delta_tts = self._tts_model_type in ("moss_tts_nano", "indextts2")
+        delta_chunks: list[Any] = []
+        delta_sample_rate: int | None = None
 
         final_output: OmniRequestOutput | None = None
         async for res in generator:
             final_output = res
-            if not is_moss:
+            if not is_single_stage_delta_tts:
                 continue
             try:
                 step_audio, step_key = self._extract_audio_output(res)
@@ -2227,11 +2363,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             candidates = chunk if isinstance(chunk, list) else [chunk]
             for cand in candidates:
                 if hasattr(cand, "numel") and cand.numel() > 0:
-                    moss_chunks.append(cand)
+                    delta_chunks.append(cand)
             sr_step = step_audio.get("sr")
             if sr_step is not None:
                 sr_val_step = sr_step[-1] if isinstance(sr_step, list) and sr_step else sr_step
-                moss_sample_rate = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
+                delta_sample_rate = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
 
         if final_output is None:
             raise ValueError("No output generated from the model.")
@@ -2245,7 +2381,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
-        if is_moss:
+        if is_single_stage_delta_tts:
             # Prefer the engine's own consolidated audio when present. After the
             # vllm 0.20 rebase non-stream requests resolve to FINAL_ONLY, so
             # final_output already carries the full concatenated waveform; the
@@ -2261,12 +2397,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             if final_audio is not None:
                 audio_tensor = final_audio
-            elif moss_chunks:
-                audio_tensor = torch.cat(moss_chunks, dim=-1)
+            elif delta_chunks:
+                audio_tensor = torch.cat(delta_chunks, dim=-1)
             else:
                 audio_tensor = np.zeros((0,), dtype=np.float32)
-            if moss_sample_rate is not None:
-                sample_rate = moss_sample_rate
+            if delta_sample_rate is not None:
+                sample_rate = delta_sample_rate
         elif isinstance(audio_tensor, list):
             async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
             if async_chunk:

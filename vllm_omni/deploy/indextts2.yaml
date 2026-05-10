@@ -1,0 +1,25 @@
+# IndexTTS2 MVP deploy: single-stage upstream runtime wrapper.
+#
+# The upstream IndexTTS2 inference path owns GPT mel-code generation,
+# s2mel/CFM, and BigVGAN in one Python generator. Keep async_chunk disabled
+# until the decoder path has a validated codec-frame chunking contract.
+async_chunk: false
+trust_remote_code: true
+dtype: float16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    skip_mm_profiling: true
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 1.0
+      top_k: 50
+      max_tokens: 4096
+      seed: 42

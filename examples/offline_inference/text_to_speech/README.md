@@ -16,6 +16,7 @@ list of supported architectures across all modalities, see
 |---|---|---|---|---|---|---|
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 22.05 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
+| IndexTTS2 | local IndexTTS2 checkpoint | single (upstream runtime) | ✓ | segment-level MVP | emotion controls | 22.05 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
@@ -125,6 +126,41 @@ Streaming requires `async_chunk: true` in the stage config.
 ### Notes
 - Output: 44.1 kHz mono WAV.
 - DAC codec weights (`codec.pth`) are loaded lazily from the model directory.
+
+---
+
+## IndexTTS2
+
+Single-stage MVP wrapper around upstream IndexTTS2 at 22.05 kHz. The upstream
+runtime owns GPT mel-code generation, semantic codec, s2mel/CFM, and BigVGAN.
+Every request requires a speaker reference clip via `--ref-audio`.
+
+### Prerequisites
+Install the upstream package and download its checkpoint according to
+<https://github.com/index-tts/index-tts>. The checkpoint directory must contain
+`config.yaml` or `checkpoints/config.yaml`.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model /path/to/IndexTTS2/checkpoint \
+    --text "你好，这是 IndexTTS2 的 vLLM-Omni 演示。" \
+    --ref-audio /path/to/reference.wav
+```
+
+### Emotion controls
+```bash
+python examples/offline_inference/text_to_speech/indextts2/end2end.py \
+    --model /path/to/IndexTTS2/checkpoint \
+    --text "I am excited to try this voice." \
+    --ref-audio /path/to/reference.wav \
+    --emo-text "excited and happy"
+```
+
+### Notes
+- Deploy config: `vllm_omni/deploy/indextts2.yaml`.
+- Streaming is segment-level in the MVP; codec-frame `async_chunk` is not yet enabled.
+- Review upstream licensing before redistributing code or checkpoints.
 
 ---
 

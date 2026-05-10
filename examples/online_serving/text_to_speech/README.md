@@ -15,6 +15,7 @@ For the full list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| IndexTTS2 | local IndexTTS2 checkpoint | ✓ (`ref_audio`) | segment-level MVP | reference upload | — |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
@@ -179,6 +180,46 @@ python examples/online_serving/text_to_speech/ming_flash_omni_tts/speech_client.
 - Server uses `use_zero_spk_emb=True` and the cookbook decode defaults (`max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`). For other caption fields (`语速`, `基频`, `IP`, BGM, etc.) or overriding decode args, use the offline example where `additional_information` is set explicitly.
 - This is the online counterpart of [`examples/offline_inference/text_to_speech/ming_flash_omni_tts/`](../../offline_inference/text_to_speech/ming_flash_omni_tts/).
 - For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../../ming_flash_omni/).
+
+---
+
+## IndexTTS2
+
+Single-stage MVP wrapper around upstream IndexTTS2. Every request requires
+`ref_audio`; `ref_text` is not consumed by IndexTTS2. Output sample rate is
+22.05 kHz.
+
+### Prerequisites
+Install the upstream package and download its checkpoint according to
+<https://github.com/index-tts/index-tts>. The checkpoint directory must contain
+`config.yaml` or `checkpoints/config.yaml`.
+
+### Launch
+```bash
+vllm serve /path/to/IndexTTS2/checkpoint --omni --trust-remote-code --port 8091
+# or:
+./indextts2/run_server.sh /path/to/IndexTTS2/checkpoint
+```
+
+### CLI client
+```bash
+cd examples/online_serving/text_to_speech
+python indextts2/speech_client.py \
+    --ref-audio /path/to/reference.wav \
+    --text "Hello, this is IndexTTS2 online serving."
+```
+
+### Emotion controls
+Pass IndexTTS2-specific options through `extra_params`, for example
+`emo_audio`, `emo_alpha`, `emo_vector`, `top_p`, `top_k`, `temperature`,
+`num_beams`, and `max_mel_tokens`. The client exposes `--emo-audio` and
+`--emo-text` for common cases.
+
+### Notes
+- Deploy config auto-loads from `vllm_omni/deploy/indextts2.yaml`.
+- Streaming is segment-level in the MVP and returns PCM chunks; codec-frame
+  `async_chunk` is not yet enabled.
+- Review upstream licensing before redistributing code or checkpoints.
 
 ---
 

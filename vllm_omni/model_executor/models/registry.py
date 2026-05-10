@@ -180,6 +180,12 @@ _OMNI_MODELS = {
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
     ),
+    ## IndexTTS2
+    "IndexTTS2ForGeneration": (
+        "indextts2",
+        "modeling_indextts2",
+        "IndexTTS2ForGeneration",
+    ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",
         "dynin_omni",
