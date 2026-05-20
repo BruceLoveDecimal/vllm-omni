@@ -843,6 +843,28 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model)
                 if cfg is None:
+                    try:
+                        from vllm.transformers_utils.repo_utils import file_or_path_exists
+
+                        has_sana_wm_layout = (
+                            self.model_class_name in {"SanaWmPipeline", "SanaWmTwoStagesPipeline"}
+                            or (
+                                file_or_path_exists(self.model, "config.yaml", revision=self.revision)
+                                and file_or_path_exists(
+                                    self.model,
+                                    "dit/sana_wm_1600m_720p.safetensors",
+                                    revision=self.revision,
+                                )
+                            )
+                        )
+                    except Exception:
+                        has_sana_wm_layout = bool(self.model and "SANA-WM" in self.model.upper())
+                    if has_sana_wm_layout:
+                        if self.model_class_name is None:
+                            self.model_class_name = "SanaWmTwoStagesPipeline"
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
                     raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
 
                 self.set_tf_model_config(TransformerConfig.from_dict(cfg))
