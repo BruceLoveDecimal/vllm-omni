@@ -45,6 +45,16 @@ def test_sana_wm_official_backend_generates_video() -> None:
         model_class_name=model_class_name,
         enforce_eager=True,
     )
+    extra_args = {"sana_wm_sampling_algo": "flow_euler_ltx", "sana_wm_offload_vae": True}
+    if os.environ.get("SANA_WM_E2E_INPROCESS_REFINER") == "1":
+        extra_args.update(
+            {
+                "sana_wm_inprocess_refiner": True,
+                "sana_wm_refiner_output_type": os.environ.get("SANA_WM_E2E_OUTPUT_TYPE", "np"),
+                "sana_wm_inprocess_refiner_steps": int(os.environ.get("SANA_WM_E2E_REFINER_STEPS", "1")),
+            }
+        )
+
     output = omni.generate(
         {
             "prompt": "A slow forward camera move through a quiet city street.",
@@ -73,7 +83,7 @@ def test_sana_wm_official_backend_generates_video() -> None:
             num_inference_steps=1,
             guidance_scale=1.0,
             guidance_scale_provided=True,
-            extra_args={"sana_wm_sampling_algo": "flow_euler_ltx", "sana_wm_offload_vae": True},
+            extra_args=extra_args,
         ),
     )
 

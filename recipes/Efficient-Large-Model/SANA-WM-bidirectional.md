@@ -19,8 +19,9 @@ paths:
 - **Official backend**: calls an NVlabs/Sana checkout for real output parity.
 - **Native smoke backend**: exercises vLLM-Omni Stage-1 request, camera, and
   scheduler plumbing at reduced resolution.
-- **Two-stage backend**: loads the SANA-WM release layout and reserves the
-  LTX-2 refiner slots; full native refiner quality still needs GPU validation.
+- **Two-stage backend**: loads the SANA-WM release layout, the bundled LTX-2
+  refiner slots, and an opt-in in-process refiner step for native integration
+  testing.
 
 ## References
 
@@ -149,6 +150,28 @@ The official repo must contain:
 inference_video_scripts/inference_sana_wm.py
 ```
 
+## In-Process Refiner Smoke
+
+The two-stage pipeline also exposes an opt-in native refiner path. This bypasses
+the official CLI subprocess and routes the Stage-1 latent through the loaded
+`refiner/text_encoder`, `refiner/connectors`, and `refiner/transformer`
+components:
+
+```bash
+export VLLM_OMNI_SANA_WM_OFFICIAL_REPO=/path/to/NVlabs/Sana
+export SANA_WM_E2E_MODEL=/path/to/SANA-WM_bidirectional
+export SANA_WM_E2E_MODEL_CLASS=SanaWmTwoStagesPipeline
+export SANA_WM_E2E_INPROCESS_REFINER=1
+export SANA_WM_E2E_REFINER_STEPS=1
+
+SANA_WM_E2E=1 \
+pytest tests/e2e/accuracy/test_sana_wm_video_e2e.py -q
+```
+
+This path is for integration validation. The official CLI bridge remains the
+quality reference until the native Stage-1 Gated DeltaNet kernel is numerically
+matched against NVlabs/Sana.
+
 ## Request Shape
 
 SANA-WM requires a first-frame image and exactly one camera control source.
@@ -188,7 +211,7 @@ Explicit camera poses use:
 
 - Native Gated DeltaNet is still a PyTorch reference fallback, not the fused
   Triton implementation.
-- Full native Stage-2 refiner quality requires GPU validation with the bundled
-  LTX-2 refiner weights.
+- The in-process refiner path is an integration smoke, not yet a quality
+  replacement for the official CLI bridge.
 - There is no tagged upstream release yet; pin an exact vLLM-Omni commit and
   exact SANA-WM snapshot for reproducible tests.
