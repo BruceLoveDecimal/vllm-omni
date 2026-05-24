@@ -203,6 +203,8 @@ def run_sana_wm_official_backend(
 
         env = os.environ.copy()
         env["TOKENIZERS_PARALLELISM"] = "false"
+        pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = str(repo) if not pythonpath else f"{repo}{os.pathsep}{pythonpath}"
         completed = subprocess.run(
             cmd,
             cwd=str(repo),
