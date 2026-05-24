@@ -1,0 +1,7 @@
+{
+  "model": "Efficient-Large-Model/SANA-WM_bidirectional",
+  "model_class_name": "SanaWmTwoStagesPipeline",
+  "task": "image_to_video",
+  "status": "pending_gpu_validation",
+  "notes": "SANA-WM perf requires Stage-2 refiner and GPU e2e validation."
+}

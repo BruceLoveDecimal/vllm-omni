@@ -283,6 +283,21 @@ def _try_resolve_omni_model_type(model: str) -> str | None:
     return best_match
 
 
+def _looks_like_sana_wm_layout(model: str) -> bool:
+    path = Path(model)
+    if path.is_dir():
+        return (path / "config.yaml").is_file() and (path / "dit" / "sana_wm_1600m_720p.safetensors").is_file()
+
+    try:
+        return file_or_path_exists(model, "config.yaml", revision=None) and file_or_path_exists(
+            model,
+            "dit/sana_wm_1600m_720p.safetensors",
+            revision=None,
+        )
+    except Exception:
+        return "sana-wm" in model.lower() or "sana_wm" in model.lower()
+
+
 def resolve_model_config_path(model: str) -> str:
     """Resolve the stage config file path from the model name.
 
@@ -328,6 +343,8 @@ def resolve_model_config_path(model: str) -> str:
                         raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
             except Exception as e:
                 raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
+        elif _looks_like_sana_wm_layout(model):
+            return None
         else:
             raise ValueError(
                 f"Could not determine model_type for model: {model}. "

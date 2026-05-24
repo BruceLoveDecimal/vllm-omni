@@ -59,6 +59,11 @@ def test_sana_wm_official_backend_generates_video() -> None:
             width=SANA_WM_OUTPUT_WIDTH,
             num_frames=17,
             seed=0,
+            fps=16,
+            num_inference_steps=1,
+            guidance_scale=1.0,
+            guidance_scale_provided=True,
+            extra_args={"sana_wm_sampling_algo": "flow_euler_ltx", "sana_wm_offload_vae": True},
         ),
     )
 

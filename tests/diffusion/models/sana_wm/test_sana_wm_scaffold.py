@@ -61,8 +61,10 @@ def test_sana_wm_pipelines_registered() -> None:
 def test_sana_wm_exports_and_constants() -> None:
     from vllm_omni.diffusion.models.sana_wm import (
         SANA_WM_DEFAULT_NUM_FRAMES,
+        SANA_WM_FORCE_CLI_ENV,
         SANA_WM_GDN_ERROR,
         SANA_WM_MODEL_ID,
+        SANA_WM_NATIVE_BACKEND_ERROR,
         SANA_WM_OFFICIAL_BACKEND_ERROR,
         SANA_WM_OFFICIAL_REPO_ENV,
         SANA_WM_OFFICIAL_SCRIPT,
@@ -70,16 +72,24 @@ def test_sana_wm_exports_and_constants() -> None:
         SANA_WM_OUTPUT_WIDTH,
         SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE,
         SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE,
+        SANA_WM_STAGE1_PROMPT_CHANNELS,
         SANA_WM_STAGE1_DIT_FILE,
+        SANA_WM_STAGE1_TEXT_ENCODER_ENV,
+        SANA_WM_STAGE1_TEXT_ENCODER_FALLBACK_ID,
         SANA_WM_STAGE1_TEXT_ENCODER_ID,
         SANA_WM_TRANSFORMER_FORWARD_ERROR,
         SANA_WM_VAE_WEIGHT_FILE,
         BidirectionalGatedDeltaNetTriton,
+        SanaWmCameraEmbedder,
         SanaWmConfig,
+        SanaWmFlowDpmScheduler,
         SanaWmPipeline,
+        SanaWmNativeRunResult,
         SanaWmTransformer3DModel,
         SanaWmTwoStagesPipeline,
         build_sana_wm_official_command,
+        reference_bidirectional_gated_delta_net,
+        shift_flow_timestep,
     )
 
     assert SANA_WM_MODEL_ID == "Efficient-Large-Model/SANA-WM_bidirectional"
@@ -88,28 +98,41 @@ def test_sana_wm_exports_and_constants() -> None:
     assert SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE == "refiner/transformer/diffusion_pytorch_model.safetensors"
     assert SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE == "refiner/connectors/diffusion_pytorch_model.safetensors"
     assert SANA_WM_STAGE1_TEXT_ENCODER_ID == "google/gemma-2-2b-it"
+    assert SANA_WM_STAGE1_TEXT_ENCODER_FALLBACK_ID == "Efficient-Large-Model/gemma-2-2b-it"
+    assert SANA_WM_STAGE1_TEXT_ENCODER_ENV == "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER"
     assert SANA_WM_OUTPUT_HEIGHT == 704
     assert SANA_WM_OUTPUT_WIDTH == 1280
     assert SANA_WM_DEFAULT_NUM_FRAMES == 321
+    assert SANA_WM_STAGE1_PROMPT_CHANNELS == 2304
+    assert SANA_WM_FORCE_CLI_ENV == "VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI"
+    assert "in-process native backend" in SANA_WM_NATIVE_BACKEND_ERROR
     assert SanaWmPipeline.support_image_input is True
     assert SanaWmPipeline._dit_modules == ["transformer"]
-    assert SanaWmPipeline._encoder_modules == ["text_encoder"]
+    assert SanaWmPipeline._encoder_modules == ["text_encoder", "camera_encoder"]
     assert SanaWmTwoStagesPipeline.support_image_input is True
     assert SanaWmTwoStagesPipeline._dit_modules == ["transformer"]
     assert SanaWmTwoStagesPipeline._encoder_modules == [
         "text_encoder",
+        "camera_encoder",
         "refiner_text_encoder",
         "refiner_connectors",
     ]
     assert SanaWmTwoStagesPipeline._resident_modules == ["refiner_transformer"]
     assert SanaWmTransformer3DModel._repeated_blocks == ["blocks"]
     assert SanaWmConfig().num_blocks == 20
+    assert SanaWmNativeRunResult.__name__ == "SanaWmNativeRunResult"
     assert "Gated DeltaNet" in SANA_WM_GDN_ERROR
     assert "forward is not implemented" in SANA_WM_TRANSFORMER_FORWARD_ERROR
     assert "official runner" in SANA_WM_OFFICIAL_BACKEND_ERROR
     assert SANA_WM_OFFICIAL_REPO_ENV == "VLLM_OMNI_SANA_WM_OFFICIAL_REPO"
     assert SANA_WM_OFFICIAL_SCRIPT == "inference_video_scripts/inference_sana_wm.py"
-    assert BidirectionalGatedDeltaNetTriton().__class__.__name__ == "BidirectionalGatedDeltaNetTriton"
+    gdn = BidirectionalGatedDeltaNetTriton()
+    assert gdn.__class__.__name__ == "BidirectionalGatedDeltaNetTriton"
+    assert gdn.triton_available is False
+    assert SanaWmCameraEmbedder().__class__.__name__ == "SanaWmCameraEmbedder"
+    assert SanaWmFlowDpmScheduler(num_inference_steps=1).num_inference_steps == 1
+    assert callable(reference_bidirectional_gated_delta_net)
+    assert callable(shift_flow_timestep)
     assert callable(build_sana_wm_official_command)
 
 
@@ -126,11 +149,125 @@ def test_sana_wm_config_parses_release_yaml(tmp_path) -> None:
     assert config.hidden_size == 2240
     assert config.mlp_ratio == 3.0
     assert config.attn_type == "BidirectionalGDNTriton"
+    assert config.qk_norm is True
+    assert config.cross_norm is True
+    assert config.cam_attn_compress == 1
+    assert config.patch_size == (1, 1, 1)
+    assert config.t_kernel_size == 3
+    assert config.k_conv_only is True
     assert config.scheduler_type == "flow_dpm-solver"
     assert config.inference_flow_shift == 9.8
     assert config.chi_prompt == ["enhance prompt"]
     assert config.y_norm_scale_factor == 0.01
     assert config.model_max_length == 300
+
+
+def test_sana_wm_flow_shift_scheduler() -> None:
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmFlowDpmScheduler, shift_flow_timestep
+
+    assert shift_flow_timestep(torch.tensor([1.0]), 9.8).item() == pytest.approx(1.0)
+    assert shift_flow_timestep(torch.tensor([0.0]), 9.8).item() == pytest.approx(0.0)
+    scheduler = SanaWmFlowDpmScheduler(num_inference_steps=2, shift=9.8)
+
+    assert scheduler.timesteps(device=torch.device("cpu")).shape == (2,)
+    assert scheduler.deltas(device=torch.device("cpu")).shape == (2,)
+
+
+def test_sana_wm_transformer_native_smoke_forward_shape() -> None:
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+
+    config = SanaWmConfig(
+        num_blocks=1,
+        hidden_size=8,
+        linear_head_dim=4,
+        mlp_ratio=1,
+        model_max_length=3,
+        chunk_plucker_channels=6,
+    )
+    model = SanaWmTransformer3DModel(config=config)
+    latents = torch.randn(1, 4, 2, 4, 4)
+    prompt_embeds = torch.randn(1, 3, 6)
+
+    output = model(latents, torch.tensor([1.0]), encoder_hidden_states=prompt_embeds)
+
+    assert output.shape == latents.shape
+    assert torch.isfinite(output).all()
+    assert model.is_materialized is True
+
+
+def test_sana_wm_transformer_marks_hybrid_softmax_blocks() -> None:
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+
+    config = SanaWmConfig(
+        num_blocks=4,
+        hidden_size=8,
+        linear_head_dim=4,
+        mlp_ratio=1,
+        softmax_every_n=2,
+    )
+    model = SanaWmTransformer3DModel(config=config, materialize=True)
+
+    assert [block.attn.use_gdn for block in model.blocks] == [True, False, True, False]
+
+
+def test_sana_wm_transformer_hybrid_softmax_forward_shape() -> None:
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+
+    config = SanaWmConfig(
+        num_blocks=1,
+        hidden_size=8,
+        linear_head_dim=4,
+        mlp_ratio=1,
+        model_max_length=3,
+        softmax_every_n=1,
+    )
+    model = SanaWmTransformer3DModel(config=config)
+    latents = torch.randn(1, 4, 2, 4, 4)
+    prompt_embeds = torch.randn(1, 3, 6)
+
+    output = model(latents, torch.tensor([1.0]), encoder_hidden_states=prompt_embeds)
+
+    assert output.shape == latents.shape
+    assert torch.isfinite(output).all()
+
+
+def test_sana_wm_transformer_limits_plucker_post_blocks() -> None:
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+
+    config = SanaWmConfig(
+        num_blocks=3,
+        hidden_size=8,
+        linear_head_dim=4,
+        mlp_ratio=1,
+        chunk_plucker_post_attn_blocks=1,
+    )
+    model = SanaWmTransformer3DModel(config=config, materialize=True)
+
+    assert [block.plucker_proj is not None for block in model.blocks] == [True, False, False]
+
+
+def test_sana_wm_gdn_reference_forward_shape() -> None:
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import BidirectionalGatedDeltaNetTriton
+
+    op = BidirectionalGatedDeltaNetTriton()
+    query = torch.rand(1, 2, 4, 6) + 0.1
+    key = torch.rand(1, 2, 4, 6) + 0.1
+    value = torch.rand(1, 2, 4, 6)
+    beta = torch.full((1, 2, 3, 2), 0.5)
+    decay = torch.full((1, 2, 3), 0.9)
+
+    output = op(query, key, value, beta=beta, decay=decay, spatial_tokens=2)
+
+    assert output.shape == query.shape
+    assert torch.isfinite(output).all()
 
 
 def test_sana_wm_download_patterns() -> None:
@@ -197,16 +334,23 @@ def test_sana_wm_weight_mapping() -> None:
     from vllm_omni.diffusion.models.sana_wm import normalize_sana_wm_stage1_weight_name
 
     assert normalize_sana_wm_stage1_weight_name("pos_embed") == "transformer.pos_embed"
-    assert (
-        normalize_sana_wm_stage1_weight_name("blocks.0.attn.A_log")
-        == "transformer.blocks.0.attention.A_log"
+    assert normalize_sana_wm_stage1_weight_name("blocks.0.attn.A_log") == "transformer.blocks.0.attn.A_log"
+    assert normalize_sana_wm_stage1_weight_name("blocks.0.scale_shift_table") == (
+        "transformer.blocks.0.scale_shift_table"
     )
     assert (
         normalize_sana_wm_stage1_weight_name("blocks.3.plucker_post.weight")
-        == "transformer.blocks.3.camera_post.weight"
+        == "transformer.blocks.3.plucker_proj.weight"
     )
-    assert normalize_sana_wm_stage1_weight_name("y_embedder.linear.weight") == (
-        "transformer.text_embedder.linear.weight"
+    assert normalize_sana_wm_stage1_weight_name("y_embedder.y_proj.fc1.weight") == (
+        "transformer.y_embedder.y_proj.fc1.weight"
+    )
+    assert normalize_sana_wm_stage1_weight_name("x_embedder.proj.weight") == "transformer.x_embedder.proj.weight"
+    assert normalize_sana_wm_stage1_weight_name("plucker_embedder.proj.weight") == (
+        "transformer.plucker_embedder.proj.weight"
+    )
+    assert normalize_sana_wm_stage1_weight_name("raymap_embedder.proj.weight") == (
+        "transformer.raymap_embedder.proj.weight"
     )
     assert normalize_sana_wm_stage1_weight_name("unknown.weight") is None
 
@@ -227,6 +371,124 @@ def test_sana_wm_pipeline_fails_fast_when_executed() -> None:
     assert "official runner" in SANA_WM_SCAFFOLD_ERROR
 
 
+def test_sana_wm_pipeline_native_smoke_opt_in_runs_small_latents() -> None:
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmPipeline
+
+    config = SanaWmConfig(
+        num_blocks=1,
+        hidden_size=8,
+        linear_head_dim=4,
+        mlp_ratio=1,
+        model_max_length=3,
+        chunk_plucker_channels=48,
+    )
+    pipeline = SanaWmPipeline(od_config=None)
+    pipeline.sana_wm_config = config
+    pipeline.transformer.config = config
+    req = SimpleNamespace(
+        prompts=[
+            {
+                "prompt": "native smoke",
+                "multi_modal_data": {"image": object()},
+                "sana_wm": {"action": "w-1", "num_frames": 1, "height": 64, "width": 64},
+            }
+        ],
+        sampling_params=SimpleNamespace(
+            height=64,
+            width=64,
+            num_frames=1,
+            num_inference_steps=1,
+            seed=0,
+            extra_args={"sana_wm_native_smoke": True, "sana_wm_hash_prompt_smoke": True},
+        ),
+    )
+
+    output = pipeline(req)
+
+    assert output.output.shape == (1, 128, 1, 2, 2)
+    assert output.custom_output["sana_wm_backend"] == "native_gdn_smoke"
+    assert output.custom_output["sana_wm_output_space"] == "latent"
+    assert output.custom_output["sana_wm_prompt_source"] == "hash_smoke"
+    assert output.custom_output["sana_wm_chi_prompt_applied"] is False
+
+
+def test_sana_wm_native_smoke_prompt_embeddings_are_deterministic() -> None:
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmPipeline
+
+    pipeline = SanaWmPipeline(od_config=None)
+    pipeline.sana_wm_config = SanaWmConfig(model_max_length=2, chi_prompt=["enhance prompt"])
+
+    first, source = pipeline._native_smoke_prompt_embeds(
+        {"prompt": "drive forward"},
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        allow_hash_fallback=True,
+    )
+    second, _ = pipeline._native_smoke_prompt_embeds(
+        {"prompt": "drive forward"},
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        allow_hash_fallback=True,
+    )
+    different, _ = pipeline._native_smoke_prompt_embeds(
+        {"prompt": "turn left"},
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        allow_hash_fallback=True,
+    )
+
+    assert source == "hash_smoke"
+    assert torch.equal(first, second)
+    assert not torch.equal(first, different)
+
+
+def test_sana_wm_native_smoke_prompt_embeddings_can_use_real_encoder(monkeypatch) -> None:
+    import sys
+    import types
+
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmPipeline
+
+    class FakeTokenizer:
+        pad_token = None
+        eos_token = "<eos>"
+
+        def __call__(self, *args, **kwargs):
+            class FakeBatch(dict):
+                def to(self, device):
+                    return self
+
+            return FakeBatch(input_ids=torch.zeros(1, 2, dtype=torch.long))
+
+    class FakeModel(torch.nn.Module):
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+        def forward(self, *args, **kwargs):
+            return types.SimpleNamespace(hidden_states=[torch.ones(1, 2, 2304)])
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: FakeTokenizer())
+    fake_transformers.AutoModelForCausalLM = FakeModel
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    pipeline = SanaWmPipeline(od_config=None)
+    pipeline.sana_wm_config = SanaWmConfig(model_max_length=2, chi_prompt=["enhance prompt"])
+
+    embeds, source = pipeline._native_smoke_prompt_embeds(
+        {"prompt": "drive forward"},
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert source == "gemma2"
+    assert embeds.shape == (1, 2, 2304)
+
+
 def test_sana_wm_official_backend_env_skips_stage1_weight_source(monkeypatch, tmp_path) -> None:
     from vllm_omni.diffusion.models.sana_wm import SANA_WM_OFFICIAL_REPO_ENV, SanaWmPipeline
 
@@ -237,6 +499,7 @@ def test_sana_wm_official_backend_env_skips_stage1_weight_source(monkeypatch, tm
 
     assert pipeline.use_official_backend is True
     assert pipeline.weights_sources == []
+    assert list(pipeline.named_parameters()) == []
     assert pipeline.load_weights([("pos_embed", object())]) == set()
 
 
@@ -274,6 +537,42 @@ def test_sana_wm_official_backend_command_builds_release_cli(tmp_path) -> None:
     assert str(paths.stage1_dit) in cmd
 
 
+def test_sana_wm_action_rollout_and_plucker_shapes() -> None:
+    from vllm_omni.diffusion.models.sana_wm import SanaWmCameraCondition
+    from vllm_omni.diffusion.models.sana_wm.camera_control import action_string_to_c2w, build_plucker_condition
+
+    c2w = action_string_to_c2w("w-16", translation_speed=0.055, rotation_speed_deg=1.2)
+    assert c2w.shape == (17, 4, 4)
+    assert c2w[0, 2, 3] == 0.0
+    assert c2w[-1, 2, 3] > 0.8
+
+    camera = build_plucker_condition(
+        SanaWmCameraCondition(
+            action="w-16",
+            intrinsics={"fx": 1000.0, "fy": 1000.0, "cx": 640.0, "cy": 352.0},
+            num_frames=17,
+            height=704,
+            width=1280,
+        )
+    )
+    assert camera["raymap"].shape == (3, 20)
+    assert camera["chunk_plucker"].shape == (48, 3, 22, 40)
+
+
+def test_sana_wm_native_backend_script_resolution(tmp_path) -> None:
+    from vllm_omni.diffusion.models.sana_wm import (
+        find_sana_wm_native_script,
+        require_sana_wm_native_script,
+    )
+
+    script = tmp_path / "inference_video_scripts/inference_sana_wm.py"
+    script.parent.mkdir(parents=True)
+    script.touch()
+
+    assert find_sana_wm_native_script(tmp_path) == script
+    assert require_sana_wm_native_script(tmp_path) == script
+
+
 def test_sana_wm_stage1_weight_loads_with_remap() -> None:
     import torch
 
@@ -289,11 +588,42 @@ def test_sana_wm_stage1_weight_loads_with_remap() -> None:
     )
 
     assert "transformer.pos_embed" in loaded
-    assert "transformer.blocks.0.attention.A_log" in loaded
-    assert "camera_encoder.plucker.proj.weight" in loaded
+    assert "transformer.blocks.0.attn.A_log" in loaded
+    assert "transformer.plucker_embedder.proj.weight" in loaded
     assert pipeline.transformer.last_load_report.total_weights == 3
     assert pipeline.transformer.last_load_report.loaded_weights == 3
     assert pipeline.transformer.get_loaded_tensor("transformer.pos_embed").shape == (1, 2)
+
+
+def test_sana_wm_stage1_weight_audit_materializes_cached_weights() -> None:
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+
+    config = SanaWmConfig(num_blocks=1, hidden_size=8, linear_head_dim=4, mlp_ratio=1, model_max_length=3)
+    model = SanaWmTransformer3DModel(config=config)
+
+    model.load_weights([("x_embedder.proj.bias", torch.ones(8))])
+    model.materialize(latent_channels=4, prompt_channels=6)
+
+    assert torch.equal(model.x_embedder.proj.bias, torch.ones_like(model.x_embedder.proj.bias))
+    assert model.last_load_report.materialized_weights == 1
+    assert model.last_load_report.unapplied_weights == ()
+
+
+def test_sana_wm_stage1_weight_audit_rejects_unconsumed_remapped_keys() -> None:
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+
+    config = SanaWmConfig(num_blocks=1, hidden_size=8, linear_head_dim=4, mlp_ratio=1, model_max_length=3)
+    model = SanaWmTransformer3DModel(config=config)
+    model.load_weights([("blocks.0.attn.no_such_weight", torch.zeros(1))])
+
+    with pytest.raises(ValueError, match="not consumed"):
+        model.materialize(latent_channels=4, prompt_channels=6)
+
+    assert model.last_load_report.unapplied_weights == ("transformer.blocks.0.attn.no_such_weight",)
 
 
 def test_sana_wm_stage1_weight_loader_rejects_unmapped_keys() -> None:
@@ -364,6 +694,16 @@ def test_sana_wm_checkpoint_resolution_uses_od_config_model(tmp_path) -> None:
     assert pipeline.sana_wm_config.num_blocks == 20
 
 
+def test_sana_wm_layout_uses_default_diffusion_stage_config(tmp_path) -> None:
+    from vllm_omni.entrypoints.utils import resolve_model_config_path
+
+    (tmp_path / "dit").mkdir()
+    (tmp_path / "config.yaml").write_text("model:\n  model: SanaMSVideoCamCtrl_1600M_P1_D20\n", encoding="utf-8")
+    (tmp_path / "dit" / "sana_wm_1600m_720p.safetensors").touch()
+
+    assert resolve_model_config_path(str(tmp_path)) is None
+
+
 def test_sana_wm_pipeline_declares_stage1_weight_source() -> None:
     from vllm_omni.diffusion.models.sana_wm import SanaWmPipeline
 
@@ -377,3 +717,15 @@ def test_sana_wm_pipeline_declares_stage1_weight_source() -> None:
     assert source.prefix == ""
     assert source.fall_back_to_pt is False
     assert source.allow_patterns_overrides == ["sana_wm_1600m_720p.safetensors"]
+
+
+def test_sana_wm_two_stage_exposes_refiner_loader_surface() -> None:
+    from vllm_omni.diffusion.models.sana_wm import SanaWmTwoStagesPipeline
+
+    pipeline = SanaWmTwoStagesPipeline(od_config=None)
+
+    assert callable(pipeline.ensure_refiner_components)
+    assert pipeline.refiner_transformer is None
+    assert pipeline.refiner_text_encoder is None
+    assert pipeline.refiner_connectors is None
+    assert pipeline.refiner_tokenizer is None

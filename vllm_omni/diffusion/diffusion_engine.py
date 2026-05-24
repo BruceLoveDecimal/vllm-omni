@@ -674,6 +674,10 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
+        if self.od_config.model_class_name in {"SanaWmPipeline", "SanaWmTwoStagesPipeline"}:
+            logger.info("Skipping dummy run for Sana-WM; camera-conditioned backend warms up on the first request.")
+            return
+
         num_inference_steps = 1
         height = 512
         width = 512

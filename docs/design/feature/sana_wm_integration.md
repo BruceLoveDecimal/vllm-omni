@@ -1,6 +1,15 @@
 # Sana-WM Integration Spec
 
-> **Status as of 2026-05-19 (post-weight-release update).**
+> **Status as of 2026-05-21 (consolidated single source of truth).**
+> This document is the **canonical** Sana-WM integration spec for
+> vllm-omni. It supersedes and absorbs the earlier
+> `sana_wm_spec_v0.1.md` pre-release planning draft (now removed): all
+> remaining-valid content from v0.1 (scope statement, non-goals,
+> milestone breakdown, test plan) has been merged in below, and the
+> speculative parts (T2V-first framing, dual-conv-stem camera
+> conditioning, GDN-as-generic-attention-backend) have been dropped
+> because the HF release contradicts them.
+>
 > NVIDIA released the SANA-WM weights to Hugging Face on 2026-05-18
 > (Beijing time evening). All "Work Allowed Before Weight Release"
 > guidance below has been superseded by concrete checkpoint
@@ -8,6 +17,10 @@
 > "Concrete Architecture (from `config.yaml` + HF component configs)",
 > and "Updated Implementation Plan" further down. The earlier
 > pre-release sections are kept for historical context only.
+>
+> **Tracking:** GitHub issue
+> [vllm-project/vllm-omni#3656](https://github.com/vllm-project/vllm-omni/issues/3656),
+> local branch `feat/sana_wm`.
 
 ## Status
 

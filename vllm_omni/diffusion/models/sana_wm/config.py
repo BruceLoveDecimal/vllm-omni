@@ -42,6 +42,19 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _as_tuple3(value: Any, default: tuple[int, int, int]) -> tuple[int, int, int]:
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return (value, value, value)
+    if isinstance(value, list | tuple):
+        if len(value) == 2:
+            return (1, int(value[0]), int(value[1]))
+        if len(value) == 3:
+            return (int(value[0]), int(value[1]), int(value[2]))
+    return default
+
+
 def _parse_num_blocks(architecture_name: str | None, default: int) -> int:
     if not architecture_name:
         return default
@@ -66,11 +79,18 @@ class SanaWmConfig:
     softmax_every_n: int = 4
     linear_head_dim: int = 112
     conv_kernel_size: int = 4
+    t_kernel_size: int = 3
+    k_conv_only: bool = True
     ffn_type: str = "GLUMBConvTemp"
     pos_embed_type: str = "wan_rope"
+    patch_size: tuple[int, int, int] = (1, 1, 1)
+    qk_norm: bool = True
+    cross_norm: bool = True
     mixed_precision: str = "bf16"
     fp32_attention: bool = True
     image_size: int = 720
+    cam_attn_compress: int = 1
+    use_chunk_plucker_post_attn: bool = True
     chunk_plucker_channels: int = 48
     chunk_plucker_post_attn_blocks: int = 20
     inference_flow_shift: float = 9.8
@@ -111,11 +131,20 @@ class SanaWmConfig:
             softmax_every_n=int(model_field("softmax_every_n", cls.softmax_every_n)),
             linear_head_dim=int(model_field("linear_head_dim", cls.linear_head_dim)),
             conv_kernel_size=int(model_field("conv_kernel_size", cls.conv_kernel_size)),
+            t_kernel_size=int(model_field("t_kernel_size", cls.t_kernel_size)),
+            k_conv_only=_as_bool(model_field("k_conv_only", cls.k_conv_only)),
             ffn_type=str(model_field("ffn_type", cls.ffn_type)),
             pos_embed_type=str(model_field("pos_embed_type", cls.pos_embed_type)),
+            patch_size=_as_tuple3(model_field("patch_size", cls.patch_size), cls.patch_size),
+            qk_norm=_as_bool(model_field("qk_norm", cls.qk_norm)),
+            cross_norm=_as_bool(model_field("cross_norm", cls.cross_norm)),
             mixed_precision=str(model_field("mixed_precision", cls.mixed_precision)),
             fp32_attention=_as_bool(model_field("fp32_attention", cls.fp32_attention)),
             image_size=int(model_field("image_size", cls.image_size)),
+            cam_attn_compress=int(model_field("cam_attn_compress", cls.cam_attn_compress)),
+            use_chunk_plucker_post_attn=_as_bool(
+                model_field("use_chunk_plucker_post_attn", cls.use_chunk_plucker_post_attn)
+            ),
             chunk_plucker_channels=int(model_field("chunk_plucker_channels", cls.chunk_plucker_channels)),
             chunk_plucker_post_attn_blocks=int(
                 model_field("chunk_plucker_post_attn_blocks", cls.chunk_plucker_post_attn_blocks)
