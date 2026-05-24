@@ -536,6 +536,23 @@ def test_sana_wm_official_backend_command_builds_release_cli(tmp_path) -> None:
     assert "--model_path" in cmd
     assert str(paths.stage1_dit) in cmd
 
+    refiner_cmd = build_sana_wm_official_command(
+        script=tmp_path / "Sana/inference_video_scripts/inference_sana_wm.py",
+        image_path=tmp_path / "input.png",
+        prompt_path=tmp_path / "prompt.txt",
+        output_dir=tmp_path / "out",
+        num_frames=17,
+        release_paths=paths,
+        include_refiner=True,
+        action="w-4",
+        python_executable="python",
+    )
+    assert "--refiner_root" in refiner_cmd
+    assert str(paths.root / "refiner") in refiner_cmd
+    assert "--refiner_gemma_root" in refiner_cmd
+    assert str(paths.refiner_text_encoder_dir) in refiner_cmd
+    assert "--refiner_checkpoint" not in refiner_cmd
+
 
 def test_sana_wm_action_rollout_and_plucker_shapes() -> None:
     from vllm_omni.diffusion.models.sana_wm import SanaWmCameraCondition

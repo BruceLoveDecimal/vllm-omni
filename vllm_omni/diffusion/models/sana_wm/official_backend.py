@@ -139,7 +139,7 @@ def build_sana_wm_official_command(
     if include_refiner:
         cmd.extend(
             [
-                "--refiner_checkpoint",
+                "--refiner_root",
                 str(release_paths.root / "refiner"),
                 "--refiner_gemma_root",
                 str(release_paths.refiner_text_encoder_dir),
