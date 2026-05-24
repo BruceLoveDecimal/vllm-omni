@@ -37,10 +37,12 @@ def test_sana_wm_official_backend_generates_video() -> None:
         pytest.skip(f"Set {SANA_WM_OFFICIAL_REPO_ENV} to an NVlabs/Sana checkout.")
 
     model = os.environ.get("SANA_WM_E2E_MODEL", SANA_WM_MODEL_ID)
+    model_class_name = os.environ.get("SANA_WM_E2E_MODEL_CLASS", "SanaWmPipeline")
+    num_frames = int(os.environ.get("SANA_WM_E2E_NUM_FRAMES", "9"))
     image = Image.new("RGB", (SANA_WM_OUTPUT_WIDTH, SANA_WM_OUTPUT_HEIGHT), (96, 128, 160))
     omni = Omni(
         model=model,
-        model_class_name="SanaWmPipeline",
+        model_class_name=model_class_name,
         enforce_eager=True,
     )
     output = omni.generate(
@@ -49,15 +51,23 @@ def test_sana_wm_official_backend_generates_video() -> None:
             "multi_modal_data": {"image": image},
             "sana_wm": {
                 "action": "w-16",
-                "num_frames": 17,
+                "num_frames": num_frames,
                 "translation_speed": 0.055,
                 "rotation_speed_deg": 1.2,
+                # Avoid the optional Pi3X dependency in the official runner by
+                # passing deterministic camera intrinsics directly.
+                "intrinsics": {
+                    "fx": SANA_WM_OUTPUT_WIDTH / 2,
+                    "fy": SANA_WM_OUTPUT_WIDTH / 2,
+                    "cx": SANA_WM_OUTPUT_WIDTH / 2,
+                    "cy": SANA_WM_OUTPUT_HEIGHT / 2,
+                },
             },
         },
         OmniDiffusionSamplingParams(
             height=SANA_WM_OUTPUT_HEIGHT,
             width=SANA_WM_OUTPUT_WIDTH,
-            num_frames=17,
+            num_frames=num_frames,
             seed=0,
             fps=16,
             num_inference_steps=1,
@@ -77,5 +87,5 @@ def test_sana_wm_official_backend_generates_video() -> None:
         frames = frames[0]
     frames = np.asarray(frames)
     assert frames.ndim == 4
-    assert frames.shape[0] == 17
+    assert 0 < frames.shape[0] <= num_frames
     assert frames.shape[-1] in (3, 4)

@@ -251,6 +251,13 @@ def run_sana_wm_official_backend(
 
         env = os.environ.copy()
         env["TOKENIZERS_PARALLELISM"] = "false"
+        # The official SANA-WM stack imports FLA kernels decorated with
+        # torch.compile. On the Blackwell validation image used for this model,
+        # torch.compile currently trips a TorchInductor template-registration
+        # issue before inference starts. Disabling Dynamo is safe for the
+        # subprocess bridge because this path is a correctness/e2e fallback, not
+        # the optimized native serving path.
+        env.setdefault("TORCHDYNAMO_DISABLE", "1")
         pythonpath = env.get("PYTHONPATH")
         env["PYTHONPATH"] = str(repo) if not pythonpath else f"{repo}{os.pathsep}{pythonpath}"
         completed = subprocess.run(

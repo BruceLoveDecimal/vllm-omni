@@ -104,9 +104,28 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             raise ValueError("Sana-WM two-stage refiner transformer requires a resolved checkpoint.")
 
         from safetensors.torch import load_file
+        from contextlib import nullcontext
+
+        from vllm.config import (
+            CompilationConfig,
+            DeviceConfig,
+            VllmConfig,
+            get_current_vllm_config,
+            set_current_vllm_config,
+        )
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import create_transformer_from_config
 
-        with torch.device("cpu"):
+        try:
+            get_current_vllm_config()
+            vllm_config_context = nullcontext()
+        except AssertionError:
+            vllm_config = VllmConfig(
+                compilation_config=CompilationConfig(),
+                device_config=DeviceConfig(device=device),
+            )
+            vllm_config_context = set_current_vllm_config(vllm_config)
+
+        with vllm_config_context, torch.device("cpu"):
             self.refiner_transformer = create_transformer_from_config(self._load_refiner_transformer_config())
         state_dict = load_file(str(self.release_paths.refiner_transformer_weights), device="cpu")
         if hasattr(self.refiner_transformer, "load_weights"):
