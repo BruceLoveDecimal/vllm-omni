@@ -75,6 +75,7 @@ SANA_WM_REFINER_TEXT_ENCODER_INDEX_FILE = "refiner/text_encoder/model.safetensor
 SANA_WM_STAGE1_TEXT_ENCODER_ID = "google/gemma-2-2b-it"
 SANA_WM_STAGE1_TEXT_ENCODER_FALLBACK_ID = "Efficient-Large-Model/gemma-2-2b-it"
 SANA_WM_STAGE1_TEXT_ENCODER_ENV = "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER"
+SANA_WM_REFINER_ROOT_ENV = "VLLM_OMNI_SANA_WM_REFINER_ROOT"
 SANA_WM_OUTPUT_HEIGHT = 704
 SANA_WM_OUTPUT_WIDTH = 1280
 SANA_WM_DEFAULT_NUM_FRAMES = 321
@@ -107,6 +108,7 @@ class SanaWmLocalPaths:
     stage1_dit: Path
     vae_config: Path
     vae_weights: Path
+    refiner_root: Path
     refiner_transformer_config: Path
     refiner_transformer_weights: Path
     refiner_connectors_config: Path
@@ -139,19 +141,25 @@ def build_sana_wm_download_patterns(*, include_refiner: bool = True) -> tuple[st
     return tuple(patterns)
 
 
-def resolve_sana_wm_local_paths(snapshot_dir: str | Path) -> SanaWmLocalPaths:
+def resolve_sana_wm_local_paths(
+    snapshot_dir: str | Path,
+    *,
+    refiner_root: str | Path | None = None,
+) -> SanaWmLocalPaths:
     root = Path(snapshot_dir)
+    resolved_refiner_root = Path(refiner_root) if refiner_root is not None else root / "refiner"
     return SanaWmLocalPaths(
         root=root,
         config=root / SANA_WM_CONFIG_FILE,
         stage1_dit=root / SANA_WM_STAGE1_DIT_FILE,
         vae_config=root / SANA_WM_VAE_CONFIG_FILE,
         vae_weights=root / SANA_WM_VAE_WEIGHT_FILE,
-        refiner_transformer_config=root / SANA_WM_REFINER_TRANSFORMER_CONFIG_FILE,
-        refiner_transformer_weights=root / SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE,
-        refiner_connectors_config=root / SANA_WM_REFINER_CONNECTORS_CONFIG_FILE,
-        refiner_connectors_weights=root / SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE,
-        refiner_text_encoder_dir=root / SANA_WM_REFINER_TEXT_ENCODER_DIR,
+        refiner_root=resolved_refiner_root,
+        refiner_transformer_config=resolved_refiner_root / "transformer/config.json",
+        refiner_transformer_weights=resolved_refiner_root / "transformer/diffusion_pytorch_model.safetensors",
+        refiner_connectors_config=resolved_refiner_root / "connectors/config.json",
+        refiner_connectors_weights=resolved_refiner_root / "connectors/diffusion_pytorch_model.safetensors",
+        refiner_text_encoder_dir=resolved_refiner_root / "text_encoder",
     )
 
 
@@ -201,7 +209,8 @@ def resolve_or_download_sana_wm_checkpoint(
                 require_all=True,
             )
         )
-    paths = resolve_sana_wm_local_paths(snapshot_dir)
+    refiner_root = os.environ.get(SANA_WM_REFINER_ROOT_ENV, "").strip() or None
+    paths = resolve_sana_wm_local_paths(snapshot_dir, refiner_root=refiner_root)
     validate_sana_wm_local_paths(paths, include_refiner=include_refiner)
     return paths
 

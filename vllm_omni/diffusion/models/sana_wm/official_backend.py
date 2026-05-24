@@ -43,6 +43,7 @@ class SanaWmLocalPathsLike(Protocol):
     root: Path
     config: Path
     stage1_dit: Path
+    refiner_root: Path
     refiner_text_encoder_dir: Path
 
 
@@ -140,7 +141,7 @@ def build_sana_wm_official_command(
         cmd.extend(
             [
                 "--refiner_root",
-                str(release_paths.root / "refiner"),
+                str(release_paths.refiner_root),
                 "--refiner_gemma_root",
                 str(release_paths.refiner_text_encoder_dir),
             ]
@@ -148,6 +149,46 @@ def build_sana_wm_official_command(
     else:
         cmd.append("--no_refiner")
     return cmd
+
+
+def _write_official_config_with_local_vae(
+    *,
+    source_config: Path,
+    local_model_root: Path,
+    output_dir: Path,
+) -> Path:
+    """Patch the official YAML so the CLI does not snapshot-download the repo.
+
+    NVlabs/Sana's public config points ``vae.vae_pretrained`` at the HF repo
+    root. If the official CLI receives that config unchanged, it calls
+    ``snapshot_download`` without an allow-list and tries to fetch Stage 1,
+    VAE, and the huge refiner tree again. vLLM-Omni has already resolved a
+    local snapshot, so pass that local root into the CLI instead.
+    """
+
+    output_path = output_dir / "config.local_vae.yaml"
+    try:
+        import yaml
+
+        config = yaml.safe_load(source_config.read_text(encoding="utf-8")) or {}
+        vae_config = config.setdefault("vae", {})
+        if isinstance(vae_config, dict):
+            vae_config["vae_pretrained"] = str(local_model_root)
+        output_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    except Exception:
+        lines = []
+        replaced = False
+        for line in source_config.read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("vae_pretrained:"):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines.append(f"{indent}vae_pretrained: {local_model_root}")
+                replaced = True
+            else:
+                lines.append(line)
+        if not replaced:
+            lines.extend(["vae:", f"  vae_pretrained: {local_model_root}"])
+        output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_path
 
 
 def run_sana_wm_official_backend(
@@ -174,6 +215,11 @@ def run_sana_wm_official_backend(
 
         _save_image(image, input_image_path)
         prompt_path.write_text(str(prompt.get("prompt") or ""), encoding="utf-8")
+        config_path = _write_official_config_with_local_vae(
+            source_config=release_paths.config,
+            local_model_root=release_paths.root,
+            output_dir=tmpdir,
+        )
 
         camera_path = None
         camera = payload.get("camera")
@@ -200,6 +246,8 @@ def run_sana_wm_official_backend(
             translation_speed=payload.get("translation_speed"),
             rotation_speed_deg=payload.get("rotation_speed_deg"),
         )
+        config_index = cmd.index("--config") + 1
+        cmd[config_index] = str(config_path)
 
         env = os.environ.copy()
         env["TOKENIZERS_PARALLELISM"] = "false"

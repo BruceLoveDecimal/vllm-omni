@@ -71,6 +71,7 @@ def test_sana_wm_exports_and_constants() -> None:
         SANA_WM_OUTPUT_HEIGHT,
         SANA_WM_OUTPUT_WIDTH,
         SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE,
+        SANA_WM_REFINER_ROOT_ENV,
         SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE,
         SANA_WM_STAGE1_PROMPT_CHANNELS,
         SANA_WM_STAGE1_DIT_FILE,
@@ -97,6 +98,7 @@ def test_sana_wm_exports_and_constants() -> None:
     assert SANA_WM_VAE_WEIGHT_FILE == "vae/diffusion_pytorch_model.safetensors"
     assert SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE == "refiner/transformer/diffusion_pytorch_model.safetensors"
     assert SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE == "refiner/connectors/diffusion_pytorch_model.safetensors"
+    assert SANA_WM_REFINER_ROOT_ENV == "VLLM_OMNI_SANA_WM_REFINER_ROOT"
     assert SANA_WM_STAGE1_TEXT_ENCODER_ID == "google/gemma-2-2b-it"
     assert SANA_WM_STAGE1_TEXT_ENCODER_FALLBACK_ID == "Efficient-Large-Model/gemma-2-2b-it"
     assert SANA_WM_STAGE1_TEXT_ENCODER_ENV == "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER"
@@ -510,6 +512,7 @@ def test_sana_wm_official_backend_command_builds_release_cli(tmp_path) -> None:
         root=tmp_path,
         config=tmp_path / "config.yaml",
         stage1_dit=tmp_path / "dit/sana_wm_1600m_720p.safetensors",
+        refiner_root=tmp_path / "refiner",
         refiner_text_encoder_dir=tmp_path / "refiner/text_encoder",
     )
 
@@ -552,6 +555,21 @@ def test_sana_wm_official_backend_command_builds_release_cli(tmp_path) -> None:
     assert "--refiner_gemma_root" in refiner_cmd
     assert str(paths.refiner_text_encoder_dir) in refiner_cmd
     assert "--refiner_checkpoint" not in refiner_cmd
+
+
+def test_sana_wm_refiner_root_override(tmp_path) -> None:
+    from vllm_omni.diffusion.models.sana_wm import resolve_sana_wm_local_paths
+
+    model_root = tmp_path / "model"
+    refiner_root = tmp_path / "official-refiner"
+
+    paths = resolve_sana_wm_local_paths(model_root, refiner_root=refiner_root)
+
+    assert paths.root == model_root
+    assert paths.refiner_root == refiner_root
+    assert paths.refiner_transformer_config == refiner_root / "transformer/config.json"
+    assert paths.refiner_connectors_weights == refiner_root / "connectors/diffusion_pytorch_model.safetensors"
+    assert paths.refiner_text_encoder_dir == refiner_root / "text_encoder"
 
 
 def test_sana_wm_action_rollout_and_plucker_shapes() -> None:

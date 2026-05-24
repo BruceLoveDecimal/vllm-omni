@@ -46,6 +46,7 @@ class SanaWmLocalPathsLike(Protocol):
     root: Path
     config: Path
     stage1_dit: Path
+    refiner_root: Path
     refiner_text_encoder_dir: Path
 
 
@@ -445,7 +446,7 @@ def run_sana_wm_native_backend(
     refiner = None
     if include_refiner:
         refiner = module.RefinerSettings(
-            root=release_paths.root / "refiner",
+            root=release_paths.refiner_root,
             gemma_root=release_paths.refiner_text_encoder_dir,
             sink_size=int(extra_args.get("sana_wm_sink_size", 1)),
             seed=int(extra_args.get("sana_wm_refiner_seed", seed)),
