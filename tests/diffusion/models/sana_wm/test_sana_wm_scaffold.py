@@ -63,6 +63,8 @@ def test_sana_wm_exports_and_constants() -> None:
         SANA_WM_DEFAULT_NUM_FRAMES,
         SANA_WM_FORCE_CLI_ENV,
         SANA_WM_GDN_ERROR,
+        SANA_WM_INPROCESS_REFINER_ARG,
+        SANA_WM_INPROCESS_REFINER_STEPS_ARG,
         SANA_WM_MODEL_ID,
         SANA_WM_NATIVE_BACKEND_ERROR,
         SANA_WM_OFFICIAL_BACKEND_ERROR,
@@ -102,6 +104,8 @@ def test_sana_wm_exports_and_constants() -> None:
     assert SANA_WM_STAGE1_TEXT_ENCODER_ID == "google/gemma-2-2b-it"
     assert SANA_WM_STAGE1_TEXT_ENCODER_FALLBACK_ID == "Efficient-Large-Model/gemma-2-2b-it"
     assert SANA_WM_STAGE1_TEXT_ENCODER_ENV == "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER"
+    assert SANA_WM_INPROCESS_REFINER_ARG == "sana_wm_inprocess_refiner"
+    assert SANA_WM_INPROCESS_REFINER_STEPS_ARG == "sana_wm_inprocess_refiner_steps"
     assert SANA_WM_OUTPUT_HEIGHT == 704
     assert SANA_WM_OUTPUT_WIDTH == 1280
     assert SANA_WM_DEFAULT_NUM_FRAMES == 321

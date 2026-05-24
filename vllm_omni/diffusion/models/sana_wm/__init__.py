@@ -68,6 +68,8 @@ from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import (
     validate_sana_wm_local_paths,
 )
 from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm_two_stages import (
+    SANA_WM_INPROCESS_REFINER_ARG,
+    SANA_WM_INPROCESS_REFINER_STEPS_ARG,
     SanaWmTwoStagesPipeline,
 )
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
@@ -93,6 +95,8 @@ __all__ = [
     "SANA_WM_DEFAULT_NUM_FRAMES",
     "SANA_WM_GDN_ERROR",
     "SANA_WM_FORCE_CLI_ENV",
+    "SANA_WM_INPROCESS_REFINER_ARG",
+    "SANA_WM_INPROCESS_REFINER_STEPS_ARG",
     "SANA_WM_MODEL_ID",
     "SANA_WM_NATIVE_BACKEND_ERROR",
     "SANA_WM_OFFICIAL_BACKEND_ERROR",
