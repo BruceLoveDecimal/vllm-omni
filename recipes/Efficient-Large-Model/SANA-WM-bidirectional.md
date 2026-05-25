@@ -131,6 +131,10 @@ Use 4x or 8x 80GB GPUs for Stage 2 refiner validation and accuracy runs. The
 refiner is a repackaged LTX-2 19B distilled refiner, so memory pressure is much
 higher than Stage 1.
 
+The current single-GPU integration smoke was validated on an RTX PRO 6000
+Blackwell Server Edition (96GB). Loading the refiner text encoder, connectors,
+and transformer uses roughly 60.6 GiB VRAM before the denoising step.
+
 ## Official Backend
 
 Until the native Gated DeltaNet kernel is numerically validated, use the
@@ -162,13 +166,16 @@ export VLLM_OMNI_SANA_WM_OFFICIAL_REPO=/path/to/NVlabs/Sana
 export SANA_WM_E2E_MODEL=/path/to/SANA-WM_bidirectional
 export SANA_WM_E2E_MODEL_CLASS=SanaWmTwoStagesPipeline
 export SANA_WM_E2E_INPROCESS_REFINER=1
+export SANA_WM_E2E_OUTPUT_TYPE=latent
 export SANA_WM_E2E_REFINER_STEPS=1
 
 SANA_WM_E2E=1 \
 pytest tests/e2e/accuracy/test_sana_wm_video_e2e.py -q
 ```
 
-This path is for integration validation. The official CLI bridge remains the
+This path is for integration validation. With `SANA_WM_E2E_OUTPUT_TYPE=latent`,
+it validates the Stage-1 latent handoff through the loaded LTX-2 refiner without
+spending additional time on VAE decode. The official CLI bridge remains the
 quality reference until the native Stage-1 Gated DeltaNet kernel is numerically
 matched against NVlabs/Sana.
 

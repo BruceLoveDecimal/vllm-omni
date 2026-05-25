@@ -1,8 +1,8 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-05-25 (revision 2)
+> **Audit date:** 2026-05-25 (revision 3)
 > **Branch:** `feat/sana_wm`
-> **Branch HEAD:** `76b8138e fix(sana-wm): validate refiner e2e path`
+> **Branch HEAD:** `f9c09825 fix(sana-wm): keep refiner tensors on runtime device`
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
 > **Worktree state at audit:** clean (sync'd with fork HEAD; only `.agents/` untracked)
 > **Spec (single source of truth):**
@@ -18,7 +18,7 @@
 ## 1. TL;DR
 
 Overall progress against the post-release implementation plan:
-**roughly 60–65%** (up from 40–45% in the 2026-05-24 snapshot).
+**roughly 65–70%** (up from 40–45% in the 2026-05-24 snapshot).
 
 - **P0 + P0.5 (scaffold + official CLI bridge): 100% done.** Unchanged.
 - **P1 (Stage-1 reference forward path): ~95% done.** Real-GPU 1-step
@@ -29,23 +29,24 @@ Overall progress against the post-release implementation plan:
   is **still a PyTorch reference fallback**, not the actual Triton
   kernel. Cindy's msg `234705a3` decomposes the blocker into four
   concrete sub-items — see §6.
-- **P3 (LTX-2 refiner attach + dual text encoder): ~70% done.**
-  `pipeline_sana_wm_two_stages.py` has grown from 45 → 163 lines.
+- **P3 (LTX-2 refiner attach + dual text encoder): ~85% done.**
+  `pipeline_sana_wm_two_stages.py` has grown from 45 → 461 lines.
   `Gemma3ForConditionalGeneration` (refiner text encoder),
   `LTX2TextConnectors` (refiner connectors), and
   `LTX2VideoTransformer3DModel` (refiner transformer) are now **all
   real-loadable** from `refiner/text_encoder/`, `refiner/connectors/`,
-  and `refiner/transformer/`. The 9-minute e2e test (RTX PRO 6000
-  Blackwell 96 GB) produced a `(8, 704, 1280, 3)` video tensor.
-  **What's still missing:** the in-process Stage-1 → refiner denoising
-  loop. Today the refiner components are *loaded* in vLLM-Omni but the
-  actual Stage-2 forward pass is delegated to NVlabs' CLI subprocess
-  through the bridge; a true native two-stage forward is still pending.
+  and `refiner/transformer/`. The official-bridge e2e produced a
+  `(8, 704, 1280, 3)` video tensor; the in-process refiner smoke now
+  runs Stage-1 latent → LTX-2 refiner transformer → latent output in
+  vLLM-Omni on RTX PRO 6000 Blackwell 96 GB.
+  **What's still missing:** decoded-video in-process validation and
+  reference alignment against the NVlabs bridge.
 - **P4 (online serving + recipe + accuracy): ~50% done.**
   `recipes/Efficient-Large-Model/SANA-WM-bidirectional.md` landed
   (194 lines); offline example committed; OpenAI-style online serving
   hookup and `accuracy ≥ PSNR 30 / SSIM 0.93` reference-alignment tests
-  still pending.
+  still pending, but the e2e test now supports both decoded video and
+  latent-output in-process refiner smoke.
 - **P5 (SP/USP/CFG-parallel/HSDP + dfx perf): ~10% done.**
   `test_sana_wm_hsdp.py`, `test_sana_wm_cfg_parallel_adaptation.py`,
   `test_sana_wm_cfg_parallel_parity.py`, and the dfx-perf JSON now
@@ -55,10 +56,42 @@ Overall progress against the post-release implementation plan:
 The system today can produce real videos end-to-end via the **official
 CLI bridge** (Stage 1 + LTX-2 refiner inside the NVlabs subprocess).
 The vLLM-Omni native path can now (a) load every refiner component,
-(b) run Stage-1 reference math under a PyTorch GDN fallback, and (c)
-decode through the real `AutoencoderKLLTX2Video`. It still relies on
-the CLI bridge for actual Stage-2 denoising and for production-quality
-Stage-1 generation.
+(b) run Stage-1 reference math under a PyTorch GDN fallback, (c) run one
+in-process LTX-2 refiner denoising step on the Stage-1 latent, and (d)
+decode through the real `AutoencoderKLLTX2Video`. It still relies on the
+CLI bridge for production-quality Stage-1 generation and for the decoded
+video reference.
+
+## 1.2. Changes since revision 2
+
+One additional commit landed on `feat/sana_wm` and was pushed to `fork`:
+
+```text
+f9c09825  fix(sana-wm): keep refiner tensors on runtime device
+```
+
+Concrete deltas:
+
+- **In-process refiner validation now passes on GPU.** Command:
+  `SANA_WM_E2E_MODEL_CLASS=SanaWmTwoStagesPipeline`,
+  `SANA_WM_E2E_INPROCESS_REFINER=1`,
+  `SANA_WM_E2E_OUTPUT_TYPE=latent`,
+  `SANA_WM_E2E_REFINER_STEPS=1`.
+  Result on `sana-wm-seeta` RTX PRO 6000 Blackwell 96 GB:
+  `1 passed, 4 warnings in 200.92s`.
+- **Root cause fixed:** vLLM `RMSNorm(has_weight=False)` stores
+  `weight` as a plain tensor attribute, not as a parameter or buffer.
+  `Module.to()` and the first migration helper missed it, causing
+  CUDA activations to meet CPU RMSNorm weights inside the LTX-2
+  refiner. `_force_module_tensors_to` now migrates parameters,
+  buffers, and plain tensor attributes.
+- **Regression coverage added:** `test_sana_wm_two_stage_force_module_tensors_handles_plain_tensor_attrs`
+  covers the plain tensor attribute case; `test_sana_wm_video_e2e.py`
+  accepts the latent-output e2e mode without converting CUDA tensors
+  through `np.asarray`.
+- **Unit validation:** `tests/diffusion/models/sana_wm`
+  + `tests/model_executor/stage_input_processors/test_sana_wm.py`
+  now pass as `53 passed, 2 skipped` on the GPU instance.
 
 ## 1.1. Changes since 2026-05-24 snapshot
 
@@ -76,7 +109,7 @@ e21b582e  feat(sana-wm): add native smoke and refiner loaders
 Concrete deltas:
 
 - **`pipeline_sana_wm.py`:** 554 → 696 lines. `AutoencoderKLLTX2Video.from_pretrained(..., subfolder="vae", local_files_only=True)` is now wired; `AutoModelForCausalLM.from_pretrained(text_encoder_model_id, ...)` is wired for Stage-1 Gemma-2-2B-IT (env-overridable via `VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER`); `_native_smoke_prompt_embeds` falls back to deterministic `hash_smoke` only when the real encoder cannot be obtained.
-- **`pipeline_sana_wm_two_stages.py`:** 45 → 163 lines. Adds `_ensure_refiner_text_encoder` (real `Gemma3ForConditionalGeneration` load), `_ensure_refiner_connectors` (real `LTX2TextConnectors` load), `_ensure_refiner_transformer` (real `LTX2VideoTransformer3DModel` via `create_transformer_from_config` + `safetensors.load_file`), and `ensure_refiner_components` orchestrator. Forward path triggers loading when `sampling_params.extra_args["sana_wm_load_refiner_components"]` is set; the actual Stage-2 denoising still routes through Stage-1's official-CLI path.
+- **`pipeline_sana_wm_two_stages.py`:** 45 → 476 lines. Adds `_ensure_refiner_text_encoder` (real `Gemma3ForConditionalGeneration` load), `_ensure_refiner_connectors` (real `LTX2TextConnectors` load), `_ensure_refiner_transformer` (real `LTX2VideoTransformer3DModel` via `create_transformer_from_config` + `safetensors.load_file`), `ensure_refiner_components`, and the opt-in in-process latent refiner step. The path is validated for latent output; decoded-output and accuracy alignment remain open.
 - **`official_backend.py`:** 344 → 401 lines. Supports external official refiner root (`SANA_WM_REFINER_ROOT_ENV`), CLI flag, and `PYTHONPATH` propagation so the NVlabs subprocess can find the locally cached weights.
 - **`gated_deltanet_triton.py`:** unchanged file name; +236 line edits but still a PyTorch reference, no Triton kernel yet.
 - **`recipes/Efficient-Large-Model/SANA-WM-bidirectional.md`:** new, 194 lines. Documents checkpoint layout, the three execution paths (official / native smoke / two-stage), and the GPU requirement bands.
@@ -124,8 +157,8 @@ vllm_omni/diffusion/models/sana_wm/
   sana_wm_transformer.py           1084 LOC   ✅ reference DiT — GDN PyTorch fallback, Wan RoPE, camera branch
   pipeline_sana_wm.py               696 LOC   ✅ Stage-1 pipeline w/ HF download, validation, 3-backend dispatch,
                                               real Gemma-2-2B-IT + LTX-2 VAE loaders
-  pipeline_sana_wm_two_stages.py    163 LOC   ⚠️ real refiner-component loaders shipped; in-process Stage-2 forward
-                                              still delegates to Stage-1 / official CLI path
+  pipeline_sana_wm_two_stages.py    476 LOC   ⚠️ real refiner-component loaders + in-process latent refiner
+                                              smoke; decoded-output validation still open
   camera_control.py                 332 LOC   ✅ Plücker / raymap + all camera schemas
   weight_mapping.py                  49 LOC   ✅ Stage-1 prefix remap helper (slightly extended)
   gated_deltanet_triton.py          244 LOC   ⚠️ PyTorch reference fallback; real Triton kernel NOT written
@@ -133,16 +166,16 @@ vllm_omni/diffusion/models/sana_wm/
   native_backend.py                 489 LOC   ✅ direct-import NVlabs Python modules (no subprocess)
   scheduling_sana_wm.py              52 LOC   ✅ SanaWmFlowDpmScheduler w/ inference_flow_shift=9.8
 vllm_omni/model_executor/stage_input_processors/sana_wm.py  309 LOC   ✅ request payload schema validator
-recipes/Efficient-Large-Model/SANA-WM-bidirectional.md      194 LOC   ✅ checkpoint layout + 3 backends + GPU bands
+recipes/Efficient-Large-Model/SANA-WM-bidirectional.md      217 LOC   ✅ checkpoint layout + 3 backends + GPU bands
 tests/diffusion/models/sana_wm/test_sana_wm_scaffold.py     766 LOC   ✅ ~30+ test functions (incl. refiner-loader contract)
 tests/diffusion/models/sana_wm/test_sana_wm_pipeline.py      37 LOC   ✅ real test (component declarations + preprocess)
-tests/diffusion/models/sana_wm/test_sana_wm_two_stages.py    28 LOC   ✅ real test (isolated refiner slots + loader gate)
+tests/diffusion/models/sana_wm/test_sana_wm_two_stages.py   165 LOC   ✅ real test (refiner slots, prompt encode, in-process step)
 tests/diffusion/models/sana_wm/test_sana_wm_camera_control.py  16 LOC ✅ real test (Plücker shape)
 tests/diffusion/models/sana_wm/test_sana_wm_hsdp.py          10 LOC   ⚠️ pytest.skip stub
 tests/diffusion/models/sana_wm/test_sana_wm_cfg_parallel_adaptation.py
                                                              10 LOC   ⚠️ pytest.skip stub
 tests/model_executor/stage_input_processors/test_sana_wm.py 236 LOC   ✅ request schema tests
-tests/e2e/accuracy/test_sana_wm_video_e2e.py                 91 LOC   ✅ env-driven gates; supports two-stage class
+tests/e2e/accuracy/test_sana_wm_video_e2e.py                107 LOC   ✅ env-driven gates; supports two-stage latent mode
 tests/examples/offline_inference/test_sana_wm_cfg_parallel_parity.py
                                                              10 LOC   ⚠️ pytest.skip stub
 tests/dfx/perf/tests/test_sana_wm_vllm_omni.json              7 LOC   ⚠️ {"status": "pending_gpu_validation"}
@@ -160,8 +193,8 @@ documented stubs gated on GPU validation).
 | **P0.5** — official CLI backend bridge for GPU smoke | `official_backend.py` ships, supports external refiner root (`SANA_WM_REFINER_ROOT_ENV`), `PYTHONPATH` propagation, and `TORCHDYNAMO_DISABLE=1` workaround for Blackwell | `official_backend.py` 401 LOC; `test_sana_wm_video_e2e.py` 91 LOC gated by `SANA_WM_E2E=1` and class env knob | ✅ **100%** |
 | **P1** — Stage-1 weight load (softmax fallback only) + image/camera input packing | `weight_mapping.remap` + `load_weights` + Wan-RoPE positional path + GDN PyTorch fallback + image/camera packing through `normalize_sana_wm_payload` | All present statically; real-GPU validation reported as passing `50 passed, 2 skipped` on `seeta-gpu` (RTX PRO 6000 Blackwell 96 GB). | ✅ **~95%** |
 | **P2** — `GatedDeltaNetTriton` kernel + Plücker camera injection → offline native e2e | `camera_control.py` (Plücker, raymap, action DSL, all camera schemas) is done; `gated_deltanet_triton.py` remains **only** a PyTorch reference recurrence — no Triton kernel | Plücker done (✅), Triton GDN missing (❌); offline native e2e for the Stage-1 reference path is exercised inside the CLI bridge (production-grade native is still pending) | ⚠️ **~35%** |
-| **P3** — LTX-2 refiner attach via `refiner/transformer/`, `refiner/connectors/`, and dual-text-encoder loading | `pipeline_sana_wm_two_stages.py` (163 LOC) **now loads** `Gemma3ForConditionalGeneration` from `refiner/text_encoder/`, `LTX2TextConnectors` from `refiner/connectors/`, and `LTX2VideoTransformer3DModel` (via `create_transformer_from_config` + `safetensors.load_file`) from `refiner/transformer/`. The `ensure_refiner_components` orchestrator is wired into `forward()` behind `extra_args["sana_wm_load_refiner_components"]`. Cindy's GPU run loaded all three components into ~60.6 GiB VRAM. | **Pending:** the in-process Stage-1 → refiner denoising loop. Current `forward()` defers Stage-2 inference to NVlabs' CLI subprocess after loading the components in-process. | ⚠️ **~70%** |
-| **P4** — Online serving + recipes + accuracy thresholds | `recipes/Efficient-Large-Model/SANA-WM-bidirectional.md` (194 LOC) committed; offline example present; the `(8, 704, 1280, 3)` e2e tensor proves the full pipeline runs end-to-end on a real Blackwell GPU; online OpenAI-style serving hookup and explicit PSNR/SSIM thresholds against NVlabs reference are still pending | Recipe ✅; e2e via CLI bridge ✅; online serving ❌; accuracy reference-alignment ❌ | ⚠️ **~50%** |
+| **P3** — LTX-2 refiner attach via `refiner/transformer/`, `refiner/connectors/`, and dual-text-encoder loading | `pipeline_sana_wm_two_stages.py` now loads `Gemma3ForConditionalGeneration` from `refiner/text_encoder/`, `LTX2TextConnectors` from `refiner/connectors/`, and `LTX2VideoTransformer3DModel` (via `create_transformer_from_config` + `safetensors.load_file`) from `refiner/transformer/`. The in-process path now runs Stage-1 latent through the loaded LTX-2 refiner transformer for one denoising step and returns latent output. | **Pending:** decoded-video in-process validation and reference alignment; production-quality Stage-1 still depends on solving the GDN parity problem. | ⚠️ **~85%** |
+| **P4** — Online serving + recipes + accuracy thresholds | `recipes/Efficient-Large-Model/SANA-WM-bidirectional.md` committed; offline example present; the `(8, 704, 1280, 3)` e2e tensor proves the official-bridge pipeline runs end-to-end on a real Blackwell GPU; the in-process refiner latent smoke now passes; online OpenAI-style serving hookup and explicit PSNR/SSIM thresholds against NVlabs reference are still pending | Recipe ✅; e2e via CLI bridge ✅; in-process latent e2e ✅; online serving ❌; accuracy reference-alignment ❌ | ⚠️ **~55%** |
 | **P5** — SP/USP/CFG-parallel/HSDP + dfx perf; cache-DiT if useful | `test_sana_wm_hsdp.py`, `test_sana_wm_cfg_parallel_adaptation.py`, `test_sana_wm_cfg_parallel_parity.py`, and `test_sana_wm_vllm_omni.json` exist as documented stubs. No actual SP/USP wiring; no DiT cache integration. | All four stub files in place ✅; actual perf and parallelism wiring ❌ | ⚠️ **~10%** |
 
 ## 5. What's already strong
@@ -206,15 +239,11 @@ documented stubs gated on GPU validation).
 (Items 1, 4, 5, 6, 7 from the 2026-05-24 snapshot are now resolved
 and recorded in §1.1.)
 
-1. **In-process Stage-1 → refiner forward is not implemented.**
-   `pipeline_sana_wm_two_stages.py::forward` loads the refiner
-   components and then calls `super().forward(req, ...)`, which is
-   the Stage-1 pipeline path. When the official-backend env vars
-   are set, the actual two-stage denoising executes inside the
-   NVlabs CLI subprocess via the bridge. A native two-stage
-   denoising loop (Stage-1 latent → `LTX2TextConnectors` →
-   `LTX2VideoTransformer3DModel` refinement → VAE decode) is still
-   pending.
+1. **In-process refiner is still an integration smoke, not a quality
+   replacement.** It now executes Stage-1 latent →
+   `LTX2TextConnectors` → `LTX2VideoTransformer3DModel` for latent
+   output, but decoded in-process video, multi-step quality validation,
+   and reference alignment against the official bridge are still pending.
 2. **`gated_deltanet_triton.py` is still PyTorch-only.** Cindy
    (msg `234705a3`) decomposed the blocker into four sub-items:
    - GDN ≠ standard attention — uses `A_log`, `beta_proj`, `conv_k`
@@ -248,13 +277,10 @@ and recorded in §1.1.)
 (The 2026-05-24 list of six items is now mostly resolved — see §1.1.
 Remaining non-GPU work.)
 
-1. **Implement the in-process Stage-1 → refiner denoising loop.**
-   Even before tackling the Triton GDN kernel, `SanaWmTwoStagesPipeline.forward`
-   can be extended to actually invoke the loaded
-   `LTX2VideoTransformer3DModel` for the Stage-2 refinement step
-   instead of deferring to the official-CLI subprocess. The
-   loaders, the text-encoder, the connectors, and the VAE are all
-   in place.
+1. **Extend the in-process refiner smoke to decoded video.**
+   The latent-output path passes on GPU. The next local code step is
+   ensuring the output-type path can decode the refined latent through
+   `AutoencoderKLLTX2Video` without falling back to the CLI subprocess.
 2. **Online serving wiring.** Add the `/v1/videos/generations`
    request-side mapping (image + camera trajectory + action) into
    `additional_information["sana_wm"]`. Currently only the offline
@@ -277,10 +303,9 @@ Remaining non-GPU work.)
 
 1. **Triton GDN kernel + reference-alignment math.** See Cindy's
    four-point blocker breakdown captured in §6 item 2.
-2. **vLLM-Omni native two-stage forward.** The end-state has Stage-1
-   reference latent → in-process `LTX2VideoTransformer3DModel`
-   refinement → `AutoencoderKLLTX2Video` decode, all inside vLLM-Omni
-   without the CLI subprocess.
+2. **vLLM-Omni native two-stage decoded output.** The latent handoff
+   is validated; decoded output still needs GPU validation without the
+   CLI subprocess.
 3. **Accuracy thresholds.** PSNR ≥ 30 / SSIM-Y All ≥ 0.93 vs the
    CLI-bridge reference once the native path produces a tensor.
 4. **`SANA_WM_E2E_MODEL_CLASS=SanaWmTwoStagesPipeline` smoke
@@ -291,13 +316,11 @@ Remaining non-GPU work.)
 
 ## 9. Suggested next-step ordering
 
-The biggest single open item is **the in-process two-stage forward
-loop** (§7 item 1). It does not require new GPU work — the loaders
-and the CLI-bridge reference output already give us everything
-needed to write the loop and then validate it against the bridge
-output once the GPU instance is open. After that:
+The biggest single open item is now **turning the in-process refiner
+latent smoke into decoded-output validation** (§7 item 1), then using
+the official bridge as a reference for alignment. After that:
 
-1. Write the in-process Stage-1 → refiner forward (§7 item 1).
+1. Validate decoded-output in-process refiner mode (§7 item 1).
 2. Plumb the latent-level reference-alignment test (§7 item 3) and
    run it against the CLI bridge output to confirm parity.
 3. Online serving wiring (§7 item 2).
