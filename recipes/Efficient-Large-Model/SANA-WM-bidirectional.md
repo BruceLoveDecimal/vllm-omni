@@ -198,6 +198,51 @@ export SANA_WM_E2E_OUTPUT_TYPE=np
 On RTX PRO 6000 Blackwell 96GB, the 9-frame decoded smoke has been validated
 with output shape `(1, 9, 704, 1280, 3)`.
 
+For a multi-step smoke, raise the refiner step count. This is slower but checks
+the sigma loop state over more than one update:
+
+```bash
+export SANA_WM_E2E_REFINER_STEPS=2
+```
+
+## Reference Alignment Harness
+
+The e2e test can run the official CLI bridge and in-process refiner path in the
+same process and compare decoded frames:
+
+```bash
+export VLLM_OMNI_SANA_WM_OFFICIAL_REPO=/path/to/NVlabs/Sana
+export SANA_WM_E2E_MODEL=/path/to/SANA-WM_bidirectional
+export SANA_WM_E2E_MODEL_CLASS=SanaWmTwoStagesPipeline
+export SANA_WM_E2E_REFERENCE_ALIGNMENT=1
+export SANA_WM_E2E_REFERENCE_MAX_MAE=255.0
+
+SANA_WM_E2E=1 \
+pytest tests/e2e/accuracy/test_sana_wm_video_e2e.py::test_sana_wm_inprocess_refiner_aligns_with_official_bridge -q
+```
+
+`SANA_WM_E2E_REFERENCE_MAX_MAE=255.0` is intentionally permissive while the
+native Stage-1 path is still being aligned. Tighten it after the native path is
+matched against NVlabs/Sana.
+
+## Online Serving
+
+The video entrypoint accepts SANA-WM camera control through either the explicit
+`sana_wm` form field or `extra_params.sana_wm`. Both are forwarded to
+`prompt["sana_wm"]` before the diffusion pipeline preprocesses the request.
+
+```bash
+curl -X POST http://localhost:8000/v1/videos/generations/sync \
+  -F 'prompt=A slow forward camera move through a quiet city street.' \
+  -F 'input_reference=@first_frame.png' \
+  -F 'width=1280' \
+  -F 'height=704' \
+  -F 'num_frames=9' \
+  -F 'fps=16' \
+  -F 'sana_wm={"action":"w-16","translation_speed":0.055,"rotation_speed_deg":1.2,"intrinsics":{"fx":640,"fy":640,"cx":640,"cy":352}}' \
+  --output sana_wm.mp4
+```
+
 ## Request Shape
 
 SANA-WM requires a first-frame image and exactly one camera control source.
