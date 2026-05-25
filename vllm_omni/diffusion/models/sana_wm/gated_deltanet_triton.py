@@ -299,9 +299,9 @@ def triton_bidirectional_gated_delta_net_from_qkv(
 class BidirectionalGatedDeltaNetTriton(nn.Module):
     """Reference-compatible wrapper for SANA-WM's model-local GDN operator.
 
-    The production fused Triton path is still pending. Keeping the same module
-    boundary gives tests and the native smoke transformer a concrete recurrence
-    to validate while preserving the model-local API choice.
+    The fused path is intentionally model-local: SANA-WM uses a bidirectional
+    video-latent recurrence instead of the autoregressive GDN cache contract
+    implemented by vLLM's Qwen3-Next layers.
     """
 
     def __init__(self, *, eps: float = 1e-8) -> None:
@@ -331,6 +331,72 @@ class BidirectionalGatedDeltaNetTriton(nn.Module):
         )
 
 
+def warmup_sana_wm_gdn_kernel(
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    batch_size: int = 1,
+    frames: int = 2,
+    spatial_tokens: int = 4,
+    num_heads: int = 2,
+    head_dim: int = 16,
+) -> bool:
+    """Compile/autotune the fused SANA-WM GDN kernel with a small workload.
+
+    vLLM's Qwen3-Next GDN path warms its chunked prefill kernels before real
+    inference to avoid first-request autotune after cache allocation. SANA-WM
+    does not use the autoregressive GDN cache path, but the same operational
+    concern applies to the model-local Triton recurrence.
+
+    Returns ``True`` when the warmup ran. Returns ``False`` when CUDA is not
+    available or the fused path is explicitly disabled.
+    """
+
+    if _triton_disabled() or not torch.cuda.is_available():
+        return False
+    device = torch.device(device or "cuda")
+    token_count = frames * spatial_tokens
+    qkv = torch.zeros(
+        batch_size,
+        token_count,
+        3,
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    beta = torch.full(
+        (batch_size, num_heads, frames, spatial_tokens),
+        0.5,
+        device=device,
+        dtype=torch.float32,
+    )
+    decay = torch.full(
+        (batch_size, num_heads, frames),
+        0.9,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    class _WarmupNorm(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.eps = 1e-6
+            self.weight = nn.Parameter(torch.ones(num_heads * head_dim, device=device))
+
+    triton_bidirectional_gated_delta_net_from_qkv(
+        qkv,
+        beta=beta,
+        decay=decay,
+        q_norm=_WarmupNorm(),
+        k_norm=_WarmupNorm(),
+        spatial_tokens=spatial_tokens,
+        k_scale=(head_dim**-0.5) * (spatial_tokens**-0.5),
+    )
+    torch.cuda.synchronize(device)
+    return True
+
+
 __all__ = [
     "SANA_WM_GDN_ERROR",
     "SANA_WM_DISABLE_TRITON_GDN_ENV",
@@ -338,4 +404,5 @@ __all__ = [
     "BidirectionalGatedDeltaNetTriton",
     "reference_bidirectional_gated_delta_net",
     "triton_bidirectional_gated_delta_net_from_qkv",
+    "warmup_sana_wm_gdn_kernel",
 ]

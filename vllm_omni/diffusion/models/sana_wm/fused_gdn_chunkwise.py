@@ -17,6 +17,10 @@
 """
 Fused GDN — Chunkwise-parallel forward (v2).
 
+Ported from the Apache-2.0 NVlabs/Sana reference and kept model-local because
+these kernels implement SANA-WM's bidirectional video-latent recurrence, not
+vLLM's autoregressive Qwen3-Next GDN prefill/decode cache path.
+
 V2 changes vs v1:
   1. Phase A is split into TWO kernels along the GDN data streams (KV and Z;
      these are the two gating sub-paths within the GDN block, not CUDA

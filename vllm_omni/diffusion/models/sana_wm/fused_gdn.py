@@ -16,6 +16,10 @@
 
 """Inference-side helpers for the bidirectional fused GDN path.
 
+Ported from the Apache-2.0 NVlabs/Sana reference and kept model-local
+because SANA-WM's bidirectional video-latent recurrence is not the same
+contract as vLLM's autoregressive Qwen3-Next GDN cache path.
+
 What this file contains:
   1. Config helpers (``_get_kernel_config``, ``_kcfg``, ``_precision_params``,
      ``_resolve_launch_config``) — re-used by ``fused_gdn_chunkwise``.
