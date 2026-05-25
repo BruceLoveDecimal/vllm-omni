@@ -76,6 +76,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
     def _ensure_refiner_connectors(self, *, device: torch.device, dtype: torch.dtype) -> None:
         if self.refiner_connectors is not None:
             self.refiner_connectors.to(device=device, dtype=dtype)
+            self._force_module_tensors_to(self.refiner_connectors, device=device, dtype=dtype)
             return
         if self.release_paths is None:
             self.resolve_checkpoint(include_refiner=True)
@@ -90,6 +91,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             torch_dtype=dtype,
             local_files_only=True,
         ).to(device)
+        self._force_module_tensors_to(self.refiner_connectors, device=device, dtype=dtype)
 
     def _load_refiner_transformer_config(self) -> dict[str, Any]:
         if self.release_paths is None:
@@ -102,6 +104,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
     def _ensure_refiner_transformer(self, *, device: torch.device, dtype: torch.dtype) -> None:
         if self.refiner_transformer is not None:
             self.refiner_transformer.to(device=device, dtype=dtype)
+            self._force_module_tensors_to(self.refiner_transformer, device=device, dtype=dtype)
             return
         if self.release_paths is None:
             self.resolve_checkpoint(include_refiner=True)
@@ -138,6 +141,52 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         else:
             self.refiner_transformer.load_state_dict(state_dict, strict=False)
         self.refiner_transformer.to(device=device, dtype=dtype)
+        self._force_module_tensors_to(self.refiner_transformer, device=device, dtype=dtype)
+
+    @staticmethod
+    def _force_module_tensors_to(module: nn.Module, *, device: torch.device, dtype: torch.dtype) -> None:
+        """Move custom-op tensors that may not be migrated by `Module.to`.
+
+        Some vLLM custom layers attach parameters/buffers in ways that can leave
+        CPU tensors behind after loading safetensors on CPU. The refiner forward
+        is fully CUDA, so fail-fast migration here is safer than discovering a
+        device mismatch inside the first RMSNorm call.
+        """
+
+        for child in module.modules():
+            for name, param in list(child._parameters.items()):
+                if param is None:
+                    continue
+                target_dtype = dtype if param.is_floating_point() else param.dtype
+                if param.device == device and param.dtype == target_dtype:
+                    continue
+                moved = param.detach().to(device=device, dtype=target_dtype)
+                replacement = nn.Parameter(moved, requires_grad=param.requires_grad)
+                weight_loader = getattr(param, "weight_loader", None)
+                if weight_loader is not None:
+                    replacement.weight_loader = weight_loader
+                child._parameters[name] = replacement
+            for name, buffer in list(child._buffers.items()):
+                if buffer is None:
+                    continue
+                target_dtype = dtype if buffer.is_floating_point() else buffer.dtype
+                if buffer.device == device and buffer.dtype == target_dtype:
+                    continue
+                child._buffers[name] = buffer.to(device=device, dtype=target_dtype)
+            for name, value in list(vars(child).items()):
+                if (
+                    name.startswith("_")
+                    or name in child._parameters
+                    or name in child._buffers
+                    or name in child._modules
+                ):
+                    continue
+                if not isinstance(value, torch.Tensor):
+                    continue
+                target_dtype = dtype if value.is_floating_point() else value.dtype
+                if value.device == device and value.dtype == target_dtype:
+                    continue
+                setattr(child, name, value.to(device=device, dtype=target_dtype))
 
     def ensure_refiner_components(
         self,

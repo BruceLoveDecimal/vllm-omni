@@ -95,6 +95,12 @@ def test_sana_wm_official_backend_generates_video() -> None:
     frames = request_output.images[0]
     if isinstance(frames, list):
         frames = frames[0]
+    if isinstance(frames, torch.Tensor):
+        assert frames.is_cuda or frames.device.type == "cpu"
+        assert frames.ndim == 5
+        assert frames.shape[0] == 1
+        assert frames.shape[2] <= num_frames
+        return
     frames = np.asarray(frames)
     assert frames.ndim == 4
     assert 0 < frames.shape[0] <= num_frames

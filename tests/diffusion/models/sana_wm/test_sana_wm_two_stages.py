@@ -28,6 +28,28 @@ def test_sana_wm_two_stage_refiner_loader_requires_checkpoint() -> None:
         pipe.ensure_refiner_components()
 
 
+def test_sana_wm_two_stage_force_module_tensors_handles_plain_tensor_attrs() -> None:
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmTwoStagesPipeline
+
+    class FakeCustomNorm(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.ones(4, dtype=torch.float64)
+
+    module = FakeCustomNorm()
+
+    SanaWmTwoStagesPipeline._force_module_tensors_to(
+        module,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert isinstance(module.weight, torch.Tensor)
+    assert module.weight.dtype == torch.float32
+
+
 def test_sana_wm_two_stage_refiner_prompt_encoder_uses_connectors() -> None:
     import types
 
