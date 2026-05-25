@@ -102,6 +102,9 @@ def test_sana_wm_official_backend_generates_video() -> None:
         assert frames.shape[2] <= num_frames
         return
     frames = np.asarray(frames)
+    if frames.ndim == 5:
+        assert frames.shape[0] == 1
+        frames = frames[0]
     assert frames.ndim == 4
     assert 0 < frames.shape[0] <= num_frames
     assert frames.shape[-1] in (3, 4)

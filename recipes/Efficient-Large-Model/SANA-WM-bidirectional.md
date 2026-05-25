@@ -179,6 +179,15 @@ spending additional time on VAE decode. The official CLI bridge remains the
 quality reference until the native Stage-1 Gated DeltaNet kernel is numerically
 matched against NVlabs/Sana.
 
+For the heavier in-process decoded-output smoke, change:
+
+```bash
+export SANA_WM_E2E_OUTPUT_TYPE=np
+```
+
+On RTX PRO 6000 Blackwell 96GB, the 9-frame decoded smoke has been validated
+with output shape `(1, 9, 704, 1280, 3)`.
+
 ## Request Shape
 
 SANA-WM requires a first-frame image and exactly one camera control source.

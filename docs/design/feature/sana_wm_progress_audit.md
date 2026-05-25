@@ -1,6 +1,6 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-05-25 (revision 3)
+> **Audit date:** 2026-05-25 (revision 4)
 > **Branch:** `feat/sana_wm`
 > **Branch HEAD:** `f9c09825 fix(sana-wm): keep refiner tensors on runtime device`
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
@@ -37,16 +37,16 @@ Overall progress against the post-release implementation plan:
   real-loadable** from `refiner/text_encoder/`, `refiner/connectors/`,
   and `refiner/transformer/`. The official-bridge e2e produced a
   `(8, 704, 1280, 3)` video tensor; the in-process refiner smoke now
-  runs Stage-1 latent → LTX-2 refiner transformer → latent output in
+  runs Stage-1 latent → LTX-2 refiner transformer → VAE decode in
   vLLM-Omni on RTX PRO 6000 Blackwell 96 GB.
-  **What's still missing:** decoded-video in-process validation and
-  reference alignment against the NVlabs bridge.
+  **What's still missing:** reference alignment against the NVlabs
+  bridge and multi-step quality validation.
 - **P4 (online serving + recipe + accuracy): ~50% done.**
   `recipes/Efficient-Large-Model/SANA-WM-bidirectional.md` landed
   (194 lines); offline example committed; OpenAI-style online serving
   hookup and `accuracy ≥ PSNR 30 / SSIM 0.93` reference-alignment tests
-  still pending, but the e2e test now supports both decoded video and
-  latent-output in-process refiner smoke.
+  still pending, but the e2e test now supports both latent-output and
+  decoded-video in-process refiner smoke.
 - **P5 (SP/USP/CFG-parallel/HSDP + dfx perf): ~10% done.**
   `test_sana_wm_hsdp.py`, `test_sana_wm_cfg_parallel_adaptation.py`,
   `test_sana_wm_cfg_parallel_parity.py`, and the dfx-perf JSON now
@@ -92,6 +92,11 @@ Concrete deltas:
 - **Unit validation:** `tests/diffusion/models/sana_wm`
   + `tests/model_executor/stage_input_processors/test_sana_wm.py`
   now pass as `53 passed, 2 skipped` on the GPU instance.
+- **Decoded-output validation also passes.** Running the same e2e with
+  `SANA_WM_E2E_OUTPUT_TYPE=np` now passes as `1 passed, 4 warnings in
+  212.22s`; the test accepts the in-process decoded output shape
+  `(1, 9, 704, 1280, 3)` and normalizes the batch dimension before
+  applying video-frame assertions.
 
 ## 1.1. Changes since 2026-05-24 snapshot
 
@@ -193,8 +198,8 @@ documented stubs gated on GPU validation).
 | **P0.5** — official CLI backend bridge for GPU smoke | `official_backend.py` ships, supports external refiner root (`SANA_WM_REFINER_ROOT_ENV`), `PYTHONPATH` propagation, and `TORCHDYNAMO_DISABLE=1` workaround for Blackwell | `official_backend.py` 401 LOC; `test_sana_wm_video_e2e.py` 91 LOC gated by `SANA_WM_E2E=1` and class env knob | ✅ **100%** |
 | **P1** — Stage-1 weight load (softmax fallback only) + image/camera input packing | `weight_mapping.remap` + `load_weights` + Wan-RoPE positional path + GDN PyTorch fallback + image/camera packing through `normalize_sana_wm_payload` | All present statically; real-GPU validation reported as passing `50 passed, 2 skipped` on `seeta-gpu` (RTX PRO 6000 Blackwell 96 GB). | ✅ **~95%** |
 | **P2** — `GatedDeltaNetTriton` kernel + Plücker camera injection → offline native e2e | `camera_control.py` (Plücker, raymap, action DSL, all camera schemas) is done; `gated_deltanet_triton.py` remains **only** a PyTorch reference recurrence — no Triton kernel | Plücker done (✅), Triton GDN missing (❌); offline native e2e for the Stage-1 reference path is exercised inside the CLI bridge (production-grade native is still pending) | ⚠️ **~35%** |
-| **P3** — LTX-2 refiner attach via `refiner/transformer/`, `refiner/connectors/`, and dual-text-encoder loading | `pipeline_sana_wm_two_stages.py` now loads `Gemma3ForConditionalGeneration` from `refiner/text_encoder/`, `LTX2TextConnectors` from `refiner/connectors/`, and `LTX2VideoTransformer3DModel` (via `create_transformer_from_config` + `safetensors.load_file`) from `refiner/transformer/`. The in-process path now runs Stage-1 latent through the loaded LTX-2 refiner transformer for one denoising step and returns latent output. | **Pending:** decoded-video in-process validation and reference alignment; production-quality Stage-1 still depends on solving the GDN parity problem. | ⚠️ **~85%** |
-| **P4** — Online serving + recipes + accuracy thresholds | `recipes/Efficient-Large-Model/SANA-WM-bidirectional.md` committed; offline example present; the `(8, 704, 1280, 3)` e2e tensor proves the official-bridge pipeline runs end-to-end on a real Blackwell GPU; the in-process refiner latent smoke now passes; online OpenAI-style serving hookup and explicit PSNR/SSIM thresholds against NVlabs reference are still pending | Recipe ✅; e2e via CLI bridge ✅; in-process latent e2e ✅; online serving ❌; accuracy reference-alignment ❌ | ⚠️ **~55%** |
+| **P3** — LTX-2 refiner attach via `refiner/transformer/`, `refiner/connectors/`, and dual-text-encoder loading | `pipeline_sana_wm_two_stages.py` now loads `Gemma3ForConditionalGeneration` from `refiner/text_encoder/`, `LTX2TextConnectors` from `refiner/connectors/`, and `LTX2VideoTransformer3DModel` (via `create_transformer_from_config` + `safetensors.load_file`) from `refiner/transformer/`. The in-process path now runs Stage-1 latent through the loaded LTX-2 refiner transformer for one denoising step and can return either latent output or decoded video output. | **Pending:** reference alignment; production-quality Stage-1 still depends on solving the GDN parity problem. | ⚠️ **~90%** |
+| **P4** — Online serving + recipes + accuracy thresholds | `recipes/Efficient-Large-Model/SANA-WM-bidirectional.md` committed; offline example present; the `(8, 704, 1280, 3)` e2e tensor proves the official-bridge pipeline runs end-to-end on a real Blackwell GPU; the in-process refiner latent and decoded-video smokes both pass; online OpenAI-style serving hookup and explicit PSNR/SSIM thresholds against NVlabs reference are still pending | Recipe ✅; e2e via CLI bridge ✅; in-process latent e2e ✅; in-process decoded e2e ✅; online serving ❌; accuracy reference-alignment ❌ | ⚠️ **~60%** |
 | **P5** — SP/USP/CFG-parallel/HSDP + dfx perf; cache-DiT if useful | `test_sana_wm_hsdp.py`, `test_sana_wm_cfg_parallel_adaptation.py`, `test_sana_wm_cfg_parallel_parity.py`, and `test_sana_wm_vllm_omni.json` exist as documented stubs. No actual SP/USP wiring; no DiT cache integration. | All four stub files in place ✅; actual perf and parallelism wiring ❌ | ⚠️ **~10%** |
 
 ## 5. What's already strong
@@ -241,9 +246,9 @@ and recorded in §1.1.)
 
 1. **In-process refiner is still an integration smoke, not a quality
    replacement.** It now executes Stage-1 latent →
-   `LTX2TextConnectors` → `LTX2VideoTransformer3DModel` for latent
-   output, but decoded in-process video, multi-step quality validation,
-   and reference alignment against the official bridge are still pending.
+   `LTX2TextConnectors` → `LTX2VideoTransformer3DModel` → VAE decode,
+   but multi-step quality validation and reference alignment against
+   the official bridge are still pending.
 2. **`gated_deltanet_triton.py` is still PyTorch-only.** Cindy
    (msg `234705a3`) decomposed the blocker into four sub-items:
    - GDN ≠ standard attention — uses `A_log`, `beta_proj`, `conv_k`
@@ -277,19 +282,18 @@ and recorded in §1.1.)
 (The 2026-05-24 list of six items is now mostly resolved — see §1.1.
 Remaining non-GPU work.)
 
-1. **Extend the in-process refiner smoke to decoded video.**
-   The latent-output path passes on GPU. The next local code step is
-   ensuring the output-type path can decode the refined latent through
-   `AutoencoderKLLTX2Video` without falling back to the CLI subprocess.
+1. **Reference-alignment test harness.** Write the comparison between
+   vLLM-Omni native output and the CLI bridge output at the latent or
+   decoded-frame level. This is the next useful correctness gate now
+   that both latent and decoded in-process smokes pass.
 2. **Online serving wiring.** Add the `/v1/videos/generations`
    request-side mapping (image + camera trajectory + action) into
    `additional_information["sana_wm"]`. Currently only the offline
    path is exercised.
-3. **Reference-alignment test harness.** Write the comparison
-   between vLLM-Omni native Stage-1 output and the CLI bridge
-   output at the latent level (PSNR-on-latents is cheaper than
-   video PSNR and runs without ffmpeg); land it as a skip-by-default
-   test that flips on once the native path returns a valid latent.
+3. **Recipe extensions for decoded-output validation.** The recipe
+   now includes the latent command; add the decoded-output command and
+   measured `(1, 9, 704, 1280, 3)` shape if reviewers need a heavier
+   smoke.
 4. **Recipe extensions.** The existing recipe documents the three
    execution paths well; extending it with the
    `SANA_WM_E2E_MODEL_CLASS=SanaWmTwoStagesPipeline` invocation and
@@ -303,9 +307,9 @@ Remaining non-GPU work.)
 
 1. **Triton GDN kernel + reference-alignment math.** See Cindy's
    four-point blocker breakdown captured in §6 item 2.
-2. **vLLM-Omni native two-stage decoded output.** The latent handoff
-   is validated; decoded output still needs GPU validation without the
-   CLI subprocess.
+2. **vLLM-Omni native two-stage quality validation.** Latent and decoded
+   output are validated structurally; numeric parity against the CLI
+   bridge is still pending.
 3. **Accuracy thresholds.** PSNR ≥ 30 / SSIM-Y All ≥ 0.93 vs the
    CLI-bridge reference once the native path produces a tensor.
 4. **`SANA_WM_E2E_MODEL_CLASS=SanaWmTwoStagesPipeline` smoke
@@ -316,14 +320,13 @@ Remaining non-GPU work.)
 
 ## 9. Suggested next-step ordering
 
-The biggest single open item is now **turning the in-process refiner
-latent smoke into decoded-output validation** (§7 item 1), then using
-the official bridge as a reference for alignment. After that:
+The biggest single open item is now **reference alignment** against the
+official bridge, because the in-process refiner can return both latent
+and decoded video tensors. After that:
 
-1. Validate decoded-output in-process refiner mode (§7 item 1).
-2. Plumb the latent-level reference-alignment test (§7 item 3) and
+1. Plumb the latent/frame-level reference-alignment test (§7 item 1) and
    run it against the CLI bridge output to confirm parity.
-3. Online serving wiring (§7 item 2).
+2. Online serving wiring (§7 item 2).
 4. Triton GDN kernel (§8 item 1).
 5. SP/USP/CFG-parallel/HSDP wiring (§8 item 5).
 6. Accuracy thresholds (§8 item 3).
