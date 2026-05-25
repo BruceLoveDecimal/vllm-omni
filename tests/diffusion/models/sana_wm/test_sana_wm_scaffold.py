@@ -61,6 +61,7 @@ def test_sana_wm_pipelines_registered() -> None:
 def test_sana_wm_exports_and_constants() -> None:
     from vllm_omni.diffusion.models.sana_wm import (
         SANA_WM_DEFAULT_NUM_FRAMES,
+        SANA_WM_DISABLE_TRITON_GDN_ENV,
         SANA_WM_FORCE_CLI_ENV,
         SANA_WM_GDN_ERROR,
         SANA_WM_INPROCESS_REFINER_ARG,
@@ -75,6 +76,7 @@ def test_sana_wm_exports_and_constants() -> None:
         SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE,
         SANA_WM_REFINER_ROOT_ENV,
         SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE,
+        SANA_WM_REQUIRE_TRITON_GDN_ENV,
         SANA_WM_STAGE1_PROMPT_CHANNELS,
         SANA_WM_STAGE1_DIT_FILE,
         SANA_WM_STAGE1_TEXT_ENCODER_ENV,
@@ -111,6 +113,8 @@ def test_sana_wm_exports_and_constants() -> None:
     assert SANA_WM_DEFAULT_NUM_FRAMES == 321
     assert SANA_WM_STAGE1_PROMPT_CHANNELS == 2304
     assert SANA_WM_FORCE_CLI_ENV == "VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI"
+    assert SANA_WM_DISABLE_TRITON_GDN_ENV == "VLLM_OMNI_SANA_WM_DISABLE_TRITON_GDN"
+    assert SANA_WM_REQUIRE_TRITON_GDN_ENV == "VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN"
     assert "in-process native backend" in SANA_WM_NATIVE_BACKEND_ERROR
     assert SanaWmPipeline.support_image_input is True
     assert SanaWmPipeline._dit_modules == ["transformer"]
@@ -134,7 +138,7 @@ def test_sana_wm_exports_and_constants() -> None:
     assert SANA_WM_OFFICIAL_SCRIPT == "inference_video_scripts/inference_sana_wm.py"
     gdn = BidirectionalGatedDeltaNetTriton()
     assert gdn.__class__.__name__ == "BidirectionalGatedDeltaNetTriton"
-    assert gdn.triton_available is False
+    assert gdn.triton_available is True
     assert SanaWmCameraEmbedder().__class__.__name__ == "SanaWmCameraEmbedder"
     assert SanaWmFlowDpmScheduler(num_inference_steps=1).num_inference_steps == 1
     assert callable(reference_bidirectional_gated_delta_net)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 from dataclasses import dataclass, field, replace
 from functools import reduce
 from operator import mul
@@ -22,7 +23,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
-from vllm_omni.diffusion.models.sana_wm.gated_deltanet_triton import reference_bidirectional_gated_delta_net
+from vllm_omni.diffusion.models.sana_wm.gated_deltanet_triton import (
+    SANA_WM_REQUIRE_TRITON_GDN_ENV,
+    reference_bidirectional_gated_delta_net,
+    triton_bidirectional_gated_delta_net_from_qkv,
+)
 from vllm_omni.diffusion.models.sana_wm.weight_mapping import normalize_sana_wm_stage1_weight_name
 
 SANA_WM_TRANSFORMER_FORWARD_ERROR = (
@@ -522,6 +527,38 @@ class SanaWmSelfAttention(nn.Module):
         query, key, value = self.qkv(hidden_states).chunk(3, dim=-1)
         if self.conv_k is not None:
             key = self._bidirectional_temporal_short_conv(key, self.conv_k, spatial_shape)
+        beta, decay = self._compute_frame_gates(hidden_states, spatial_shape)
+
+        if hidden_states.is_cuda:
+            qkv = torch.stack(
+                (
+                    query.reshape(batch_size, token_count, self.num_heads, self.head_dim),
+                    key.reshape(batch_size, token_count, self.num_heads, self.head_dim),
+                    value.reshape(batch_size, token_count, self.num_heads, self.head_dim),
+                ),
+                dim=2,
+            )
+            try:
+                output = triton_bidirectional_gated_delta_net_from_qkv(
+                    qkv,
+                    beta=beta,
+                    decay=decay,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    spatial_tokens=spatial_tokens,
+                    rotary_emb=rotary_emb,
+                    k_scale=(self.head_dim**-0.5) * (spatial_tokens**-0.5),
+                    eps=self.eps,
+                )
+                output = output.permute(0, 3, 1, 2).reshape(batch_size, token_count, hidden_size)
+                gate = F.silu(self.output_gate(hidden_states).float()).to(output.dtype)
+                return self.proj((output * gate).to(self.proj.weight.dtype))
+            except Exception:
+                if os.environ.get(SANA_WM_REQUIRE_TRITON_GDN_ENV, "").lower() in {"1", "true", "yes", "on"}:
+                    raise
+                # The fused path is an optimization. Keep the reference path as
+                # the correctness fallback for unsupported GPUs / Triton builds.
+                pass
         query = self.q_norm(query).reshape(batch_size, token_count, self.num_heads, self.head_dim)
         key = self.k_norm(key).reshape(batch_size, token_count, self.num_heads, self.head_dim)
         value = value.reshape(batch_size, token_count, self.num_heads, self.head_dim)
@@ -537,7 +574,6 @@ class SanaWmSelfAttention(nn.Module):
             query_rot = query
             key_rot = key
 
-        beta, decay = self._compute_frame_gates(hidden_states, spatial_shape)
         output = reference_bidirectional_gated_delta_net(
             query,
             key,

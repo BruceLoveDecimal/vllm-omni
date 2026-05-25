@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Model-local Bidirectional Gated DeltaNet fallback for SANA-WM."""
+"""Model-local Bidirectional Gated DeltaNet kernels for SANA-WM."""
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
 from torch import nn
 
 SANA_WM_GDN_ERROR = (
-    "Sana-WM fused Bidirectional Gated DeltaNet Triton kernel is not implemented yet. "
-    "This module runs a pure PyTorch reference recurrence until the NVlabs "
-    "Triton recurrence is ported and dtype parity is validated."
+    "Sana-WM fused Bidirectional Gated DeltaNet Triton kernel is unavailable. "
+    "This module falls back to the pure PyTorch reference recurrence when the "
+    "fused NVlabs recurrence cannot be launched."
 )
+SANA_WM_DISABLE_TRITON_GDN_ENV = "VLLM_OMNI_SANA_WM_DISABLE_TRITON_GDN"
+SANA_WM_REQUIRE_TRITON_GDN_ENV = "VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN"
 
 
 def _validate_gdn_inputs(
@@ -202,6 +205,97 @@ def reference_bidirectional_gated_delta_net(
     return output.to(dtype_orig)
 
 
+def _triton_disabled() -> bool:
+    return os.environ.get(SANA_WM_DISABLE_TRITON_GDN_ENV, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _rms_norm_weight(module: nn.Module, hidden_size: int, *, device: torch.device) -> torch.Tensor:
+    weight = getattr(module, "weight", None)
+    if isinstance(weight, torch.Tensor):
+        return weight.float().contiguous()
+    return torch.ones(hidden_size, device=device, dtype=torch.float32)
+
+
+def triton_bidirectional_gated_delta_net_from_qkv(
+    qkv: torch.Tensor,
+    *,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    q_norm: nn.Module,
+    k_norm: nn.Module,
+    spatial_tokens: int,
+    rotary_emb: torch.Tensor | None = None,
+    k_scale: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Run the fused NVlabs bidirectional GDN kernel from raw QKV.
+
+    Args:
+      qkv: ``[B, N, 3, H, D]`` raw projected Q/K/V after temporal K-conv.
+      beta: ``[B, H, T, S]`` token gates.
+      decay: ``[B, H, T]`` per-frame decay.
+
+    Returns:
+      Tensor shaped ``[B, H, D, N]`` to match
+      :func:`reference_bidirectional_gated_delta_net`.
+    """
+
+    if _triton_disabled():
+        raise RuntimeError(f"{SANA_WM_DISABLE_TRITON_GDN_ENV} disables the fused Sana-WM GDN kernel.")
+    if not qkv.is_cuda:
+        raise RuntimeError("Sana-WM fused GDN requires CUDA tensors.")
+    if qkv.ndim != 5 or qkv.shape[2] != 3:
+        raise ValueError(f"Sana-WM fused GDN expects qkv [B, N, 3, H, D], got {tuple(qkv.shape)}.")
+    if spatial_tokens <= 0:
+        raise ValueError("Sana-WM fused GDN spatial_tokens must be positive.")
+
+    batch_size, token_count, _, num_heads, head_dim = qkv.shape
+    if token_count % spatial_tokens != 0:
+        raise ValueError(
+            f"Sana-WM fused GDN token count {token_count} is not divisible by spatial_tokens={spatial_tokens}."
+        )
+    frames = token_count // spatial_tokens
+    if beta.shape != (batch_size, num_heads, frames, spatial_tokens):
+        raise ValueError(
+            "Sana-WM fused GDN beta shape mismatch: expected "
+            f"{(batch_size, num_heads, frames, spatial_tokens)}, got {tuple(beta.shape)}."
+        )
+    if decay.shape != (batch_size, num_heads, frames):
+        raise ValueError(
+            "Sana-WM fused GDN decay shape mismatch: expected "
+            f"{(batch_size, num_heads, frames)}, got {tuple(decay.shape)}."
+        )
+
+    from vllm_omni.diffusion.models.sana_wm.fused_gdn import (
+        fused_bigdn_func,
+        fused_qk_inv_rms,
+        prepare_rope_tables,
+    )
+
+    qkv = qkv.contiguous()
+    q_inv_rms, k_inv_rms = fused_qk_inv_rms(qkv, eps=float(getattr(q_norm, "eps", 1e-5)))
+    hidden_size = num_heads * head_dim
+    q_norm_weight = _rms_norm_weight(q_norm, hidden_size, device=qkv.device)
+    k_norm_weight = _rms_norm_weight(k_norm, hidden_size, device=qkv.device)
+    rope_cos, rope_sin = prepare_rope_tables(rotary_emb, token_count, head_dim, qkv.device)
+    output = fused_bigdn_func(
+        qkv,
+        q_inv_rms,
+        k_inv_rms,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+        rope_cos=rope_cos,
+        rope_sin=rope_sin,
+        beta=beta.contiguous(),
+        decay=decay.contiguous(),
+        F=frames,
+        S=spatial_tokens,
+        k_scale=k_scale,
+        eps=eps,
+    )
+    return output.permute(0, 2, 3, 1).contiguous()
+
+
 class BidirectionalGatedDeltaNetTriton(nn.Module):
     """Reference-compatible wrapper for SANA-WM's model-local GDN operator.
 
@@ -213,7 +307,7 @@ class BidirectionalGatedDeltaNetTriton(nn.Module):
     def __init__(self, *, eps: float = 1e-8) -> None:
         super().__init__()
         self.eps = eps
-        self.triton_available = False
+        self.triton_available = True
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         try:
@@ -239,6 +333,9 @@ class BidirectionalGatedDeltaNetTriton(nn.Module):
 
 __all__ = [
     "SANA_WM_GDN_ERROR",
+    "SANA_WM_DISABLE_TRITON_GDN_ENV",
+    "SANA_WM_REQUIRE_TRITON_GDN_ENV",
     "BidirectionalGatedDeltaNetTriton",
     "reference_bidirectional_gated_delta_net",
+    "triton_bidirectional_gated_delta_net_from_qkv",
 ]

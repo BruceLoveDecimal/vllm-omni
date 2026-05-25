@@ -9,9 +9,12 @@ from vllm_omni.diffusion.models.sana_wm.camera_control import (
 )
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.gated_deltanet_triton import (
+    SANA_WM_DISABLE_TRITON_GDN_ENV,
     SANA_WM_GDN_ERROR,
+    SANA_WM_REQUIRE_TRITON_GDN_ENV,
     BidirectionalGatedDeltaNetTriton,
     reference_bidirectional_gated_delta_net,
+    triton_bidirectional_gated_delta_net_from_qkv,
 )
 from vllm_omni.diffusion.models.sana_wm.native_backend import (
     SANA_WM_FORCE_CLI_ENV,
@@ -93,6 +96,7 @@ __all__ = [
     "SANA_WM_CAMERA_ERROR",
     "SANA_WM_CONFIG_FILE",
     "SANA_WM_DEFAULT_NUM_FRAMES",
+    "SANA_WM_DISABLE_TRITON_GDN_ENV",
     "SANA_WM_GDN_ERROR",
     "SANA_WM_FORCE_CLI_ENV",
     "SANA_WM_INPROCESS_REFINER_ARG",
@@ -111,6 +115,7 @@ __all__ = [
     "SANA_WM_REFINER_ROOT_ENV",
     "SANA_WM_REFINER_TRANSFORMER_CONFIG_FILE",
     "SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE",
+    "SANA_WM_REQUIRE_TRITON_GDN_ENV",
     "SANA_WM_SCAFFOLD_ERROR",
     "SANA_WM_STAGE1_DIT_FILE",
     "SANA_WM_STAGE1_TEXT_ENCODER_ENV",
@@ -157,5 +162,6 @@ __all__ = [
     "run_sana_wm_native_backend",
     "should_force_sana_wm_cli_backend",
     "shift_flow_timestep",
+    "triton_bidirectional_gated_delta_net_from_qkv",
     "validate_sana_wm_local_paths",
 ]
