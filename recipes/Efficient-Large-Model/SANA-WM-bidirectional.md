@@ -179,6 +179,16 @@ spending additional time on VAE decode. The official CLI bridge remains the
 quality reference until the native Stage-1 Gated DeltaNet kernel is numerically
 matched against NVlabs/Sana.
 
+To assert the Stage-1 path is using the fused Triton GDN kernel instead of the
+PyTorch fallback, add:
+
+```bash
+export VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN=1
+```
+
+Use `VLLM_OMNI_SANA_WM_DISABLE_TRITON_GDN=1` only when debugging the PyTorch
+reference recurrence.
+
 For the heavier in-process decoded-output smoke, change:
 
 ```bash
@@ -225,8 +235,8 @@ Explicit camera poses use:
 
 ## Known Limitations
 
-- Native Gated DeltaNet is still a PyTorch reference fallback, not the fused
-  Triton implementation.
+- Native Gated DeltaNet uses the fused Triton implementation on CUDA, with a
+  PyTorch recurrence fallback for unsupported environments.
 - The in-process refiner path is an integration smoke, not yet a quality
   replacement for the official CLI bridge.
 - There is no tagged upstream release yet; pin an exact vLLM-Omni commit and

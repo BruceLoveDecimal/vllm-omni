@@ -1,8 +1,8 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-05-25 (revision 5)
+> **Audit date:** 2026-05-25 (revision 6)
 > **Branch:** `feat/sana_wm`
-> **Branch HEAD:** `b69a24a3 test(sana-wm): accept decoded in-process refiner output`
+> **Implementation HEAD:** `8458c6cf feat(sana-wm): add fused Triton GDN path`
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
 > **Worktree state at audit:** clean (sync'd with fork HEAD; only `.agents/` untracked)
 > **Spec (single source of truth):**
@@ -18,19 +18,20 @@
 ## 1. TL;DR
 
 Overall progress against the post-release implementation plan:
-**roughly 70%** (up from 40–45% in the 2026-05-24 snapshot, and from
+**roughly 75%** (up from 40–45% in the 2026-05-24 snapshot, and from
 ~65% in revision 4).
 
 - **P0 + P0.5 (scaffold + official CLI bridge): 100% done.** Unchanged.
 - **P1 (Stage-1 reference forward path): ~95% done.** Real-GPU 1-step
   shape verified during the overnight GPU run; SANA-WM units now report
-  `53 passed, 2 skipped` on the GPU instance (up from 50 passed in
+  `54 passed, 2 skipped` on the GPU instance (up from 50 passed in
   revision 2).
-- **P2 (real fused Triton GDN + offline native e2e): ~35% done.**
-  Plücker rasterization remains complete; `gated_deltanet_triton.py`
-  is **still a PyTorch reference fallback**, not the actual Triton
-  kernel. Cindy's msg `234705a3` decomposes the blocker into four
-  concrete sub-items — see §6.
+- **P2 (real fused Triton GDN + offline native e2e): ~70% done.**
+  The NVlabs Apache-2.0 fused GDN/chunkwise Triton kernels are now
+  vendored under `sana_wm/`, Stage-1 GDN prefers the fused path on CUDA,
+  and `VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN=1` forces fail-fast if the
+  pipeline would fall back. Small fused-vs-reference parity and the
+  in-process e2e both pass on RTX PRO 6000 Blackwell.
 - **P3 (LTX-2 refiner attach + dual text encoder): ~90% done.**
   `pipeline_sana_wm_two_stages.py` has grown from 45 → 476 lines.
   `Gemma3ForConditionalGeneration` (refiner text encoder),
@@ -46,7 +47,7 @@ Overall progress against the post-release implementation plan:
   NVlabs bridge and multi-step quality validation.
 - **P4 (online serving + recipe + accuracy): ~50% done.**
   `recipes/Efficient-Large-Model/SANA-WM-bidirectional.md` landed
-  (194 lines); offline example committed; OpenAI-style online serving
+  (217 lines); offline example committed; OpenAI-style online serving
   hookup and `accuracy ≥ PSNR 30 / SSIM 0.93` reference-alignment tests
   still pending, but the e2e test now supports both latent-output and
   decoded-video in-process refiner smoke.
@@ -59,11 +60,10 @@ Overall progress against the post-release implementation plan:
 The system today can produce real videos end-to-end via the **official
 CLI bridge** (Stage 1 + LTX-2 refiner inside the NVlabs subprocess).
 The vLLM-Omni native path can now (a) load every refiner component,
-(b) run Stage-1 reference math under a PyTorch GDN fallback, (c) run one
+(b) run Stage-1 GDN through the fused Triton kernel on CUDA with PyTorch fallback, (c) run one
 in-process LTX-2 refiner denoising step on the Stage-1 latent, and (d)
 decode through the real `AutoencoderKLLTX2Video`. It still relies on the
-CLI bridge for production-quality Stage-1 generation and for the decoded
-video reference.
+CLI bridge as the decoded-video reference until multi-step numeric alignment is measured.
 
 ## 1.2. Changes since revision 2
 
@@ -125,7 +125,7 @@ Concrete deltas:
   Blackwell 96 GB run.
 - **Unit validation:** `tests/diffusion/models/sana_wm`
   + `tests/model_executor/stage_input_processors/test_sana_wm.py`
-  now pass as `53 passed, 2 skipped` on the GPU instance (up from
+  now pass as `54 passed, 2 skipped` on the GPU instance (up from
   50 passed in revision 2).
 
 ## 1.1. Changes since 2026-05-24 snapshot
@@ -146,8 +146,8 @@ Concrete deltas:
 - **`pipeline_sana_wm.py`:** 554 → 696 lines. `AutoencoderKLLTX2Video.from_pretrained(..., subfolder="vae", local_files_only=True)` is now wired; `AutoModelForCausalLM.from_pretrained(text_encoder_model_id, ...)` is wired for Stage-1 Gemma-2-2B-IT (env-overridable via `VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER`); `_native_smoke_prompt_embeds` falls back to deterministic `hash_smoke` only when the real encoder cannot be obtained.
 - **`pipeline_sana_wm_two_stages.py`:** 45 → 476 lines. Adds `_ensure_refiner_text_encoder` (real `Gemma3ForConditionalGeneration` load), `_ensure_refiner_connectors` (real `LTX2TextConnectors` load), `_ensure_refiner_transformer` (real `LTX2VideoTransformer3DModel` via `create_transformer_from_config` + `safetensors.load_file`), `ensure_refiner_components`, and the opt-in in-process latent refiner step. The path is validated for latent output; decoded-output and accuracy alignment remain open.
 - **`official_backend.py`:** 344 → 401 lines. Supports external official refiner root (`SANA_WM_REFINER_ROOT_ENV`), CLI flag, and `PYTHONPATH` propagation so the NVlabs subprocess can find the locally cached weights.
-- **`gated_deltanet_triton.py`:** unchanged file name; +236 line edits but still a PyTorch reference, no Triton kernel yet.
-- **`recipes/Efficient-Large-Model/SANA-WM-bidirectional.md`:** new, 194 lines. Documents checkpoint layout, the three execution paths (official / native smoke / two-stage), and the GPU requirement bands.
+- **`gated_deltanet_triton.py` + fused kernels:** the wrapper now dispatches to vendored NVlabs Triton kernels on CUDA and keeps the PyTorch recurrence as fallback; `VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN=1` validates fail-fast fused execution.
+- **`recipes/Efficient-Large-Model/SANA-WM-bidirectional.md`:** new, 217 lines. Documents checkpoint layout, the three execution paths (official / native smoke / two-stage), fused-GDN controls, and the GPU requirement bands.
 - **New test files (7 of 8 spec-listed):**
   - `test_sana_wm_camera_control.py` — real test (Plücker condition shape).
   - `test_sana_wm_pipeline.py` — real test (component-slot declarations + preprocess).
@@ -160,6 +160,29 @@ Concrete deltas:
 - **`test_sana_wm_video_e2e.py`:** 81 → 91 lines. Now reads `SANA_WM_E2E_MODEL_CLASS=SanaWmTwoStagesPipeline`, `SANA_WM_E2E_NUM_FRAMES`, and accepts deterministic intrinsics to bypass the optional `pi3` dependency in NVlabs' code.
 - **GPU validation result (Cindy's msg `1dd5a346`):** `seeta-gpu` RTX PRO 6000 Blackwell 96 GB; `50 passed, 2 skipped` on the SANA-WM test suite; LTX-2 refiner component load uses ~60.6 GiB VRAM; end-to-end `SanaWmTwoStagesPipeline` + official CLI bridge + local refiner ran for ~9 minutes and produced a `(8, 704, 1280, 3)` video tensor.
 - **Three concrete fixes shipped during GPU validation:** default `TORCHDYNAMO_DISABLE=1` for the CLI subprocess to dodge a TorchInductor/FLA-import quirk on Blackwell; two-stage refiner loader now creates a temporary `VllmConfig` only when one is not already active (so real worker contexts are not overwritten); e2e test exposes the env knobs and intrinsics path so optional NVlabs dependencies are not required.
+
+
+## 1.3. Changes since revision 5
+
+Triton GDN work landed after `b69a24a3`:
+
+- Vendored the Apache-2.0 NVlabs fused GDN implementation into
+  `vllm_omni/diffusion/models/sana_wm/fused_gdn.py` and
+  `fused_gdn_chunkwise.py`, with imports rewritten to stay inside the
+  vLLM-Omni package.
+- Added `triton_bidirectional_gated_delta_net_from_qkv`, which wraps
+  the fused kernel from raw `[B, N, 3, H, D]` QKV and returns the same
+  `[B, H, D, N]` layout as the PyTorch reference recurrence.
+- Wired `SanaWmSelfAttention._forward_gdn` to prefer the fused kernel on
+  CUDA, while retaining the PyTorch recurrence as a correctness fallback.
+  `VLLM_OMNI_SANA_WM_DISABLE_TRITON_GDN=1` disables the fused path;
+  `VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN=1` makes fallback fail-fast for
+  validation.
+- GPU validation on RTX PRO 6000 Blackwell 96 GB:
+  - fused-vs-reference small parity: `1 passed` (`atol=rtol=1e-2`);
+  - SANA-WM unit/stage-input suite: `54 passed, 2 skipped`;
+  - in-process e2e with `VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN=1`,
+    latent output, one refiner step: `1 passed, 4 warnings in 172.39s`.
 
 ## 2. Method
 
@@ -189,23 +212,26 @@ The status icons mean:
 vllm_omni/diffusion/models/sana_wm/
   __init__.py                       157 LOC   ✅ public surface; re-exports camera/transformer/two-stages
   config.py                         165 LOC   ✅ SanaWmConfig + from_yaml
-  sana_wm_transformer.py           1084 LOC   ✅ reference DiT — GDN PyTorch fallback, Wan RoPE, camera branch
+  sana_wm_transformer.py           1120 LOC   ✅ Stage-1 DiT — fused GDN on CUDA + fallback, Wan RoPE, camera branch
   pipeline_sana_wm.py               696 LOC   ✅ Stage-1 pipeline w/ HF download, validation, 3-backend dispatch,
                                               real Gemma-2-2B-IT + LTX-2 VAE loaders
   pipeline_sana_wm_two_stages.py    476 LOC   ⚠️ real refiner-component loaders + in-process latent refiner
-                                              smoke; decoded-output validation still open
+                                              and decoded-output smokes; reference alignment still open
   camera_control.py                 332 LOC   ✅ Plücker / raymap + all camera schemas
   weight_mapping.py                  49 LOC   ✅ Stage-1 prefix remap helper (slightly extended)
-  gated_deltanet_triton.py          244 LOC   ⚠️ PyTorch reference fallback; real Triton kernel NOT written
+  gated_deltanet_triton.py          341 LOC   ✅ fused GDN wrapper + PyTorch fallback
+  fused_gdn.py                      271 LOC   ✅ vendored NVlabs fused QK/RMS + BiGDN entry point
+  fused_gdn_chunkwise.py           2269 LOC   ✅ vendored NVlabs chunkwise Triton kernels
   official_backend.py               401 LOC   ✅ NVlabs CLI bridge w/ external refiner root + PYTHONPATH wiring
   native_backend.py                 489 LOC   ✅ direct-import NVlabs Python modules (no subprocess)
   scheduling_sana_wm.py              52 LOC   ✅ SanaWmFlowDpmScheduler w/ inference_flow_shift=9.8
 vllm_omni/model_executor/stage_input_processors/sana_wm.py  309 LOC   ✅ request payload schema validator
 recipes/Efficient-Large-Model/SANA-WM-bidirectional.md      217 LOC   ✅ checkpoint layout + 3 backends + GPU bands
-tests/diffusion/models/sana_wm/test_sana_wm_scaffold.py     766 LOC   ✅ ~30+ test functions (incl. refiner-loader contract)
+tests/diffusion/models/sana_wm/test_sana_wm_scaffold.py     774 LOC   ✅ ~30+ test functions (incl. refiner-loader contract)
 tests/diffusion/models/sana_wm/test_sana_wm_pipeline.py      37 LOC   ✅ real test (component declarations + preprocess)
 tests/diffusion/models/sana_wm/test_sana_wm_two_stages.py   165 LOC   ✅ real test (refiner slots, prompt encode, in-process step)
 tests/diffusion/models/sana_wm/test_sana_wm_camera_control.py  16 LOC ✅ real test (Plücker shape)
+tests/diffusion/models/sana_wm/test_sana_wm_gdn_triton.py     74 LOC   ✅ GPU fused-vs-reference parity
 tests/diffusion/models/sana_wm/test_sana_wm_hsdp.py          10 LOC   ⚠️ pytest.skip stub
 tests/diffusion/models/sana_wm/test_sana_wm_cfg_parallel_adaptation.py
                                                              10 LOC   ⚠️ pytest.skip stub
@@ -225,9 +251,9 @@ documented stubs gated on GPU validation).
 | Phase | Spec scope | Concrete status | Coverage |
 | --- | --- | --- | --- |
 | **P0** — scaffold + registry + pipeline classes + processor stub | All declared in spec §"Phased rollout" | 4 pipeline registry entries, 4 metadata entries, pre/post-process registered, `SanaWmConfig` dataclass, `normalize_sana_wm_payload`, all tests collect, all compileall passes | ✅ **100%** |
-| **P0.5** — official CLI backend bridge for GPU smoke | `official_backend.py` ships, supports external refiner root (`SANA_WM_REFINER_ROOT_ENV`), `PYTHONPATH` propagation, and `TORCHDYNAMO_DISABLE=1` workaround for Blackwell | `official_backend.py` 401 LOC; `test_sana_wm_video_e2e.py` 91 LOC gated by `SANA_WM_E2E=1` and class env knob | ✅ **100%** |
-| **P1** — Stage-1 weight load (softmax fallback only) + image/camera input packing | `weight_mapping.remap` + `load_weights` + Wan-RoPE positional path + GDN PyTorch fallback + image/camera packing through `normalize_sana_wm_payload` | All present statically; real-GPU validation reported as passing `50 passed, 2 skipped` on `seeta-gpu` (RTX PRO 6000 Blackwell 96 GB). | ✅ **~95%** |
-| **P2** — `GatedDeltaNetTriton` kernel + Plücker camera injection → offline native e2e | `camera_control.py` (Plücker, raymap, action DSL, all camera schemas) is done; `gated_deltanet_triton.py` remains **only** a PyTorch reference recurrence — no Triton kernel | Plücker done (✅), Triton GDN missing (❌); offline native e2e for the Stage-1 reference path is exercised inside the CLI bridge (production-grade native is still pending) | ⚠️ **~35%** |
+| **P0.5** — official CLI backend bridge for GPU smoke | `official_backend.py` ships, supports external refiner root (`SANA_WM_REFINER_ROOT_ENV`), `PYTHONPATH` propagation, and `TORCHDYNAMO_DISABLE=1` workaround for Blackwell | `official_backend.py` 401 LOC; `test_sana_wm_video_e2e.py` 107 LOC gated by `SANA_WM_E2E=1` and class env knob | ✅ **100%** |
+| **P1** — Stage-1 weight load (softmax fallback only) + image/camera input packing | `weight_mapping.remap` + `load_weights` + Wan-RoPE positional path + GDN PyTorch fallback + image/camera packing through `normalize_sana_wm_payload` | All present statically; real-GPU validation reported as passing `54 passed, 2 skipped` on `seeta-gpu` (RTX PRO 6000 Blackwell 96 GB). | ✅ **~95%** |
+| **P2** — `GatedDeltaNetTriton` kernel + Plücker camera injection → offline native e2e | `camera_control.py` (Plücker, raymap, action DSL, all camera schemas) is done; NVlabs fused GDN/chunkwise Triton kernels are vendored and wired into Stage-1 GDN on CUDA with PyTorch fallback. | Plücker ✅; fused-vs-reference small parity ✅; require-fused in-process e2e ✅; production multi-step numeric alignment still pending | ⚠️ **~70%** |
 | **P3** — LTX-2 refiner attach via `refiner/transformer/`, `refiner/connectors/`, and dual-text-encoder loading | `pipeline_sana_wm_two_stages.py` now loads `Gemma3ForConditionalGeneration` from `refiner/text_encoder/`, `LTX2TextConnectors` from `refiner/connectors/`, and `LTX2VideoTransformer3DModel` (via `create_transformer_from_config` + `safetensors.load_file`) from `refiner/transformer/`. The in-process path now runs Stage-1 latent through the loaded LTX-2 refiner transformer for one denoising step and can return either latent output or decoded video output. | **Pending:** reference alignment; production-quality Stage-1 still depends on solving the GDN parity problem. | ⚠️ **~90%** |
 | **P4** — Online serving + recipes + accuracy thresholds | `recipes/Efficient-Large-Model/SANA-WM-bidirectional.md` committed; offline example present; the `(8, 704, 1280, 3)` e2e tensor proves the official-bridge pipeline runs end-to-end on a real Blackwell GPU; the in-process refiner latent and decoded-video smokes both pass; online OpenAI-style serving hookup and explicit PSNR/SSIM thresholds against NVlabs reference are still pending | Recipe ✅; e2e via CLI bridge ✅; in-process latent e2e ✅; in-process decoded e2e ✅; online serving ❌; accuracy reference-alignment ❌ | ⚠️ **~60%** |
 | **P5** — SP/USP/CFG-parallel/HSDP + dfx perf; cache-DiT if useful | `test_sana_wm_hsdp.py`, `test_sana_wm_cfg_parallel_adaptation.py`, `test_sana_wm_cfg_parallel_parity.py`, and `test_sana_wm_vllm_omni.json` exist as documented stubs. No actual SP/USP wiring; no DiT cache integration. | All four stub files in place ✅; actual perf and parallelism wiring ❌ | ⚠️ **~10%** |
@@ -279,20 +305,18 @@ and recorded in §1.1.)
    `LTX2TextConnectors` → `LTX2VideoTransformer3DModel` → VAE decode,
    but multi-step quality validation and reference alignment against
    the official bridge are still pending.
-2. **`gated_deltanet_triton.py` is still PyTorch-only.** Cindy
-   (msg `234705a3`) decomposed the blocker into four sub-items:
+2. **Triton GDN is integrated but not fully quality-closed.** The
+   fused path now runs in the real pipeline; remaining sub-items are:
    - GDN ≠ standard attention — uses `A_log`, `beta_proj`, `conv_k`
      state-space / recurrent parameters; cannot reuse the generic
      vLLM attention backend interface.
-   - Triton kernel must reproduce the bidirectional scan +
-     gating + depthwise conv + chunking + dtype boundaries of the
-     official FLA kernel; shape-only parity is insufficient — video
-     quality will drift if the math is off.
+   - Multi-step numeric parity against the official NVlabs path is
+     still unmeasured; small fused-vs-reference parity is covered.
    - The native Stage-1 path must integrate with vLLM-Omni's token
      layout, camera Plücker injection, scheduler step, VAE/refiner
      hand-off, device-offload, and (eventually) SP/CFG-parallel.
-     `native smoke` only proves "weights load + forward shape OK",
-     not production parity.
+     `native smoke` plus the require-fused e2e proves the fused kernel
+     executes, but not production video quality parity.
    - Reference-alignment tests against the official NVlabs path at
      identical `(seed, prompt, camera, steps)` are not yet wired.
 3. **Stage-1 reference-alignment vs official CLI not yet measured.**
@@ -331,8 +355,9 @@ items are now resolved — see §1.1 and §1.2. Remaining non-GPU work.)
 
 ## 8. Outstanding work that DOES require GPU access
 
-1. **Triton GDN kernel + reference-alignment math.** See Cindy's
-   four-point blocker breakdown captured in §6 item 2.
+1. **Triton GDN multi-step reference-alignment math.** The fused kernel
+   executes; parity must still be checked against the official NVlabs path
+   over realistic shapes and steps.
 2. **vLLM-Omni native two-stage quality validation.** Latent and decoded
    output are validated structurally; numeric parity against the CLI
    bridge is still pending.
@@ -353,7 +378,8 @@ and decoded video tensors. After that:
 1. Plumb the latent/frame-level reference-alignment test (§7 item 1) and
    run it against the CLI bridge output to confirm parity.
 2. Online serving wiring (§7 item 2).
-4. Triton GDN kernel (§8 item 1).
+3. Multi-step in-process refiner smoke (§7 item 3).
+4. Triton GDN multi-step reference alignment (§8 item 1).
 5. SP/USP/CFG-parallel/HSDP wiring (§8 item 5).
 6. Accuracy thresholds (§8 item 3).
 
