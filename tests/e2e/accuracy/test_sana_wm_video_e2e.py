@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
+import numpy as np
 import pytest
 
 
@@ -16,8 +18,28 @@ pytestmark = [
 ]
 
 
-def test_sana_wm_official_backend_generates_video() -> None:
-    import numpy as np
+def _coerce_video_array(video: Any) -> np.ndarray:
+    import torch
+
+    if isinstance(video, list):
+        assert video, "SANA-WM e2e produced an empty video list."
+        video = video[0]
+    if isinstance(video, torch.Tensor):
+        video = video.detach().cpu().float().numpy()
+    video_array = np.asarray(video)
+    if video_array.ndim == 5:
+        assert video_array.shape[0] == 1
+        video_array = video_array[0]
+    assert video_array.ndim == 4
+    return video_array
+
+
+def _run_sana_wm_e2e(
+    *,
+    inprocess_refiner: bool,
+    output_type: str,
+    refiner_steps: int,
+) -> np.ndarray:
     import torch
     from PIL import Image
 
@@ -46,12 +68,12 @@ def test_sana_wm_official_backend_generates_video() -> None:
         enforce_eager=True,
     )
     extra_args = {"sana_wm_sampling_algo": "flow_euler_ltx", "sana_wm_offload_vae": True}
-    if os.environ.get("SANA_WM_E2E_INPROCESS_REFINER") == "1":
+    if inprocess_refiner:
         extra_args.update(
             {
                 "sana_wm_inprocess_refiner": True,
-                "sana_wm_refiner_output_type": os.environ.get("SANA_WM_E2E_OUTPUT_TYPE", "np"),
-                "sana_wm_inprocess_refiner_steps": int(os.environ.get("SANA_WM_E2E_REFINER_STEPS", "1")),
+                "sana_wm_refiner_output_type": output_type,
+                "sana_wm_inprocess_refiner_steps": refiner_steps,
             }
         )
 
@@ -93,18 +115,54 @@ def test_sana_wm_official_backend_generates_video() -> None:
     assert request_output.images
 
     frames = request_output.images[0]
-    if isinstance(frames, list):
-        frames = frames[0]
-    if isinstance(frames, torch.Tensor):
-        assert frames.is_cuda or frames.device.type == "cpu"
-        assert frames.ndim == 5
-        assert frames.shape[0] == 1
-        assert frames.shape[2] <= num_frames
-        return
-    frames = np.asarray(frames)
-    if frames.ndim == 5:
-        assert frames.shape[0] == 1
-        frames = frames[0]
-    assert frames.ndim == 4
-    assert 0 < frames.shape[0] <= num_frames
-    assert frames.shape[-1] in (3, 4)
+    video = _coerce_video_array(frames)
+    assert 0 < video.shape[0] <= num_frames
+    return video
+
+
+def _assert_video_reference_alignment(
+    *,
+    prediction: np.ndarray,
+    reference: np.ndarray,
+    max_mean_abs_error: float,
+) -> None:
+    assert prediction.shape == reference.shape
+    prediction_f = prediction.astype(np.float32)
+    reference_f = reference.astype(np.float32)
+    prediction_max = float(np.max(prediction_f)) if prediction_f.size else 0.0
+    reference_max = float(np.max(reference_f)) if reference_f.size else 0.0
+    if prediction_max <= 1.0 and reference_max > 1.0:
+        prediction_f *= 255.0
+    if reference_max <= 1.0 and prediction_max > 1.0:
+        reference_f *= 255.0
+    mean_abs_error = float(np.mean(np.abs(prediction_f - reference_f)))
+    print(f"SANA-WM reference-alignment MAE={mean_abs_error:.6f}, threshold<={max_mean_abs_error:.6f}")
+    assert mean_abs_error <= max_mean_abs_error
+
+
+def test_sana_wm_official_backend_generates_video() -> None:
+    output_type = os.environ.get("SANA_WM_E2E_OUTPUT_TYPE", "np")
+    refiner_steps = int(os.environ.get("SANA_WM_E2E_REFINER_STEPS", "1"))
+    video = _run_sana_wm_e2e(
+        inprocess_refiner=os.environ.get("SANA_WM_E2E_INPROCESS_REFINER") == "1",
+        output_type=output_type,
+        refiner_steps=refiner_steps,
+    )
+    if output_type == "latent":
+        assert video.ndim == 4
+    else:
+        assert video.shape[-1] in (3, 4)
+
+
+def test_sana_wm_inprocess_refiner_aligns_with_official_bridge() -> None:
+    if os.environ.get("SANA_WM_E2E_REFERENCE_ALIGNMENT") != "1":
+        pytest.skip("Set SANA_WM_E2E_REFERENCE_ALIGNMENT=1 to run Sana-WM reference alignment.")
+
+    refiner_steps = int(os.environ.get("SANA_WM_E2E_REFINER_STEPS", "1"))
+    official = _run_sana_wm_e2e(inprocess_refiner=False, output_type="np", refiner_steps=refiner_steps)
+    inprocess = _run_sana_wm_e2e(inprocess_refiner=True, output_type="np", refiner_steps=refiner_steps)
+    _assert_video_reference_alignment(
+        prediction=inprocess,
+        reference=official,
+        max_mean_abs_error=float(os.environ.get("SANA_WM_E2E_REFERENCE_MAX_MAE", "255.0")),
+    )

@@ -1,7 +1,142 @@
-{
-  "model": "Efficient-Large-Model/SANA-WM_bidirectional",
-  "model_class_name": "SanaWmTwoStagesPipeline",
-  "task": "image_to_video",
-  "status": "pending_gpu_validation",
-  "notes": "SANA-WM perf requires Stage-2 refiner and GPU e2e validation."
-}
+[
+    {
+        "test_name": "test_sana_wm_official_bridge_eager",
+        "description": "SANA-WM official bridge baseline with local SANA-WM weights and NVlabs/Sana runner",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Efficient-Large-Model/SANA-WM_bidirectional",
+            "model_class_name": "SanaWmTwoStagesPipeline",
+            "serve_args": {
+                "enforce-eager": true,
+                "enable-diffusion-pipeline-profiler": true
+            },
+            "env": {
+                "VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI": "1",
+                "TORCHDYNAMO_DISABLE": "1"
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "704x1280_9f_steps1_action",
+                "dataset": "random",
+                "task": "i2v",
+                "backend": "v1/videos",
+                "width": 1280,
+                "height": 704,
+                "num-frames": 9,
+                "fps": 16,
+                "num-inference-steps": 1,
+                "num-prompts": 1,
+                "max-concurrency": 1,
+                "extra-params": {
+                    "sana_wm": {
+                        "action": "w-16",
+                        "translation_speed": 0.055,
+                        "rotation_speed_deg": 1.2,
+                        "intrinsics": {
+                            "fx": 640,
+                            "fy": 640,
+                            "cx": 640,
+                            "cy": 352
+                        }
+                    }
+                }
+            }
+        ]
+    },
+    {
+        "test_name": "test_sana_wm_inprocess_refiner_eager",
+        "description": "SANA-WM native Stage-1 fused-GDN plus in-process LTX-2 refiner smoke",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Efficient-Large-Model/SANA-WM_bidirectional",
+            "model_class_name": "SanaWmTwoStagesPipeline",
+            "serve_args": {
+                "enforce-eager": true,
+                "enable-diffusion-pipeline-profiler": true
+            },
+            "env": {
+                "VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN": "1",
+                "TORCHDYNAMO_DISABLE": "1"
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "704x1280_9f_steps1_inprocess",
+                "dataset": "random",
+                "task": "i2v",
+                "backend": "v1/videos",
+                "width": 1280,
+                "height": 704,
+                "num-frames": 9,
+                "fps": 16,
+                "num-inference-steps": 1,
+                "num-prompts": 1,
+                "max-concurrency": 1,
+                "extra-params": {
+                    "sana_wm": {
+                        "action": "w-16",
+                        "translation_speed": 0.055,
+                        "rotation_speed_deg": 1.2,
+                        "intrinsics": {
+                            "fx": 640,
+                            "fy": 640,
+                            "cx": 640,
+                            "cy": 352
+                        }
+                    },
+                    "sana_wm_inprocess_refiner": true,
+                    "sana_wm_inprocess_refiner_steps": 1
+                }
+            }
+        ]
+    },
+    {
+        "test_name": "test_sana_wm_cfg2_eager",
+        "description": "CFG-parallel contract smoke; requires reference-alignment before perf baselining",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Efficient-Large-Model/SANA-WM_bidirectional",
+            "model_class_name": "SanaWmTwoStagesPipeline",
+            "serve_args": {
+                "cfg-parallel-size": 2,
+                "enforce-eager": true,
+                "enable-diffusion-pipeline-profiler": true
+            },
+            "env": {
+                "VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN": "1",
+                "TORCHDYNAMO_DISABLE": "1"
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "704x1280_9f_steps1_cfg2_inprocess",
+                "dataset": "random",
+                "task": "i2v",
+                "backend": "v1/videos",
+                "width": 1280,
+                "height": 704,
+                "num-frames": 9,
+                "fps": 16,
+                "num-inference-steps": 1,
+                "num-prompts": 1,
+                "max-concurrency": 1,
+                "extra-params": {
+                    "sana_wm": {
+                        "action": "w-16",
+                        "translation_speed": 0.055,
+                        "rotation_speed_deg": 1.2,
+                        "intrinsics": {
+                            "fx": 640,
+                            "fy": 640,
+                            "cx": 640,
+                            "cy": 352
+                        }
+                    },
+                    "sana_wm_inprocess_refiner": true,
+                    "sana_wm_inprocess_refiner_steps": 1
+                }
+            }
+        ]
+    }
+]

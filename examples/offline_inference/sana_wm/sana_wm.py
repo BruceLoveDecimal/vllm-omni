@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run Stage 1 only with the official --no_refiner flag.",
     )
+    parser.add_argument(
+        "--inprocess-refiner",
+        action="store_true",
+        help="Run the vLLM-Omni in-process LTX-2 refiner path instead of the official CLI refiner.",
+    )
+    parser.add_argument("--inprocess-refiner-steps", type=int, default=1)
     parser.add_argument("--output", default="sana_wm_output.mp4", help="Output mp4 path.")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile in vLLM-Omni.")
     return parser.parse_args()
@@ -108,6 +114,14 @@ def main() -> None:
             width=SANA_WM_OUTPUT_WIDTH,
             num_frames=args.num_frames,
             seed=args.seed,
+            extra_args=(
+                {
+                    "sana_wm_inprocess_refiner": True,
+                    "sana_wm_inprocess_refiner_steps": args.inprocess_refiner_steps,
+                }
+                if args.inprocess_refiner
+                else {}
+            ),
         ),
     )
 

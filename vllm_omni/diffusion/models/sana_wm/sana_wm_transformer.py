@@ -43,6 +43,12 @@ SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
 SANA_WM_STAGE1_GDN_STATE_SIZE = 20
 
 
+def _is_sana_wm_transformer_block(name: str, module: Any) -> bool:
+    del module
+    parts = name.split(".")
+    return len(parts) == 2 and parts[0] == "blocks" and parts[1].isdigit()
+
+
 def _prod(values: tuple[int, ...]) -> int:
     return reduce(mul, values, 1)
 
@@ -749,6 +755,7 @@ class SanaWmTransformer3DModel(nn.Module):
 
     _repeated_blocks: ClassVar[list[str]] = ["blocks"]
     _layerwise_offload_blocks_attr: ClassVar[str] = "blocks"
+    _hsdp_shard_conditions: ClassVar[list[Any]] = [_is_sana_wm_transformer_block]
 
     def __init__(
         self,

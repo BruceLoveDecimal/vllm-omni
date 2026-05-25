@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -255,6 +256,7 @@ def get_sana_wm_pre_process_func(od_config: OmniDiffusionConfig):
 
 class SanaWmPipeline(
     nn.Module,
+    CFGParallelMixin,
     SupportImageInput,
     SupportsComponentDiscovery,
     ProgressBarMixin,
