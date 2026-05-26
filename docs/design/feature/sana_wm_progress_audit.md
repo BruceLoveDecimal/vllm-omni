@@ -584,7 +584,116 @@ against the official bridge once the GPU endpoint is reachable again:
 4. Run a live `/v1/videos/generations/sync` SANA-WM request against the OpenAI server.
 5. Run SP/USP/CFG-parallel/HSDP sweeps from the dfx perf config.
 
-## 10. References
+## 10. vLLM Infrastructure Integration Deep-Dive
+
+> Contributed by @Kimi (msg `f14d1990`) in response to BruceLiu's
+> question about whether Sana-WM's DiT and Gemma should be migrated
+> onto vllm-omni's internal layer stack, and *why* not doing so
+> breaks automatic inheritance of TP/SP/quantization.
+
+### 10.1 TL;DR
+
+- **Gemma text encoder**: *Not a Sana-WM-specific debt.* LTX-2 and
+  Wan2.2 also load their text encoders directly via `transformers`
+  (`Gemma3ForConditionalGeneration`, `UMT5EncoderModel`). Only
+  Flux/Flux2/HunyuanVideo/MagiHuman use vllm-omni's unified
+  `T5EncoderModel` / `MistralEncoderModel`. Migrating Gemma to a
+  unified encoder would be a *framework-wide* refactor, not a
+  Sana-WM-only task.
+- **DiT backbone**: *This is the real debt.* `SanaWmTransformer3DModel`
+  uses plain `nn.Linear`, `nn.Conv3d`, and a custom
+  `SanaWmRMSNorm`. LTX-2 and Wan use `QKVParallelLinear`,
+  `ColumnParallelLinear`, `RowParallelLinear`, vLLM `RMSNorm`, and
+  `vllm_omni.diffusion.attention.layer.Attention`. The result:
+  Sana-WM gets **zero** TP/SP/quantization for free.
+- **GDN core**: *Should stay model-local.* The bidirectional
+  video-latent recurrence is not a standard `Q·K^T·V` attention, so
+  it cannot live in `diffusion/attention/backends/`. However, the
+  **projections inside GDN blocks** (QKV in/out) *can* and *should*
+  be replaced by vLLM parallel layers.
+
+### 10.2 Why Plain `nn.Linear` Breaks Automatic TP/SP/Quant
+
+vLLM's "automatic" distributed/quantized behaviour is **not**
+magic — it is baked into the layer constructors at init time.
+
+| Mechanism | How vLLM layer does it | What `nn.Linear` misses |
+|---|---|---|
+| **Tensor Parallelism** | `ColumnParallelLinear.__init__` reads `get_tensor_model_parallel_world_size()` and physically creates a weight shard of size `output_size // tp_size`. Forward needs no extra code. | `nn.Linear` creates a full-sized weight. Every rank loads the whole matrix → OOM. No all-reduce → outputs diverge. |
+| **Quantization** | `LinearBase.__init__` checks `quant_config`. If non-None, `quant_method.create_weights()` replaces `nn.Parameter` with `BlockQuantScaleParameter` (FP8/AWQ/etc.) and registers a quantization-aware `weight_loader`. Forward dispatches to `cutlass/cublas` FP8 GEMM. | `nn.Linear` knows nothing about `quant_config`. Even if you pass one in, the weight stays plain FP16/BF16. No quantized kernel dispatch. |
+| **Sequence Parallelism** | `_sp_plan` declares `SequenceParallelInput` / `SequenceParallelOutput` boundaries. A runtime wrapper injects all-to-all (Ulysses) or slice (Ring) at those boundaries. | No plan → no split/gather. Sequence length is identical on every rank. Attention KV is not sharded along the sequence dim. |
+| **Fused RMSNorm** | `vllm.model_executor.layers.layernorm.RMSNorm` calls a CUDA/HIP kernel. TP variant all-reduces squared sums so the global RMS is correct. | Custom `SanaWmRMSNorm` is pure PyTorch. Slower, and not TP-aware. |
+| **FlashAttention dispatch** | `vllm_omni.diffusion.attention.layer.Attention` selects FlashAttn / SDPA / SageAttention based on platform and shape. | `F.scaled_dot_product_attention` only gives PyTorch SDPA. No FlashAttn, no memory-efficient backend switching. |
+
+**Bottom line**: You don't get TP/SP/quantization by wrapping a
+model. You get them by using the right layer primitives, because
+each primitive self-shards, self-quantizes, and self-plans at
+`__init__` time.
+
+### 10.3 Concrete Change List (DiT Migration)
+
+| Priority | Change | Work | Payoff |
+|---|---|---|---|
+| P1 | Replace `nn.Linear` QKV / proj with `QKVParallelLinear` + `RowParallelLinear` | Large | TP support + unified weight loading |
+| P1 | Thread `quant_config` through `SanaWmTransformer3DModel.__init__` to every parallel layer | Small | FP8 / AWQ / GPTQ / etc. |
+| P2 | Replace `SanaWmRMSNorm` with vLLM `RMSNorm` (or `DistributedRMSNorm` when `tp_size>1`) | Medium | Speed + TP correctness |
+| P2 | Replace softmax attention blocks with `vllm_omni.diffusion.attention.layer.Attention` | Medium | FlashAttn + SP inheritance |
+| P2 | Add `_sp_plan` (split at `blocks.0`, gather at final output) | Medium | Sequence parallelism |
+| P3 | Refactor weight loading from deferred materialization to `AutoWeightsLoader` + `stacked_params_mapping` + `param.weight_loader` | Large | Quantized checkpoint loading + TP sharding |
+| P3 | Parallelize pointwise 1×1 conv inside `SanaWmMbConvFfn` (depthwise 3×3 stays `nn.Conv2d`) | Medium | Full FFN TP coverage |
+| P4 | Build `GemmaEncoderModelTP` in vllm-omni unified encoder package | Large | TP for text encoder (framework-wide, not Sana-WM-only) |
+
+### 10.4 What Should *Not* Change
+
+- **GDN recurrence core**: The chunkwise Triton scan
+  (`fused_gdn_chunkwise.py`) is a bidirectional frame-wise
+  delta-rule, not a standard attention. It correctly lives in
+  `models/sana_wm/`. vLLM's `QwenGatedDeltaNetAttention` is
+  autoregressive / SSM-cache shaped and cannot be reused.
+- **Camera-control dual branch**: Plücker / UCPE computation is
+  model-specific geometry. Keeping it in `camera_control.py` is
+  correct.
+- **LTX-2 refiner coupling**: The refiner *is* an LTX-2 19B model;
+  importing `LTX2TextConnectors` is architecturally sound.
+
+### 10.5 Mechanism Detail — How `ColumnParallelLinear` Self-Shards
+
+```python
+# vllm/model_executor/layers/linear.py (simplified)
+class ColumnParallelLinear(LinearBase):
+    def __init__(self, input_size, output_size, ...):
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.output_size_per_partition = divide(output_size, self.tp_size)
+        # Physical weight is only 1/tp_size of the logical size
+        self.weight = Parameter(
+            torch.empty(input_size, self.output_size_per_partition)
+        )
+```
+
+At `forward()` time no extra code is needed beyond the standard
+`matmul` — the weight is already the right size for the local
+rank. The `weight_loader` (registered at init) knows how to slice
+the global checkpoint tensor to `output_size_per_partition`.
+
+### 10.6 Mechanism Detail — How Quantization Self-Registers
+
+```python
+# vllm/model_executor/layers/linear.py (simplified)
+class LinearBase(nn.Module):
+    def __init__(self, ..., quant_config=None):
+        if quant_config is not None:
+            self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+            self.quant_method.create_weights(layer=self, ...)
+        # create_weights replaces plain Parameter with BlockQuantScaleParameter
+        # and registers a quantization-aware weight_loader
+```
+
+When `quant_config=Fp8Config()`, the layer stores FP8 weights +
+per-block scales and forwards through `cutlass`/`cublas` FP8 GEMM.
+The model author only passes `quant_config=quant_config` at layer
+construction.
+
+## 11. References
 
 - Spec: [`sana_wm_integration.md`](sana_wm_integration.md)
 - Tracking issue: <https://github.com/vllm-project/vllm-omni/issues/3656>
