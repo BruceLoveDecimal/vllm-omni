@@ -249,7 +249,10 @@ def test_sana_wm_transformer_hybrid_softmax_forward_shape() -> None:
 
 def test_sana_wm_transformer_uses_vllm_parallel_layers_when_available() -> None:
     from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
-    from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import _vllm_parallel_layers_available
+    from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
+        _vllm_attention_available,
+        _vllm_parallel_layers_available,
+    )
 
     config = SanaWmConfig(
         num_blocks=1,
@@ -277,6 +280,47 @@ def test_sana_wm_transformer_uses_vllm_parallel_layers_when_available() -> None:
     else:
         assert block.attn.qkv.__class__.__name__ == "Linear"
         assert block.cross_attn.kv_linear.__class__.__name__ == "Linear"
+    if _vllm_attention_available():
+        assert block.cross_attn.softmax_attn.__class__.__name__ == "Attention"
+
+
+def test_sana_wm_transformer_softmax_blocks_use_attention_layer_when_available() -> None:
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+    from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import _vllm_attention_available
+
+    config = SanaWmConfig(
+        num_blocks=1,
+        hidden_size=8,
+        linear_head_dim=4,
+        mlp_ratio=1,
+        model_max_length=3,
+        softmax_every_n=1,
+    )
+    model = SanaWmTransformer3DModel(config=config, materialize=True)
+    block = model.blocks[0]
+
+    assert block.attn.use_gdn is False
+    if _vllm_attention_available():
+        assert block.attn.softmax_attn.__class__.__name__ == "Attention"
+        assert block.cross_attn.softmax_attn.__class__.__name__ == "Attention"
+    else:
+        assert block.attn.softmax_attn is None
+        assert block.cross_attn.softmax_attn is None
+
+
+def test_sana_wm_transformer_declares_sp_plan_when_available() -> None:
+    from vllm_omni.diffusion.models.sana_wm import SanaWmTransformer3DModel
+    from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import _sequence_parallel_plan_available
+
+    if not _sequence_parallel_plan_available():
+        assert SanaWmTransformer3DModel._sp_plan is None
+        return
+
+    assert SanaWmTransformer3DModel._sp_plan is not None
+    assert "blocks.0" in SanaWmTransformer3DModel._sp_plan
+    assert "final_layer" in SanaWmTransformer3DModel._sp_plan
+    assert "hidden_states" in SanaWmTransformer3DModel._sp_plan["blocks.0"]
+    assert "camera_hidden_states" in SanaWmTransformer3DModel._sp_plan["blocks.0"]
 
 
 def test_sana_wm_pipeline_passes_quant_config_to_stage1_transformer() -> None:

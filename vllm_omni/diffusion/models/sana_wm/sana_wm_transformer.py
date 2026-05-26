@@ -42,11 +42,20 @@ try:
         RowParallelLinear,
     )
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.attention.layer import Attention
+    from vllm_omni.diffusion.distributed.sp_plan import (
+        SequenceParallelInput,
+        SequenceParallelOutput,
+    )
 except ImportError:  # pragma: no cover - local macOS/dev environments may not install vLLM.
+    Attention = None
     ColumnParallelLinear = None
     QKVParallelLinear = None
     QuantizationConfig = Any  # type: ignore[misc, assignment]
     RowParallelLinear = None
+    SequenceParallelInput = None
+    SequenceParallelOutput = None
     VllmRMSNorm = None
     get_tensor_model_parallel_rank = None
     get_tensor_model_parallel_world_size = None
@@ -101,6 +110,14 @@ def _vllm_parallel_layers_available() -> bool:
     )
 
 
+def _vllm_attention_available() -> bool:
+    return Attention is not None
+
+
+def _sequence_parallel_plan_available() -> bool:
+    return SequenceParallelInput is not None and SequenceParallelOutput is not None
+
+
 def _disable_tp_for_vllm_layer() -> bool:
     return not _vllm_tp_group_ready()
 
@@ -132,6 +149,29 @@ def _is_sana_wm_transformer_block(name: str, module: Any) -> bool:
 
 def _prod(values: tuple[int, ...]) -> int:
     return reduce(mul, values, 1)
+
+
+def _build_sana_wm_sp_plan() -> dict[str, Any] | None:
+    """Declare Sana-WM Stage-1 sequence sharding boundaries.
+
+    The first transformer block is the earliest point where video latents have
+    already been patchified to ``[B, seq, hidden]``. The final layer is the last
+    sequence-shaped output before unpatchify, so it is the natural gather point.
+    RoPE is kept unsharded for now because the native GDN path consumes temporal
+    layout information and needs a separate multi-card correctness pass.
+    """
+
+    if not _sequence_parallel_plan_available():
+        return None
+    assert SequenceParallelInput is not None
+    assert SequenceParallelOutput is not None
+    return {
+        "blocks.0": {
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
+            "camera_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
+        },
+        "final_layer": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
 
 def _to_3tuple(value: int | tuple[int, int] | tuple[int, int, int]) -> tuple[int, int, int]:
@@ -478,6 +518,7 @@ class SanaWmSelfAttention(nn.Module):
         self.eps = 1e-8
         self.attn_type = config.attn_type
         self.use_gdn = use_gdn and "GDN" in config.attn_type
+        self.use_vllm_attention = (not self.use_gdn) and _vllm_attention_available()
         self.k_conv_only = config.k_conv_only
         self.conv_kernel_size = config.conv_kernel_size
         self.uses_vllm_parallel_layers = use_vllm_parallel_layers and _vllm_parallel_layers_available()
@@ -547,6 +588,20 @@ class SanaWmSelfAttention(nn.Module):
         norm_cls = _maybe_make_vllm_rms_norm if config.qk_norm else (lambda *_args, **_kwargs: nn.Identity())
         self.q_norm = norm_cls(local_inner_dim)
         self.k_norm = norm_cls(local_inner_dim)
+        self.softmax_attn = (
+            Attention(
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                num_kv_heads=self.num_kv_heads,
+                softmax_scale=1.0 / (self.head_dim**0.5),
+                causal=False,
+                role="self",
+                qkv_layout="BSND",
+                prefix=prefix,
+            )
+            if self.use_vllm_attention
+            else None
+        )
 
         # These names mirror the official GDN checkpoint. The current forward
         # executes a pure PyTorch recurrence; the fused Triton scan is ported
@@ -836,6 +891,10 @@ class SanaWmSelfAttention(nn.Module):
         tensor = tensor.reshape(batch, seq_len, self.num_heads, hidden_size // self.num_heads)
         return tensor.transpose(1, 2)
 
+    def _reshape_to_seq_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, hidden_size = tensor.shape
+        return tensor.reshape(batch, seq_len, self.num_heads, hidden_size // self.num_heads)
+
     def _merge_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         batch, _, seq_len, _ = tensor.shape
         return tensor.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
@@ -852,6 +911,15 @@ class SanaWmSelfAttention(nn.Module):
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        if self.softmax_attn is not None:
+            query = self._reshape_to_seq_heads(self.q_norm(query))
+            key = self._reshape_to_seq_heads(self.k_norm(key))
+            value = self._reshape_to_seq_heads(value)
+            if rotary_emb is not None:
+                query = self._apply_rotary_emb_to_sdpa(query.transpose(1, 2), rotary_emb).transpose(1, 2)
+                key = self._apply_rotary_emb_to_sdpa(key.transpose(1, 2), rotary_emb).transpose(1, 2)
+            attn = self.softmax_attn(query, key, value)
+            return _linear_output(self.proj(attn.flatten(2, 3)))
         query = self._split_heads(self.q_norm(query))
         key = self._split_heads(self.k_norm(key))
         value = self._split_heads(value)
@@ -920,20 +988,48 @@ class SanaWmCrossAttention(nn.Module):
         norm_cls = _maybe_make_vllm_rms_norm if config.cross_norm else (lambda *_args, **_kwargs: nn.Identity())
         self.q_norm = norm_cls(local_inner)
         self.k_norm = norm_cls(local_inner)
+        self.softmax_attn = (
+            Attention(
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                num_kv_heads=self.num_heads,
+                softmax_scale=1.0 / (self.head_dim**0.5),
+                causal=False,
+                role="cross",
+                qkv_layout="BSND",
+                skip_sequence_parallel=True,
+                disable_kv_quant=True,
+                prefix=prefix,
+            )
+            if _vllm_attention_available()
+            else None
+        )
 
     def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_size = tensor.shape
         tensor = tensor.reshape(batch, seq_len, self.num_heads, hidden_size // self.num_heads)
         return tensor.transpose(1, 2)
 
+    def _reshape_to_seq_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, hidden_size = tensor.shape
+        return tensor.reshape(batch, seq_len, self.num_heads, hidden_size // self.num_heads)
+
     def _merge_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         batch, _, seq_len, _ = tensor.shape
         return tensor.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
 
     def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        query = self._split_heads(self.q_norm(_linear_output(self.q_linear(hidden_states))))
+        query = self.q_norm(_linear_output(self.q_linear(hidden_states)))
         key, value = _linear_output(self.kv_linear(encoder_hidden_states)).chunk(2, dim=-1)
-        key = self._split_heads(self.k_norm(key))
+        key = self.k_norm(key)
+        if self.softmax_attn is not None:
+            query = self._reshape_to_seq_heads(query)
+            key = self._reshape_to_seq_heads(key)
+            value = self._reshape_to_seq_heads(value)
+            attn = self.softmax_attn(query, key, value)
+            return _linear_output(self.proj(attn.flatten(2, 3)))
+        query = self._split_heads(query)
+        key = self._split_heads(key)
         value = self._split_heads(value)
         attn = F.scaled_dot_product_attention(query, key, value)
         return _linear_output(self.proj(self._merge_heads(attn)))
@@ -1059,6 +1155,7 @@ class SanaWmTransformer3DModel(nn.Module):
     _repeated_blocks: ClassVar[list[str]] = ["blocks"]
     _layerwise_offload_blocks_attr: ClassVar[str] = "blocks"
     _hsdp_shard_conditions: ClassVar[list[Any]] = [_is_sana_wm_transformer_block]
+    _sp_plan: ClassVar[dict[str, Any] | None] = _build_sana_wm_sp_plan()
 
     def __init__(
         self,
