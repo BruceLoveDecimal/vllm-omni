@@ -247,6 +247,48 @@ def test_sana_wm_transformer_hybrid_softmax_forward_shape() -> None:
     assert torch.isfinite(output).all()
 
 
+def test_sana_wm_transformer_uses_vllm_parallel_layers_when_available() -> None:
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+    from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import _vllm_parallel_layers_available
+
+    config = SanaWmConfig(
+        num_blocks=1,
+        hidden_size=8,
+        linear_head_dim=4,
+        mlp_ratio=1,
+        model_max_length=3,
+    )
+    model = SanaWmTransformer3DModel(config=config, materialize=True)
+    block = model.blocks[0]
+
+    assert model.use_vllm_parallel_layers is _vllm_parallel_layers_available()
+    if _vllm_parallel_layers_available():
+        assert block.attn.qkv.__class__.__name__ == "QKVParallelLinear"
+        assert block.attn.proj.__class__.__name__ == "RowParallelLinear"
+        assert block.attn.beta_proj.__class__.__name__ == "ColumnParallelLinear"
+        assert block.attn.output_gate.__class__.__name__ == "ColumnParallelLinear"
+        assert block.cross_attn.q_linear.__class__.__name__ == "ColumnParallelLinear"
+        assert block.cross_attn.kv_linear.__class__.__name__ == "ColumnParallelLinear"
+        assert block.cross_attn.proj.__class__.__name__ == "RowParallelLinear"
+        assert model.y_embedder.y_proj.fc1.__class__.__name__ == "ColumnParallelLinear"
+        assert model.y_embedder.y_proj.fc2.__class__.__name__ == "RowParallelLinear"
+        assert model.t_embedder.mlp[0].__class__.__name__ == "ColumnParallelLinear"
+        assert model.t_embedder.mlp[2].__class__.__name__ == "RowParallelLinear"
+    else:
+        assert block.attn.qkv.__class__.__name__ == "Linear"
+        assert block.cross_attn.kv_linear.__class__.__name__ == "Linear"
+
+
+def test_sana_wm_pipeline_passes_quant_config_to_stage1_transformer() -> None:
+    from vllm_omni.diffusion.models.sana_wm import SanaWmPipeline
+
+    quant_config = object()
+    pipeline = SanaWmPipeline(od_config=SimpleNamespace(model=None, quantization_config=quant_config))
+
+    assert pipeline.quant_config is quant_config
+    assert pipeline.transformer.quant_config is quant_config
+
+
 def test_sana_wm_transformer_limits_plucker_post_blocks() -> None:
     from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
 

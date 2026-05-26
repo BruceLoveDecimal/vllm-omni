@@ -282,7 +282,12 @@ class SanaWmPipeline(
         self.default_num_frames = SANA_WM_DEFAULT_NUM_FRAMES
 
         self.sana_wm_config = SanaWmConfig()
-        self.transformer = SanaWmTransformer3DModel(config=self.sana_wm_config)
+        self.quant_config = getattr(od_config, "quantization_config", None) if od_config is not None else None
+        self.transformer = SanaWmTransformer3DModel(
+            config=self.sana_wm_config,
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.transformer" if prefix else "transformer",
+        )
         self.camera_encoder: SanaWmCameraEmbedder | None = None
 
         # Filled by the real implementation.
