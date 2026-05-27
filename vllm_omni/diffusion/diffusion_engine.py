@@ -25,6 +25,7 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
@@ -674,8 +675,8 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
-        if self.od_config.model_class_name in {"SanaWmPipeline", "SanaWmTwoStagesPipeline"}:
-            logger.info("Skipping dummy run for Sana-WM; camera-conditioned backend warms up on the first request.")
+        if get_diffusion_model_metadata(self.od_config.model_class_name).skip_dummy_run:
+            logger.info("Skipping dummy run for %s; model warms up on the first request.", self.od_config.model_class_name)
             return
 
         num_inference_steps = 1

@@ -135,11 +135,59 @@ def _run_sana_wm_e2e(
     return video
 
 
+def _normalize_to_uint8(video_f: np.ndarray) -> np.ndarray:
+    """Ensure pixel values are in [0, 255] float32."""
+    vmax = float(np.max(video_f)) if video_f.size else 0.0
+    if vmax <= 1.0:
+        return video_f * 255.0
+    return video_f
+
+
+def _compute_psnr(pred: np.ndarray, ref: np.ndarray) -> float:
+    """Per-video PSNR (dB) over all frames, assuming uint8 range [0, 255]."""
+    mse = float(np.mean((pred - ref) ** 2))
+    if mse == 0.0:
+        return float("inf")
+    return float(10.0 * np.log10((255.0 ** 2) / mse))
+
+
+def _compute_ssim_y(pred: np.ndarray, ref: np.ndarray) -> float:
+    """Mean SSIM on the Y (luma) channel across all frames.
+
+    Converts RGB→Y via BT.601, then computes per-patch SSIM and averages.
+    Implements the standard SSIM formula without external dependencies.
+    """
+    # RGB → Y (BT.601), inputs in [0, 255]
+    def _to_y(v: np.ndarray) -> np.ndarray:
+        # v: [T, H, W, 3]
+        r, g, b = v[..., 0], v[..., 1], v[..., 2]
+        return 0.299 * r + 0.587 * g + 0.114 * b  # [T, H, W]
+
+    pred_y = _to_y(pred)
+    ref_y = _to_y(ref)
+
+    # SSIM constants (K1=0.01, K2=0.03, L=255)
+    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+
+    def _ssim_frame(p: np.ndarray, r: np.ndarray) -> float:
+        mu_p, mu_r = p.mean(), r.mean()
+        sig_p = float(np.var(p))
+        sig_r = float(np.var(r))
+        sig_pr = float(np.mean((p - mu_p) * (r - mu_r)))
+        num = (2 * mu_p * mu_r + c1) * (2 * sig_pr + c2)
+        den = (mu_p ** 2 + mu_r ** 2 + c1) * (sig_p + sig_r + c2)
+        return float(num / den) if den != 0.0 else 1.0
+
+    return float(np.mean([_ssim_frame(pred_y[t], ref_y[t]) for t in range(pred_y.shape[0])]))
+
+
 def _assert_video_reference_alignment(
     *,
     prediction: np.ndarray,
     reference: np.ndarray,
     max_mean_abs_error: float,
+    min_psnr: float | None = None,
+    min_ssim_y: float | None = None,
 ) -> None:
     assert prediction.ndim == reference.ndim == 4
     assert prediction.shape[1:] == reference.shape[1:]
@@ -152,17 +200,23 @@ def _assert_video_reference_alignment(
         num_common_frames = min(prediction.shape[0], reference.shape[0])
         prediction = prediction[:num_common_frames]
         reference = reference[:num_common_frames]
-    prediction_f = prediction.astype(np.float32)
-    reference_f = reference.astype(np.float32)
-    prediction_max = float(np.max(prediction_f)) if prediction_f.size else 0.0
-    reference_max = float(np.max(reference_f)) if reference_f.size else 0.0
-    if prediction_max <= 1.0 and reference_max > 1.0:
-        prediction_f *= 255.0
-    if reference_max <= 1.0 and prediction_max > 1.0:
-        reference_f *= 255.0
+    prediction_f = _normalize_to_uint8(prediction.astype(np.float32))
+    reference_f = _normalize_to_uint8(reference.astype(np.float32))
     mean_abs_error = float(np.mean(np.abs(prediction_f - reference_f)))
-    print(f"SANA-WM reference-alignment MAE={mean_abs_error:.6f}, threshold<={max_mean_abs_error:.6f}")
-    assert mean_abs_error <= max_mean_abs_error
+    psnr = _compute_psnr(prediction_f, reference_f)
+    ssim_y = _compute_ssim_y(prediction_f, reference_f)
+    print(
+        f"SANA-WM reference-alignment  MAE={mean_abs_error:.4f} (≤{max_mean_abs_error:.1f})"
+        f"  PSNR={psnr:.2f} dB"
+        f"  SSIM-Y={ssim_y:.4f}"
+    )
+    assert mean_abs_error <= max_mean_abs_error, (
+        f"MAE {mean_abs_error:.4f} exceeds threshold {max_mean_abs_error:.1f}"
+    )
+    if min_psnr is not None:
+        assert psnr >= min_psnr, f"PSNR {psnr:.2f} dB below threshold {min_psnr:.1f} dB"
+    if min_ssim_y is not None:
+        assert ssim_y >= min_ssim_y, f"SSIM-Y {ssim_y:.4f} below threshold {min_ssim_y:.4f}"
 
 
 def test_sana_wm_official_backend_generates_video() -> None:
@@ -186,8 +240,19 @@ def test_sana_wm_inprocess_refiner_aligns_with_official_bridge() -> None:
     refiner_steps = int(os.environ.get("SANA_WM_E2E_REFINER_STEPS", "1"))
     official = _run_sana_wm_e2e(inprocess_refiner=False, output_type="np", refiner_steps=refiner_steps)
     inprocess = _run_sana_wm_e2e(inprocess_refiner=True, output_type="np", refiner_steps=refiner_steps)
+
+    max_mae = float(os.environ.get("SANA_WM_E2E_REFERENCE_MAX_MAE", "30.0"))
+    # PSNR/SSIM gates are opt-in via env vars (set to empty string to disable).
+    # Spec targets: PSNR ≥ 30 dB, SSIM-Y ≥ 0.93.
+    psnr_env = os.environ.get("SANA_WM_E2E_MIN_PSNR", "30.0")
+    ssim_env = os.environ.get("SANA_WM_E2E_MIN_SSIM_Y", "0.93")
+    min_psnr = float(psnr_env) if psnr_env else None
+    min_ssim_y = float(ssim_env) if ssim_env else None
+
     _assert_video_reference_alignment(
         prediction=inprocess,
         reference=official,
-        max_mean_abs_error=float(os.environ.get("SANA_WM_E2E_REFERENCE_MAX_MAE", "255.0")),
+        max_mean_abs_error=max_mae,
+        min_psnr=min_psnr,
+        min_ssim_y=min_ssim_y,
     )

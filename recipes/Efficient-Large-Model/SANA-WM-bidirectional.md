@@ -278,6 +278,42 @@ Explicit camera poses use:
 }
 ```
 
+## Adding model_index.json to the HF Repo (Maintainer Action)
+
+The upstream HF repo does not include `model_index.json` (it uses `config.yaml`
+instead of the standard Diffusers format). vllm-omni detects the layout via
+heuristics in `hf_utils.py` and `data.py`, following the same pattern as BAGEL.
+
+If write access to `Efficient-Large-Model/SANA-WM_bidirectional` is available,
+adding the following `model_index.json` removes the need for those heuristics:
+
+```python
+# Run from an environment with huggingface_hub installed:
+from huggingface_hub import HfApi
+import json, tempfile, pathlib
+
+MODEL_INDEX = {
+    "_class_name": "SanaWmTwoStagesPipeline",
+    "_diffusers_version": "0.31.0",
+    "force_zeros_for_empty_prompt": True,
+}
+
+with tempfile.TemporaryDirectory() as tmp:
+    p = pathlib.Path(tmp) / "model_index.json"
+    p.write_text(json.dumps(MODEL_INDEX, indent=2))
+    HfApi().upload_file(
+        path_or_fileobj=str(p),
+        path_in_repo="model_index.json",
+        repo_id="Efficient-Large-Model/SANA-WM_bidirectional",
+        repo_type="model",
+        commit_message="Add model_index.json for standard pipeline detection",
+    )
+```
+
+After the file is uploaded, the `_looks_like_sana_wm` heuristic in
+`vllm_omni/diffusion/utils/hf_utils.py` and the matching block in
+`vllm_omni/diffusion/data.py` can be removed.
+
 ## Known Limitations
 
 - Native Gated DeltaNet uses the fused Triton implementation on CUDA, with a

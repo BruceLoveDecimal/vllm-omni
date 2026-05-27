@@ -10,6 +10,10 @@ class DiffusionModelMetadata:
     # config/model plumbing can read it without importing concrete pipelines.
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
+    # True when the pipeline cannot handle a synthetic text-only warmup request.
+    # Models that require mandatory non-text inputs (e.g. camera conditioning)
+    # set this so the engine skips _dummy_run at startup.
+    skip_dummy_run: bool = False
 
 
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
@@ -29,10 +33,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "SanaWmPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
+        skip_dummy_run=True,
     ),
     "SanaWmTwoStagesPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
+        skip_dummy_run=True,
     ),
 }
 
