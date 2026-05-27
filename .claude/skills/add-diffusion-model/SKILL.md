@@ -568,6 +568,7 @@ See the [Profiling Single-Stage Diffusion](../../../docs/contributing/profiling.
 
 ## Reference Files
 
+- [Practical Integration Tips](references/intergration.md) — weight format, tests, dependencies, PR checklist (read first)
 - [Transformer Adaptation](references/transformer-adaptation.md) — porting transformers from diffusers
 - [Custom Model Patterns](references/custom-model-patterns.md) — patterns for non-diffusers models
 - [Parallelism Patterns](references/parallelism-patterns.md) — TP, SP/USP, CFG parallel, HSDP implementation details
