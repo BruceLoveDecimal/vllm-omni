@@ -1,21 +1,147 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-05-26 (revision 8)
-> **Branch:** `feat/sana_wm`
+> **Audit date:** 2026-05-27 (revision 9)
+> **Branch:** `feat/sana_wm` (reviewed from `claude/sana-wm-production-readiness-hkmjA`)
 > **Implementation HEAD:** `7148ecdf test(sana-wm): harden GDN Triton coverage`
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
-> **Worktree state at audit:** clean (sync'd with fork HEAD; only `.agents/` untracked)
+> **Worktree state at audit:** clean
 > **Spec (single source of truth):**
-> [`sana_wm_integration.md`](sana_wm_integration.md) (1120 lines).
+> [`sana_wm_integration.md`](sana_wm_integration.md) — see new section
+> **"Native Stage-1 Production Readiness Gap (post-revision-8 review)"**
+> for the consolidated five-item critical path.
 > **Tracking issue:**
 > [vllm-project/vllm-omni#3656](https://github.com/vllm-project/vllm-omni/issues/3656).
 >
-> This is a snapshot. The previous audit (2026-05-24) is preserved
-> via git; this revision tracks the substantial GPU-validation push
-> that landed overnight. Re-run by reading the spec end-to-end, then
-> walking the file inventory in §3 and the P0–P5 table in §4.
+> This is a snapshot. The previous audit (revision 8, 2026-05-26)
+> remains the body of this document below; this revision-9 header
+> consolidates an independent gap review against the actual code
+> on `feat/sana_wm@7148ecdf`. Each gap below was verified against
+> the file it concerns and cross-references the spec section that
+> owns the acceptance criterion.
 
-## 1. TL;DR
+## 0. Revision 9 — Native Stage-1 Production Readiness Gap (2026-05-27)
+
+> Independent peer review against the revision-8 branch HEAD.
+> Headline: revision 8 puts overall progress at 82–85%, but **none
+> of the remaining gap can be closed in parallel** — the five items
+> below form a directed dependency graph where item 2 (VAE encode)
+> is the upstream bottleneck for every other quality measurement.
+> Until that single line in `_run_native_smoke_backend` changes,
+> reference-alignment MAE cannot tighten regardless of how good the
+> other components become.
+
+### 0.1 Verified-in-code findings (review claim → file:line)
+
+| # | Review claim | Verified in | Status |
+|---|---|---|---|
+| 1 | GDN Triton kernel needs multi-card correctness + frame-level parity | `fused_gdn_chunkwise.py` (2,269 LOC); small parity in `test_sana_wm_gdn_triton.py` only | ✅ confirmed |
+| 2 | First-frame VAE encode missing; native smoke uses `torch.randn` | `pipeline_sana_wm.py:545` — `latents = torch.randn(...)` in `_run_native_smoke_backend`; no `_ensure_vae_encode` exists | ✅ confirmed |
+| 3 | `SanaWmFlowDpmScheduler` is single-step Euler | `scheduling_sana_wm.py::step` returns `latents - delta * noise_pred`; docstring admits "exact numerical parity still belongs to the official backend until the upstream solver is ported" | ✅ confirmed |
+| 4 | `SanaWmCameraEmbedder` is a smoke placeholder | `sana_wm_transformer.py:440` — docstring says "Small camera branch used by the native smoke path"; impl is `Conv3d(48, 2240, k=1)` + `Linear(20, 2240)`; UCPE branch absent | ✅ confirmed |
+| 5 | CUDA Graphs / Cache-DiT / HSDP+USP not validated | audit §6 #9, §8 #6 already declare this; verified the static wiring is `CFGParallelMixin` inheritance + HSDP block predicates only | ✅ confirmed |
+
+### 0.2 Why item 2 is the root non-comparability cause
+
+The reference-alignment harness landed in revision 7 (`0ec9a7af`)
+and produced **`MAE = 69.64 / 255.0`** on the GPU instance. That
+number does not move meaningfully until item 2 lands, because the
+official-bridge path encodes the first frame with the LTX-2 VAE
+and uses it as an I2V condition at every denoising step, while
+`_run_native_smoke_backend` seeds latents from `torch.randn` and
+never tells the model what frame to start from. The MAE delta is
+currently measuring:
+
+```text
+official_path:  vae.encode(image) + camera + Gemma prompt + GDN
+native_smoke:   torch.randn       + camera + Gemma prompt + GDN
+                                  └──── only common signal ─────┘
+```
+
+Closing items 1, 3, 4 individually will not move MAE meaningfully
+because the model is processing different inputs. Item 2 must land
+before any reference-alignment threshold tightening (audit §6 item 3,
+§7 item 4, §8 item 4) can produce a signal.
+
+### 0.3 Five-item critical path with acceptance criteria
+
+Full text lives in
+[`sana_wm_integration.md` §"Native Stage-1 Production Readiness Gap"](sana_wm_integration.md).
+One-line summary per item:
+
+| # | Item | Audit cross-ref | Spec ID |
+|---|---|---|---|
+| 1 | GDN Triton — long-sequence + multi-card + block-0 isolation parity vs. NVlabs | §6.2, §8.2 | spec item 1 |
+| 2 | `_ensure_vae_encode` for first-frame I2V conditioning | §6.1, §6.3, §7.4, §8.3 | spec item 2 (**root bottleneck**) |
+| 3 | Vendor NVlabs flow-DPM solver (not diffusers); replace Euler dataclass | §7.2 | spec item 3 |
+| 4 | UCPE branch decomposition + numeric Plucker reference test | §6.6, §7.3 | spec item 4 |
+| 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG, NOT parallel) | §6.4, §6.9, §8.5, §8.6, §10 | spec item 5 |
+
+### 0.4 Recommended ordering (replacing §9 of revision 8)
+
+Revision 8's §9 ordered next steps as:
+1. Run reference-alignment harness on GPU.
+2. Tighten threshold + add PSNR/SSIM.
+3. Run 2-step in-process refiner e2e.
+4. Live `/v1/videos/generations/sync` smoke.
+5. SP/USP/CFG-parallel/HSDP sweeps.
+
+That ordering is no longer optimal — steps 1–2 cannot produce a
+meaningful signal until item 2 (VAE encode) lands. Revised:
+
+```text
+Step 1  (no GPU):  Land `_ensure_vae_encode` + first-frame slot
+                   pinning in `_run_native_smoke_backend`.
+                   Spec item 2. Unit test with synthetic PIL image.
+
+Step 2  (no GPU):  Vendor NVlabs flow-DPM solver into
+                   `scheduling_sana_wm.py`. Spec item 3.
+                   Scheduler-call-sequence unit test.
+
+Step 3  (no GPU):  Decompose `SanaWmCameraEmbedder` into UCPE
+                   sub-modules + add numeric Plucker reference test.
+                   Spec item 4.
+
+Step 4  (GPU):     Re-run `SANA_WM_E2E_REFERENCE_ALIGNMENT=1`.
+                   Expected: MAE drops from 69.64 to under 30 on
+                   24-frame 256×448 smoke.
+
+Step 5  (GPU):     If step 4 succeeds, tighten threshold and add
+                   PSNR/SSIM assertions.
+
+Step 6  (GPU):     Item 1 long-sequence GDN parity at full Stage-1
+                   shape (T=11, 704×1280, 321 frames).
+
+Step 7  (refactor + GPU): Item 5a — replace plain nn.Linear with
+                   vLLM TP-aware layers across the DiT. Single-GPU
+                   regression check first, then tp_size=2 parity.
+
+Step 8  (GPU multi-card): Items 5b–5d sequentially. Cache-DiT only
+                   ships in production once reference-alignment
+                   PSNR ≥ 30 / SSIM-Y ≥ 0.93 holds WITHOUT it.
+
+Step 9  (release): Mark Sana-WM as production-supported. Until
+                   step 9, the official CLI bridge ships as
+                   "preview" and the native path stays behind
+                   `VLLM_OMNI_SANA_WM_NATIVE_SMOKE=1`.
+```
+
+### 0.5 What does NOT change from revision 8
+
+The official CLI bridge path is real, GPU-validated, and produces
+decoded `(8, 704, 1280, 3)` videos at ~9 minutes per request on
+RTX PRO 6000 Blackwell 96 GB. Items 1–5 above scope the **native**
+path; the bridge path can ship as a "preview" backend independent
+of this critical path.
+
+The four code-test gaps Kimi flagged (msg `ee738f7c`) remain
+non-GPU work: VAE unit test, scheduler-loop test, camera numeric
+test, threshold tightening. Item 2 of revision 9 (VAE encode in
+the pipeline) is upstream of Kimi's VAE *test* — once the encode
+exists in the pipeline, the test becomes natural to write.
+
+---
+
+## 1. TL;DR (revision 8, retained verbatim below for diff continuity)
 
 Overall progress against the post-release implementation plan:
 **roughly 82–85%** (up from 40–45% in the 2026-05-24 snapshot, and

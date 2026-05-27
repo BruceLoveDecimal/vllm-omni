@@ -1118,3 +1118,385 @@ native vLLM-Omni transformer path still requires P1/P2.
     `SanaWmConfig.from_yaml` will pick it up automatically. Do not hardcode
     architecture constants (num_blocks=20, hidden_size=2240) anywhere except as
     defaults in `SanaWmConfig` with a comment pointing to `config.yaml`.
+
+---
+
+## Native Stage-1 Production Readiness Gap (post-revision-8 review)
+
+> Added 2026-05-27 after an independent peer review of the
+> revision-8 `feat/sana_wm` branch HEAD (`7148ecdf`). The progress
+> audit puts the branch at ~82–85% against the post-release plan,
+> but the remaining gap is concentrated in **five mutually-coupled
+> items** that together gate any production claim on the native
+> (non-CLI-bridge) Stage-1 path. Each item below ships with a
+> concrete acceptance criterion and a cross-reference to the audit
+> doc so the two files stay in sync.
+
+### Why this section exists separately
+
+The reference-alignment harness landed in `0ec9a7af` and produced
+`MAE = 69.64 / 255.0` on the GPU instance. That number proves the
+*harness* is functional. It does **not** prove the native path
+matches the official path, because — as the next subsection makes
+explicit — `_run_native_smoke_backend` still seeds latents from
+`torch.randn` instead of encoding the first frame. Until that
+single line changes, native-vs-official MAE measures "noise +
+conditioning distribution similarity," not model behaviour, and
+the audit's loose `MAE ≤ 255` threshold cannot meaningfully tighten.
+
+The five items below are the critical path to closing that gap.
+They must land in roughly this order: items 2 and 4 unblock the
+"can a number actually mean something" question; item 3 unblocks
+multi-step quality; item 1 unblocks quality at scale; item 5 is
+deliberately last because every perf optimisation is a quality risk
+that cannot be evaluated until 1–4 land.
+
+### 1. GDN Triton kernel — production correctness pass
+
+**Status:** vendored kernel in `fused_gdn_chunkwise.py` (2,269 LOC,
+Apache-2.0 from NVlabs) is wired into `SanaWmSelfAttention._forward_gdn`
+on CUDA with PyTorch fallback. Small fused-vs-reference parity passes
+(`atol=rtol=1e-2`) and the multi-shape / fp32+bf16 / disable-env /
+warmup matrix added in `7148ecdf` passes on RTX PRO 6000 Blackwell.
+
+**What's still open:**
+
+- **Frame-level parity vs. the official NVlabs path** at realistic
+  Stage-1 video shape (`T=11, H=22, W=40` at 704×1280, 321 frames),
+  not just the small test shapes. The chunkwise scan has subtle
+  numerical sensitivity in the log-domain state; small-shape parity
+  does not imply long-sequence parity.
+- **Multi-card correctness.** The current parity tests are
+  single-GPU. Once Stage-1 routes through vLLM TP layers (item 5),
+  the fused kernel needs to run correctly under shard splits along
+  the head dim and produce the same output as the single-card path.
+- **Dtype discipline audit.** Spec §"Pitfalls" #10 specifies the
+  policy (bf16 projections, f32 `A_log` state, bf16 `conv_k`,
+  bf16 output). The vendored kernel needs an explicit audit that
+  it doesn't silently up- or down-cast the state-space path; the
+  `compute_dtype` argument should be threaded through.
+- **Inference-only scope.** No backward pass needed. State this
+  explicitly to prevent scope creep into training-style kernels.
+
+**Acceptance criterion:**
+
+```text
+[ ] tests/diffusion/models/sana_wm/test_sana_wm_gdn_triton.py
+    extended with a "long-sequence parity" case at T=11, with
+    rtol/atol ≤ 1e-2 bf16 / 1e-4 fp32 against the PyTorch reference.
+[ ] Block-0 isolation harness: dump one block's output from the
+    official NVlabs path on a fixed input + state; vllm-omni's
+    fused path matches to rtol=1e-2 bf16 / 1e-4 fp32.
+[ ] tp_size=2 fused vs. tp_size=1 fused produces identical decoded
+    output for a 24-frame 256×448 smoke (after item 5 lands).
+[ ] `compute_dtype` is an explicit argument to the kernel entry
+    points, not inferred from input dtypes.
+```
+
+Cross-ref: audit §6 item 2, §8 item 2.
+
+### 2. First-frame VAE encode — root non-comparability cause
+
+**Status (verified in code):** `pipeline_sana_wm.py::_run_native_smoke_backend`
+currently does:
+
+```python
+latents = torch.randn(
+    (1, 128, latent_frames, latent_height, latent_width),
+    device=device, dtype=dtype, generator=generator,
+)
+```
+
+The first frame from `prompt["image"]` is validated by the request
+processor and resized inside the official-CLI-bridge path, but is
+**never encoded** in the native smoke path. The VAE is initialised
+(`_ensure_vae` runs to allow decoding the result), but no
+`_ensure_vae_encode(image)` exists.
+
+**Why this matters more than any other item:** the official
+checkpoint is image-to-video first. Reference-alignment MAE between
+official-bridge output and native-smoke output is currently
+measuring "noise plus camera conditioning plus partial Gemma
+prompt similarity," not "model output." The audit's
+`MAE = 69.64 / 255.0` result will not move meaningfully no matter
+how good the GDN kernel, scheduler, or camera embedder become,
+because the model is never told what the first frame is.
+
+**Required changes (concrete):**
+
+```python
+# pipeline_sana_wm.py
+def _ensure_vae_encode(self, image: PIL.Image.Image | torch.Tensor,
+                       *, device, dtype, num_frames) -> torch.Tensor:
+    """Encode the first frame with the LTX-2 VAE and return the
+    Stage-1 first-frame latent slot (B, C, 1, H/32, W/32)."""
+    self._ensure_vae(device=device, dtype=dtype)
+    frame_tensor = _resize_and_center_crop(image, (704, 1280))  # CHW, [-1, 1]
+    frame_tensor = frame_tensor.unsqueeze(0).unsqueeze(2)        # (1, 3, 1, H, W)
+    posterior = self.vae.encode(frame_tensor.to(self.vae.dtype)).latent_dist
+    return posterior.sample().to(dtype=dtype)                    # (1, 128, 1, H/32, W/32)
+
+# in _run_native_smoke_backend, replace the torch.randn call with:
+first_frame_latent = self._ensure_vae_encode(
+    payload["image"], device=device, dtype=dtype, num_frames=params.num_frames,
+)
+noise = torch.randn(
+    (1, 128, latent_frames, latent_height, latent_width),
+    device=device, dtype=dtype, generator=generator,
+)
+latents = noise
+# I2V conditioning: at every denoising step, overwrite the first
+# frame slot with first_frame_latent before calling the transformer,
+# matching the official I2V pattern.
+```
+
+**Acceptance criterion:**
+
+```text
+[ ] `_ensure_vae_encode` exists and is unit-tested with a synthetic
+    PIL image: returns (1, 128, 1, 22, 40) for 704×1280 input
+    (modulo VAE-actual spatial compression).
+[ ] `_run_native_smoke_backend` calls `_ensure_vae_encode` and
+    pins the first-frame latent slot at every denoising step.
+[ ] Reference-alignment MAE on the same fixed prompt + image +
+    camera drops below the current 69.64 baseline. Target: MAE
+    falls under 30 for a 24-frame 256×448 smoke.
+```
+
+Cross-ref: audit §6 item 1, §6 item 3.
+
+### 3. Scheduler — vendor NVlabs flow-DPM solver (not diffusers)
+
+**Status (verified in code):** `SanaWmFlowDpmScheduler` is a
+dataclass with one Euler step:
+
+```python
+def step(self, latents, noise_pred, delta) -> torch.Tensor:
+    return latents - delta * noise_pred  # explicit Euler
+```
+
+Its docstring acknowledges: "exact numerical parity still belongs
+to the official backend until the upstream solver is ported."
+This does not match `config.yaml::vis_sampler: flow_dpm-solver`.
+
+**Recommendation: vendor NVlabs' solver directly, do not use diffusers'
+`FlowMatchDPMSolverMultistepScheduler`.** Same Apache-2.0 vendor
+pattern we used for `fused_gdn_chunkwise.py`. Rationale:
+
+- Bit-level parity with the reference path. Sigma schedules,
+  history-buffer initialisation, and final-step handling vary
+  enough between solvers that "looks the same" turns into "MAE
+  drifts by 10–20" over 30 steps.
+- `inference_flow_shift = 9.8` is non-standard. The diffusers
+  scheduler accepts a `shift` parameter but the way it composes
+  with the DPM-Solver coefficient table is solver-implementation-
+  dependent; we'd be debugging the diffusers internals to chase
+  parity. Cheaper to vendor.
+- We already vendor 2,269 LOC of Triton kernel code from the same
+  upstream repo. Adding ~300 LOC of pure-Python solver is small
+  incremental maintenance surface.
+
+**Required surface:**
+
+```python
+# scheduling_sana_wm.py
+class SanaWmFlowDpmSolverMultistep:
+    """Vendored from NVlabs/Sana::diffusion/schedulers/scheduling_flow_dpm.py
+    (Apache-2.0)."""
+    def __init__(self, num_inference_steps: int,
+                 flow_shift: float = 9.8,
+                 solver_order: int = 2):
+        ...
+    def set_timesteps(self, *, device: torch.device) -> None: ...
+    def step(self, model_output: Tensor, timestep: Tensor,
+             sample: Tensor) -> Tensor: ...
+```
+
+History-buffer-based multi-step formulation; signature should
+match `LTX2`'s scheduler so the in-process refiner can reuse the
+step loop without restructuring.
+
+**Acceptance criterion:**
+
+```text
+[ ] `SanaWmFlowDpmSolverMultistep` ships in `scheduling_sana_wm.py`
+    with file-header provenance comment ("ported from NVlabs/Sana,
+    Apache-2.0, NVIDIA copyright preserved").
+[ ] Scheduler-call-sequence unit test (mirrors Wan2.2's
+    `test_wan22_pipeline_diffuse.py`): monkeypatch
+    `predict_noise_maybe_with_cfg`, assert 30-step solver calls
+    `step` in the right order with the right history-buffer state.
+[ ] `SanaWmFlowDpmScheduler` (the current Euler dataclass) is
+    retained as a debug-only opt-in (`SANA_WM_USE_EULER_DEBUG=1`)
+    or removed once the new solver lands.
+```
+
+Cross-ref: audit §7 item 2.
+
+### 4. Camera embedder — UCPE branch + numeric reference test
+
+**Status (verified in code):** `SanaWmCameraEmbedder` is two trivial
+projections:
+
+```python
+self.plucker.proj = nn.Conv3d(config.chunk_plucker_channels,
+                              config.hidden_size, kernel_size=1)
+self.raymap.proj = nn.Linear(20, config.hidden_size)
+```
+
+Its own docstring: "Small camera branch used by the native smoke path."
+
+This does not match the official architecture. `config.yaml` declares:
+
+```yaml
+camctrl_type: BidirectionalGDNUCPESinglePathLiteLABothTriton
+cam_attn_compress: 1
+init_cam_from_base: true
+use_chunk_plucker_post_attn: true
+chunk_plucker_channels: 48
+chunk_plucker_post_attn_blocks: 20   # injected into ALL blocks
+```
+
+UCPE = Unified Camera-Pose Encoding. "SinglePathLite" + "LABoth"
+indicate a specific compress-then-broadcast architecture, not a
+single 1×1 conv.
+
+**Required decomposition:**
+
+```text
+plucker_embedder:
+  - K=4 conv (matches `conv_kernel_size: 4` in main attention),
+    multi-scale per `aspect_ratio_type: ASPECT_RATIO_VIDEO_720_MS_DIV32`.
+  - Input channels: 48 (chunk_plucker_channels).
+  - Output channels: 2240 (hidden_size).
+  - Injected post-attention in every one of the 20 blocks.
+
+raymap_embedder:
+  - Input: 20-d ray features (already correct shape).
+  - Multi-block injection (currently only injects via the plucker
+    side; raymap needs its own per-block path).
+
+UCPE branch:
+  - cam_attn_compress=1: 1x compression on camera attention.
+  - init_cam_from_base=True: camera-branch weights warm-started
+    from the base attention block at load time (weight_mapping must
+    handle the duplication explicitly).
+  - LABoth: linear attention on both spatial and temporal axes.
+```
+
+**Numeric reference test (Kimi P2 item):** beyond
+`test_sana_wm_camera_control.py`'s current shape-only assertions,
+add a numeric check against a reference Plucker embedding produced
+by a verbatim port of NVlabs' `camera_utils.py` on a fixed
+trajectory (e.g. straight-line `w-80,w-40,w-40,w-100`).
+
+**Acceptance criterion:**
+
+```text
+[ ] `SanaWmCameraEmbedder` is renamed or replaced; the docstring
+    "smoke path" qualifier is removed.
+[ ] Three sub-modules — `plucker_embedder`, `raymap_embedder`,
+    `ucpe_branch` — exist with `weight_mapping.py` entries that
+    correctly map `plucker_embedder.*` and `raymap_embedder.*`
+    Stage-1 checkpoint keys (currently mapped to
+    `camera_encoder.plucker.*` / `camera_encoder.raymap.*`).
+[ ] init_cam_from_base warm-start is implemented in `load_weights`
+    or `weight_mapping.remap` and tested.
+[ ] tests/diffusion/models/sana_wm/test_sana_wm_camera_control.py
+    asserts numeric equivalence (atol=1e-5 fp32) to a reference
+    Plucker tensor dumped from NVlabs camera_utils on a fixed
+    trajectory.
+```
+
+Cross-ref: audit §6 item 6, §7 item 3.
+
+### 5. Performance optimisations — ordered DAG, not parallel todos
+
+**Status:** static wiring exists; no multi-GPU sweep ran.
+`CFGParallelMixin` is inherited, HSDP block conditions are
+declared, dfx perf JSON has three concrete entries. None of
+this has been validated end-to-end on a multi-GPU instance.
+
+**Critical constraint: these are NOT independent.** Treating them
+as a parallel todo list will produce optimisations that look good
+on a microbenchmark and silently regress quality. Required ordering:
+
+```text
+5a (must precede everything else): TP-aware layers.
+    Replace plain nn.Linear / nn.Conv3d / SanaWmRMSNorm with
+    QKVParallelLinear / ColumnParallelLinear / RowParallelLinear /
+    vLLM RMSNorm. This is Kimi's ⭐⭐☆☆☆ framework-consistency item
+    (audit §10.3). Without it, TP/SP/quant inherit nothing.
+
+5b (after 5a + items 1-4): HSDP + USP/Ulysses.
+    HSDP shard policy on `blocks.*` is already declared. USP/Ulysses
+    requires routing attention through
+    vllm_omni.diffusion.attention.layer.Attention so the SP plan can
+    inject all-to-all at the right boundary. Cannot validate without
+    5a because the layer-level SP boundaries don't exist yet.
+
+5c (after 5b): CUDA Graphs.
+    Static shapes are partially given (fixed 704×1280), but
+    num_frames varies per request → bucket by num_frames (e.g.
+    {65, 129, 193, 257, 321}) and capture per-bucket graphs.
+    Skip this entirely if num_frames variation is dominant
+    in production traffic.
+
+5d (last, gated by quality): Cache-DiT.
+    Spec §"Phased rollout" item 7 already says "Cache-DiT only
+    after baseline quality and deterministic behavior are known."
+    Spatial-feature cache (within-step across blocks) is lower-risk;
+    temporal-feature cache (across denoising steps) requires the
+    scheduler from item 3 to be deterministic. Do not enable
+    Cache-DiT for the production default until reference-alignment
+    PSNR ≥ 30 / SSIM-Y ≥ 0.93 has been demonstrated WITHOUT it.
+```
+
+**Acceptance criterion:**
+
+```text
+[ ] 5a: SanaWmTransformer3DModel uses vLLM parallel layers
+    end-to-end; tp_size=2 produces identical decoded output to
+    tp_size=1 for a 24-frame 256×448 smoke (deterministic seed).
+[ ] 5b: dfx perf entry for HSDP + USP shows >1.6x speedup over
+    single-GPU at 4×80 GB; output PSNR vs. single-GPU ≥ 40.
+[ ] 5c: num_frames-bucketed CUDA graph capture works for the top-3
+    request shapes in observed traffic; no quality regression vs.
+    eager.
+[ ] 5d: Cache-DiT temporal+spatial both opt-in (env var or
+    sampling_params extra arg) and ship disabled by default until
+    reference-alignment thresholds are met without it.
+```
+
+Cross-ref: audit §6 items 4 and 9, §8 items 5 and 6, §10.
+
+### Recap — critical path to "production native"
+
+```text
+ITEM 2 (VAE encode)      ───┐
+                            ├── ITEM 3 (scheduler) ───┐
+ITEM 4 (camera UCPE)     ───┘                          ├── reference-
+                                                       │   alignment
+ITEM 1 (GDN long-seq parity)  ─────────────────────────┘   tightening
+                                                                │
+ITEM 5a (TP layers)  ───────────────────────────────────────────┤
+                                                                │
+ITEM 5b (HSDP+USP)  ────────────────────────────────────────────┤
+                                                                │
+ITEM 5c (CUDA Graphs)  ─────────────────────────────────────────┤
+                                                                │
+ITEM 5d (Cache-DiT)  ───────────────────────────────────────────┘
+                                                                │
+                                                  ┌─────────────┘
+                                                  ▼
+                                  Production-native Stage-1
+                                  (PSNR ≥ 30, SSIM-Y ≥ 0.93
+                                   vs. official CLI bridge)
+```
+
+The current `feat/sana_wm` branch can ship the **official CLI
+bridge path** today as a "preview" — that path is real, GPU-validated,
+and produces decoded video. The **native path** should remain
+behind `VLLM_OMNI_SANA_WM_NATIVE_SMOKE=1` / `_run_native_smoke_backend`
+until items 1–4 land and the reference-alignment threshold tightens.
+Marking Sana-WM as production-supported requires the full DAG above.
