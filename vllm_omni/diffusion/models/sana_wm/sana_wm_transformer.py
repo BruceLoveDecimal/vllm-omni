@@ -440,14 +440,36 @@ class SanaWmWanRotaryPosEmbed(nn.Module):
 class SanaWmCameraEmbedder(nn.Module):
     """Small camera branch used by the native smoke path."""
 
-    def __init__(self, config: SanaWmConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: SanaWmConfig | None = None,
+        *,
+        use_vllm_parallel_layers: bool = True,
+        quant_config: Any = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         config = config or SanaWmConfig()
         self.hidden_size = config.hidden_size
         self.plucker = nn.Module()
+        # Conv3d has no vLLM parallel equivalent — kept as nn.Conv3d.
         self.plucker.proj = nn.Conv3d(config.chunk_plucker_channels, config.hidden_size, kernel_size=1)
         self.raymap = nn.Module()
-        self.raymap.proj = nn.Linear(20, config.hidden_size)
+        # raymap.proj is a plain Linear over 20 Plücker features; use
+        # ColumnParallelLinear when vLLM TP layers are available.
+        if use_vllm_parallel_layers and _vllm_parallel_layers_available() and ColumnParallelLinear is not None:
+            self.raymap.proj: nn.Module = ColumnParallelLinear(
+                20,
+                config.hidden_size,
+                bias=True,
+                gather_output=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.raymap.proj" if prefix else "raymap.proj",
+                disable_tp=_disable_tp_for_vllm_layer(),
+            )
+        else:
+            self.raymap.proj = nn.Linear(20, config.hidden_size)
 
     @staticmethod
     def _match_tokens(hidden_states: torch.Tensor, expected_tokens: int) -> torch.Tensor:

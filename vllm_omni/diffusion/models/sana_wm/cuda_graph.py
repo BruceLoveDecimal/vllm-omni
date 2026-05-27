@@ -62,7 +62,7 @@ class _SanaWmCudaGraphEntry:
     timestep: torch.Tensor
     encoder_hidden_states: torch.Tensor
     plucker: torch.Tensor
-    raymap: torch.Tensor
+    spatial_raymap: torch.Tensor | None
     output: torch.Tensor
 
 
@@ -89,17 +89,15 @@ class SanaWmCudaGraphDenoiser:
         timestep: torch.Tensor,
         *,
         encoder_hidden_states: torch.Tensor,
-        camera_encoder: torch.nn.Module | None,
         plucker: torch.Tensor,
-        raymap: torch.Tensor,
+        spatial_raymap: torch.Tensor | None,
     ) -> torch.Tensor:
         return transformer(
             latents,
             timestep,
             encoder_hidden_states=encoder_hidden_states,
-            camera_encoder=camera_encoder,
             plucker=plucker,
-            raymap=raymap,
+            spatial_raymap=spatial_raymap,
         )
 
     @staticmethod
@@ -110,14 +108,12 @@ class SanaWmCudaGraphDenoiser:
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         plucker: torch.Tensor,
-        raymap: torch.Tensor,
+        spatial_raymap: torch.Tensor | None,
         transformer: torch.nn.Module,
-        camera_encoder: torch.nn.Module | None,
     ) -> tuple[Any, ...]:
         return (
             bucket,
             id(transformer),
-            id(camera_encoder),
             latents.device.type,
             latents.device.index,
             latents.dtype,
@@ -125,7 +121,7 @@ class SanaWmCudaGraphDenoiser:
             tuple(timestep.shape),
             tuple(encoder_hidden_states.shape),
             tuple(plucker.shape),
-            tuple(raymap.shape),
+            tuple(spatial_raymap.shape) if spatial_raymap is not None else None,
         )
 
     def run(
@@ -135,9 +131,8 @@ class SanaWmCudaGraphDenoiser:
         timestep: torch.Tensor,
         *,
         encoder_hidden_states: torch.Tensor,
-        camera_encoder: torch.nn.Module | None,
         plucker: torch.Tensor,
-        raymap: torch.Tensor,
+        spatial_raymap: torch.Tensor | None,
         num_frames: int,
         buckets: tuple[int, ...] = SANA_WM_CUDAGRAPH_BUCKETS,
     ) -> tuple[torch.Tensor, bool]:
@@ -149,9 +144,8 @@ class SanaWmCudaGraphDenoiser:
                     latents,
                     timestep,
                     encoder_hidden_states=encoder_hidden_states,
-                    camera_encoder=camera_encoder,
                     plucker=plucker,
-                    raymap=raymap,
+                    spatial_raymap=spatial_raymap,
                 ),
                 False,
             )
@@ -162,9 +156,8 @@ class SanaWmCudaGraphDenoiser:
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
             plucker=plucker,
-            raymap=raymap,
+            spatial_raymap=spatial_raymap,
             transformer=transformer,
-            camera_encoder=camera_encoder,
         )
         if key in self.disabled_keys:
             return (
@@ -173,9 +166,8 @@ class SanaWmCudaGraphDenoiser:
                     latents,
                     timestep,
                     encoder_hidden_states=encoder_hidden_states,
-                    camera_encoder=camera_encoder,
                     plucker=plucker,
-                    raymap=raymap,
+                    spatial_raymap=spatial_raymap,
                 ),
                 False,
             )
@@ -188,9 +180,8 @@ class SanaWmCudaGraphDenoiser:
                     latents,
                     timestep,
                     encoder_hidden_states=encoder_hidden_states,
-                    camera_encoder=camera_encoder,
                     plucker=plucker,
-                    raymap=raymap,
+                    spatial_raymap=spatial_raymap,
                 )
                 self.graphs[key] = entry
                 self.capture_count += 1
@@ -203,9 +194,8 @@ class SanaWmCudaGraphDenoiser:
                         latents,
                         timestep,
                         encoder_hidden_states=encoder_hidden_states,
-                        camera_encoder=camera_encoder,
                         plucker=plucker,
-                        raymap=raymap,
+                        spatial_raymap=spatial_raymap,
                     ),
                     False,
                 )
@@ -214,7 +204,8 @@ class SanaWmCudaGraphDenoiser:
             entry.timestep.copy_(timestep)
             entry.encoder_hidden_states.copy_(encoder_hidden_states)
             entry.plucker.copy_(plucker)
-            entry.raymap.copy_(raymap)
+            if entry.spatial_raymap is not None and spatial_raymap is not None:
+                entry.spatial_raymap.copy_(spatial_raymap)
             entry.graph.replay()
             self.replay_count += 1
 
@@ -227,15 +218,14 @@ class SanaWmCudaGraphDenoiser:
         timestep: torch.Tensor,
         *,
         encoder_hidden_states: torch.Tensor,
-        camera_encoder: torch.nn.Module | None,
         plucker: torch.Tensor,
-        raymap: torch.Tensor,
+        spatial_raymap: torch.Tensor | None,
     ) -> _SanaWmCudaGraphEntry:
         static_latents = latents.detach().clone()
         static_timestep = timestep.detach().clone()
         static_encoder_hidden_states = encoder_hidden_states.detach().clone()
         static_plucker = plucker.detach().clone()
-        static_raymap = raymap.detach().clone()
+        static_spatial_raymap = spatial_raymap.detach().clone() if spatial_raymap is not None else None
 
         with torch.inference_mode():
             static_output = self._eager(
@@ -243,9 +233,8 @@ class SanaWmCudaGraphDenoiser:
                 static_latents,
                 static_timestep,
                 encoder_hidden_states=static_encoder_hidden_states,
-                camera_encoder=camera_encoder,
                 plucker=static_plucker,
-                raymap=static_raymap,
+                spatial_raymap=static_spatial_raymap,
             )
             torch.cuda.synchronize(static_latents.device)
             graph = torch.cuda.CUDAGraph()
@@ -255,9 +244,8 @@ class SanaWmCudaGraphDenoiser:
                     static_latents,
                     static_timestep,
                     encoder_hidden_states=static_encoder_hidden_states,
-                    camera_encoder=camera_encoder,
                     plucker=static_plucker,
-                    raymap=static_raymap,
+                    spatial_raymap=static_spatial_raymap,
                 )
 
         return _SanaWmCudaGraphEntry(
@@ -266,6 +254,6 @@ class SanaWmCudaGraphDenoiser:
             timestep=static_timestep,
             encoder_hidden_states=static_encoder_hidden_states,
             plucker=static_plucker,
-            raymap=static_raymap,
+            spatial_raymap=static_spatial_raymap,
             output=static_output,
         )

@@ -50,6 +50,11 @@ from vllm_omni.diffusion.models.sana_wm.scheduling_sana_wm import (
     SanaWmFlowDpmScheduler,  # noqa: F401 – kept for backward-compat imports
     SanaWmFlowMatchScheduler,
 )
+from vllm_omni.diffusion.models.sana_wm.cuda_graph import (
+    SanaWmCudaGraphDenoiser,
+    parse_sana_wm_cudagraph_buckets,
+    sana_wm_cudagraph_requested,
+)
 from vllm_omni.diffusion.models.sana_wm.weight_mapping import normalize_sana_wm_stage1_weight_name
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
@@ -687,15 +692,30 @@ class SanaWmPipeline(
             spatial_raymap = spatial_raymap.to(device=device, dtype=dtype)
 
         self.transformer.config = self.sana_wm_config
+        use_cudagraph = sana_wm_cudagraph_requested(extra_args)
+        cudagraph_denoiser = SanaWmCudaGraphDenoiser() if use_cudagraph else None
+        cudagraph_buckets = parse_sana_wm_cudagraph_buckets(extra_args) if use_cudagraph else ()
         for timestep in timesteps:
-            noise_pred = self.transformer(
-                latents,
-                timestep.expand(1),
-                encoder_hidden_states=prompt_embeds,
-                plucker=plucker,
-                raymap=raymap,
-                spatial_raymap=spatial_raymap,
-            )
+            if cudagraph_denoiser is not None:
+                noise_pred, _ = cudagraph_denoiser.run(
+                    self.transformer,
+                    latents,
+                    timestep.expand(1),
+                    encoder_hidden_states=prompt_embeds,
+                    plucker=plucker,
+                    spatial_raymap=spatial_raymap,
+                    num_frames=params.num_frames,
+                    buckets=cudagraph_buckets,
+                )
+            else:
+                noise_pred = self.transformer(
+                    latents,
+                    timestep.expand(1),
+                    encoder_hidden_states=prompt_embeds,
+                    plucker=plucker,
+                    raymap=raymap,
+                    spatial_raymap=spatial_raymap,
+                )
             latents = scheduler.step(noise_pred, timestep, latents)
 
         output_type = str(extra_args.get("sana_wm_output_type", "latent"))

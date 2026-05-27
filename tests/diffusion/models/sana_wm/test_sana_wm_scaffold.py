@@ -1000,3 +1000,77 @@ def test_sana_wm_forward_shape_consistent_across_layer_modes() -> None:
             f"use_vllm_parallel_layers={use_parallel}: shape {out.shape} != {latents.shape}"
         )
         assert torch.isfinite(out).all(), f"non-finite output at use_vllm_parallel_layers={use_parallel}"
+
+
+# ---------------------------------------------------------------------------
+# C.3 — Serving endpoint payload routing
+# ---------------------------------------------------------------------------
+
+def test_serving_video_build_sana_wm_payload_from_request_field() -> None:
+    """sana_wm dict on the request is forwarded to the prompt payload."""
+    from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+    from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
+
+    req = VideoGenerationRequest(
+        prompt="forward drive",
+        sana_wm={"action": "w-1", "num_frames": 5},
+    )
+    vp = SimpleNamespace(width=512, height=288, num_frames=5, fps=None)
+
+    payload = OmniOpenAIServingVideo._build_sana_wm_payload(req, vp)
+
+    assert payload["action"] == "w-1"
+    assert payload["num_frames"] == 5
+    assert payload["width"] == 512
+    assert payload["height"] == 288
+
+
+def test_serving_video_build_sana_wm_payload_from_extra_params() -> None:
+    """Extra params sana_wm dict and top-level keys are merged into payload."""
+    from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+    from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
+
+    req = VideoGenerationRequest(
+        prompt="left turn",
+        extra_params={
+            "sana_wm": {"action": "a-3"},
+            "translation_speed": 0.07,
+        },
+    )
+    vp = SimpleNamespace(width=None, height=None, num_frames=None, fps=None)
+
+    payload = OmniOpenAIServingVideo._build_sana_wm_payload(req, vp)
+
+    assert payload["action"] == "a-3"
+    assert payload["translation_speed"] == 0.07
+
+
+def test_serving_video_build_sana_wm_payload_empty_when_no_sana_wm() -> None:
+    """Requests without sana_wm fields produce an empty payload."""
+    from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+    from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
+
+    req = VideoGenerationRequest(prompt="generic video")
+    vp = SimpleNamespace(width=512, height=288, num_frames=4, fps=None)
+
+    payload = OmniOpenAIServingVideo._build_sana_wm_payload(req, vp)
+
+    assert payload == {}, f"Expected empty payload, got {payload}"
+
+
+def test_serving_video_build_sana_wm_payload_request_wins_over_extra_params() -> None:
+    """When both sana_wm and extra_params.sana_wm set the same key, extra_params wins (update order)."""
+    from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+    from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
+
+    req = VideoGenerationRequest(
+        prompt="conflict test",
+        sana_wm={"action": "w-1"},
+        extra_params={"sana_wm": {"action": "w-8"}},
+    )
+    vp = SimpleNamespace(width=None, height=None, num_frames=None, fps=None)
+
+    payload = OmniOpenAIServingVideo._build_sana_wm_payload(req, vp)
+
+    # extra_params.sana_wm is applied after request.sana_wm, so it wins.
+    assert payload["action"] == "w-8"
