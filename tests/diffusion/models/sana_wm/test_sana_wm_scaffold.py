@@ -266,6 +266,7 @@ def test_sana_wm_transformer_uses_vllm_parallel_layers_when_available() -> None:
 
     assert model.use_vllm_parallel_layers is _vllm_parallel_layers_available()
     if _vllm_parallel_layers_available():
+        # --- pre-existing main-attention sites ---
         assert block.attn.qkv.__class__.__name__ == "QKVParallelLinear"
         assert block.attn.proj.__class__.__name__ == "RowParallelLinear"
         assert block.attn.beta_proj.__class__.__name__ == "ColumnParallelLinear"
@@ -277,9 +278,25 @@ def test_sana_wm_transformer_uses_vllm_parallel_layers_when_available() -> None:
         assert model.y_embedder.y_proj.fc2.__class__.__name__ == "RowParallelLinear"
         assert model.t_embedder.mlp[0].__class__.__name__ == "ColumnParallelLinear"
         assert model.t_embedder.mlp[2].__class__.__name__ == "RowParallelLinear"
+        # --- newly parallelised sites (5a completion) ---
+        assert block.attn.q_proj_cam.__class__.__name__ == "ColumnParallelLinear"
+        assert block.attn.k_proj_cam.__class__.__name__ == "ColumnParallelLinear"
+        assert block.attn.v_proj_cam.__class__.__name__ == "ColumnParallelLinear"
+        assert block.attn.out_proj_cam.__class__.__name__ == "RowParallelLinear"
+        assert block.plucker_proj.__class__.__name__ == "ColumnParallelLinear"
+        assert model.final_layer.linear.__class__.__name__ == "ColumnParallelLinear"
+        assert model.t_block[1].__class__.__name__ == "ColumnParallelLinear"
+        assert "RMSNorm" in model.attention_y_norm.__class__.__name__
     else:
         assert block.attn.qkv.__class__.__name__ == "Linear"
         assert block.cross_attn.kv_linear.__class__.__name__ == "Linear"
+        # fallback for new sites
+        assert block.attn.q_proj_cam.__class__.__name__ == "Linear"
+        assert block.attn.out_proj_cam.__class__.__name__ == "Linear"
+        assert block.plucker_proj.__class__.__name__ == "Linear"
+        assert model.final_layer.linear.__class__.__name__ == "Linear"
+        assert block.attn.q_proj_cam.in_features == config.hidden_size
+        assert block.attn.out_proj_cam.out_features == config.hidden_size
     if _vllm_attention_available():
         assert block.cross_attn.softmax_attn.__class__.__name__ == "Attention"
 
@@ -858,3 +875,122 @@ def test_sana_wm_two_stage_exposes_refiner_loader_surface() -> None:
     assert pipeline.refiner_text_encoder is None
     assert pipeline.refiner_connectors is None
     assert pipeline.refiner_tokenizer is None
+
+
+# ---------------------------------------------------------------------------
+# TP-layer completeness tests (5a) — no GPU required
+# ---------------------------------------------------------------------------
+
+
+def test_sana_wm_transformer_all_new_sites_fallback_to_linear() -> None:
+    """When use_vllm_parallel_layers=False every new parallel site is nn.Linear."""
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+
+    config = SanaWmConfig(
+        num_blocks=2,
+        hidden_size=8,
+        linear_head_dim=4,
+        mlp_ratio=1,
+        model_max_length=3,
+        chunk_plucker_post_attn_blocks=1,  # block 0 has plucker_proj, block 1 does not
+    )
+    model = SanaWmTransformer3DModel(config=config, materialize=True, use_vllm_parallel_layers=False)
+    b0 = model.blocks[0]
+    b1 = model.blocks[1]
+
+    # camera attention projections
+    assert isinstance(b0.attn.q_proj_cam, torch.nn.Linear), "q_proj_cam must be nn.Linear in fallback"
+    assert isinstance(b0.attn.k_proj_cam, torch.nn.Linear), "k_proj_cam must be nn.Linear in fallback"
+    assert isinstance(b0.attn.v_proj_cam, torch.nn.Linear), "v_proj_cam must be nn.Linear in fallback"
+    assert isinstance(b0.attn.out_proj_cam, torch.nn.Linear), "out_proj_cam must be nn.Linear in fallback"
+    # shapes match config
+    assert b0.attn.q_proj_cam.in_features == config.hidden_size
+    assert b0.attn.out_proj_cam.out_features == config.hidden_size
+
+    # plucker_proj
+    assert isinstance(b0.plucker_proj, torch.nn.Linear), "plucker_proj must be nn.Linear in fallback"
+    assert b1.plucker_proj is None, "block beyond chunk_plucker_post_attn_blocks must have None"
+
+    # final layer output head
+    assert isinstance(model.final_layer.linear, torch.nn.Linear), "final_layer.linear must be nn.Linear in fallback"
+
+    # t_block Sequential[1]
+    assert isinstance(model.t_block[1], torch.nn.Linear), "t_block[1] must be nn.Linear in fallback"
+    assert model.t_block[1].in_features == config.hidden_size
+    assert model.t_block[1].out_features == 6 * config.hidden_size
+
+
+def test_sana_wm_final_layer_shape_in_both_modes() -> None:
+    """SanaWmFinalLayer produces the correct output tensor shape in both TP and fallback modes."""
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import SanaWmFinalLayer
+
+    hidden_size = 16
+    patch_size = (1, 2, 2)
+    out_channels = 8
+    batch, seq = 2, 10
+    expected_out_features = 1 * 2 * 2 * out_channels  # = 32
+
+    for use_parallel in (True, False):
+        layer = SanaWmFinalLayer(
+            hidden_size, patch_size, out_channels, use_vllm_parallel_layers=use_parallel
+        )
+        hidden = torch.randn(batch, seq, hidden_size)
+        t_embed = torch.randn(batch, hidden_size)
+        out = layer(hidden, t_embed)
+        assert out.shape == (batch, seq, expected_out_features), (
+            f"use_vllm_parallel_layers={use_parallel}: got {out.shape}"
+        )
+        assert torch.isfinite(out).all()
+
+
+def test_sana_wm_t_block_indexing_unwraps_parallel_output() -> None:
+    """_linear_output correctly handles plain tensors and (tensor, None) tuples.
+
+    This guards the t_block[1] indexing pattern introduced to support
+    ColumnParallelLinear inside nn.Sequential.
+    """
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import _linear_output
+
+    tensor = torch.randn(2, 8)
+    # plain tensor passes through unchanged
+    assert _linear_output(tensor) is tensor
+    # (output, None) tuple — as ColumnParallelLinear returns — unwraps to output
+    assert _linear_output((tensor, None)) is tensor
+    # (output, bias) tuple also unwraps to output
+    bias = torch.zeros(8)
+    result = _linear_output((tensor, bias))
+    assert result is tensor
+
+
+def test_sana_wm_forward_shape_consistent_across_layer_modes() -> None:
+    """Full forward produces the same output shape regardless of parallel-layer mode."""
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+
+    config = SanaWmConfig(
+        num_blocks=2,
+        hidden_size=8,
+        linear_head_dim=4,
+        mlp_ratio=1,
+        model_max_length=3,
+        chunk_plucker_channels=6,
+        softmax_every_n=2,  # block 0 GDN, block 1 softmax — exercises both paths
+    )
+    latents = torch.randn(1, 4, 1, 4, 4)
+    enc = torch.randn(1, 3, 6)
+    plucker = torch.randn(1, 6, 1, 4, 4)
+
+    for use_parallel in (True, False):
+        model = SanaWmTransformer3DModel(config=config, materialize=True, use_vllm_parallel_layers=use_parallel)
+        out = model(latents, torch.tensor([0.5]), encoder_hidden_states=enc, plucker=plucker)
+        assert out.shape == latents.shape, (
+            f"use_vllm_parallel_layers={use_parallel}: shape {out.shape} != {latents.shape}"
+        )
+        assert torch.isfinite(out).all(), f"non-finite output at use_vllm_parallel_layers={use_parallel}"
