@@ -85,6 +85,7 @@ from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
 from vllm_omni.diffusion.models.sana_wm.scheduling_sana_wm import (
     SANA_WM_DEFAULT_INFERENCE_FLOW_SHIFT,
     SanaWmFlowDpmScheduler,
+    SanaWmFlowMatchScheduler,
     shift_flow_timestep,
 )
 from vllm_omni.diffusion.models.sana_wm.weight_mapping import (
@@ -132,6 +133,7 @@ __all__ = [
     "SanaWmCameraEmbedder",
     "SanaWmConfig",
     "SanaWmFlowDpmScheduler",
+    "SanaWmFlowMatchScheduler",
     "SanaWmLocalPaths",
     "SanaWmNativeRunResult",
     "SanaWmNativeSmokeParams",

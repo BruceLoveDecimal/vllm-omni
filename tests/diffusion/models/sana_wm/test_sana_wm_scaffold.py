@@ -519,7 +519,7 @@ def test_sana_wm_pipeline_native_smoke_opt_in_runs_small_latents() -> None:
     output = pipeline(req)
 
     assert output.output.shape == (1, 128, 1, 2, 2)
-    assert output.custom_output["sana_wm_backend"] == "native_gdn_smoke"
+    assert output.custom_output["sana_wm_backend"] == "native_gdn"
     assert output.custom_output["sana_wm_output_space"] == "latent"
     assert output.custom_output["sana_wm_prompt_source"] == "hash_smoke"
     assert output.custom_output["sana_wm_chi_prompt_applied"] is False

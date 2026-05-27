@@ -255,8 +255,9 @@ def _pack_camera_conditions(
     raymap = torch.cat([poses[time_indices].reshape(len(time_indices), -1), intrinsics_latent[time_indices]], dim=-1)
 
     chunks: list[torch.Tensor] = []
+    spatial_raymap_frames: list[torch.Tensor] = []
     chunk_starts = time_indices - (vae_time_stride - 1)
-    for start in chunk_starts:
+    for start, t_idx in zip(chunk_starts, time_indices):
         start_idx = max(0, int(start))
         end_idx = start_idx + vae_time_stride
         chunk_poses = poses[start_idx:end_idx]
@@ -267,8 +268,24 @@ def _pack_camera_conditions(
             chunk_intrinsics = torch.cat([chunk_intrinsics, chunk_intrinsics[-1:].repeat(pad, 1)], dim=0)
         plucker = compute_raymap(chunk_intrinsics, chunk_poses, latent_height, latent_width, use_plucker=True)
         chunks.append(plucker.permute(0, 3, 1, 2).reshape(-1, latent_height, latent_width))
+
+        # Per-frame spatial ray-direction map for raymap_embedder: take the
+        # representative frame in each chunk (the anchor at t_idx) and use only
+        # the direction channels (last 3 of 6 in the origin+direction layout).
+        t = int(t_idx)
+        od = compute_raymap(
+            intrinsics_latent[t : t + 1],
+            poses[t : t + 1],
+            latent_height,
+            latent_width,
+            use_plucker=False,
+        )  # [1, H, W, 6]
+        spatial_raymap_frames.append(od[0, :, :, 3:])  # [H, W, 3] — direction only
+
     chunk_plucker = torch.stack(chunks).permute(1, 0, 2, 3)
-    return {"raymap": raymap, "chunk_plucker": chunk_plucker}
+    # spatial_raymap: [3, F_latent, H, W] — consumed by raymap_embedder
+    spatial_raymap = torch.stack(spatial_raymap_frames).permute(3, 0, 1, 2)
+    return {"raymap": raymap, "chunk_plucker": chunk_plucker, "spatial_raymap": spatial_raymap}
 
 
 def build_plucker_condition(

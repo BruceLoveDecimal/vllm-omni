@@ -522,6 +522,8 @@ class SanaWmSelfAttention(nn.Module):
         self.k_conv_only = config.k_conv_only
         self.conv_kernel_size = config.conv_kernel_size
         self.uses_vllm_parallel_layers = use_vllm_parallel_layers and _vllm_parallel_layers_available()
+        # cam_dim must be known before the TP/fallback branch uses it for layer sizes.
+        self.cam_dim = hidden_size // max(config.cam_attn_compress, 1)
         if self.uses_vllm_parallel_layers:
             assert ColumnParallelLinear is not None
             assert QKVParallelLinear is not None
@@ -662,7 +664,6 @@ class SanaWmSelfAttention(nn.Module):
         self.conv_v = None
 
         cam_compress = max(config.cam_attn_compress, 1)
-        self.cam_dim = hidden_size // cam_compress
         self.cam_heads = max(self.num_heads // cam_compress, 1)
         self.cam_head_dim = self.cam_dim // self.cam_heads
         # q_proj_cam / k_proj_cam / v_proj_cam / out_proj_cam are initialised
@@ -942,35 +943,69 @@ class SanaWmSelfAttention(nn.Module):
         batch, _, seq_len, _ = tensor.shape
         return tensor.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
 
+    def _forward_ucpe(
+        self,
+        hidden_states: torch.Tensor,
+        camera_hidden_states: torch.Tensor,
+        spatial_shape: tuple[int, int, int] | None,
+    ) -> torch.Tensor:
+        """UCPE camera cross-attention: visual Q attends to camera K/V.
+
+        Implements BidirectionalGDNUCPESinglePathLiteLABothTriton using the
+        loaded q_proj_cam / k_proj_cam / v_proj_cam / out_proj_cam weights.
+        """
+        q_cam = self.q_norm_cam(_linear_output(self.q_proj_cam(hidden_states)))
+        k_cam = self.k_norm_cam(_linear_output(self.k_proj_cam(camera_hidden_states)))
+        v_cam = _linear_output(self.v_proj_cam(camera_hidden_states))
+
+        if self.conv_k_cam is not None and spatial_shape is not None:
+            k_cam = self._bidirectional_temporal_short_conv(k_cam, self.conv_k_cam, spatial_shape)
+
+        batch, seq_len, _ = hidden_states.shape
+        q_cam = q_cam.reshape(batch, seq_len, self.cam_heads, self.cam_head_dim).transpose(1, 2)
+        k_cam = k_cam.reshape(batch, camera_hidden_states.shape[1], self.cam_heads, self.cam_head_dim).transpose(1, 2)
+        v_cam = v_cam.reshape(batch, camera_hidden_states.shape[1], self.cam_heads, self.cam_head_dim).transpose(1, 2)
+
+        cam_attn = F.scaled_dot_product_attention(q_cam, k_cam, v_cam)
+        cam_out = cam_attn.transpose(1, 2).reshape(batch, seq_len, self.cam_dim)
+        return _linear_output(self.out_proj_cam(cam_out))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         spatial_shape: tuple[int, int, int] | None = None,
         rotary_emb: torch.Tensor | None = None,
+        camera_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if spatial_shape is not None and self.use_gdn:
-            return self._forward_gdn(hidden_states, spatial_shape, rotary_emb)
-        qkv = _linear_output(self.qkv(hidden_states))
-        q_size = self.num_heads * self.head_dim
-        kv_size = self.num_kv_heads * self.head_dim
-        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
-        if self.softmax_attn is not None:
-            query = self._reshape_to_seq_heads(self.q_norm(query))
-            key = self._reshape_to_seq_heads(self.k_norm(key))
-            value = self._reshape_to_seq_heads(value)
-            if rotary_emb is not None:
-                query = self._apply_rotary_emb_to_sdpa(query.transpose(1, 2), rotary_emb).transpose(1, 2)
-                key = self._apply_rotary_emb_to_sdpa(key.transpose(1, 2), rotary_emb).transpose(1, 2)
-            attn = self.softmax_attn(query, key, value)
-            return _linear_output(self.proj(attn.flatten(2, 3)))
-        query = self._split_heads(self.q_norm(query))
-        key = self._split_heads(self.k_norm(key))
-        value = self._split_heads(value)
-        if rotary_emb is not None:
-            query = self._apply_rotary_emb_to_sdpa(query, rotary_emb)
-            key = self._apply_rotary_emb_to_sdpa(key, rotary_emb)
-        attn = F.scaled_dot_product_attention(query, key, value)
-        return _linear_output(self.proj(self._merge_heads(attn)))
+            output = self._forward_gdn(hidden_states, spatial_shape, rotary_emb)
+        else:
+            qkv = _linear_output(self.qkv(hidden_states))
+            q_size = self.num_heads * self.head_dim
+            kv_size = self.num_kv_heads * self.head_dim
+            query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+            if self.softmax_attn is not None:
+                query = self._reshape_to_seq_heads(self.q_norm(query))
+                key = self._reshape_to_seq_heads(self.k_norm(key))
+                value = self._reshape_to_seq_heads(value)
+                if rotary_emb is not None:
+                    query = self._apply_rotary_emb_to_sdpa(query.transpose(1, 2), rotary_emb).transpose(1, 2)
+                    key = self._apply_rotary_emb_to_sdpa(key.transpose(1, 2), rotary_emb).transpose(1, 2)
+                attn = self.softmax_attn(query, key, value)
+                output = _linear_output(self.proj(attn.flatten(2, 3)))
+            else:
+                query = self._split_heads(self.q_norm(query))
+                key = self._split_heads(self.k_norm(key))
+                value = self._split_heads(value)
+                if rotary_emb is not None:
+                    query = self._apply_rotary_emb_to_sdpa(query, rotary_emb)
+                    key = self._apply_rotary_emb_to_sdpa(key, rotary_emb)
+                attn = F.scaled_dot_product_attention(query, key, value)
+                output = _linear_output(self.proj(self._merge_heads(attn)))
+
+        if camera_hidden_states is not None:
+            output = output + self._forward_ucpe(hidden_states, camera_hidden_states, spatial_shape)
+        return output
 
 
 class SanaWmCrossAttention(nn.Module):
@@ -1183,7 +1218,7 @@ class SanaWmBlock(nn.Module):
             self.scale_shift_table[None] + timestep_modulation.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
         attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
-        attn_output = self.attn(attn_input, spatial_shape, rotary_emb)
+        attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_hidden_states)
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         hidden_states = hidden_states + gate_msa * attn_output
@@ -1522,6 +1557,7 @@ class SanaWmTransformer3DModel(nn.Module):
         self,
         *,
         plucker: torch.Tensor | None,
+        spatial_raymap: torch.Tensor | None,
         spatial_shape: tuple[int, int, int],
         batch_size: int,
         dtype: torch.dtype,
@@ -1536,7 +1572,19 @@ class SanaWmTransformer3DModel(nn.Module):
             plucker = plucker.expand(batch_size, -1, -1, -1, -1)
         camera_hidden_states = self.plucker_embedder(plucker)
         expected_tokens = spatial_shape[0] * spatial_shape[1] * spatial_shape[2]
-        return self._match_tokens(camera_hidden_states, expected_tokens)
+        camera_hidden_states = self._match_tokens(camera_hidden_states, expected_tokens)
+
+        # Fuse per-pixel ray-direction map via raymap_embedder when available.
+        if spatial_raymap is not None and hasattr(self, "raymap_embedder"):
+            if spatial_raymap.ndim == 4:  # [C, F, H, W] → [1, C, F, H, W]
+                spatial_raymap = spatial_raymap.unsqueeze(0)
+            spatial_raymap = spatial_raymap.to(device=device, dtype=dtype)
+            if spatial_raymap.shape[0] == 1 and batch_size > 1:
+                spatial_raymap = spatial_raymap.expand(batch_size, -1, -1, -1, -1)
+            ray_hidden = self._match_tokens(self.raymap_embedder(spatial_raymap), expected_tokens)
+            camera_hidden_states = camera_hidden_states + ray_hidden
+
+        return camera_hidden_states
 
     def _unpatchify(self, hidden_states: torch.Tensor, spatial_shape: tuple[int, int, int]) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
@@ -1571,6 +1619,7 @@ class SanaWmTransformer3DModel(nn.Module):
         camera_encoder: SanaWmCameraEmbedder | None = None,
         plucker: torch.Tensor | None = None,
         raymap: torch.Tensor | None = None,
+        spatial_raymap: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.ndim != 5:
             raise ValueError("Sana-WM transformer expects latent input shaped [B, C, F, H, W].")
@@ -1621,6 +1670,7 @@ class SanaWmTransformer3DModel(nn.Module):
         if camera_hidden_states is None:
             camera_hidden_states = self._camera_hidden_states_from_conditions(
                 plucker=plucker,
+                spatial_raymap=spatial_raymap,
                 spatial_shape=spatial_shape,
                 batch_size=batch_size,
                 dtype=hidden_states.dtype,

@@ -46,7 +46,10 @@ from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SanaWmCameraEmbedder,
     SanaWmTransformer3DModel,
 )
-from vllm_omni.diffusion.models.sana_wm.scheduling_sana_wm import SanaWmFlowDpmScheduler
+from vllm_omni.diffusion.models.sana_wm.scheduling_sana_wm import (
+    SanaWmFlowDpmScheduler,  # noqa: F401 – kept for backward-compat imports
+    SanaWmFlowMatchScheduler,
+)
 from vllm_omni.diffusion.models.sana_wm.weight_mapping import normalize_sana_wm_stage1_weight_name
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
@@ -430,6 +433,80 @@ class SanaWmPipeline(
         self.camera_encoder.to(device=device, dtype=dtype)
         return self.camera_encoder
 
+    @staticmethod
+    def _preprocess_first_frame(
+        image: Any,
+        *,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return the first-frame image as ``[1, 3, 1, H, W]`` in ``[-1, 1]``."""
+        import numpy as np
+
+        if hasattr(image, "convert"):
+            image = image.convert("RGB").resize((width, height))
+            arr = np.array(image, dtype=np.float32) / 127.5 - 1.0
+        elif isinstance(image, np.ndarray):
+            if image.shape[:2] != (height, width):
+                from PIL import Image as _PIL
+
+                image = _PIL.fromarray(image).resize((width, height))
+                arr = np.array(image, dtype=np.float32) / 127.5 - 1.0
+            else:
+                arr = image.astype(np.float32) / 127.5 - 1.0
+        elif isinstance(image, torch.Tensor):
+            t = image.float()
+            if t.ndim == 3:
+                t = t.unsqueeze(0)
+            if t.shape[1] != 3:
+                t = t.permute(0, 3, 1, 2)
+            t = F.interpolate(t, size=(height, width), mode="bilinear", align_corners=False)
+            t = t * 2.0 - 1.0 if t.max() <= 1.0 + 1e-3 else t / 127.5 - 1.0
+            return t.unsqueeze(2).to(device=device, dtype=dtype)
+        else:
+            raise TypeError(f"Sana-WM first-frame image must be PIL/ndarray/Tensor, got {type(image).__name__}.")
+
+        # arr: [H, W, 3] → [1, 3, 1, H, W]
+        tensor = torch.from_numpy(arr.transpose(2, 0, 1)[np.newaxis, :, np.newaxis])
+        return tensor.to(device=device, dtype=dtype)
+
+    def _vae_encode_first_frame(
+        self,
+        image: Any,
+        *,
+        height: int,
+        width: int,
+        latent_height: int,
+        latent_width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Encode the first-frame image to latent space via the LTX-2 VAE.
+
+        Returns shape ``[1, 128, 1, latent_height, latent_width]``.
+        """
+        self._ensure_vae(device=device, dtype=dtype)
+        if self.vae is None:
+            raise RuntimeError("Sana-WM VAE did not initialize.")
+        frame = self._preprocess_first_frame(image, height=height, width=width, device=device, dtype=dtype)
+        with torch.inference_mode():
+            encoded = self.vae.encode(frame)
+            dist = getattr(encoded, "latent_dist", None)
+            first_latent = dist.mean if dist is not None else encoded.latents
+            scaling = float(getattr(getattr(self.vae, "config", None), "scaling_factor", 1.0))
+            first_latent = first_latent * scaling
+        # VAE latent may differ from expected spatial size; resize if needed.
+        if first_latent.shape[-2:] != (latent_height, latent_width):
+            first_latent = F.interpolate(
+                first_latent.squeeze(2),
+                size=(latent_height, latent_width),
+                mode="bilinear",
+                align_corners=False,
+            ).unsqueeze(2)
+        return first_latent  # [1, 128, 1, lh, lw]
+
     def _stage1_prompt_text(self, prompt: dict[str, Any]) -> str:
         parts = [part for part in self.sana_wm_config.chi_prompt if part]
         user_prompt = str(prompt.get("prompt") or "")
@@ -542,12 +619,47 @@ class SanaWmPipeline(
         device, dtype = self._runtime_device_dtype()
         generator = torch.Generator(device=device)
         generator.manual_seed(params.seed)
-        latents = torch.randn(
+        noise = torch.randn(
             (1, 128, latent_frames, latent_height, latent_width),
             device=device,
             dtype=dtype,
             generator=generator,
         )
+
+        # A.2: production flow-DPM-Solver++ scheduler (replaces shifted-Euler smoke)
+        scheduler = SanaWmFlowMatchScheduler(
+            params.num_inference_steps,
+            shift=self.sana_wm_config.inference_flow_shift,
+        )
+        timesteps = scheduler.timesteps(device=device)
+
+        # A.1: first-frame VAE encode — initialize latents from the request image.
+        # Only attempt encoding for PIL/ndarray/Tensor; other types (e.g. test
+        # placeholder objects) fall through to pure-noise initialization.
+        import numpy as _np
+
+        first_frame_image = (prompt.get("multi_modal_data") or {}).get("image")
+        _is_image = first_frame_image is not None and (
+            hasattr(first_frame_image, "convert")
+            or isinstance(first_frame_image, (_np.ndarray, torch.Tensor))
+        )
+        if _is_image:
+            first_latent = self._vae_encode_first_frame(
+                first_frame_image,
+                height=params.height,
+                width=params.width,
+                latent_height=latent_height,
+                latent_width=latent_width,
+                device=device,
+                dtype=dtype,
+            )
+            # Noise first-frame latent to the highest timestep; remaining frames
+            # start as pure noise (the model generates them from scratch).
+            first_noised = scheduler.add_noise(first_latent, noise[:, :, :1], timesteps[0])
+            latents = torch.cat([first_noised, noise[:, :, 1:]], dim=2)
+        else:
+            latents = noise
+
         allow_hash_fallback = bool(extra_args.get("sana_wm_hash_prompt_smoke", False))
         prompt_embeds, prompt_source = self._native_smoke_prompt_embeds(
             prompt,
@@ -570,30 +682,32 @@ class SanaWmPipeline(
         camera_tensors = build_plucker_condition(condition)
         plucker = camera_tensors["chunk_plucker"].to(device=device, dtype=dtype)
         raymap = camera_tensors["raymap"].to(device=device, dtype=dtype)
+        spatial_raymap = camera_tensors.get("spatial_raymap")
+        if spatial_raymap is not None:
+            spatial_raymap = spatial_raymap.to(device=device, dtype=dtype)
 
         self.transformer.config = self.sana_wm_config
-        camera_encoder = self._ensure_camera_encoder(device=device, dtype=dtype)
-        scheduler = SanaWmFlowDpmScheduler(params.num_inference_steps, shift=self.sana_wm_config.inference_flow_shift)
-        for timestep, delta in zip(scheduler.timesteps(device=device), scheduler.deltas(device=device), strict=True):
+        for timestep in timesteps:
             noise_pred = self.transformer(
                 latents,
                 timestep.expand(1),
                 encoder_hidden_states=prompt_embeds,
-                camera_encoder=camera_encoder,
                 plucker=plucker,
                 raymap=raymap,
+                spatial_raymap=spatial_raymap,
             )
-            latents = scheduler.step(latents, noise_pred, delta)
+            latents = scheduler.step(noise_pred, timestep, latents)
 
         output_type = str(extra_args.get("sana_wm_output_type", "latent"))
         output = self._decode_native_smoke_latents(latents, output_type=output_type, device=device, dtype=dtype)
         return DiffusionOutput(
             output=output,
             custom_output={
-                "sana_wm_backend": "native_gdn_smoke",
+                "sana_wm_backend": "native_gdn",
                 "sana_wm_output_space": output_type,
                 "sana_wm_prompt_source": prompt_source,
                 "sana_wm_chi_prompt_applied": bool(self.sana_wm_config.chi_prompt),
+                "sana_wm_first_frame_encoded": _is_image,
                 "sana_wm_num_frames": params.num_frames,
                 "sana_wm_height": params.height,
                 "sana_wm_width": params.width,
