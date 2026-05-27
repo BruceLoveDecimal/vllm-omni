@@ -313,7 +313,10 @@ def build_plucker_condition(
 
     num_frames = condition.num_frames or int(poses_c2w.shape[0])
     if poses_c2w.shape[0] < num_frames:
-        raise ValueError(f"Sana-WM c2w poses length {poses_c2w.shape[0]} is shorter than num_frames {num_frames}.")
+        if condition.action:
+            num_frames = int(poses_c2w.shape[0])
+        else:
+            raise ValueError(f"Sana-WM c2w poses length {poses_c2w.shape[0]} is shorter than num_frames {num_frames}.")
     poses_c2w = poses_c2w[:num_frames]
 
     intrinsics = intrinsics_to_vec4_array(

@@ -247,6 +247,8 @@ class SanaWmCudaGraphDenoiser:
                     plucker=static_plucker,
                     spatial_raymap=static_spatial_raymap,
                 )
+            graph.replay()
+            torch.cuda.synchronize(static_latents.device)
 
         return _SanaWmCudaGraphEntry(
             graph=graph,

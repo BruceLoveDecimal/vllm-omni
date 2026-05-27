@@ -782,6 +782,65 @@ def test_cuda_graph_denoiser_capture_failure_falls_back_to_eager() -> None:
     assert torch.allclose(out, torch.ones_like(latents))
 
 
+def test_cuda_graph_denoiser_cuda_capture_returns_first_output() -> None:
+    """CUDA capture path returns the captured step output, not stale storage."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA graph capture smoke requires CUDA.")
+
+    from vllm_omni.diffusion.models.sana_wm.cuda_graph import SanaWmCudaGraphDenoiser
+
+    class ToyTransformer(torch.nn.Module):
+        def forward(self, h, t, *, encoder_hidden_states, plucker, spatial_raymap=None):
+            bias = encoder_hidden_states.mean() * 0.001 + plucker.mean() * 0.0001
+            if spatial_raymap is not None:
+                bias = bias + spatial_raymap.mean() * 0.01
+            return h * 2.0 + bias
+
+    device = torch.device("cuda")
+    model = ToyTransformer().to(device).eval()
+    denoiser = SanaWmCudaGraphDenoiser()
+    latents1 = torch.ones(1, 4, 1, 2, 2, device=device)
+    latents2 = torch.full_like(latents1, 2.0)
+    ts = torch.tensor([500.0], device=device)
+    enc = torch.ones(1, 3, 8, device=device)
+    plucker = torch.ones(1, 6, 1, 2, 2, device=device)
+    spatial_raymap = torch.ones(3, 1, 2, 2, device=device)
+
+    with torch.inference_mode():
+        out1, graphed1 = denoiser.run(
+            model,
+            latents1,
+            ts,
+            encoder_hidden_states=enc,
+            plucker=plucker,
+            spatial_raymap=spatial_raymap,
+            num_frames=1,
+            buckets=(1,),
+        )
+        out2, graphed2 = denoiser.run(
+            model,
+            latents2,
+            ts,
+            encoder_hidden_states=enc,
+            plucker=plucker,
+            spatial_raymap=spatial_raymap,
+            num_frames=1,
+            buckets=(1,),
+        )
+        torch.cuda.synchronize()
+
+    expected1 = model(latents1, ts, encoder_hidden_states=enc, plucker=plucker, spatial_raymap=spatial_raymap)
+    expected2 = model(latents2, ts, encoder_hidden_states=enc, plucker=plucker, spatial_raymap=spatial_raymap)
+
+    assert graphed1 and graphed2
+    assert denoiser.capture_count == 1
+    assert denoiser.replay_count == 1
+    assert torch.allclose(out1, expected1)
+    assert torch.allclose(out2, expected2)
+
+
 # ---------------------------------------------------------------------------
 # B.2 — Full scheduler-loop / VAE roundtrip integration tests
 # ---------------------------------------------------------------------------
@@ -845,7 +904,13 @@ def test_vae_encode_then_add_noise_roundtrip_shape() -> None:
 
     first_frame = Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
     latent = pipeline._vae_encode_first_frame(
-        first_frame, device=torch.device("cpu"), dtype=torch.float32
+        first_frame,
+        height=64,
+        width=64,
+        latent_height=8,
+        latent_width=8,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
     )
 
     # latent: [1, 4, 1, H_lat, W_lat]

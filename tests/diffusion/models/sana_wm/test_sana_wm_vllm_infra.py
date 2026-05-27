@@ -61,12 +61,13 @@ def test_sana_wm_stage1_uses_vllm_parallel_layers_inside_tp_context() -> None:
     if not torch.cuda.is_available():
         pytest.skip("SANA-WM vLLM parallel-layer smoke requires CUDA.")
 
-    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+    from vllm_omni.diffusion.models.sana_wm import SanaWmCameraEmbedder, SanaWmConfig, SanaWmTransformer3DModel
 
     cleanup = _init_vllm_tp(port=29681)
     try:
+        config = SanaWmConfig(**_TINY_CFG_KWARGS)
         model = SanaWmTransformer3DModel(
-            config=SanaWmConfig(**_TINY_CFG_KWARGS),
+            config=config,
             materialize=True,
         )
         block = model.blocks[0]
@@ -93,6 +94,10 @@ def test_sana_wm_stage1_uses_vllm_parallel_layers_inside_tp_context() -> None:
         assert model.final_layer.linear.__class__.__name__ == "ColumnParallelLinear"
         assert model.t_block[1].__class__.__name__ == "ColumnParallelLinear"
         assert "RMSNorm" in model.attention_y_norm.__class__.__name__
+
+        camera_embedder = SanaWmCameraEmbedder(config)
+        assert camera_embedder.plucker.proj.__class__.__name__ == "Conv3d"
+        assert camera_embedder.raymap.proj.__class__.__name__ == "ColumnParallelLinear"
     finally:
         cleanup()
 

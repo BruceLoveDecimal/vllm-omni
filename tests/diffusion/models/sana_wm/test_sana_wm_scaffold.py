@@ -886,7 +886,7 @@ def test_sana_wm_transformer_all_new_sites_fallback_to_linear() -> None:
     """When use_vllm_parallel_layers=False every new parallel site is nn.Linear."""
     import torch
 
-    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+    from vllm_omni.diffusion.models.sana_wm import SanaWmCameraEmbedder, SanaWmConfig, SanaWmTransformer3DModel
 
     config = SanaWmConfig(
         num_blocks=2,
@@ -920,6 +920,10 @@ def test_sana_wm_transformer_all_new_sites_fallback_to_linear() -> None:
     assert isinstance(model.t_block[1], torch.nn.Linear), "t_block[1] must be nn.Linear in fallback"
     assert model.t_block[1].in_features == config.hidden_size
     assert model.t_block[1].out_features == 6 * config.hidden_size
+
+    camera_embedder = SanaWmCameraEmbedder(config, use_vllm_parallel_layers=False)
+    assert isinstance(camera_embedder.plucker.proj, torch.nn.Conv3d), "plucker.proj stays Conv3d"
+    assert isinstance(camera_embedder.raymap.proj, torch.nn.Linear), "raymap.proj must be nn.Linear in fallback"
 
 
 def test_sana_wm_final_layer_shape_in_both_modes() -> None:
