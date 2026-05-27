@@ -1078,3 +1078,76 @@ def test_serving_video_build_sana_wm_payload_request_wins_over_extra_params() ->
 
     # extra_params.sana_wm is applied after request.sana_wm, so it wins.
     assert payload["action"] == "w-8"
+
+
+# ===========================================================================
+# hf_utils — _looks_like_sana_wm
+# ===========================================================================
+
+
+def test_looks_like_sana_wm_local_dir_positive(tmp_path) -> None:
+    """Local dir with config.yaml + dit weight → detected as SANA-WM."""
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_sana_wm
+
+    (tmp_path / "dit").mkdir()
+    (tmp_path / "config.yaml").write_text("model: SanaMSVideoCamCtrl", encoding="utf-8")
+    (tmp_path / "dit" / "sana_wm_1600m_720p.safetensors").write_bytes(b"")
+
+    assert _looks_like_sana_wm(str(tmp_path)) is True
+
+
+def test_looks_like_sana_wm_local_dir_missing_weight(tmp_path) -> None:
+    """Local dir with config.yaml but no dit weight → not SANA-WM."""
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_sana_wm
+
+    (tmp_path / "config.yaml").write_text("model: SanaMSVideoCamCtrl", encoding="utf-8")
+
+    assert _looks_like_sana_wm(str(tmp_path)) is False
+
+
+def test_looks_like_sana_wm_local_dir_missing_config(tmp_path) -> None:
+    """Local dir with dit weight but no config.yaml → not SANA-WM."""
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_sana_wm
+
+    (tmp_path / "dit").mkdir()
+    (tmp_path / "dit" / "sana_wm_1600m_720p.safetensors").write_bytes(b"")
+
+    assert _looks_like_sana_wm(str(tmp_path)) is False
+
+
+def test_looks_like_sana_wm_fallback_name_match() -> None:
+    """Non-existent path with SANA-WM in name falls back to name check."""
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_sana_wm
+
+    assert _looks_like_sana_wm("/nonexistent/SANA-WM_bidirectional") is False
+
+
+# ===========================================================================
+# data.py — OmniDiffusionConfig SANA-WM detection via model_class_name
+# ===========================================================================
+
+
+def test_omni_diffusion_config_sana_wm_class_name_from_kwarg() -> None:
+    """model_class_name='SanaWmTwoStagesPipeline' kwarg is preserved."""
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    cfg = OmniDiffusionConfig(
+        model="/nonexistent/fake_sana_wm",
+        model_class_name="SanaWmTwoStagesPipeline",
+        diffusion_load_format="native",
+    )
+
+    assert cfg.model_class_name == "SanaWmTwoStagesPipeline"
+
+
+def test_omni_diffusion_config_sana_wm_pipeline_class_name_from_kwarg() -> None:
+    """model_class_name='SanaWmPipeline' kwarg (Stage-1 only) is preserved."""
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    cfg = OmniDiffusionConfig(
+        model="/nonexistent/fake_sana_wm",
+        model_class_name="SanaWmPipeline",
+        diffusion_load_format="native",
+    )
+
+    assert cfg.model_class_name == "SanaWmPipeline"
