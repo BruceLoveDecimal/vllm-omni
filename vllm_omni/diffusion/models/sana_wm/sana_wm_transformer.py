@@ -1164,7 +1164,10 @@ class SanaWmSelfAttention(nn.Module):
         4x4 transforms that are applied to the Q/K/V channels via UCPE.
         """
         if spatial_shape is not None and self.use_gdn:
-            if camera_conditions is None or self.q_proj_cam is None:
+            cam_disabled = os.environ.get("VLLM_OMNI_SANA_WM_DISABLE_CAM_BRANCH", "").lower() in {
+                "1", "true", "yes", "on",
+            }
+            if camera_conditions is None or self.q_proj_cam is None or cam_disabled:
                 # Main branch only — preserves legacy path when the request
                 # has no camera info or the cam projections were not built.
                 return self._forward_gdn(hidden_states, spatial_shape, rotary_emb)

@@ -20,7 +20,8 @@ Five blockers were identified in revision 9. Three closed since revision 10.
 | 1 | GDN Triton — long-sequence + multi-card parity vs. NVlabs | ⚠️ **Open** — main-branch GDN math verified equivalent (see §6.10); divergence is upstream of recurrence |
 | 2 | First-frame VAE encode for I2V conditioning | ✅ **Closed** — commit `f7e59121` A.1 |
 | 3 | NVlabs flow-DPM solver | ✅ **Closed** — commit `f7e59121` A.2 (`DPMSolverMultistepScheduler`) |
-| 4 | UCPE branch decomposition + numeric Plücker reference test | ⚠️ **Port landed, GPU verification pending (2026-05-27 late)** — UCPE math (`ucpe.py`) ported with passing unit tests; cam branch rewritten to use bidirectional GDN with UCPE per-ray transforms. End-to-end MAE drop on GPU still to be confirmed. See §6.10. |
+| 4 | UCPE branch decomposition + numeric Plücker reference test | ⚠️ **Port landed, contribution masked by §6.11 loader bug** — UCPE math (`ucpe.py`) ported with passing unit tests; cam branch rewritten and verified to execute. GPU run 2026-05-28 produced MAE=98.31 because `out_proj_cam.weight==0` masks the cam contribution. See §6.10 + §6.11. |
+| 6 | vLLM parallel linear weight loading | ❌ **NEW (2026-05-28)** — `QKVParallelLinear.weight==0` and `out_proj_cam.weight==0` at inference time despite the checkpoint being correct. Dominant reference-alignment blocker. See §6.11. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The GPU run on 2026-05-27 produced MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame harness. That result is consistent with item 4 being functionally open: the model has no working camera-conditioning path, so the output is structurally unrelated to the official reference regardless of how accurate the GDN recurrence is. Items 1 and 4 must close before PSNR ≥ 30 / SSIM-Y ≥ 0.93 is achievable.
@@ -202,10 +203,71 @@ remote GPU venv (energy-preservation delta = 2.38e-07 at identity poses,
 4.77e-07 with RoPE); `SanaWmSelfAttention` rewritten to do main +
 cam → shared output_gate + proj; `camera_conditions` routed through
 the transformer; tests/diffusion/models/sana_wm/test_sana_wm_ucpe.py
-added. E2E reference-alignment MAE drop verification on GPU is the
-remaining work — see §8 item 1.
+added.
+
+**Update 2026-05-28 (overnight GPU run):** E2E reference-alignment harness
+re-run on remote GPU produced MAE=98.31 / PSNR=6.86 / SSIM=0.011 — almost
+identical to the pre-UCPE result (MAE=95.82). Trace instrumentation
+inside `_forward_gdn_raw` and `_forward_cam_branch` revealed two
+pre-existing bugs that the UCPE port cannot mask:
+
+1. **`QKVParallelLinear.weight` is all zeros for every GDN block.**
+   Trace at the start of `_forward_gdn_raw` showed
+   `qkv_w_norm=0.0` and `qkv_proj_norm=0.0` while `hidden_norm`
+   was at the bf16 fp32-fp16-mixed overflow boundary (norm = inf).
+   With weight=0 and only bias contributing, all 15 GDN blocks return
+   `bias` for QKV → bounded constant per channel through the recurrence
+   → bounded constant output. The 5 softmax blocks plus the residual
+   stream are doing all the "denoising work", explaining why the
+   pre-UCPE MAE was already in the 90s — the model was operating
+   purely on bias paths even before UCPE was reopened.
+
+2. **`out_proj_cam.weight` is also zero** (consistent with the
+   `init_cam_from_base=True` warm-start that NVlabs does at load time
+   but our weight loader does not). With weight=0, `out_proj_cam(cam_raw)`
+   returns just the bias regardless of how meaningful `cam_raw` is.
+   The UCPE cam branch IS being invoked correctly (cam_raw_norm shows
+   non-zero values pre-projection) but its contribution is masked.
+
+The UCPE port itself is correct — `ucpe.py` unit tests pass with
+1e-7 energy-preservation precision, `_forward_cam_branch` executes,
+and the dual-branch fusion ordering matches NVlabs. The reference
+alignment cannot improve until the QKV / out_proj_cam weight-loading
+bugs are fixed. That is now §6.11 / §7 item 11 below.
 
 Verified by deep-dive vs NVlabs `sana_gdn_camctrl_blocks.py` on 2026-05-27.
+
+### 6.11 vLLM Parallel Linear Weight Loading Broken — `QKVParallelLinear.weight=0` ❌ CRITICAL — NEW
+
+Trace from 2026-05-28 GPU run shows every GDN block has
+`self.qkv.weight.norm() == 0.0` at inference time. The vLLM
+`QKVParallelLinear` and `nn.Linear` (`out_proj_cam`) parameters in
+`SanaWmSelfAttention` are not being populated from the SANA-WM
+Stage-1 checkpoint. Symptom: every GDN attention block computes
+`Wx + b` with `W=0`, so attention output collapses to a per-channel
+bias constant. Same checkpoint loads fine into NVlabs reference path
+(the official-CLI bridge produces meaningful video). So the
+checkpoint is correct; our `load_weights` / `_apply_loaded_tensors_to_materialized`
+must be missing the QKV remapping for vLLM parallel layers.
+
+**Acceptance criterion:**
+
+```text
+[ ] tests/diffusion/models/sana_wm/test_sana_wm_scaffold.py adds an
+    assertion that after `SanaWmTransformer3DModel.load_weights(...)`
+    every `block.attn.qkv` parameter has a non-zero norm and matches
+    the source checkpoint tensor for that block.
+[ ] Same assertion for `block.attn.q_proj_cam`,
+    `block.attn.k_proj_cam`, `block.attn.v_proj_cam`,
+    `block.attn.out_proj_cam`.
+[ ] Optional: assertion for q_norm / k_norm / conv_k weight load.
+[ ] e2e MAE drops to a comparison-meaningful value (≤ 30) on the
+    9-frame harness after the loader fix.
+```
+
+Cross-ref: integration.md §1 ("Main-branch math is verified
+equivalent" — still true, the math is the same as NVlabs; the
+inputs to the math are just zero-weight matmul outputs).
 
 **Symptom.** Reference-alignment harness reports MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame smoke even after A.1–A.3 landed. That is essentially uncorrelated output — too large to be a recurrence-precision issue.
 
@@ -258,6 +320,8 @@ Cross-ref: integration.md §1124 "Native Stage-1 Production Readiness Gap" items
 9. **Architecture diagram** for PR description. Include a diagram of the Stage-1 DiT structure (input packing → camera branch → GDN block → cross-attn → FFN). This is a strong reviewer-attention signal.
 
 10. ~~**Port UCPE per-block attention (§6.10).** Add `vllm_omni/diffusion/models/sana_wm/ucpe.py` with `prepare_prope_fns` ported from NVlabs `sana_camctrl_blocks.py`. Rewrite `_forward_ucpe` to use bidirectional GDN recurrence (reuse `reference_bidirectional_gated_delta_net`) with `q_cam_trans`/`k_cam_trans` as the rotary inputs. Add `_prepare_cam_qkv` (project → mask → conv → norm → ReLU → scale → permute → UCPE). Add inflation_sq → β discount. Add `apply_output_gate=False` mode to `_forward_gdn`. Rewire `SanaWmSelfAttention.forward` to compute `main_raw + out_proj_cam(cam_raw)` then apply shared `output_gate` + `proj` once. Unit test against NVlabs `_GDNUCPEBase` block (atol=1e-4 fp32 single-block).~~ ✅ **Done 2026-05-27.** Module-level energy-preservation tests pass at 1e-7 precision. Single-block end-to-end NVlabs parity test still needs GPU run (moved to §8 item 1 sub-step).
+
+11. **Fix vLLM parallel linear weight loading (§6.11).** GPU trace on 2026-05-28 showed `QKVParallelLinear.weight == 0` for every GDN block at inference time, and the same for `out_proj_cam`. This is a `SanaWmTransformer3DModel.load_weights` / `_apply_loaded_tensors_to_materialized` bug — vLLM parallel linear layers have their own `weight_loader` contract that our remap path is not honouring. The pre-existing MAE=95.82 result (and the post-UCPE MAE=98.31 result) are both symptoms: with `W=0` every GDN block degenerates to a per-channel bias constant and contributes essentially nothing to denoising. **This is now the dominant blocker for reference alignment — UCPE port cannot improve MAE until this loader bug is fixed.** Add the load assertions described in §6.11 acceptance criterion as a guard.
 
 ---
 
