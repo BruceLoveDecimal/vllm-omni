@@ -22,7 +22,8 @@ Five blockers were identified in revision 9. Three closed since revision 10.
 | 3 | NVlabs flow-DPM solver | ✅ **Closed** — commit `f7e59121` A.2 (`DPMSolverMultistepScheduler`) |
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ⚠️ **Port landed, contribution masked by §6.11 loader bug** — UCPE math (`ucpe.py`) ported with passing unit tests; cam branch rewritten and verified to execute. GPU run 2026-05-28 produced MAE=98.31 because `out_proj_cam.weight==0` masks the cam contribution. See §6.10 + §6.11. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
-| 7 | Stage-1 latent magnitude vs LTX-2 refiner | ❌ **NEW (2026-05-28)** — Stage-1 raw latent at STAGE1_STEPS=1 is `[-59, 61]` (10× LTX-2 refiner expected range). New dominant reference-alignment blocker. See §6.12. |
+| 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
+| 8 | ~90 MAE baseline gap (multiple residual alignment items) | ❌ **NEW (2026-05-28)** — main-only is best at MAE=91.76; adding correct cam branch makes it 102.48. Suspect downstream: softmax-UCPE port, camera embedder structural alignment, `init_cam_from_base` warm-start. See §6.13. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The GPU run on 2026-05-27 produced MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame harness. That result is consistent with item 4 being functionally open: the model has no working camera-conditioning path, so the output is structurally unrelated to the official reference regardless of how accurate the GDN recurrence is. Items 1 and 4 must close before PSNR ≥ 30 / SSIM-Y ≥ 0.93 is achievable.
@@ -282,53 +283,89 @@ The 9-frame e2e MAE moved from `98.31` (zero-weight era) to `95.25`
 (loaded-weight era) — small drop because a *new* downstream
 blocker has been exposed (see §6.12).
 
-### 6.12 Stage-1 Latent Magnitude 10× Too Large for LTX-2 Refiner ❌ NEW — CRITICAL
+### 6.12 Stage-1 Latent Magnitude 10× Too Large for LTX-2 Refiner ✅ FIXED 2026-05-28
 
-**Symptom (2026-05-28, post §6.11 fix).** With genuine GDN+UCPE
-attention now contributing, the Stage-1 raw latent at
-`STAGE1_STEPS=1` is in range `[-59.0, 61.0]`. Before the loader
-fix (when GDN contributed nothing), the same latent was
-`[-5.9, 6.1]`. Typical LTX-2 latents the refiner is trained on are
-in `[-4, 4]`. The refiner cannot denoise a latent that is 10× its
-expected magnitude, so the decoded video is dominated by noise:
+**Resolution.** The 10× magnitude inflation was localised to the cam
+branch via a `VLLM_OMNI_SANA_WM_DISABLE_CAM_BRANCH=1` isolation run
+(`[-10.5, 9.75]` main-only vs `[-59, 61]` with cam). The cam branch
+was missing **three** pieces required by the SANA-WM 1600M release
+config `camctrl_type: BidirectionalGDNUCPESinglePathLiteLABothTriton`:
 
-```
-MAE=95.25  PSNR=7.04 dB  SSIM-Y=-0.003
-```
+1. **Single-path delta-rule recurrence** (numerator only, no Z
+   denominator, no `num/den` divide). NVlabs
+   `torch_recurrent_cam_single_path_delta_rule`. We were running the
+   full bidirectional GDN with denominator divide.
+2. **`apply_fn_o` inverse output transform** — applied after the
+   recurrence to bring the output from per-ray frame back to world
+   frame.
+3. **`_downscale_to_reference_rms` (PostUCPERenorm)** — clips the
+   UCPE-transformed Q/K/V back to their pre-UCPE per-token RMS
+   envelope. Without this, the per-ray 4×4 projection inflates
+   magnitudes by ~6-10×.
 
-**Hypotheses.**
+After porting all three plus the existing β-discount logic,
+`STAGE1_STEPS=1` latent dropped to `[-12.3, 11.8]` — within the
+LTX-2 refiner input distribution. fp32 attention discipline added
+on the recurrence accumulator to match NVlabs `fp32_attention=True`.
 
-1. **Missing Stage-1 scheduler `scale` factor.** The NVlabs scheduler
-   may scale the predicted noise by `1 / sqrt(snr)` or apply a flow
-   correction we are missing. Compare
-   `_native_smoke_backend` against NVlabs `inference_sana_wm.py`
-   step ordering.
-2. **Missing `out_proj_cam` bias offset.** If the cam branch's
-   `out_proj_cam` was trained with `init_cam_from_base=True`
-   warm-start and we are using the at-init bias only, the cam
-   contribution may add a wrong baseline. Confirm by inspecting
-   the official checkpoint loader.
-3. **fp32 vs bf16 mismatch in GDN recurrence accumulator.** Our
-   `reference_bidirectional_gated_delta_net` uses fp32 internally
-   and casts back to bf16 at the boundary; the fused Triton path
-   may diverge in scale.
-4. **Refiner input normalisation.** LTX-2 refiner may expect the
-   Stage-1 latent to be VAE-decoded then re-encoded with a specific
-   scale. Compare against NVlabs `inference_sana_wm.py` Stage-1 →
-   Stage-2 handoff.
+### 6.13 Persistent ~90 MAE Baseline — Cam Hurts Slightly ❌ NEW
+
+**Symptom (2026-05-28, post §6.10/§6.11/§6.12 all closed).**
+
+| Configuration | MAE | PSNR | SSIM-Y |
+|---|---|---|---|
+| Loader fix + main-only (`DISABLE_CAM_BRANCH=1`) | 91.76 | 7.25 | 0.076 |
+| Loader fix + new cam (single-path + apply_fn_o + RMS) | 102.48 | 6.57 | -0.017 |
+
+Main-branch only at MAE=91.76 is the best result so far — and adding
+the algorithmically-correct cam branch makes it ~10 MAE worse, even
+though the latent magnitude is now in the normal range. The cam
+branch is structurally matched to NVlabs but is not yet improving
+output quality.
+
+Both numbers are still in the "uncorrelated to reference" regime
+(MAE > 80 means the decoded video has essentially no overlap with
+the official Stage-1 → refiner output). This is a sign that
+multiple non-cam-branch alignment items still dominate the
+remaining error budget.
+
+**Suspect downstream items (intersected with the open items in
+integration.md):**
+
+1. **Camera embedder (integration.md §4a).** Our
+   `SanaWmCameraEmbedder` is two trivial conv/linear projections;
+   the NVlabs `chunk_plucker` + `raymap_embedder` use K=4 conv with
+   multi-scale per `ASPECT_RATIO_VIDEO_720_MS_DIV32`. Plucker/raymap
+   numerical equivalence has not been audited.
+2. **softmax-attention blocks (every 4th of the 20).** These still
+   run plain SDPA without UCPE — NVlabs has a separate
+   `BidirectionalSoftmaxUCPESinglePathLiteLA` variant for them that
+   we have not ported.
+3. **Stage-1 scheduler step alignment.** Our
+   `SanaWmFlowMatchScheduler` wraps `DPMSolverMultistepScheduler`;
+   compare to NVlabs `flow_dpm` ordering at each step.
+4. **`init_cam_from_base=True` warm-start.** The NVlabs cam-branch
+   weights at load time are warm-started from base attention; our
+   weight loader does not implement this duplication. Check whether
+   the checkpoint stores the post-warm-start values or expects us
+   to apply the warm-start.
+5. **First-frame VAE encoding scale.** Compare per-frame encoder
+   output statistics against NVlabs.
 
 **Acceptance criterion:**
 
 ```text
-[ ] STAGE1_STEPS=1 latent range is within ~[-8, 8] (matches LTX-2
-    refiner input distribution).
-[ ] e2e MAE on the 9-frame harness drops below 30.
-[ ] PSNR ≥ 20 dB on the 9-frame harness (intermediate target —
-    the 30 dB / SSIM-Y ≥ 0.93 final target may still need the
-    full UCPE warm-start handling).
+[ ] Add a single-block parity test against NVlabs
+    `BidirectionalGDNUCPESinglePathLiteLA.forward` at atol=1e-4
+    fp32. This will localise whether the residual MAE comes from
+    the cam branch math, the camera embedder, or downstream blocks.
+[ ] Port softmax-UCPE variant for the 5 softmax blocks.
+[ ] Audit camera embedder against NVlabs to land item integration.md §4a.
+[ ] Inspect official checkpoint for `init_cam_from_base` warm-start
+    treatment.
 ```
 
-Cross-ref: integration.md §3 (scheduler), §4b (UCPE warm-start).
+Cross-ref: integration.md §3 (scheduler), §4a (embedder), §4b (UCPE branch).
 
 **Symptom.** Reference-alignment harness reports MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame smoke even after A.1–A.3 landed. That is essentially uncorrelated output — too large to be a recurrence-precision issue.
 
@@ -384,7 +421,9 @@ Cross-ref: integration.md §1124 "Native Stage-1 Production Readiness Gap" items
 
 11. ~~**Fix vLLM parallel linear weight loading (§6.11).**~~ ✅ **Done 2026-05-28** — fixed by tightening `use_official_backend` gating to require `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. `qkv.weight.norm()` now matches the checkpoint (7.21e+02 ≡ 7.20e+02), `out_proj_cam.weight.norm()` is now 10.78 (was 0). The MAE drop from this fix alone is small (98.31 → 95.25) because it exposed §6.12.
 
-12. **Fix Stage-1 latent magnitude (§6.12).** With the loader fix landed, the GDN+UCPE attention now contributes real values, but the Stage-1 raw latent comes out 10× too large for the LTX-2 refiner. This is the new dominant blocker — the refiner cannot denoise out-of-distribution latents and the decoded video remains noise (MAE=95.25, PSNR=7.04). Investigation order: NVlabs flow scheduler step alignment → cam-branch warm-start bias → Stage-1 → Stage-2 handoff scaling.
+12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). Cam branch rewritten to match NVlabs `BidirectionalGDNUCPESinglePathLiteLA`: single-path delta-rule recurrence (no Z denominator), `apply_fn_o` inverse output transform, and `_downscale_to_reference_rms` PostUCPERenorm. Latent at STAGE1_STEPS=1 dropped from `[-59, 61]` to `[-12.3, 11.8]`.
+
+13. **Close the ~90 MAE baseline gap (§6.13).** Even with all of §6.10/§6.11/§6.12 closed, the 9-frame harness reports MAE=91-102 — still "uncorrelated to reference". Items to investigate next: single-block parity test against NVlabs `BidirectionalGDNUCPESinglePathLiteLA` (highest-leverage debug tool), softmax-UCPE port for the 5 softmax blocks, camera embedder structural alignment (integration.md §4a), `init_cam_from_base` warm-start handling, scheduler step alignment.
 
 ---
 

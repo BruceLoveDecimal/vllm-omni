@@ -25,6 +25,7 @@ from torch import nn
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.gated_deltanet_triton import (
     SANA_WM_REQUIRE_TRITON_GDN_ENV,
+    _flip_and_shift,
     reference_bidirectional_gated_delta_net,
     triton_bidirectional_gated_delta_net_from_qkv,
 )
@@ -999,6 +1000,135 @@ class SanaWmSelfAttention(nn.Module):
         batch, _, seq_len, _ = tensor.shape
         return tensor.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
 
+    @staticmethod
+    def _downscale_to_reference_rms(
+        ref: torch.Tensor,
+        transformed: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Downscale ``transformed`` so its per-token channel RMS does not
+        exceed ``ref``'s. Mirrors NVlabs ``_downscale_to_reference_rms``.
+
+        Inputs are ``(B, H, N, D)`` (channel dim last). The RMS-scale is
+        clamped at 1.0 — the function only ever shrinks, never amplifies.
+        """
+        ref_rms = ref.square().mean(dim=-1, keepdim=True).add(eps).sqrt()
+        tr_rms = transformed.square().mean(dim=-1, keepdim=True).add(eps).sqrt()
+        scale = (ref_rms / tr_rms.clamp_min(eps)).clamp(max=1.0)
+        return transformed * scale
+
+    @staticmethod
+    def _cam_single_path_delta_scan(
+        q_rot: torch.Tensor,  # (B, H, D, N)
+        k_rot: torch.Tensor,  # (B, H, D, N)
+        value: torch.Tensor,  # (B, H, D, N)
+        beta: torch.Tensor,  # (B, H, T, S)
+        decay: torch.Tensor,  # (B, H, T)
+        *,
+        spatial_tokens: int,
+    ) -> torch.Tensor:
+        """Numerator-only delta-rule recurrence used by the SANA-WM cam branch.
+
+        Matches NVlabs ``torch_recurrent_cam_single_path_delta_rule``: no Z
+        denominator stream, no final divide. Output is ``state_kv @ q_rot``
+        per frame, stacked back into ``(B, H, D, N)`` layout.
+
+        Runs in fp32 internally for numerical stability (matches NVlabs
+        ``fp32_attention=True``) and casts the result back to the input dtype.
+        """
+        dtype_orig = q_rot.dtype
+        q_rot = q_rot.float()
+        k_rot = k_rot.float()
+        value = value.float()
+        beta = beta.float()
+        decay = decay.float()
+
+        batch_size, num_heads, head_dim, token_count = q_rot.shape
+        frames = beta.shape[2]
+        if token_count != frames * spatial_tokens:
+            raise ValueError(
+                f"single-path scan token_count={token_count} != frames*S={frames * spatial_tokens}."
+            )
+
+        def to_frames(t: torch.Tensor) -> torch.Tensor:
+            return t.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
+
+        q_rot_f = to_frames(q_rot)
+        k_rot_f = to_frames(k_rot)
+        value_f = to_frames(value)
+        state_kv = torch.zeros(
+            batch_size, num_heads, head_dim, head_dim, device=q_rot.device, dtype=torch.float32
+        )
+        outputs: list[torch.Tensor] = []
+        for frame_idx in range(frames):
+            qrt = q_rot_f[:, :, frame_idx]
+            krt = k_rot_f[:, :, frame_idx]
+            vt = value_f[:, :, frame_idx]
+            bt = beta[:, :, frame_idx].unsqueeze(2)
+            gt = decay[:, :, frame_idx].view(batch_size, num_heads, 1, 1)
+
+            state_kv = state_kv * gt
+            v_pred = torch.matmul(state_kv, krt)
+            delta_v = (vt - v_pred) * bt
+            state_kv = state_kv + torch.matmul(delta_v, krt.transpose(-1, -2))
+            outputs.append(torch.matmul(state_kv, qrt))
+
+        stacked = torch.stack(outputs, dim=2)
+        out = stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, head_dim, token_count)
+        return out.to(dtype_orig)
+
+    def _bidi_single_path(
+        self,
+        q_rot: torch.Tensor,
+        k_rot: torch.Tensor,
+        value: torch.Tensor,
+        beta: torch.Tensor,
+        decay: torch.Tensor,
+        *,
+        spatial_tokens: int,
+    ) -> torch.Tensor:
+        """Bidirectional single-path scan: forward + backward, simple sum.
+
+        Backward direction shifts K/V/beta by one frame (with zero pad) and
+        the decay by one frame (with neutral 1.0 pad), matching NVlabs
+        ``flip_and_shift`` conventions.
+        """
+        batch_size, num_heads, head_dim, token_count = q_rot.shape
+        frames = beta.shape[2]
+
+        out_fwd = self._cam_single_path_delta_scan(
+            q_rot, k_rot, value, beta, decay, spatial_tokens=spatial_tokens
+        )
+
+        def to_time(t: torch.Tensor) -> torch.Tensor:
+            return t.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
+
+        def from_time(t: torch.Tensor) -> torch.Tensor:
+            return t.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, head_dim, token_count)
+
+        q_T = to_time(q_rot)
+        k_T = to_time(k_rot)
+        v_T = to_time(value)
+        q_bwd = torch.flip(q_T, dims=[2])
+        k_bwd = _flip_and_shift(k_T, dim=2, shift_value=0.0)
+        v_bwd = _flip_and_shift(v_T, dim=2, shift_value=0.0)
+        beta_bwd = _flip_and_shift(beta, dim=2, shift_value=0.0)
+        decay_bwd = _flip_and_shift(decay, dim=2, shift_value=1.0)
+
+        out_bwd_flipped = self._cam_single_path_delta_scan(
+            from_time(q_bwd),
+            from_time(k_bwd),
+            from_time(v_bwd),
+            beta_bwd,
+            decay_bwd,
+            spatial_tokens=spatial_tokens,
+        )
+        out_bwd = torch.flip(
+            out_bwd_flipped.view(batch_size, num_heads, head_dim, frames, spatial_tokens),
+            dims=[3],
+        ).reshape(batch_size, num_heads, head_dim, token_count)
+        return out_fwd + out_bwd
+
     def _forward_cam_branch(
         self,
         hidden_states: torch.Tensor,
@@ -1008,23 +1138,31 @@ class SanaWmSelfAttention(nn.Module):
         *,
         precomputed_gates: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """UCPE camera branch — bidirectional GDN with per-ray Q/K/V transforms.
+        """UCPE camera branch — matches NVlabs ``BidirectionalGDNUCPESinglePathLiteLA``
+        which is the variant declared in the SANA-WM 1600M release config
+        (``camctrl_type: BidirectionalGDNUCPESinglePathLiteLABothTriton``).
 
-        Mirrors NVlabs ``_GDNUCPEBase._forward_cam_branch`` /
-        ``BidirectionalGDNUCPELiteLA._forward_cam_branch``:
+        Pipeline (mirrors ``_GDNUCPEBase._prepare_cam_qkv`` +
+        ``BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch``):
 
         1. Project Q/K/V from ``hidden_states`` (all three from x — UCPE is
            NOT cross-attention; camera info enters via per-pixel projection
            matrices).
-        2. Short conv on K (matching main branch ordering).
+        2. Short conv on K (and optionally Q/V).
         3. ``q_norm_cam`` / ``k_norm_cam`` (RMSNorm over cam_dim).
         4. ReLU kernel + ``k_scale = D^-0.5 * S^-0.5``.
-        5. UCPE per-token block-diagonal transforms: half of head_dim goes
-           through ``apply_fn_q`` / ``apply_fn_kv`` (per-ray 4x4 projection +
-           sliced RoPE on the remaining half).
-        6. Dynamic Beta Discounting: β_cam = β / inflation_sq.clamp_min(1).
-        7. Bidirectional GDN recurrence (reuses
-           :func:`reference_bidirectional_gated_delta_net`).
+        5. UCPE per-token block-diagonal transforms via ``apply_fn_q`` and
+           ``apply_fn_kv`` (per-ray 4x4 projection on first half + sliced
+           complex RoPE on second half).
+        6. **PostUCPERenorm**: ``_downscale_to_reference_rms`` shrinks the
+           UCPE-transformed Q/K/V back to their pre-UCPE per-token RMS
+           envelope. Without this the cam branch output magnitude is ~10×
+           too large for the LTX-2 refiner.
+        7. Dynamic Beta Discounting: β_cam = β / frame_inflation_sq.clamp_min(1).
+        8. **Single-path** delta-rule recurrence (numerator only, no Z
+           denominator) — forward + backward, simple sum.
+        9. **Inverse output transform**: ``apply_fn_o`` brings the recurrence
+           output from the per-ray frame back to the world frame.
 
         Returns ``(B, N, cam_dim)`` raw — caller applies ``out_proj_cam`` and
         the shared ``output_gate`` + ``proj``.
@@ -1045,7 +1183,7 @@ class SanaWmSelfAttention(nn.Module):
             # vLLM-Omni packs the rotary embedding as (1, 1, N, D//2) complex.
             # Caller may also pass an already-squeezed (N, D//2) tensor.
             rotary_emb_freqs = rotary_emb_freqs.squeeze(0)
-        apply_fn_q, apply_fn_kv, _ = prepare_prope_fns(
+        apply_fn_q, apply_fn_kv, apply_fn_o = prepare_prope_fns(
             head_dim=self.cam_head_dim,
             camera_conditions=camera_conditions,
             HW=spatial_shape,
@@ -1057,8 +1195,7 @@ class SanaWmSelfAttention(nn.Module):
         k_cam = _linear_output(self.k_proj_cam(hidden_states))
         v_cam = _linear_output(self.v_proj_cam(hidden_states))
 
-        # 2. Short conv on K (and optionally Q, V — only K is enabled by the
-        # SANA-WM release, matching main branch).
+        # 2. Short conv on K (and optionally Q, V).
         if self.conv_k_cam is not None:
             k_cam = self._bidirectional_temporal_short_conv(k_cam, self.conv_k_cam, spatial_shape)
         if self.conv_q_cam is not None:
@@ -1082,32 +1219,33 @@ class SanaWmSelfAttention(nn.Module):
         k_scale = (self.cam_head_dim**-0.5) * (spatial_tokens**-0.5)
         k_cam = k_cam * k_scale
 
-        # 5. UCPE per-token transforms. Measure K norm before and after the
-        # transform to compute the energy-inflation factor that scales β.
-        # apply_fn_q transforms only Q; apply_fn_kv transforms both K and V
-        # (fused to one call to match NVlabs).
+        # 5. UCPE per-token transforms.
         pre_ucpe_k_norm = torch.linalg.vector_norm(k_cam, dim=-1, keepdim=True).clamp_min(1e-6)
         q_cam_trans = apply_fn_q(q_cam)
         kv_cam = torch.cat([k_cam, v_cam], dim=1)
         kv_cam_trans = apply_fn_kv(kv_cam)
         k_cam_trans, v_cam_trans = torch.chunk(kv_cam_trans, chunks=2, dim=1)
+
+        # 6. PostUCPERenorm — clip the UCPE-transformed Q/K/V to their
+        # pre-UCPE per-token RMS envelope. Without this the per-ray 4x4
+        # projection inflates magnitudes by ~6-10× and the downstream
+        # refiner cannot denoise the resulting latent.
+        q_cam_trans = self._downscale_to_reference_rms(q_cam, q_cam_trans)
+        k_cam_trans = self._downscale_to_reference_rms(k_cam, k_cam_trans)
+        v_cam_trans = self._downscale_to_reference_rms(v_cam, v_cam_trans)
+
+        # inflation_sq is computed from the *unstabilised* post-UCPE K norm
+        # to match NVlabs' behaviour (`inflation_sq` is captured before
+        # `_stabilize_cam_transforms` runs).
         post_ucpe_k_norm = torch.linalg.vector_norm(k_cam_trans, dim=-1, keepdim=True).clamp_min(1e-6)
-        # inflation_sq: (B, H, N, 1) — mean over spatial within each frame
-        # for the β discount (NVlabs reduces to per-frame scalar before
-        # applying to β of shape (B, H, T, S)).
         inflation_sq = (post_ucpe_k_norm / pre_ucpe_k_norm) ** 2  # (B, H, N, 1)
 
-        # 6. Dynamic Beta Discounting. β has shape (B, H, T, S). We need to
-        # compute frame-level inflation by averaging inflation_sq over the
-        # spatial tokens within each frame.
+        # 7. Dynamic Beta Discounting (per-frame mean over spatial tokens).
         beta, decay = precomputed_gates
         inflation_per_token = inflation_sq.squeeze(-1).reshape(
             batch_size, self.cam_heads, frames, spatial_tokens
         )
         frame_inflation_sq = inflation_per_token.mean(dim=-1)  # (B, H_cam, T)
-        # β was computed for the MAIN branch with shape (B, num_heads_main, T, S).
-        # When cam_heads != num_heads_main we can't share β directly; broadcast
-        # by repeating along the head axis to match cam_heads.
         if beta.shape[1] != self.cam_heads:
             repeat_factor = self.cam_heads // beta.shape[1]
             if repeat_factor * beta.shape[1] != self.cam_heads:
@@ -1120,32 +1258,26 @@ class SanaWmSelfAttention(nn.Module):
         else:
             beta_cam = beta
             decay_cam = decay
-        # Discount β by per-frame inflation (clamp at 1 so we never amplify).
         beta_cam = beta_cam / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
 
-        # 7. Bidirectional GDN recurrence on the cam branch. Reshape the
-        # tensors back to (B, H, D, N) layout that
-        # ``reference_bidirectional_gated_delta_net`` expects.
-        q_cam_bhdn = q_cam.permute(0, 1, 3, 2).contiguous()
-        k_cam_bhdn = k_cam.permute(0, 1, 3, 2).contiguous()
-        v_cam_bhdn = v_cam_trans.permute(0, 1, 3, 2).contiguous()
+        # 8. Single-path bidirectional delta-rule recurrence on the UCPE-
+        # transformed Q/K/V (no Z denominator, no final divide).
         q_rot_bhdn = q_cam_trans.permute(0, 1, 3, 2).contiguous()
         k_rot_bhdn = k_cam_trans.permute(0, 1, 3, 2).contiguous()
-
-        cam_out = reference_bidirectional_gated_delta_net(
-            q_cam_bhdn,
-            k_cam_bhdn,
-            v_cam_bhdn,
-            beta=beta_cam,
-            decay=decay_cam,
-            spatial_tokens=spatial_tokens,
-            query_rot=q_rot_bhdn,
-            key_rot=k_rot_bhdn,
-            eps=self.eps,
+        v_bhdn = v_cam_trans.permute(0, 1, 3, 2).contiguous()
+        cam_out_bhdn = self._bidi_single_path(
+            q_rot_bhdn, k_rot_bhdn, v_bhdn, beta_cam, decay_cam, spatial_tokens=spatial_tokens
         )
+
+        # 9. Apply inverse UCPE transform on the recurrence output.
+        # ``apply_fn_o`` expects (B, H, N, D); we currently have
+        # (B, H, D, N) — transpose, apply, transpose back.
+        cam_out_bhnd = cam_out_bhdn.transpose(-1, -2).contiguous()
+        cam_out_bhnd = apply_fn_o(cam_out_bhnd)
+        cam_out_bhdn = cam_out_bhnd.transpose(-1, -2).contiguous()
+
         # (B, H_cam, D_cam, N) → (B, N, cam_dim)
-        cam_out = cam_out.permute(0, 3, 1, 2).reshape(batch_size, token_count, self.cam_dim)
-        return cam_out
+        return cam_out_bhdn.permute(0, 3, 1, 2).reshape(batch_size, token_count, self.cam_dim)
 
     def forward(
         self,
