@@ -988,7 +988,13 @@ def test_sana_wm_forward_shape_consistent_across_layer_modes() -> None:
     plucker = torch.randn(1, 6, 1, 4, 4)
 
     for use_parallel in (True, False):
-        model = SanaWmTransformer3DModel(config=config, materialize=True, use_vllm_parallel_layers=use_parallel)
+        model = SanaWmTransformer3DModel(
+            config=config,
+            materialize=True,
+            latent_channels=latents.shape[1],
+            prompt_channels=enc.shape[-1],
+            use_vllm_parallel_layers=use_parallel,
+        )
         out = model(latents, torch.tensor([0.5]), encoder_hidden_states=enc, plucker=plucker)
         assert out.shape == latents.shape, (
             f"use_vllm_parallel_layers={use_parallel}: shape {out.shape} != {latents.shape}"

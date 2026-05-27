@@ -10,8 +10,12 @@ vLLM builds regardless of the active backend).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
+
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
 
 @pytest.fixture(scope="session", autouse=True)

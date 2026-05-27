@@ -496,7 +496,7 @@ class SanaWmPipeline(
             dist = getattr(encoded, "latent_dist", None)
             first_latent = dist.mean if dist is not None else encoded.latents
             scaling = float(getattr(getattr(self.vae, "config", None), "scaling_factor", 1.0))
-            first_latent = first_latent * scaling
+            first_latent = (first_latent * scaling).to(device=device, dtype=dtype)
         # VAE latent may differ from expected spatial size; resize if needed.
         if first_latent.shape[-2:] != (latent_height, latent_width):
             first_latent = F.interpolate(

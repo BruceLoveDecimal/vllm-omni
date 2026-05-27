@@ -37,9 +37,15 @@ class SanaWmFlowMatchScheduler:
             raise ValueError("Sana-WM scheduler num_inference_steps must be positive.")
         self.num_inference_steps = num_inference_steps
         self.shift = shift
-        from diffusers import FlowMatchDPMSolverMultistepScheduler
+        from diffusers import DPMSolverMultistepScheduler
 
-        self._sched = FlowMatchDPMSolverMultistepScheduler(shift=shift)
+        self._sched = DPMSolverMultistepScheduler(
+            prediction_type="flow_prediction",
+            use_flow_sigmas=True,
+            flow_shift=shift,
+            algorithm_type="dpmsolver++",
+            solver_order=2,
+        )
         self._timesteps_device: torch.device | None = None
 
     def _ensure_timesteps(self, device: torch.device) -> None:

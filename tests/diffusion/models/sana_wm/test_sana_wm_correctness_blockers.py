@@ -3,7 +3,7 @@
 """Tests for the three single-GPU correctness blockers:
 
   A.1 — First-frame VAE encode (pipeline_sana_wm._vae_encode_first_frame)
-  A.2 — FlowMatchDPMSolverMultistepScheduler (SanaWmFlowMatchScheduler)
+  A.2 — FlowMatch DPM-Solver++ scheduler (SanaWmFlowMatchScheduler)
   A.3 — UCPE camera branch (raymap_embedder + _forward_ucpe)
 """
 
@@ -25,6 +25,12 @@ _TINY_CFG_KWARGS = dict(
     chunk_plucker_channels=6,
     cam_attn_compress=1,
 )
+
+
+def _tiny_cfg_kwargs(**overrides):
+    kwargs = dict(_TINY_CFG_KWARGS)
+    kwargs.update(overrides)
+    return kwargs
 
 
 # ===========================================================================
@@ -335,7 +341,7 @@ def test_pipeline_first_frame_encoded_flag_false_for_placeholder() -> None:
     """object() placeholder image must NOT trigger VAE encode."""
     from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmPipeline
 
-    config = SanaWmConfig(**_TINY_CFG_KWARGS, chunk_plucker_channels=48)
+    config = SanaWmConfig(**_tiny_cfg_kwargs(chunk_plucker_channels=48))
     pipeline = SanaWmPipeline(od_config=None)
     pipeline.sana_wm_config = config
     pipeline.transformer.config = config
@@ -386,12 +392,12 @@ def test_pipeline_first_frame_encoded_flag_true_for_pil() -> None:
 
         def encode(self, x):
             b, c, f, h, w = x.shape
-            return self._FakeEncResult(torch.zeros(b, 4, f, h, w))
+            return self._FakeEncResult(torch.zeros(b, 128, f, h, w))
 
         def to(self, *args, **kwargs):
             return self
 
-    config = SanaWmConfig(**_TINY_CFG_KWARGS, chunk_plucker_channels=48)
+    config = SanaWmConfig(**_tiny_cfg_kwargs(chunk_plucker_channels=48))
     pipeline = SanaWmPipeline(od_config=None)
     pipeline.sana_wm_config = config
     pipeline.transformer.config = config
@@ -540,7 +546,7 @@ def test_transformer_forward_with_plucker_and_spatial_raymap_shape() -> None:
 
     from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
 
-    cfg = SanaWmConfig(**_TINY_CFG_KWARGS, chunk_plucker_channels=6)
+    cfg = SanaWmConfig(**_tiny_cfg_kwargs(chunk_plucker_channels=6))
     model = SanaWmTransformer3DModel(config=cfg)
     model.eval()
 
@@ -571,7 +577,7 @@ def test_camera_conditioning_changes_transformer_output() -> None:
     from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
 
     torch.manual_seed(7)
-    cfg = SanaWmConfig(**_TINY_CFG_KWARGS, chunk_plucker_channels=6)
+    cfg = SanaWmConfig(**_tiny_cfg_kwargs(chunk_plucker_channels=6))
     model = SanaWmTransformer3DModel(config=cfg)
     model.eval()
 
@@ -602,7 +608,7 @@ def test_camera_hidden_states_from_conditions_with_spatial_raymap() -> None:
     from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
 
     torch.manual_seed(3)
-    cfg = SanaWmConfig(**_TINY_CFG_KWARGS, chunk_plucker_channels=6)
+    cfg = SanaWmConfig(**_tiny_cfg_kwargs(chunk_plucker_channels=6))
     model = SanaWmTransformer3DModel(config=cfg, materialize=True)
 
     plucker = torch.randn(1, 6, 2, 2, 2)  # [B, C, F, H, W]
@@ -650,7 +656,7 @@ def test_pipeline_scheduler_uses_flow_match_and_descends() -> None:
             self.timesteps.append(float(timestep.flatten()[0]))
             return torch.zeros_like(hidden_states)
 
-    cfg = SanaWmConfig(**_TINY_CFG_KWARGS, chunk_plucker_channels=48)
+    cfg = SanaWmConfig(**_tiny_cfg_kwargs(chunk_plucker_channels=48))
     pipeline = SanaWmPipeline(od_config=None)
     pipeline.sana_wm_config = cfg
     pipeline.transformer = RecordingTransformer()
