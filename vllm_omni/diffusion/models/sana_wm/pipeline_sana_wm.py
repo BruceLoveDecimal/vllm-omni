@@ -284,7 +284,19 @@ class SanaWmPipeline(
         super().__init__()
         self.od_config = od_config
         self.prefix = prefix
-        self.use_official_backend = is_sana_wm_official_backend_requested(od_config)
+        # The official CLI bridge is only enabled when the user explicitly
+        # opts in via ``VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`` AND the
+        # NVlabs/Sana repo path is provided. Setting only the repo path is
+        # required to let the reference-alignment harness invoke the CLI
+        # bridge for the *reference* run, but must not disable native
+        # Stage-1 weight loading on the prediction-path pipeline instance —
+        # otherwise ``load_weights`` early-returns ``set()`` and the
+        # native model runs with zero-initialised parameters. See audit
+        # §6.11 for the on-GPU trace evidence that produced MAE=98.31.
+        self.use_official_backend = (
+            is_sana_wm_official_backend_requested(od_config)
+            and should_force_sana_wm_cli_backend()
+        )
         self.output_height = SANA_WM_OUTPUT_HEIGHT
         self.output_width = SANA_WM_OUTPUT_WIDTH
         self.default_num_frames = SANA_WM_DEFAULT_NUM_FRAMES

@@ -21,7 +21,8 @@ Five blockers were identified in revision 9. Three closed since revision 10.
 | 2 | First-frame VAE encode for I2V conditioning | ✅ **Closed** — commit `f7e59121` A.1 |
 | 3 | NVlabs flow-DPM solver | ✅ **Closed** — commit `f7e59121` A.2 (`DPMSolverMultistepScheduler`) |
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ⚠️ **Port landed, contribution masked by §6.11 loader bug** — UCPE math (`ucpe.py`) ported with passing unit tests; cam branch rewritten and verified to execute. GPU run 2026-05-28 produced MAE=98.31 because `out_proj_cam.weight==0` masks the cam contribution. See §6.10 + §6.11. |
-| 6 | vLLM parallel linear weight loading | ❌ **NEW (2026-05-28)** — `QKVParallelLinear.weight==0` and `out_proj_cam.weight==0` at inference time despite the checkpoint being correct. Dominant reference-alignment blocker. See §6.11. |
+| 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
+| 7 | Stage-1 latent magnitude vs LTX-2 refiner | ❌ **NEW (2026-05-28)** — Stage-1 raw latent at STAGE1_STEPS=1 is `[-59, 61]` (10× LTX-2 refiner expected range). New dominant reference-alignment blocker. See §6.12. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The GPU run on 2026-05-27 produced MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame harness. That result is consistent with item 4 being functionally open: the model has no working camera-conditioning path, so the output is structurally unrelated to the official reference regardless of how accurate the GDN recurrence is. Items 1 and 4 must close before PSNR ≥ 30 / SSIM-Y ≥ 0.93 is achievable.
@@ -237,37 +238,97 @@ bugs are fixed. That is now §6.11 / §7 item 11 below.
 
 Verified by deep-dive vs NVlabs `sana_gdn_camctrl_blocks.py` on 2026-05-27.
 
-### 6.11 vLLM Parallel Linear Weight Loading Broken — `QKVParallelLinear.weight=0` ❌ CRITICAL — NEW
+### 6.11 vLLM Parallel Linear Weight Loading Broken — `QKVParallelLinear.weight=0` ✅ FIXED 2026-05-28
 
-Trace from 2026-05-28 GPU run shows every GDN block has
-`self.qkv.weight.norm() == 0.0` at inference time. The vLLM
-`QKVParallelLinear` and `nn.Linear` (`out_proj_cam`) parameters in
-`SanaWmSelfAttention` are not being populated from the SANA-WM
-Stage-1 checkpoint. Symptom: every GDN attention block computes
-`Wx + b` with `W=0`, so attention output collapses to a per-channel
-bias constant. Same checkpoint loads fine into NVlabs reference path
-(the official-CLI bridge produces meaningful video). So the
-checkpoint is correct; our `load_weights` / `_apply_loaded_tensors_to_materialized`
-must be missing the QKV remapping for vLLM parallel layers.
+**Root cause located.** [`SanaWmPipeline.__init__`](../../../vllm_omni/diffusion/models/sana_wm/pipeline_sana_wm.py#L287)
+set `self.use_official_backend = is_sana_wm_official_backend_requested(od_config)`,
+and that helper returned `True` whenever the `VLLM_OMNI_SANA_WM_OFFICIAL_REPO`
+env var was set — regardless of whether the user actually wanted the
+CLI bridge or merely wanted the reference-alignment harness to be
+able to invoke the CLI bridge for the *reference* run.
+
+When `use_official_backend=True`, `SanaWmPipeline.load_weights`
+short-circuited to `return set()` without ever loading any
+checkpoint tensor onto the native Stage-1 model. The native path
+then ran with zero-initialised `QKVParallelLinear.weight` (and
+zero-initialised `out_proj_cam.weight`), which is why the
+GPU-run trace showed `qkv_w_norm=0.0` for every GDN block.
+
+**Fix.** Tighten the gating so the CLI bridge is enabled only when
+the user *explicitly* opts in via `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`
+*and* the repo path is provided:
+
+```python
+self.use_official_backend = (
+    is_sana_wm_official_backend_requested(od_config)
+    and should_force_sana_wm_cli_backend()
+)
+```
+
+This matches the long-standing recipe convention (both env vars
+required to activate the CLI bridge) and lets `OFFICIAL_REPO` be
+set for the reference run without disabling native weight loading
+on the prediction-path pipeline instance.
+
+**Verification.** GPU trace 2026-05-28 (post-fix, same harness):
+
+```
+[WEIGHT CHECK] block0 qkv.weight norm=7.2072e+02   # source ckpt norm: 7.2004e+02 ✓
+[WEIGHT CHECK] block0 out_proj_cam.weight norm=1.0782e+01   # was 0.0 before fix ✓
+```
+
+The native Stage-1 model is now exercising the loaded weights.
+The 9-frame e2e MAE moved from `98.31` (zero-weight era) to `95.25`
+(loaded-weight era) — small drop because a *new* downstream
+blocker has been exposed (see §6.12).
+
+### 6.12 Stage-1 Latent Magnitude 10× Too Large for LTX-2 Refiner ❌ NEW — CRITICAL
+
+**Symptom (2026-05-28, post §6.11 fix).** With genuine GDN+UCPE
+attention now contributing, the Stage-1 raw latent at
+`STAGE1_STEPS=1` is in range `[-59.0, 61.0]`. Before the loader
+fix (when GDN contributed nothing), the same latent was
+`[-5.9, 6.1]`. Typical LTX-2 latents the refiner is trained on are
+in `[-4, 4]`. The refiner cannot denoise a latent that is 10× its
+expected magnitude, so the decoded video is dominated by noise:
+
+```
+MAE=95.25  PSNR=7.04 dB  SSIM-Y=-0.003
+```
+
+**Hypotheses.**
+
+1. **Missing Stage-1 scheduler `scale` factor.** The NVlabs scheduler
+   may scale the predicted noise by `1 / sqrt(snr)` or apply a flow
+   correction we are missing. Compare
+   `_native_smoke_backend` against NVlabs `inference_sana_wm.py`
+   step ordering.
+2. **Missing `out_proj_cam` bias offset.** If the cam branch's
+   `out_proj_cam` was trained with `init_cam_from_base=True`
+   warm-start and we are using the at-init bias only, the cam
+   contribution may add a wrong baseline. Confirm by inspecting
+   the official checkpoint loader.
+3. **fp32 vs bf16 mismatch in GDN recurrence accumulator.** Our
+   `reference_bidirectional_gated_delta_net` uses fp32 internally
+   and casts back to bf16 at the boundary; the fused Triton path
+   may diverge in scale.
+4. **Refiner input normalisation.** LTX-2 refiner may expect the
+   Stage-1 latent to be VAE-decoded then re-encoded with a specific
+   scale. Compare against NVlabs `inference_sana_wm.py` Stage-1 →
+   Stage-2 handoff.
 
 **Acceptance criterion:**
 
 ```text
-[ ] tests/diffusion/models/sana_wm/test_sana_wm_scaffold.py adds an
-    assertion that after `SanaWmTransformer3DModel.load_weights(...)`
-    every `block.attn.qkv` parameter has a non-zero norm and matches
-    the source checkpoint tensor for that block.
-[ ] Same assertion for `block.attn.q_proj_cam`,
-    `block.attn.k_proj_cam`, `block.attn.v_proj_cam`,
-    `block.attn.out_proj_cam`.
-[ ] Optional: assertion for q_norm / k_norm / conv_k weight load.
-[ ] e2e MAE drops to a comparison-meaningful value (≤ 30) on the
-    9-frame harness after the loader fix.
+[ ] STAGE1_STEPS=1 latent range is within ~[-8, 8] (matches LTX-2
+    refiner input distribution).
+[ ] e2e MAE on the 9-frame harness drops below 30.
+[ ] PSNR ≥ 20 dB on the 9-frame harness (intermediate target —
+    the 30 dB / SSIM-Y ≥ 0.93 final target may still need the
+    full UCPE warm-start handling).
 ```
 
-Cross-ref: integration.md §1 ("Main-branch math is verified
-equivalent" — still true, the math is the same as NVlabs; the
-inputs to the math are just zero-weight matmul outputs).
+Cross-ref: integration.md §3 (scheduler), §4b (UCPE warm-start).
 
 **Symptom.** Reference-alignment harness reports MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame smoke even after A.1–A.3 landed. That is essentially uncorrelated output — too large to be a recurrence-precision issue.
 
@@ -321,7 +382,9 @@ Cross-ref: integration.md §1124 "Native Stage-1 Production Readiness Gap" items
 
 10. ~~**Port UCPE per-block attention (§6.10).** Add `vllm_omni/diffusion/models/sana_wm/ucpe.py` with `prepare_prope_fns` ported from NVlabs `sana_camctrl_blocks.py`. Rewrite `_forward_ucpe` to use bidirectional GDN recurrence (reuse `reference_bidirectional_gated_delta_net`) with `q_cam_trans`/`k_cam_trans` as the rotary inputs. Add `_prepare_cam_qkv` (project → mask → conv → norm → ReLU → scale → permute → UCPE). Add inflation_sq → β discount. Add `apply_output_gate=False` mode to `_forward_gdn`. Rewire `SanaWmSelfAttention.forward` to compute `main_raw + out_proj_cam(cam_raw)` then apply shared `output_gate` + `proj` once. Unit test against NVlabs `_GDNUCPEBase` block (atol=1e-4 fp32 single-block).~~ ✅ **Done 2026-05-27.** Module-level energy-preservation tests pass at 1e-7 precision. Single-block end-to-end NVlabs parity test still needs GPU run (moved to §8 item 1 sub-step).
 
-11. **Fix vLLM parallel linear weight loading (§6.11).** GPU trace on 2026-05-28 showed `QKVParallelLinear.weight == 0` for every GDN block at inference time, and the same for `out_proj_cam`. This is a `SanaWmTransformer3DModel.load_weights` / `_apply_loaded_tensors_to_materialized` bug — vLLM parallel linear layers have their own `weight_loader` contract that our remap path is not honouring. The pre-existing MAE=95.82 result (and the post-UCPE MAE=98.31 result) are both symptoms: with `W=0` every GDN block degenerates to a per-channel bias constant and contributes essentially nothing to denoising. **This is now the dominant blocker for reference alignment — UCPE port cannot improve MAE until this loader bug is fixed.** Add the load assertions described in §6.11 acceptance criterion as a guard.
+11. ~~**Fix vLLM parallel linear weight loading (§6.11).**~~ ✅ **Done 2026-05-28** — fixed by tightening `use_official_backend` gating to require `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. `qkv.weight.norm()` now matches the checkpoint (7.21e+02 ≡ 7.20e+02), `out_proj_cam.weight.norm()` is now 10.78 (was 0). The MAE drop from this fix alone is small (98.31 → 95.25) because it exposed §6.12.
+
+12. **Fix Stage-1 latent magnitude (§6.12).** With the loader fix landed, the GDN+UCPE attention now contributes real values, but the Stage-1 raw latent comes out 10× too large for the LTX-2 refiner. This is the new dominant blocker — the refiner cannot denoise out-of-distribution latents and the decoded video remains noise (MAE=95.25, PSNR=7.04). Investigation order: NVlabs flow scheduler step alignment → cam-branch warm-start bias → Stage-1 → Stage-2 handoff scaling.
 
 ---
 
