@@ -23,7 +23,7 @@ Five blockers were identified in revision 9. Three closed since revision 10.
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ⚠️ **Port landed, contribution masked by §6.11 loader bug** — UCPE math (`ucpe.py`) ported with passing unit tests; cam branch rewritten and verified to execute. GPU run 2026-05-28 produced MAE=98.31 because `out_proj_cam.weight==0` masks the cam contribution. See §6.10 + §6.11. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | ~90 MAE baseline gap (multiple residual alignment items) | ❌ **NEW (2026-05-28)** — main-only is best at MAE=91.76; adding correct cam branch makes it 102.48. Suspect downstream: softmax-UCPE port, camera embedder structural alignment, `init_cam_from_base` warm-start. See §6.13. |
+| 8 | Per-token timestep sampling contract | ❌ **NEW (2026-05-28)** — NVlabs uses per-frame sigma signalling (`condition_frame_info` → per-token timestep). Our pipeline uses scalar timestep. This is the root cause of the persistent ~90 MAE gap, localised by 2026-05-28 evening experiments. See §6.13. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The GPU run on 2026-05-27 produced MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame harness. That result is consistent with item 4 being functionally open: the model has no working camera-conditioning path, so the output is structurally unrelated to the official reference regardless of how accurate the GDN recurrence is. Items 1 and 4 must close before PSNR ≥ 30 / SSIM-Y ≥ 0.93 is achievable.
@@ -329,40 +329,70 @@ the official Stage-1 → refiner output). This is a sign that
 multiple non-cam-branch alignment items still dominate the
 remaining error budget.
 
-**Suspect downstream items (intersected with the open items in
-integration.md):**
+**Localisation experiments (2026-05-28 evening, all on remote GPU):**
 
-1. **Camera embedder (integration.md §4a).** Our
-   `SanaWmCameraEmbedder` is two trivial conv/linear projections;
-   the NVlabs `chunk_plucker` + `raymap_embedder` use K=4 conv with
-   multi-scale per `ASPECT_RATIO_VIDEO_720_MS_DIV32`. Plucker/raymap
-   numerical equivalence has not been audited.
-2. **softmax-attention blocks (every 4th of the 20).** These still
-   run plain SDPA without UCPE — NVlabs has a separate
-   `BidirectionalSoftmaxUCPESinglePathLiteLA` variant for them that
-   we have not ported.
-3. **Stage-1 scheduler step alignment.** Our
-   `SanaWmFlowMatchScheduler` wraps `DPMSolverMultistepScheduler`;
-   compare to NVlabs `flow_dpm` ordering at each step.
-4. **`init_cam_from_base=True` warm-start.** The NVlabs cam-branch
-   weights at load time are warm-started from base attention; our
-   weight loader does not implement this duplication. Check whether
-   the checkpoint stores the post-warm-start values or expects us
-   to apply the warm-start.
-5. **First-frame VAE encoding scale.** Compare per-frame encoder
-   output statistics against NVlabs.
+| Configuration | MAE | Notes |
+|---|---|---|
+| Loader fix + main-only | 91.76 | baseline |
+| Loader fix + new cam (single-path+RMS+apply_fn_o) | 102.48 | cam ~+10 MAE |
+| Above + disable `plucker_proj` external residual | 103.59 | slightly worse — embedder not the cause |
+| Clean first_latent (no add_noise) + hard-restore frame 0 | 134.31 | much worse — model expects noised conditioning |
+
+**Root cause of the persistent gap (identified 2026-05-28):**
+NVlabs' `LTXFlowEuler.sample` (see `diffusion/scheduler/flow_euler_sampler.py`)
+uses a fundamentally different sampling contract than what our
+pipeline implements:
+
+1. **Per-token timesteps.** NVlabs constructs a
+   ``(B, 1, F)`` timestep tensor where the conditioning frame's
+   timestep is forced to 0 and other frames carry the current
+   sampling sigma. This is passed as the ``timestep`` argument to
+   the model so the per-frame timestep embedding modulates each
+   frame differently.
+
+   ```python
+   condition_mask = torch.zeros_like(latents)  # 1,C,F,H,W
+   for frame_idx in condition_frame_info: condition_mask[:, :, frame_idx] = 1
+   timestep = t.expand(condition_mask_input.shape).float()
+   timestep = torch.min(timestep, (1 - condition_mask_input) * 1000.0)
+   noise_pred = self.model(latent_model_input, timestep[:, :1, :, 0, 0], ...)
+   ```
+
+2. **Per-token scheduler.step**, with ``per_token_timesteps``
+   forwarded to a flow-matching scheduler that supports per-token
+   step sizes.
+
+3. **Hard masking after step.** Only update non-conditioning tokens:
+   ```python
+   tokens_to_denoise_mask = t / 1000 - 1e-6 < (1.0 - condition_mask)
+   latents = torch.where(tokens_to_denoise_mask, denoised_latents, latents)
+   ```
+
+4. **Motion-continuity noise** (`add_noise_to_image_conditioning_latents`)
+   injected to the conditioning frame before each step.
+
+Our pipeline does a simple "noise the first frame to t=t0, run model
+with scalar timestep, scheduler.step on the full latent" loop. The
+hard-conditioning experiment (item 4 in the table above) confirmed
+the model REQUIRES per-frame sigma signalling — when we put a clean
+first frame without the per-token timestep signal, the model
+mis-interprets it and corrupts ALL frames via attention.
 
 **Acceptance criterion:**
 
 ```text
-[ ] Add a single-block parity test against NVlabs
-    `BidirectionalGDNUCPESinglePathLiteLA.forward` at atol=1e-4
-    fp32. This will localise whether the residual MAE comes from
-    the cam branch math, the camera embedder, or downstream blocks.
-[ ] Port softmax-UCPE variant for the 5 softmax blocks.
-[ ] Audit camera embedder against NVlabs to land item integration.md §4a.
-[ ] Inspect official checkpoint for `init_cam_from_base` warm-start
-    treatment.
+[ ] Refactor `SanaWmTimestepEmbedder` + `t_block` to accept and
+    output per-frame timesteps. Shape: timestep (B, F) →
+    timestep_modulation (B, F, 6*hidden_size).
+[ ] Block forward unpacks per-frame modulation and applies
+    shift/scale per spatial-token group.
+[ ] Pipeline builds the (B, F) timestep tensor with frame 0 = 0
+    (or the configured `condition_frame_info` value) and other
+    frames = current sigma.
+[ ] Replace the wrapped `DPMSolverMultistepScheduler` step with a
+    per-token-timestep aware step (LTX flow-matching style).
+[ ] Add `tokens_to_denoise_mask` to preserve conditioning frames.
+[ ] e2e MAE drops below 30 on the 9-frame harness.
 ```
 
 Cross-ref: integration.md §3 (scheduler), §4a (embedder), §4b (UCPE branch).
@@ -423,7 +453,7 @@ Cross-ref: integration.md §1124 "Native Stage-1 Production Readiness Gap" items
 
 12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). Cam branch rewritten to match NVlabs `BidirectionalGDNUCPESinglePathLiteLA`: single-path delta-rule recurrence (no Z denominator), `apply_fn_o` inverse output transform, and `_downscale_to_reference_rms` PostUCPERenorm. Latent at STAGE1_STEPS=1 dropped from `[-59, 61]` to `[-12.3, 11.8]`.
 
-13. **Close the ~90 MAE baseline gap (§6.13).** Even with all of §6.10/§6.11/§6.12 closed, the 9-frame harness reports MAE=91-102 — still "uncorrelated to reference". Items to investigate next: single-block parity test against NVlabs `BidirectionalGDNUCPESinglePathLiteLA` (highest-leverage debug tool), softmax-UCPE port for the 5 softmax blocks, camera embedder structural alignment (integration.md §4a), `init_cam_from_base` warm-start handling, scheduler step alignment.
+13. **Refactor to per-frame timesteps (§6.13 root cause).** Localisation experiments on 2026-05-28 evening (plucker_proj disable, hard-conditioning) pointed to a fundamental sampling-contract mismatch: NVlabs' `LTXFlowEuler.sample` uses **per-token timesteps** where the conditioning frame's sigma is 0 and other frames carry the current sampling sigma, plus a `condition_mask` so only non-conditioning tokens are updated by `scheduler.step`. Our pipeline uses scalar timestep and simple noise+denoise. The hard-conditioning experiment (clean first frame without per-token timestep signal) made MAE 32 worse, confirming the model REQUIRES per-frame sigma signalling. Refactor `SanaWmTimestepEmbedder` + `t_block` + block forward to accept per-frame timesteps, switch the wrapped DPM scheduler to a per-token-timestep flow-matching step, and add `tokens_to_denoise_mask`. 1-2 person days. See §6.13.
 
 ---
 

@@ -1560,7 +1560,14 @@ class SanaWmBlock(nn.Module):
         ).chunk(6, dim=1)
         attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
         attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_conditions)
-        if camera_hidden_states is not None and self.plucker_proj is not None:
+        plucker_proj_disabled = os.environ.get(
+            "VLLM_OMNI_SANA_WM_DISABLE_PLUCKER_PROJ", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        if (
+            camera_hidden_states is not None
+            and self.plucker_proj is not None
+            and not plucker_proj_disabled
+        ):
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         hidden_states = hidden_states + gate_msa * attn_output
         hidden_states = hidden_states + self.cross_attn(hidden_states, encoder_hidden_states)
