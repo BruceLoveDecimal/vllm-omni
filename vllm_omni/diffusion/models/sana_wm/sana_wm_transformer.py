@@ -578,12 +578,56 @@ class SanaWmSelfAttention(nn.Module):
                 prefix=f"{prefix}.output_gate" if prefix else "output_gate",
                 disable_tp=_disable_tp_for_vllm_layer(),
             )
+            self.q_proj_cam = ColumnParallelLinear(
+                hidden_size,
+                self.cam_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_proj_cam" if prefix else "q_proj_cam",
+                disable_tp=_disable_tp_for_vllm_layer(),
+            )
+            self.k_proj_cam = ColumnParallelLinear(
+                hidden_size,
+                self.cam_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.k_proj_cam" if prefix else "k_proj_cam",
+                disable_tp=_disable_tp_for_vllm_layer(),
+            )
+            self.v_proj_cam = ColumnParallelLinear(
+                hidden_size,
+                self.cam_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.v_proj_cam" if prefix else "v_proj_cam",
+                disable_tp=_disable_tp_for_vllm_layer(),
+            )
+            self.out_proj_cam = RowParallelLinear(
+                self.cam_dim,
+                hidden_size,
+                bias=True,
+                input_is_parallel=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.out_proj_cam" if prefix else "out_proj_cam",
+                disable_tp=_disable_tp_for_vllm_layer(),
+            )
         else:
             self.qkv = nn.Linear(hidden_size, self.num_heads * self.head_dim * 3, bias=False)
             self.proj = nn.Linear(self.num_heads * self.head_dim, hidden_size)
             self.beta_proj = nn.Linear(hidden_size, self.num_heads)
             self.gate_proj = nn.Linear(hidden_size, self.num_heads)
             self.output_gate = nn.Linear(hidden_size, hidden_size)
+            self.q_proj_cam = nn.Linear(hidden_size, self.cam_dim, bias=True)
+            self.k_proj_cam = nn.Linear(hidden_size, self.cam_dim, bias=True)
+            self.v_proj_cam = nn.Linear(hidden_size, self.cam_dim, bias=True)
+            self.out_proj_cam = nn.Linear(self.cam_dim, hidden_size, bias=True)
         local_inner_dim = self.num_heads * self.head_dim
         norm_cls = _maybe_make_vllm_rms_norm if config.qk_norm else (lambda *_args, **_kwargs: nn.Identity())
         self.q_norm = norm_cls(local_inner_dim)
@@ -621,10 +665,9 @@ class SanaWmSelfAttention(nn.Module):
         self.cam_dim = hidden_size // cam_compress
         self.cam_heads = max(self.num_heads // cam_compress, 1)
         self.cam_head_dim = self.cam_dim // self.cam_heads
-        self.q_proj_cam = nn.Linear(hidden_size, self.cam_dim, bias=True)
-        self.k_proj_cam = nn.Linear(hidden_size, self.cam_dim, bias=True)
-        self.v_proj_cam = nn.Linear(hidden_size, self.cam_dim, bias=True)
-        self.out_proj_cam = nn.Linear(self.cam_dim, hidden_size, bias=True)
+        # q_proj_cam / k_proj_cam / v_proj_cam / out_proj_cam are initialised
+        # in the TP/fallback conditional above so they follow the same
+        # ColumnParallelLinear / RowParallelLinear pattern as qkv and proj.
         self.q_norm_cam = norm_cls(self.cam_dim)
         self.k_norm_cam = norm_cls(self.cam_dim)
         self.conv_k_cam = (
@@ -1104,7 +1147,22 @@ class SanaWmBlock(nn.Module):
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp = SanaWmMbConvFfn(config)
-        self.plucker_proj = nn.Linear(hidden_size, hidden_size) if use_plucker_proj else None
+        if use_plucker_proj:
+            if use_vllm_parallel_layers and _vllm_parallel_layers_available() and ColumnParallelLinear is not None:
+                self.plucker_proj: nn.Module | None = ColumnParallelLinear(
+                    hidden_size,
+                    hidden_size,
+                    bias=True,
+                    gather_output=True,
+                    return_bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.plucker_proj" if prefix else "plucker_proj",
+                    disable_tp=_disable_tp_for_vllm_layer(),
+                )
+            else:
+                self.plucker_proj = nn.Linear(hidden_size, hidden_size)
+        else:
+            self.plucker_proj = None
         self.scale_shift_table = nn.Parameter(torch.zeros(6, hidden_size))
 
     @staticmethod
@@ -1127,7 +1185,7 @@ class SanaWmBlock(nn.Module):
         attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
         attn_output = self.attn(attn_input, spatial_shape, rotary_emb)
         if camera_hidden_states is not None and self.plucker_proj is not None:
-            attn_output = attn_output + self.plucker_proj(camera_hidden_states)
+            attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         hidden_states = hidden_states + gate_msa * attn_output
         hidden_states = hidden_states + self.cross_attn(hidden_states, encoder_hidden_states)
         mlp_input = self._modulate(self.norm2(hidden_states), shift_mlp, scale_mlp)
@@ -1136,17 +1194,39 @@ class SanaWmBlock(nn.Module):
 
 
 class SanaWmFinalLayer(nn.Module):
-    def __init__(self, hidden_size: int, patch_size: tuple[int, int, int], out_channels: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        patch_size: tuple[int, int, int],
+        out_channels: int,
+        *,
+        quant_config: Any = None,
+        use_vllm_parallel_layers: bool = True,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.scale_shift_table = nn.Parameter(torch.zeros(2, hidden_size))
-        self.linear = nn.Linear(hidden_size, _prod(patch_size) * out_channels)
         self.out_channels = out_channels
+        out_features = _prod(patch_size) * out_channels
+        if use_vllm_parallel_layers and _vllm_parallel_layers_available() and ColumnParallelLinear is not None:
+            self.linear: nn.Module = ColumnParallelLinear(
+                hidden_size,
+                out_features,
+                bias=True,
+                gather_output=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.linear" if prefix else "linear",
+                disable_tp=_disable_tp_for_vllm_layer(),
+            )
+        else:
+            self.linear = nn.Linear(hidden_size, out_features)
 
     def forward(self, hidden_states: torch.Tensor, timestep_embed: torch.Tensor) -> torch.Tensor:
         shift, scale = (self.scale_shift_table[None] + timestep_embed[:, None]).chunk(2, dim=1)
         hidden_states = self.norm_final(hidden_states) * (1 + scale) + shift
-        return self.linear(hidden_states)
+        return _linear_output(self.linear(hidden_states))
 
 
 class SanaWmTransformer3DModel(nn.Module):
@@ -1226,10 +1306,22 @@ class SanaWmTransformer3DModel(nn.Module):
             use_vllm_parallel_layers=self.use_vllm_parallel_layers,
             prefix=f"{self.prefix}.t_embedder" if self.prefix else "t_embedder",
         )
-        self.t_block = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(self.config.hidden_size, 6 * self.config.hidden_size),
-        )
+        # t_block: SiLU → Linear(hidden, 6*hidden).  Weight key is t_block.1.{weight,bias}
+        # to match the Stage-1 checkpoint layout (nn.Sequential index 1).
+        if self.use_vllm_parallel_layers and ColumnParallelLinear is not None:
+            _t_block_linear: nn.Module = ColumnParallelLinear(
+                self.config.hidden_size,
+                6 * self.config.hidden_size,
+                bias=True,
+                gather_output=True,
+                return_bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{self.prefix}.t_block.1" if self.prefix else "t_block.1",
+                disable_tp=_disable_tp_for_vllm_layer(),
+            )
+        else:
+            _t_block_linear = nn.Linear(self.config.hidden_size, 6 * self.config.hidden_size)
+        self.t_block = nn.Sequential(nn.SiLU(), _t_block_linear)
         self.plucker_embedder = SanaWmPatchEmbedMS3D(
             self.patch_size,
             self.config.chunk_plucker_channels,
@@ -1248,10 +1340,17 @@ class SanaWmTransformer3DModel(nn.Module):
                 for i in range(self.config.num_blocks)
             ]
         )
-        self.final_layer = SanaWmFinalLayer(self.config.hidden_size, self.patch_size, self._latent_channels)
+        self.final_layer = SanaWmFinalLayer(
+            self.config.hidden_size,
+            self.patch_size,
+            self._latent_channels,
+            quant_config=self.quant_config,
+            use_vllm_parallel_layers=self.use_vllm_parallel_layers,
+            prefix=f"{self.prefix}.final_layer" if self.prefix else "final_layer",
+        )
         self.pos_embed = nn.Parameter(torch.zeros(1, 484, self.config.hidden_size))
         self.rope = SanaWmWanRotaryPosEmbed(self.config.linear_head_dim)
-        self.attention_y_norm = SanaWmRMSNorm(self.config.hidden_size)
+        self.attention_y_norm = _maybe_make_vllm_rms_norm(self.config.hidden_size)
         self.to(device=device, dtype=dtype)
         self._is_materialized = True
         self._apply_loaded_tensors_to_materialized()
@@ -1514,7 +1613,10 @@ class SanaWmTransformer3DModel(nn.Module):
         elif timestep.ndim == 1 and timestep.shape[0] == 1 and batch_size > 1:
             timestep = timestep.expand(batch_size)
         time_embed = self.t_embedder(timestep)
-        timestep_modulation = self.t_block(time_embed).to(hidden_states.dtype)
+        # t_block is Sequential(SiLU, Linear|ColumnParallelLinear); index explicitly
+        # so _linear_output can unwrap the (tensor, None) tuple from parallel layers.
+        _t_silu = self.t_block[0](time_embed)
+        timestep_modulation = _linear_output(self.t_block[1](_t_silu)).to(hidden_states.dtype)
 
         if camera_hidden_states is None:
             camera_hidden_states = self._camera_hidden_states_from_conditions(
