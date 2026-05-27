@@ -1,23 +1,25 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-05-27 (revision 9)
-> **Branch:** `feat/sana_wm` (reviewed from `claude/sana-wm-production-readiness-hkmjA`)
-> **Implementation HEAD:** `7148ecdf test(sana-wm): harden GDN Triton coverage`
+> **Audit date:** 2026-05-27 (revision 10 — post-rev-9 branch sync pass)
+> **Branch:** `feat/sana_wm`
+> **Implementation HEAD:** `7317c76e test(sana-wm): add unit and GPU tests for TP-layer completeness (5a)`
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
-> **Worktree state at audit:** clean
+> **Worktree state at audit:** dirty — uncommitted in-flight deltas present
+> (`cuda_graph.py`, Cache-DiT registration, pipeline CUDA-graph wiring,
+> `attention_y_norm` vLLM RMSNorm, `_sp_plan` USP test). See §1.6.
 > **Spec (single source of truth):**
-> [`sana_wm_integration.md`](sana_wm_integration.md) — see new section
-> **"Native Stage-1 Production Readiness Gap (post-revision-8 review)"**
-> for the consolidated five-item critical path.
+> [`sana_wm_integration.md`](sana_wm_integration.md), including the
+> "Native Production Readiness Readiness Checklist" and
+> "Rev-9 framework-integration progress" sections.
 > **Tracking issue:**
 > [vllm-project/vllm-omni#3656](https://github.com/vllm-project/vllm-omni/issues/3656).
 >
-> This is a snapshot. The previous audit (revision 8, 2026-05-26)
-> remains the body of this document below; this revision-9 header
-> consolidates an independent gap review against the actual code
-> on `feat/sana_wm@7148ecdf`. Each gap below was verified against
-> the file it concerns and cross-references the spec section that
-> owns the acceptance criterion.
+> Revision 9 (2026-05-27) was an independent peer review against the code
+> on `feat/sana_wm@7148ecdf`, consolidating a five-item critical path.
+> Revision 10 records three implementation commits that landed after that
+> snapshot plus the single-GPU-vs-HA scoping pass, and updates §0.4,
+> §3, §4, §6, and §9 accordingly. The §0 analysis block is retained
+> verbatim; annotations are appended where the code has moved forward.
 
 ## 0. Revision 9 — Native Stage-1 Production Readiness Gap (2026-05-27)
 
@@ -139,13 +141,74 @@ test, threshold tightening. Item 2 of revision 9 (VAE encode in
 the pipeline) is upstream of Kimi's VAE *test* — once the encode
 exists in the pipeline, the test becomes natural to write.
 
+### 0.6 Post-revision-9 progress on §0.4 step 7 (TP layers)
+
+This block was added in revision 10 to annotate §0.3/§0.4 item 5
+("TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG)"):
+
+Two commits landed between the revision-9 review baseline
+(`7148ecdf`) and the current HEAD (`7317c76e`):
+
+- `63c58d08 feat(sana-wm): wire vLLM parallel layers for stage1` —
+  FFN, cross-attention, and GDN projection paths in Stage-1 now use
+  `ColumnParallelLinear` / `QKVParallelLinear` / `RowParallelLinear`
+  when the vLLM stack is importable; `quant_config` is threaded.
+  `test_sana_wm_vllm_infra.py` pins the contract.
+- `845247bd feat(sana-wm): wire attention sp and coverage tests` —
+  `SanaWmTransformer3DModel._sp_plan` now declares
+  `SequenceParallelInput(split_dim=1)` per block and
+  `SequenceParallelOutput(gather_dim=1)` at `final_layer`.
+  Scheduler call-sequence tests and richer camera-control coverage
+  also land in this commit.
+
+These directly advance §0.4 step 7, but do **not** close it:
+camera attention (`q_proj_cam` / `k_proj_cam` / `v_proj_cam` /
+`out_proj_cam`), `x_embedder.proj` (Conv3d), `t_block` 6×
+modulation, `final_layer.linear`, `plucker_proj`, and
+`quant_config` end-to-end audit across non-migrated sites are still
+open. Real USP validation under step 7 of §0.4 remains GPU-gated.
+
+Items 1–4 of §0.3 (GDN parity, VAE encode, scheduler, camera UCPE)
+are **unchanged** by these commits — the single-GPU correctness
+blockers remain.
+
+In addition, a commit `c77360a3 feat(sana-wm): complete TP-layer
+coverage for remaining plain nn.Linear paths` landed between
+`63c58d08` and HEAD. That commit further closes the residual
+`nn.Linear` sites. The remaining open sites per a post-landing
+code audit are enumerated in §6 item 4 (revised below).
+
 ---
 
-## 1. TL;DR (revision 8, retained verbatim below for diff continuity)
+## 1. TL;DR
 
-Overall progress against the post-release implementation plan:
+> **Revision 10 update (single-GPU vs HA scoping).** Overall progress
+> depends on the target:
+>
+> - **Single-GPU production-native inference: ~85–90%.** The remaining
+>   10–15% is dominated by the four correctness blockers in §0.3 items
+>   1–4 (GDN parity, first-frame VAE encode, real flow-DPM scheduler,
+>   camera-branch UCPE exactness). CUDA Graphs + Cache-DiT code is
+>   queued (uncommitted, §1.6) and unblocks throughput work once
+>   correctness closes.
+> - **Highly-available multi-card inference (TP/SP/HSDP + quant +
+>   live server): ~75–80%.** On top of the four blockers, requires
+>   completing the vLLM-parallel-layer migration for remaining sites
+>   (see §0.6 and §6 item 4), `quant_config` end-to-end, real USP
+>   sweep, HSDP / CFG-parallel runs, multi-card GDN correctness, and
+>   a live server smoke.
+>
+> Headline change in revision 10: vLLM parallel layers and `_sp_plan`
+> are now wired (commits `63c58d08`, `845247bd`, `c77360a3`,
+> `7317c76e`), narrowing the framework-consistency gap from Kimi's
+> review. Items 1–4 of §0.3 are unaffected by these commits.
+
+---
+
+Overall progress against the post-release implementation plan as of
+revision 8 snapshot (retained below for diff continuity):
 **roughly 82–85%** (up from 40–45% in the 2026-05-24 snapshot, and
-from ~80% in revision 7). Headline change in this revision: the
+from ~80% in revision 7). Headline change in revision 8: the
 reference-alignment harness is no longer just wired — it has produced
 a concrete measurement on the real GPU instance.
 
@@ -196,6 +259,80 @@ have now been numerically compared on the same prompt + camera at the
 decoded-frame level; the gap is bounded (`MAE = 69.64 / 255.0`) but a
 quality-grade threshold (PSNR ≥ 30 / SSIM ≥ 0.93 per spec) still needs
 to be wired and met.
+
+## 1.6. Changes since revision 8 (revision 10 addendum)
+
+Four commits landed on `feat/sana_wm` after the revision-8 audit
+snapshot (`7148ecdf`), plus a set of uncommitted in-flight deltas:
+
+```text
+7317c76e  test(sana-wm): add unit and GPU tests for TP-layer completeness (5a) ← HEAD
+c77360a3  feat(sana-wm): complete TP-layer coverage for remaining plain nn.Linear paths
+845247bd  feat(sana-wm): wire attention sp and coverage tests
+63c58d08  feat(sana-wm): wire vLLM parallel layers for stage1
+b57e96b5  docs(sana_wm): add vLLM infra integration deep-dive (Kimi)
+```
+
+Concrete deltas in `63c58d08 feat(sana-wm): wire vLLM parallel layers for stage1`:
+
+- Stage-1 transformer FFN / cross-attention / GDN projection paths now
+  use `ColumnParallelLinear` / `QKVParallelLinear` / `RowParallelLinear`
+  when the vLLM stack is importable. Fallback to `nn.Linear` on pure
+  CPU / unit-test environments.
+- `quant_config` threaded through `SanaWmTransformer3DModel.__init__`
+  and each parallel layer constructor.
+- `pipeline_sana_wm.py` propagates `quant_config` via
+  `prefix=...transformer`.
+- `test_sana_wm_vllm_infra.py` (62 LOC, new): contract test that the
+  parallel constructors are used when the vLLM layer stack is available.
+
+Concrete deltas in `845247bd feat(sana-wm): wire attention sp and coverage tests`:
+
+- `SanaWmTransformer3DModel._sp_plan` declares
+  `SequenceParallelInput(split_dim=1)` at every block for
+  `hidden_states` + `camera_hidden_states`, and
+  `SequenceParallelOutput(gather_dim=1)` at `final_layer`. No-op when
+  `vllm_omni.diffusion.distributed.sp_plan` is not importable.
+- `test_sana_wm_pipeline.py` grew to 271 LOC: scheduler call-sequence
+  test, CUDA-graph default contract.
+- `test_sana_wm_camera_control.py` grew to 46 LOC: shape + finiteness
+  checks on camera conditions.
+
+Concrete deltas in `c77360a3 feat(sana-wm): complete TP-layer coverage for remaining plain nn.Linear paths`:
+
+- Further closes the residual `nn.Linear` sites identified after
+  `63c58d08`. Camera attention projections (`q_proj_cam` /
+  `k_proj_cam` / `v_proj_cam` / `out_proj_cam`) and additional minor
+  projection paths migrated. See `test_sana_wm_vllm_infra.py` for the
+  updated coverage matrix.
+
+Concrete deltas in `7317c76e test(sana-wm): add unit and GPU tests for TP-layer completeness (5a)`:
+
+- GPU-gated TP-layer completeness tests to lock in the correctness of
+  the parallel-layer migration under non-trivial batch shapes.
+
+In-flight uncommitted deltas at audit time (not yet in `git log`):
+
+- `vllm_omni/diffusion/models/sana_wm/cuda_graph.py` (271 LOC, new):
+  `SanaWmCudaGraphDenoiser` per-bucket replay. Gated by
+  `VLLM_OMNI_SANA_WM_CUDAGRAPH=1` or
+  `extra_args["sana_wm_cudagraph"]=True`. Buckets default to
+  `(65, 129, 193, 257, 321)` frames; falls back to eager on capture
+  failure.
+- `pipeline_sana_wm.py` denoising loop wired through
+  `SanaWmCudaGraphDenoiser`; `custom_output["sana_wm_cudagraph_*"]`
+  exposes requested / used / capture-count / replay-count.
+- `cache_dit_backend.py`: `enable_cache_for_sana_wm` registered for
+  `SanaWmPipeline` and `SanaWmTwoStagesPipeline`, with deferred-
+  materialization handling that wraps `transformer.materialize`.
+- `sana_wm_transformer.py`: `attention_y_norm` switched from custom
+  `SanaWmRMSNorm` to `_maybe_make_vllm_rms_norm`.
+- `test_sana_wm_hsdp.py`: adds `_sp_plan` USP split/gather contract.
+
+These uncommitted items land single-GPU performance scaffolding behind
+feature flags. They do not affect the four correctness blockers in §0.3
+and should be committed after a GPU smoke confirms the CUDA-graph
+capture path does not regress the existing fused-GDN e2e.
 
 ## 1.5. Changes since revision 7
 
@@ -613,14 +750,16 @@ and recorded in §1.1.)
    `SANA_WM_E2E_REFERENCE_MAX_MAE=255.0` is a sanity guard, not a
    quality gate. The spec's `PSNR ≥ 30 / SSIM-Y All ≥ 0.93` still
    needs to be wired in addition to (or replacing) the coarse MAE.
-4. **Stage-1 native is not yet wired through vLLM TP-aware layers.**
-   Per Kimi's review (msg `ee738f7c` ⭐⭐☆☆☆ on framework consistency),
-   `SanaWmTransformer3DModel` uses plain `nn.Linear` / `nn.Conv3d`
-   instead of `QKVParallelLinear` / `ColumnParallelLinear` /
-   `RowParallelLinear` / vLLM `RMSNorm`. As a result, TP, SP, and
-   AWQ/GPTQ/FP8 quantization cannot be reused from the vLLM-Omni
-   layer stack without a follow-up refactor. **Largest medium-term
-   integration debt.**
+4. **vLLM infrastructure integration is partially closed (narrowed in
+   rev 10 commits, was ⭐⭐☆☆☆ in Kimi's review).** Commits
+   `63c58d08`, `845247bd`, `c77360a3` migrated Stage-1 FFN /
+   cross-attention / GDN projection paths to parallel linear layers,
+   threaded `quant_config`, and declared `_sp_plan`. Uncommitted delta
+   also switches `attention_y_norm` to `_maybe_make_vllm_rms_norm`.
+   Remaining open sites: `x_embedder.proj` (`nn.Conv3d`), `t_block` 6×
+   modulation linear, `final_layer.linear`, `plucker_proj` inside
+   `SanaWmPostAttention`; `quant_config` end-to-end audit; real USP /
+   multi-GPU validation of the new `_sp_plan`.
 5. **VAE and scheduler-loop unit tests still missing.** Kimi flagged
    these as the cheapest tests to add. LTX-2 has
    `tests/diffusion/distributed/test_autoencoder_kl_wan.py` etc., Wan2.2
@@ -699,16 +838,45 @@ tightening.)
 6. **dfx / HSDP / SP / CFG-parallel sweeps** per spec §"GPU tier
    policy" Tier 3.
 
-## 9. Suggested next-step ordering
+## 9. Suggested next-step ordering (revision 10)
 
-The biggest single open item is now **running** the reference-alignment harness
-against the official bridge once the GPU endpoint is reachable again:
+> This section supersedes revision 8's §9 (which ran the alignment
+> harness first). §0.4 revised the ordering in revision 9: items 1–2
+> of the original ordering cannot signal progress until the first-frame
+> VAE encode lands. Revision 10 refines §0.4 further by splitting
+> across two tracks tied to scope.
 
-1. Run `SANA_WM_E2E_REFERENCE_ALIGNMENT=1` on GPU and record MAE/shape results.
-2. Tighten the reference threshold and add PSNR/SSIM if MAE is stable.
-3. Run the 2-step in-process refiner e2e (`SANA_WM_E2E_REFINER_STEPS=2`).
-4. Run a live `/v1/videos/generations/sync` SANA-WM request against the OpenAI server.
-5. Run SP/USP/CFG-parallel/HSDP sweeps from the dfx perf config.
+### 9.1 Single-GPU production-native track (~85–90% done)
+
+Follow §0.4 steps 1–6, in order:
+
+1. **(no GPU)** Implement `_ensure_vae_encode` + first-frame slot
+   in `_run_native_smoke_backend`. Unit test with synthetic PIL image.
+2. **(no GPU)** Replace `SanaWmFlowDpmScheduler` with
+   `diffusers.FlowMatchDPMSolverMultistepScheduler` (preferred) or
+   NVlabs solver port. Add scheduler call-sequence test.
+3. **(no GPU)** Decompose `SanaWmCameraEmbedder` into real UCPE
+   sub-modules; add numeric Plücker reference test; hard-gate or
+   delete the smoke fallback.
+4. **(GPU)** Re-run `SANA_WM_E2E_REFERENCE_ALIGNMENT=1`; expect MAE
+   to drop from 69.64 to under 30 on 24f 256×448 smoke.
+5. **(GPU)** Tighten threshold; wire PSNR ≥ 30 / SSIM-Y ≥ 0.93.
+6. **(GPU)** GDN full-shape multi-step parity at 704×1280 / 321 frames.
+7. **(GPU smoke)** Commit the in-flight CUDA Graph + Cache-DiT plumbing
+   after confirming they do not regress the fused-GDN e2e, then collect
+   step-latency numbers.
+
+### 9.2 Highly-available multi-card track (~75–80% done, deferred)
+
+Following §0.4 step 8 and beyond:
+
+8. Complete remaining `nn.Linear` migration (see §6 item 4) and audit
+   `quant_config` end-to-end.
+9. Validate `_sp_plan` under a real USP run (multi-GPU, not CPU-static).
+10. HSDP + CFG-parallel sweeps from the dfx perf config.
+11. `fused_gdn_chunkwise.py` multi-card correctness pass.
+12. Live `/v1/videos/generations/sync` server smoke on GPU; add async
+    examples for `/v1/videos/generations`.
 
 ## 10. vLLM Infrastructure Integration Deep-Dive
 

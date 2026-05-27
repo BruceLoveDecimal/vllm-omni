@@ -1470,6 +1470,23 @@ on a microbenchmark and silently regress quality. Required ordering:
 
 Cross-ref: audit §6 items 4 and 9, §8 items 5 and 6, §10.
 
+### Rev-10 progress on item 5a
+
+Commits `63c58d08`, `845247bd`, `c77360a3`, and `7317c76e` landed
+after the revision-9 spec snapshot and partially close item 5a:
+Stage-1 FFN / cross-attention / GDN projection paths migrated to
+`ColumnParallelLinear` / `QKVParallelLinear` / `RowParallelLinear`;
+`quant_config` threaded; `_sp_plan` with explicit USP split/gather
+boundaries declared; GPU-gated TP-layer completeness tests added.
+Remaining item 5a debt (camera attention projections, `x_embedder`
+Conv3d, `t_block` modulation, `final_layer.linear`, `plucker_proj`,
+`quant_config` end-to-end, real USP sweep) is tracked in audit §0.6
+and §6 item 4.
+
+CUDA Graphs (`cuda_graph.py`) and Cache-DiT (`enable_cache_for_sana_wm`)
+scaffolding for items 5c–5d is on disk but uncommitted; GPU smoke
+required before landing.
+
 ### Recap — critical path to "production native"
 
 ```text
