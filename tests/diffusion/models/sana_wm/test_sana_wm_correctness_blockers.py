@@ -428,14 +428,29 @@ def test_pipeline_first_frame_encoded_flag_true_for_pil() -> None:
 
 
 # ===========================================================================
-# A.3 — _forward_ucpe and transformer camera conditioning
+# A.3 — UCPE camera branch (GDN+UCPE per-block attention)
 # ===========================================================================
+#
+# The original A.3 tests exercised an SDPA-based ``_forward_ucpe`` that
+# treated camera information as cross-attention K/V. That implementation
+# was reopened by the 2026-05-27 deep-dive (audit §6.10) and replaced with
+# a real bidirectional GDN+UCPE cam branch matching NVlabs' reference.
+# These tests now exercise the new ``_forward_cam_branch`` signature.
+
+
+def _make_tiny_camera_conditions(batch: int, frames: int):
+    """Build a (B, T, 20) raymap tensor with identity poses + safe intrinsics."""
+    import torch
+
+    c2w = torch.eye(4).unsqueeze(0).unsqueeze(0).repeat(batch, frames, 1, 1)
+    # Latent-pixel intrinsics. Use small fx/fy so the unprojected rays are
+    # well-defined for any (H, W) grid.
+    intrinsics = torch.tensor([[8.0, 8.0, 2.0, 2.0]]).repeat(batch, frames, 1)
+    return torch.cat([c2w.reshape(batch, frames, 16), intrinsics], dim=-1)
 
 
 def test_sana_wm_self_attention_cam_dim_set_before_projections() -> None:
     """cam_dim must be set before the TP/fallback branch so projection sizes are correct."""
-    import torch
-
     from vllm_omni.diffusion.models.sana_wm import SanaWmConfig
     from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import SanaWmSelfAttention
 
@@ -449,8 +464,8 @@ def test_sana_wm_self_attention_cam_dim_set_before_projections() -> None:
     assert attn.out_proj_cam.out_features == cfg.hidden_size
 
 
-def test_forward_ucpe_output_shape() -> None:
-    """_forward_ucpe must return tensor with same shape as hidden_states."""
+def test_forward_cam_branch_output_shape() -> None:
+    """_forward_cam_branch must return (B, N, cam_dim) raw output."""
     import torch
 
     from vllm_omni.diffusion.models.sana_wm import SanaWmConfig
@@ -460,20 +475,30 @@ def test_forward_ucpe_output_shape() -> None:
     attn = SanaWmSelfAttention(cfg, use_gdn=True, use_vllm_parallel_layers=False)
     attn.eval()
 
-    batch, seq, d = 1, 6, cfg.hidden_size
-    hidden = torch.randn(batch, seq, d)
-    camera = torch.randn(batch, seq, d)
+    batch = 1
     spatial_shape = (2, 1, 3)  # F*H*W == 6
+    frames, height, width = spatial_shape
+    seq = frames * height * width
+    hidden = torch.randn(batch, seq, cfg.hidden_size)
+    camera_conditions = _make_tiny_camera_conditions(batch, frames)
+    # Precompute gates with the same code path forward() uses.
+    beta, decay = attn._compute_frame_gates(hidden, spatial_shape)
 
     with torch.no_grad():
-        out = attn._forward_ucpe(hidden, camera, spatial_shape)
+        out = attn._forward_cam_branch(
+            hidden,
+            spatial_shape,
+            camera_conditions,
+            rotary_emb=None,
+            precomputed_gates=(beta, decay),
+        )
 
-    assert out.shape == hidden.shape
+    assert out.shape == (batch, seq, attn.cam_dim)
     assert torch.isfinite(out).all()
 
 
-def test_forward_ucpe_changes_output() -> None:
-    """With fixed weights, UCPE should produce a non-zero contribution."""
+def test_forward_with_camera_conditions_changes_output() -> None:
+    """forward() must produce a different result when camera_conditions is provided."""
     import torch
 
     from vllm_omni.diffusion.models.sana_wm import SanaWmConfig
@@ -484,14 +509,23 @@ def test_forward_ucpe_changes_output() -> None:
     attn = SanaWmSelfAttention(cfg, use_gdn=True, use_vllm_parallel_layers=False)
     attn.eval()
 
-    batch, seq, d = 1, 4, cfg.hidden_size
-    hidden = torch.randn(batch, seq, d)
-    camera = torch.randn(batch, seq, d)
+    batch = 1
+    spatial_shape = (2, 1, 3)
+    frames, height, width = spatial_shape
+    seq = frames * height * width
+    hidden = torch.randn(batch, seq, cfg.hidden_size)
+    camera_conditions = _make_tiny_camera_conditions(batch, frames)
 
     with torch.no_grad():
-        ucpe_out = attn._forward_ucpe(hidden, camera, None)
+        out_no_cam = attn(hidden, spatial_shape, rotary_emb=None, camera_conditions=None)
+        out_with_cam = attn(
+            hidden, spatial_shape, rotary_emb=None, camera_conditions=camera_conditions
+        )
 
-    assert not torch.allclose(ucpe_out, torch.zeros_like(ucpe_out))
+    # With at-init weights cam_contrib may be small but must not be exactly
+    # equal to the main-only path. Use a relaxed tolerance.
+    assert not torch.allclose(out_no_cam, out_with_cam, atol=0.0, rtol=0.0)
+    assert torch.isfinite(out_with_cam).all()
 
 
 def test_self_attention_forward_with_camera_differs_from_without() -> None:

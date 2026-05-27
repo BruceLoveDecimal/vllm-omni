@@ -1159,6 +1159,16 @@ on CUDA with PyTorch fallback. Small fused-vs-reference parity passes
 (`atol=rtol=1e-2`) and the multi-shape / fp32+bf16 / disable-env /
 warmup matrix added in `7148ecdf` passes on RTX PRO 6000 Blackwell.
 
+**Main-branch math is verified equivalent to NVlabs.** Deep-dive on
+2026-05-27 (audit §6.10) confirmed that `_delta_scan`, bidirectional
+`flip_and_shift`, bidirectional short conv, β/decay gates, ReLU
+kernel placement, `prepare_rope_tables` pair-sign encoding, and
+RMSNorm over hidden_size all match `torch_recurrent_sana_gdn` and
+`BidirectionalGDN.forward` line-for-line. The catastrophic
+reference-alignment MAE (95.82 on 2026-05-27) is **not** caused by
+the GDN recurrence itself — it is caused by item 4 (cam branch
+missing, see §6.10 / item 4 of this section).
+
 **What's still open:**
 
 - **Frame-level parity vs. the official NVlabs path** at realistic
@@ -1333,7 +1343,17 @@ step loop without restructuring.
 
 Cross-ref: audit §7 item 2.
 
-### 4. Camera embedder — UCPE branch + numeric reference test
+### 4. Camera embedder + per-block UCPE attention
+
+> **Two distinct sub-problems, intentionally kept under one item.**
+> (a) The camera *embedder* converts Plücker / raymap inputs into
+>     hidden-state-shaped features. Partially closed by commit
+>     `f7e59121` A.3.
+> (b) The per-block *UCPE attention branch* is what makes those
+>     features actually condition the recurrence. Verified missing
+>     on 2026-05-27 — see sub-section 4b below.
+
+#### 4a. Camera embedder structure
 
 **Status (verified in code):** `SanaWmCameraEmbedder` is two trivial
 projections:
@@ -1409,6 +1429,118 @@ trajectory (e.g. straight-line `w-80,w-40,w-40,w-100`).
 ```
 
 Cross-ref: audit §6 item 6, §7 item 3.
+
+#### 4b. Per-block UCPE attention branch (verified missing 2026-05-27)
+
+**Status (verified by deep-dive vs `sana_gdn_camctrl_blocks.py` on
+2026-05-27):** ❌ Not implemented. The camera *embedder* in 4a is
+correct shape and loads from the checkpoint, but the *per-block
+camera attention branch* that consumes its output is wrong on every
+axis that matters. Full evidence is in audit §6.10.
+
+**What NVlabs does** (`_GDNUCPEBase.forward`, ~70 LOC):
+
+```text
+1. precomputed_gates = self._compute_frame_gates(x, HW)    # shared
+2. main_raw = super().forward(x, ..., apply_output_gate=False,
+                              precomputed_gates=precomputed_gates)
+3. cam_raw  = self._forward_cam_branch(x, HW, camera_conditions,
+                                       rotary_emb,
+                                       precomputed_gates=precomputed_gates)
+   #  └── _prepare_cam_qkv: project → mask → conv → norm → ReLU →
+   #         scale → permute → UCPE per-ray transforms (q_cam_trans,
+   #         k_cam_trans) + inflation_sq
+   #  └── beta_cam = beta / inflation_sq.clamp_min(1.0)
+   #  └── bidirectional GDN recurrence with the SAME _delta_scan as
+   #         main branch, but using q_cam_trans/k_cam_trans as the
+   #         rotary inputs
+4. combined = main_raw + self.out_proj_cam(cam_raw)
+5. output   = self.proj(self._apply_output_gate(combined, x))
+```
+
+**What we have** (`SanaWmSelfAttention`):
+
+1. `_forward_ucpe` uses `F.scaled_dot_product_attention` — **wrong
+   operator family** (SDPA vs GDN recurrence with per-ray transforms).
+2. `_forward_ucpe` is **never invoked** from `forward()` — verified
+   by grep. `camera_hidden_states` is accepted as a kwarg and dropped.
+3. `_forward_gdn` applies `output_gate` and `proj` directly on
+   `main_raw`, leaving no insertion point for `cam_contrib`.
+4. `prepare_prope_fns`, `_prepare_cam_qkv`, Dynamic Beta Discounting
+   (β ÷ inflation_sq) — none exist.
+5. `out_proj_cam`, `q_proj_cam`, `k_proj_cam`, `v_proj_cam`,
+   `q_norm_cam`, `k_norm_cam`, `conv_k_cam` are constructed and
+   weight-loaded but **dead code** at inference time.
+
+**Impact.** The 2026-05-27 reference-alignment harness reported
+MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 — essentially uncorrelated
+to the official path. That is exactly the signature of a model
+that has been stripped of its camera-conditioning mechanism: the
+GDN recurrence runs, the pipeline produces a 128-channel latent of
+the right shape, but the latent does not respond to the camera
+trajectory at all.
+
+**Required port (P0 — estimated 4–5 person-days):**
+
+```text
+1. New file vllm_omni/diffusion/models/sana_wm/ucpe.py
+   - Port prepare_prope_fns() from NVlabs sana_camctrl_blocks.py
+     (returns apply_fn_q, apply_fn_kv, apply_fn_o closures).
+   - Pure-PyTorch reference first; Triton fusion can come later.
+
+2. SanaWmSelfAttention._prepare_cam_qkv(...)
+   - Order: project (fused qkv_w) → mask → temporal short-conv →
+            q_norm_cam/k_norm_cam → ReLU → k_scale → permute →
+            UCPE transforms → inflation_sq measurement.
+
+3. SanaWmSelfAttention._forward_cam_branch(...)
+   - Reuse reference_bidirectional_gated_delta_net.
+   - Pass q_cam_trans / k_cam_trans as query_rot / key_rot.
+   - Pre-compute β / decay once at the block level; share between
+     main and cam branch; discount β_cam by inflation_sq.
+
+4. Refactor _forward_gdn to accept apply_output_gate: bool.
+   - When False, return raw GDN output (B, N, C) before
+     output_gate/proj.
+
+5. SanaWmSelfAttention.forward rewrite:
+       precomputed_gates = self._compute_frame_gates(x, spatial_shape)
+       main_raw = self._forward_gdn(x, spatial_shape, rotary_emb,
+                                    apply_output_gate=False,
+                                    precomputed_gates=precomputed_gates)
+       if camera_hidden_states is not None:
+           cam_raw = self._forward_cam_branch(
+               x, spatial_shape, camera_hidden_states, rotary_emb,
+               precomputed_gates=precomputed_gates)
+           combined = main_raw + self.out_proj_cam(cam_raw)
+       else:
+           combined = main_raw
+       gate = F.silu(self.output_gate(x))
+       return self.proj(combined * gate)
+
+6. Route camera_hidden_states from the top-level transformer
+   down to every block's forward() (currently the kwarg exists on
+   the attention layer but the block doesn't forward it).
+```
+
+**Acceptance criterion:**
+
+```text
+[ ] tests/diffusion/models/sana_wm/test_sana_wm_ucpe.py exists:
+    - UCPE prope_fns closures match NVlabs reference at atol=1e-5
+      fp32 on a fixed camera trajectory.
+[ ] tests/diffusion/models/sana_wm/test_sana_wm_block_vs_nvlabs.py
+    exists: single-block end-to-end forward, our block output vs
+    NVlabs _GDNUCPEBase.forward at atol=1e-4 fp32 single-card.
+[ ] _forward_ucpe is either deleted or rewritten to use GDN
+    recurrence; SDPA on the cam branch is gone.
+[ ] SanaWmSelfAttention.forward routes camera_hidden_states into
+    a cam branch when present; verified by grep.
+[ ] e2e reference-alignment MAE drops below 30 (currently 95.82),
+    proving the cam branch is contributing.
+```
+
+Cross-ref: audit §6.10, audit §7 item 10.
 
 ### 5. Performance optimisations — ordered DAG, not parallel todos
 
@@ -1489,12 +1621,21 @@ required before landing.
 
 ### Recap — critical path to "production native"
 
+> **Updated 2026-05-27** after deep-dive vs NVlabs reference: item 4
+> (camera UCPE branch) is the dominant blocker for reference
+> alignment — not the GDN kernel. Main-branch GDN math is verified
+> equivalent. See §6.10 of the audit and item 4b above.
+
 ```text
 ITEM 2 (VAE encode)      ───┐
                             ├── ITEM 3 (scheduler) ───┐
-ITEM 4 (camera UCPE)     ───┘                          ├── reference-
-                                                       │   alignment
-ITEM 1 (GDN long-seq parity)  ─────────────────────────┘   tightening
+ITEM 4 (camera UCPE)*    ───┘                          ├── reference-
+   * dominant blocker —                                │   alignment
+     reopened by audit §6.10                           │   tightening
+                                                       │
+ITEM 1 (GDN long-seq parity)  ─────────────────────────┘
+   main-branch math verified;
+   long-seq Triton parity still open
                                                                 │
 ITEM 5a (TP layers)  ───────────────────────────────────────────┤
                                                                 │

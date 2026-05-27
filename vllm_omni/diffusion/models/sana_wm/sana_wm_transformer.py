@@ -28,6 +28,7 @@ from vllm_omni.diffusion.models.sana_wm.gated_deltanet_triton import (
     reference_bidirectional_gated_delta_net,
     triton_bidirectional_gated_delta_net_from_qkv,
 )
+from vllm_omni.diffusion.models.sana_wm.ucpe import prepare_prope_fns
 from vllm_omni.diffusion.models.sana_wm.weight_mapping import normalize_sana_wm_stage1_weight_name
 
 try:
@@ -872,12 +873,21 @@ class SanaWmSelfAttention(nn.Module):
 
         return restore(numerators, head_dim), restore(denominators, 1)
 
-    def _forward_gdn(
+    def _forward_gdn_raw(
         self,
         hidden_states: torch.Tensor,
         spatial_shape: tuple[int, int, int],
         rotary_emb: torch.Tensor | None,
-    ) -> torch.Tensor:
+        *,
+        precomputed_gates: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Run main-branch bidirectional GDN and return the (B, N, q_size)
+        raw output BEFORE ``output_gate`` and ``proj`` are applied.
+
+        Returns ``(raw_output, (beta, decay))`` so the caller can share the
+        beta/decay gates with the camera branch (matches NVlabs' shared
+        ``precomputed_gates`` plumbing).
+        """
         batch_size, token_count, _hidden_size = hidden_states.shape
         frames, height, width = spatial_shape
         spatial_tokens = height * width
@@ -890,7 +900,10 @@ class SanaWmSelfAttention(nn.Module):
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
         if self.conv_k is not None:
             key = self._bidirectional_temporal_short_conv(key, self.conv_k, spatial_shape)
-        beta, decay = self._compute_frame_gates(hidden_states, spatial_shape)
+        if precomputed_gates is None:
+            beta, decay = self._compute_frame_gates(hidden_states, spatial_shape)
+        else:
+            beta, decay = precomputed_gates
 
         if hidden_states.is_cuda:
             qkv = torch.stack(
@@ -914,8 +927,7 @@ class SanaWmSelfAttention(nn.Module):
                     eps=self.eps,
                 )
                 output = output.permute(0, 3, 1, 2).reshape(batch_size, token_count, q_size)
-                gate = F.silu(_linear_output(self.output_gate(hidden_states)).float()).to(output.dtype)
-                return _linear_output(self.proj((output * gate).to(_linear_weight_dtype(self.proj))))
+                return output, (beta, decay)
             except Exception:
                 if os.environ.get(SANA_WM_REQUIRE_TRITON_GDN_ENV, "").lower() in {"1", "true", "yes", "on"}:
                     raise
@@ -949,8 +961,30 @@ class SanaWmSelfAttention(nn.Module):
             eps=self.eps,
         )
         output = output.permute(0, 3, 1, 2).reshape(batch_size, token_count, q_size)
-        gate = F.silu(_linear_output(self.output_gate(hidden_states)).float()).to(output.dtype)
-        return _linear_output(self.proj((output * gate).to(_linear_weight_dtype(self.proj))))
+        return output, (beta, decay)
+
+    def _apply_output_gate_and_proj(
+        self,
+        combined: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply SiLU output gate (driven by hidden_states) + final projection.
+
+        Centralised so the same shared gate/proj path is applied whether or
+        not the camera branch contributes to ``combined``.
+        """
+        gate = F.silu(_linear_output(self.output_gate(hidden_states)).float()).to(combined.dtype)
+        return _linear_output(self.proj((combined * gate).to(_linear_weight_dtype(self.proj))))
+
+    def _forward_gdn(
+        self,
+        hidden_states: torch.Tensor,
+        spatial_shape: tuple[int, int, int],
+        rotary_emb: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Main-branch only GDN forward with output_gate + proj applied."""
+        raw, _ = self._forward_gdn_raw(hidden_states, spatial_shape, rotary_emb)
+        return self._apply_output_gate_and_proj(raw, hidden_states)
 
     def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_size = tensor.shape
@@ -965,69 +999,218 @@ class SanaWmSelfAttention(nn.Module):
         batch, _, seq_len, _ = tensor.shape
         return tensor.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
 
-    def _forward_ucpe(
+    def _forward_cam_branch(
         self,
         hidden_states: torch.Tensor,
-        camera_hidden_states: torch.Tensor,
-        spatial_shape: tuple[int, int, int] | None,
+        spatial_shape: tuple[int, int, int],
+        camera_conditions: torch.Tensor,
+        rotary_emb: torch.Tensor | None,
+        *,
+        precomputed_gates: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """UCPE camera cross-attention: visual Q attends to camera K/V.
+        """UCPE camera branch — bidirectional GDN with per-ray Q/K/V transforms.
 
-        Implements BidirectionalGDNUCPESinglePathLiteLABothTriton using the
-        loaded q_proj_cam / k_proj_cam / v_proj_cam / out_proj_cam weights.
+        Mirrors NVlabs ``_GDNUCPEBase._forward_cam_branch`` /
+        ``BidirectionalGDNUCPELiteLA._forward_cam_branch``:
+
+        1. Project Q/K/V from ``hidden_states`` (all three from x — UCPE is
+           NOT cross-attention; camera info enters via per-pixel projection
+           matrices).
+        2. Short conv on K (matching main branch ordering).
+        3. ``q_norm_cam`` / ``k_norm_cam`` (RMSNorm over cam_dim).
+        4. ReLU kernel + ``k_scale = D^-0.5 * S^-0.5``.
+        5. UCPE per-token block-diagonal transforms: half of head_dim goes
+           through ``apply_fn_q`` / ``apply_fn_kv`` (per-ray 4x4 projection +
+           sliced RoPE on the remaining half).
+        6. Dynamic Beta Discounting: β_cam = β / inflation_sq.clamp_min(1).
+        7. Bidirectional GDN recurrence (reuses
+           :func:`reference_bidirectional_gated_delta_net`).
+
+        Returns ``(B, N, cam_dim)`` raw — caller applies ``out_proj_cam`` and
+        the shared ``output_gate`` + ``proj``.
         """
-        q_cam = self.q_norm_cam(_linear_output(self.q_proj_cam(hidden_states)))
-        k_cam = self.k_norm_cam(_linear_output(self.k_proj_cam(camera_hidden_states)))
-        v_cam = _linear_output(self.v_proj_cam(camera_hidden_states))
+        batch_size, token_count, _ = hidden_states.shape
+        frames, height, width = spatial_shape
+        spatial_tokens = height * width
+        if token_count != frames * spatial_tokens:
+            raise ValueError(
+                f"Sana-WM cam branch expects N=T*H*W, got N={token_count}, THW={spatial_shape}."
+            )
 
-        if self.conv_k_cam is not None and spatial_shape is not None:
+        # Build the UCPE apply closures once per call. Future optimisation:
+        # hoist this to the block level so the same closures are reused
+        # across all 20 transformer blocks (NVlabs caches via prope_fns).
+        rotary_emb_freqs = rotary_emb.squeeze(0).squeeze(0) if rotary_emb is not None else None
+        if rotary_emb_freqs is not None and rotary_emb_freqs.ndim == 3:
+            # vLLM-Omni packs the rotary embedding as (1, 1, N, D//2) complex.
+            # Caller may also pass an already-squeezed (N, D//2) tensor.
+            rotary_emb_freqs = rotary_emb_freqs.squeeze(0)
+        apply_fn_q, apply_fn_kv, _ = prepare_prope_fns(
+            head_dim=self.cam_head_dim,
+            camera_conditions=camera_conditions,
+            HW=spatial_shape,
+            rotary_emb=rotary_emb_freqs,
+        )
+
+        # 1. Projections (all from x).
+        q_cam = _linear_output(self.q_proj_cam(hidden_states))
+        k_cam = _linear_output(self.k_proj_cam(hidden_states))
+        v_cam = _linear_output(self.v_proj_cam(hidden_states))
+
+        # 2. Short conv on K (and optionally Q, V — only K is enabled by the
+        # SANA-WM release, matching main branch).
+        if self.conv_k_cam is not None:
             k_cam = self._bidirectional_temporal_short_conv(k_cam, self.conv_k_cam, spatial_shape)
+        if self.conv_q_cam is not None:
+            q_cam = self._bidirectional_temporal_short_conv(q_cam, self.conv_q_cam, spatial_shape)
+        if self.conv_v_cam is not None:
+            v_cam = self._bidirectional_temporal_short_conv(v_cam, self.conv_v_cam, spatial_shape)
 
-        batch, seq_len, _ = hidden_states.shape
-        q_cam = q_cam.reshape(batch, seq_len, self.cam_heads, self.cam_head_dim).transpose(1, 2)
-        k_cam = k_cam.reshape(batch, camera_hidden_states.shape[1], self.cam_heads, self.cam_head_dim).transpose(1, 2)
-        v_cam = v_cam.reshape(batch, camera_hidden_states.shape[1], self.cam_heads, self.cam_head_dim).transpose(1, 2)
+        # 3. Q/K norm on flattened channel dim.
+        q_cam = self.q_norm_cam(q_cam)
+        k_cam = self.k_norm_cam(k_cam)
 
-        cam_attn = F.scaled_dot_product_attention(q_cam, k_cam, v_cam)
-        cam_out = cam_attn.transpose(1, 2).reshape(batch, seq_len, self.cam_dim)
-        return _linear_output(self.out_proj_cam(cam_out))
+        # Reshape to (B, N, H_cam, D_cam) then to (B, H_cam, N, D_cam) for
+        # UCPE apply (UCPE closures expect (B, num_heads, N, D)).
+        q_cam = q_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).transpose(1, 2)
+        k_cam = k_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).transpose(1, 2)
+        v_cam = v_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).transpose(1, 2)
+
+        # 4. ReLU kernel + k_scale.
+        q_cam = F.relu(q_cam)
+        k_cam = F.relu(k_cam)
+        k_scale = (self.cam_head_dim**-0.5) * (spatial_tokens**-0.5)
+        k_cam = k_cam * k_scale
+
+        # 5. UCPE per-token transforms. Measure K norm before and after the
+        # transform to compute the energy-inflation factor that scales β.
+        # apply_fn_q transforms only Q; apply_fn_kv transforms both K and V
+        # (fused to one call to match NVlabs).
+        pre_ucpe_k_norm = torch.linalg.vector_norm(k_cam, dim=-1, keepdim=True).clamp_min(1e-6)
+        q_cam_trans = apply_fn_q(q_cam)
+        kv_cam = torch.cat([k_cam, v_cam], dim=1)
+        kv_cam_trans = apply_fn_kv(kv_cam)
+        k_cam_trans, v_cam_trans = torch.chunk(kv_cam_trans, chunks=2, dim=1)
+        post_ucpe_k_norm = torch.linalg.vector_norm(k_cam_trans, dim=-1, keepdim=True).clamp_min(1e-6)
+        # inflation_sq: (B, H, N, 1) — mean over spatial within each frame
+        # for the β discount (NVlabs reduces to per-frame scalar before
+        # applying to β of shape (B, H, T, S)).
+        inflation_sq = (post_ucpe_k_norm / pre_ucpe_k_norm) ** 2  # (B, H, N, 1)
+
+        # 6. Dynamic Beta Discounting. β has shape (B, H, T, S). We need to
+        # compute frame-level inflation by averaging inflation_sq over the
+        # spatial tokens within each frame.
+        beta, decay = precomputed_gates
+        inflation_per_token = inflation_sq.squeeze(-1).reshape(
+            batch_size, self.cam_heads, frames, spatial_tokens
+        )
+        frame_inflation_sq = inflation_per_token.mean(dim=-1)  # (B, H_cam, T)
+        # β was computed for the MAIN branch with shape (B, num_heads_main, T, S).
+        # When cam_heads != num_heads_main we can't share β directly; broadcast
+        # by repeating along the head axis to match cam_heads.
+        if beta.shape[1] != self.cam_heads:
+            repeat_factor = self.cam_heads // beta.shape[1]
+            if repeat_factor * beta.shape[1] != self.cam_heads:
+                raise ValueError(
+                    "Sana-WM cam branch expects cam_heads to be a multiple of main heads,"
+                    f" got cam_heads={self.cam_heads} main_heads={beta.shape[1]}."
+                )
+            beta_cam = beta.repeat_interleave(repeat_factor, dim=1)
+            decay_cam = decay.repeat_interleave(repeat_factor, dim=1)
+        else:
+            beta_cam = beta
+            decay_cam = decay
+        # Discount β by per-frame inflation (clamp at 1 so we never amplify).
+        beta_cam = beta_cam / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
+
+        # 7. Bidirectional GDN recurrence on the cam branch. Reshape the
+        # tensors back to (B, H, D, N) layout that
+        # ``reference_bidirectional_gated_delta_net`` expects.
+        q_cam_bhdn = q_cam.permute(0, 1, 3, 2).contiguous()
+        k_cam_bhdn = k_cam.permute(0, 1, 3, 2).contiguous()
+        v_cam_bhdn = v_cam_trans.permute(0, 1, 3, 2).contiguous()
+        q_rot_bhdn = q_cam_trans.permute(0, 1, 3, 2).contiguous()
+        k_rot_bhdn = k_cam_trans.permute(0, 1, 3, 2).contiguous()
+
+        cam_out = reference_bidirectional_gated_delta_net(
+            q_cam_bhdn,
+            k_cam_bhdn,
+            v_cam_bhdn,
+            beta=beta_cam,
+            decay=decay_cam,
+            spatial_tokens=spatial_tokens,
+            query_rot=q_rot_bhdn,
+            key_rot=k_rot_bhdn,
+            eps=self.eps,
+        )
+        # (B, H_cam, D_cam, N) → (B, N, cam_dim)
+        cam_out = cam_out.permute(0, 3, 1, 2).reshape(batch_size, token_count, self.cam_dim)
+        return cam_out
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         spatial_shape: tuple[int, int, int] | None = None,
         rotary_emb: torch.Tensor | None = None,
-        camera_hidden_states: torch.Tensor | None = None,
+        camera_conditions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if spatial_shape is not None and self.use_gdn:
-            output = self._forward_gdn(hidden_states, spatial_shape, rotary_emb)
-        else:
-            qkv = _linear_output(self.qkv(hidden_states))
-            q_size = self.num_heads * self.head_dim
-            kv_size = self.num_kv_heads * self.head_dim
-            query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
-            if self.softmax_attn is not None:
-                query = self._reshape_to_seq_heads(self.q_norm(query))
-                key = self._reshape_to_seq_heads(self.k_norm(key))
-                value = self._reshape_to_seq_heads(value)
-                if rotary_emb is not None:
-                    query = self._apply_rotary_emb_to_sdpa(query.transpose(1, 2), rotary_emb).transpose(1, 2)
-                    key = self._apply_rotary_emb_to_sdpa(key.transpose(1, 2), rotary_emb).transpose(1, 2)
-                attn = self.softmax_attn(query, key, value)
-                output = _linear_output(self.proj(attn.flatten(2, 3)))
-            else:
-                query = self._split_heads(self.q_norm(query))
-                key = self._split_heads(self.k_norm(key))
-                value = self._split_heads(value)
-                if rotary_emb is not None:
-                    query = self._apply_rotary_emb_to_sdpa(query, rotary_emb)
-                    key = self._apply_rotary_emb_to_sdpa(key, rotary_emb)
-                attn = F.scaled_dot_product_attention(query, key, value)
-                output = _linear_output(self.proj(self._merge_heads(attn)))
+        """Forward with dual-branch GDN+UCPE when ``camera_conditions`` is
+        provided, otherwise main-branch-only GDN or softmax fallback.
 
-        if camera_hidden_states is not None:
-            output = output + self._forward_ucpe(hidden_states, camera_hidden_states, spatial_shape)
-        return output
+        ``camera_conditions`` is the raw ``(B, T_latent, 20)`` raymap tensor
+        produced by :func:`camera_control._pack_camera_conditions` — NOT the
+        embedder output. The cam branch consumes ``hidden_states`` as the
+        sole Q/K/V source and uses ``camera_conditions`` to build per-pixel
+        4x4 transforms that are applied to the Q/K/V channels via UCPE.
+        """
+        if spatial_shape is not None and self.use_gdn:
+            if camera_conditions is None or self.q_proj_cam is None:
+                # Main branch only — preserves legacy path when the request
+                # has no camera info or the cam projections were not built.
+                return self._forward_gdn(hidden_states, spatial_shape, rotary_emb)
+            # Dual-branch: precompute β/decay once, run main raw, cam raw,
+            # combine, then apply shared output_gate + proj exactly once.
+            beta, decay = self._compute_frame_gates(hidden_states, spatial_shape)
+            main_raw, _ = self._forward_gdn_raw(
+                hidden_states,
+                spatial_shape,
+                rotary_emb,
+                precomputed_gates=(beta, decay),
+            )
+            cam_raw = self._forward_cam_branch(
+                hidden_states,
+                spatial_shape,
+                camera_conditions,
+                rotary_emb,
+                precomputed_gates=(beta, decay),
+            )
+            cam_contrib = _linear_output(self.out_proj_cam(cam_raw))
+            combined = main_raw + cam_contrib.to(main_raw.dtype)
+            return self._apply_output_gate_and_proj(combined, hidden_states)
+
+        # Softmax-attention path (every-N-th block in NVlabs config) — UCPE
+        # is not yet ported for the softmax variant.
+        qkv = _linear_output(self.qkv(hidden_states))
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        if self.softmax_attn is not None:
+            query = self._reshape_to_seq_heads(self.q_norm(query))
+            key = self._reshape_to_seq_heads(self.k_norm(key))
+            value = self._reshape_to_seq_heads(value)
+            if rotary_emb is not None:
+                query = self._apply_rotary_emb_to_sdpa(query.transpose(1, 2), rotary_emb).transpose(1, 2)
+                key = self._apply_rotary_emb_to_sdpa(key.transpose(1, 2), rotary_emb).transpose(1, 2)
+            attn = self.softmax_attn(query, key, value)
+            return _linear_output(self.proj(attn.flatten(2, 3)))
+        query = self._split_heads(self.q_norm(query))
+        key = self._split_heads(self.k_norm(key))
+        value = self._split_heads(value)
+        if rotary_emb is not None:
+            query = self._apply_rotary_emb_to_sdpa(query, rotary_emb)
+            key = self._apply_rotary_emb_to_sdpa(key, rotary_emb)
+        attn = F.scaled_dot_product_attention(query, key, value)
+        return _linear_output(self.proj(self._merge_heads(attn)))
 
 
 class SanaWmCrossAttention(nn.Module):
@@ -1234,13 +1417,14 @@ class SanaWmBlock(nn.Module):
         spatial_shape: tuple[int, int, int],
         rotary_emb: torch.Tensor | None = None,
         camera_hidden_states: torch.Tensor | None = None,
+        camera_conditions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.scale_shift_table[None] + timestep_modulation.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
         attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
-        attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_hidden_states)
+        attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_conditions)
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         hidden_states = hidden_states + gate_msa * attn_output
@@ -1709,6 +1893,17 @@ class SanaWmTransformer3DModel(nn.Module):
                 device=hidden_states.device,
             )
 
+        # Build (B, T_latent, 20) camera_conditions from the raw raymap so
+        # the per-block UCPE branch can compute its per-pixel apply_fns.
+        # When the caller passes pre-embedded camera_hidden_states without
+        # raymap, the cam branch becomes a no-op (main-branch only).
+        camera_conditions: torch.Tensor | None = None
+        if raymap is not None:
+            camera_conditions = raymap if raymap.ndim == 3 else raymap.unsqueeze(0)
+            if camera_conditions.shape[0] == 1 and batch_size > 1:
+                camera_conditions = camera_conditions.expand(batch_size, -1, -1)
+            camera_conditions = camera_conditions.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
         for block in self.blocks:
             hidden_states = block(
                 hidden_states,
@@ -1717,6 +1912,7 @@ class SanaWmTransformer3DModel(nn.Module):
                 spatial_shape,
                 rotary_emb,
                 camera_hidden_states,
+                camera_conditions,
             )
 
         hidden_states = self.final_layer(hidden_states, time_embed.to(hidden_states.dtype))

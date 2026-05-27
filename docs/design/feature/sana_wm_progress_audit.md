@@ -17,13 +17,13 @@ Five blockers were identified in revision 9. Three closed since revision 10.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | GDN Triton — long-sequence + multi-card parity vs. NVlabs | ⚠️ **Open** |
+| 1 | GDN Triton — long-sequence + multi-card parity vs. NVlabs | ⚠️ **Open** — main-branch GDN math verified equivalent (see §6.10); divergence is upstream of recurrence |
 | 2 | First-frame VAE encode for I2V conditioning | ✅ **Closed** — commit `f7e59121` A.1 |
 | 3 | NVlabs flow-DPM solver | ✅ **Closed** — commit `f7e59121` A.2 (`DPMSolverMultistepScheduler`) |
-| 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Closed** — commit `f7e59121` A.3 |
+| 4 | UCPE branch decomposition + numeric Plücker reference test | ⚠️ **Port landed, GPU verification pending (2026-05-27 late)** — UCPE math (`ucpe.py`) ported with passing unit tests; cam branch rewritten to use bidirectional GDN with UCPE per-ray transforms. End-to-end MAE drop on GPU still to be confirmed. See §6.10. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
-**Implication for reference alignment:** Items 2–4 are now closed. The reference-alignment MAE (`69.64 / 255.0` from revision 8) should drop significantly on next GPU run. The PSNR ≥ 30 / SSIM-Y ≥ 0.93 threshold still needs to be wired and met.
+**Implication for reference alignment:** The GPU run on 2026-05-27 produced MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame harness. That result is consistent with item 4 being functionally open: the model has no working camera-conditioning path, so the output is structurally unrelated to the official reference regardless of how accurate the GDN recurrence is. Items 1 and 4 must close before PSNR ≥ 30 / SSIM-Y ≥ 0.93 is achievable.
 
 ---
 
@@ -46,7 +46,7 @@ f7e59121  feat(sana-wm): implement single-GPU correctness blockers A.1/A.2/A.3
 
 **A.1** — VAE encode first frame: `_preprocess_first_frame` + `_vae_encode_first_frame` in `pipeline_sana_wm.py`; replaces `torch.randn` placeholder.
 **A.2** — Real scheduler: `SanaWmFlowMatchScheduler` wraps `DPMSolverMultistepScheduler` with `flow_shift=9.8`; the shifted-Euler `SanaWmFlowDpmScheduler` is kept for backward-compat only.
-**A.3** — UCPE camera: `_forward_ucpe` SDPA cross-attention in `SanaWmSelfAttention`; `spatial_raymap` from `compute_raymap(use_plucker=False)` fused in `_camera_hidden_states_from_conditions`.
+**A.3** — UCPE camera: `_forward_ucpe` SDPA cross-attention in `SanaWmSelfAttention`; `spatial_raymap` from `compute_raymap(use_plucker=False)` fused in `_camera_hidden_states_from_conditions`. **Reopened 2026-05-27:** `_forward_ucpe` uses the wrong operator (SDPA where NVlabs uses GDN recurrence with UCPE per-ray transforms) AND is never invoked from `SanaWmSelfAttention.forward` — `camera_hidden_states` is accepted but dropped. See §6.10.
 **B.1** — CUDA Graph: `SanaWmCudaGraphDenoiser` per-bucket replay wired into pipeline denoising loop; gated by `VLLM_OMNI_SANA_WM_CUDAGRAPH=1`.
 **C.1** — TP closure: `SanaWmCameraEmbedder.raymap.proj` now uses `ColumnParallelLinear` when TP layers available. Conv3d `plucker.proj` kept as-is (no parallel equivalent).
 
@@ -194,6 +194,47 @@ The fused GDN path runs in the pipeline; small/multi-shape parity is covered. Mu
 
 `/v1/videos/generations` and `/sync` aliases are covered by unit tests. A live `vllm serve` + `curl` smoke on GPU is still pending.
 
+### 6.10 Cam Branch Uses SDPA Instead of GDN+UCPE; Never Called From `forward()` ⚠️ FIX IN PROGRESS
+
+**Update 2026-05-27 (later same day):** P0 implementation landed in this
+branch. ucpe.py ported with 7/7 standalone unit tests passing on the
+remote GPU venv (energy-preservation delta = 2.38e-07 at identity poses,
+4.77e-07 with RoPE); `SanaWmSelfAttention` rewritten to do main +
+cam → shared output_gate + proj; `camera_conditions` routed through
+the transformer; tests/diffusion/models/sana_wm/test_sana_wm_ucpe.py
+added. E2E reference-alignment MAE drop verification on GPU is the
+remaining work — see §8 item 1.
+
+Verified by deep-dive vs NVlabs `sana_gdn_camctrl_blocks.py` on 2026-05-27.
+
+**Symptom.** Reference-alignment harness reports MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame smoke even after A.1–A.3 landed. That is essentially uncorrelated output — too large to be a recurrence-precision issue.
+
+**Root cause.** What `f7e59121` A.3 actually delivered was the *camera embedder* (Plücker/raymap projections). The *per-block dual-branch attention* — which is the architectural distinguishing feature of SANA-WM vs vanilla SANA-Video — is not implemented:
+
+1. [`SanaWmSelfAttention._forward_ucpe`](../../../vllm_omni/diffusion/models/sana_wm/sana_wm_transformer.py#L968-L993) uses `F.scaled_dot_product_attention`. NVlabs uses bidirectional GDN recurrence with UCPE per-ray Q/K/V transforms (see `sana_gdn_camctrl_blocks.py:_forward_cam_branch` and `_prepare_cam_qkv`). Different operator family.
+
+2. [`SanaWmSelfAttention.forward`](../../../vllm_omni/diffusion/models/sana_wm/sana_wm_transformer.py#L995-L1003) accepts `camera_hidden_states` but only dispatches to `_forward_gdn(...)`. `_forward_ucpe` is **never called**. Verified by grep: no caller in tree.
+
+3. `out_proj_cam`, `q_proj_cam`, `k_proj_cam`, `v_proj_cam`, `q_norm_cam`, `k_norm_cam`, `conv_k_cam` are constructed and loaded from the checkpoint, but their forward contribution is never added to the block output.
+
+4. The reference fuses `main_raw + cam_contrib` BEFORE `output_gate` and `proj` (one shared application). Our `_forward_gdn` applies `output_gate * proj` directly on `main_raw`, leaving no insertion point for `cam_contrib`.
+
+5. UCPE per-ray transforms (`prepare_prope_fns` / `apply_fn_q` / `apply_fn_kv` / `apply_fn_o`), Dynamic Beta Discounting (β ÷ inflation_sq), and shared β/decay precomputation across the two branches are all absent.
+
+**What IS verified equivalent.** The main-branch GDN math itself is correct:
+- Recurrence (`_delta_scan`) matches `torch_recurrent_sana_gdn` line-for-line.
+- Bidirectional `flip_and_shift` (k/v shift=0, decay shift=1) matches.
+- Bidirectional short conv with center-tap subtraction matches.
+- `beta`/`decay` projection chain matches.
+- Triton kernel applies ReLU (default `SKIP_RELU=False`) and encodes RoPE pair-sign correctly via `prepare_rope_tables`.
+- `k_scale = D^-0.5 · S^-0.5`, RMSNorm over hidden_size — all match.
+
+**Conclusion.** Closing item 1 (GDN long-sequence parity) cannot bring PSNR ≥ 30. Item 4 must reopen and the cam branch must be ported as a real GDN+UCPE recurrence path before reference alignment is meaningful.
+
+**Fix scope (P0).** New `vllm_omni/diffusion/models/sana_wm/ucpe.py` (port `prepare_prope_fns`); rewrite `_forward_ucpe` to use the existing `reference_bidirectional_gated_delta_net` / fused Triton path (not SDPA); add `_prepare_cam_qkv` mirroring NVlabs ordering (project → mask → conv → norm → ReLU → scale → permute → UCPE); add inflation_sq → β discount; expose `apply_output_gate=False` mode in `_forward_gdn`; rewire `forward` to compute `main_raw + out_proj_cam(cam_raw)` then apply shared `output_gate` + `proj` once. Estimate: 4–5 person-days.
+
+Cross-ref: integration.md §1124 "Native Stage-1 Production Readiness Gap" items 1 and 4 (updated in same revision).
+
 ---
 
 ## 7. Outstanding Work — No GPU Required
@@ -216,11 +257,13 @@ The fused GDN path runs in the pipeline; small/multi-shape parity is covered. Mu
 
 9. **Architecture diagram** for PR description. Include a diagram of the Stage-1 DiT structure (input packing → camera branch → GDN block → cross-attn → FFN). This is a strong reviewer-attention signal.
 
+10. ~~**Port UCPE per-block attention (§6.10).** Add `vllm_omni/diffusion/models/sana_wm/ucpe.py` with `prepare_prope_fns` ported from NVlabs `sana_camctrl_blocks.py`. Rewrite `_forward_ucpe` to use bidirectional GDN recurrence (reuse `reference_bidirectional_gated_delta_net`) with `q_cam_trans`/`k_cam_trans` as the rotary inputs. Add `_prepare_cam_qkv` (project → mask → conv → norm → ReLU → scale → permute → UCPE). Add inflation_sq → β discount. Add `apply_output_gate=False` mode to `_forward_gdn`. Rewire `SanaWmSelfAttention.forward` to compute `main_raw + out_proj_cam(cam_raw)` then apply shared `output_gate` + `proj` once. Unit test against NVlabs `_GDNUCPEBase` block (atol=1e-4 fp32 single-block).~~ ✅ **Done 2026-05-27.** Module-level energy-preservation tests pass at 1e-7 precision. Single-block end-to-end NVlabs parity test still needs GPU run (moved to §8 item 1 sub-step).
+
 ---
 
 ## 8. Outstanding Work — GPU Required
 
-1. **Re-run reference-alignment harness** (`SANA_WM_E2E_REFERENCE_ALIGNMENT=1`). Expect MAE to drop substantially from 69.64 now that A.1–A.3 are closed.
+1. **Re-run reference-alignment harness** (`SANA_WM_E2E_REFERENCE_ALIGNMENT=1`). 2026-05-27 morning run produced MAE=95.82 / PSNR=7.37 / SSIM=0.0047 with the SDPA cam branch. UCPE port landed later same day (§7 item 10 ✅). Need a fresh GPU run to confirm MAE drops into the comparison-meaningful range. Also add a single-block parity test that compares our `SanaWmSelfAttention.forward(camera_conditions=...)` output against NVlabs `BidirectionalGDNUCPELiteLA.forward(..., camera_conditions=...)` at atol=1e-4 fp32 — this is the cheapest way to localise any remaining divergence before running the full 4-step e2e.
 
 2. **Wire PSNR ≥ 30 / SSIM-Y ≥ 0.93** once harness produces a qualifying result.
 
