@@ -1,8 +1,8 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-05-27 (revision 11 — post-correctness-blocker + intergration.md pass)
+> **Audit date:** 2026-05-28 (revision 13 — camera-module parity + Stage-1 forward probe + per-token timestep root cause)
 > **Branch:** `feat/sana_wm`
-> **Implementation HEAD:** `94dfaa3f fix(sana-wm): stabilize cuda graph and camera tests`
+> **Implementation HEAD:** `c57ba6bc chore(sana-wm): localise §6.13 root cause to per-token timesteps`
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
 > **Spec (single source of truth):**
 > [`sana_wm_integration.md`](sana_wm_integration.md)
@@ -13,20 +13,26 @@
 
 ## 0. Revision-9 Critical-Path Items — Updated Status
 
-Five blockers were identified in revision 9. Three closed since revision 10.
+Revision-9 blockers are mostly closed. The active correctness blocker is now
+the newly identified per-token/per-frame timestep sampling contract.
 
 | # | Item | Status |
 |---|---|---|
 | 1 | GDN Triton — long-sequence + multi-card parity vs. NVlabs | ⚠️ **Open** — main-branch GDN math verified equivalent (see §6.10); divergence is upstream of recurrence |
 | 2 | First-frame VAE encode for I2V conditioning | ✅ **Closed** — commit `f7e59121` A.1 |
 | 3 | NVlabs flow-DPM solver | ✅ **Closed** — commit `f7e59121` A.2 (`DPMSolverMultistepScheduler`) |
-| 4 | UCPE branch decomposition + numeric Plücker reference test | ⚠️ **Port landed, contribution masked by §6.11 loader bug** — UCPE math (`ucpe.py`) ported with passing unit tests; cam branch rewritten and verified to execute. GPU run 2026-05-28 produced MAE=98.31 because `out_proj_cam.weight==0` masks the cam contribution. See §6.10 + §6.11. |
+| 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Verified 2026-05-28** — UCPE math (`ucpe.py`) and native raw camera branch match NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` at fp32 `~1e-7` max abs. See §6.12a. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | Per-token timestep sampling contract | ❌ **NEW (2026-05-28)** — NVlabs uses per-frame sigma signalling (`condition_frame_info` → per-token timestep). Our pipeline uses scalar timestep. This is the root cause of the persistent ~90 MAE gap, localised by 2026-05-28 evening experiments. See §6.13. |
+| 8 | Per-token timestep sampling contract | ❌ **NEW (2026-05-28)** — NVlabs uses per-frame sigma signalling (`condition_frame_info` → per-token timestep). Our pipeline uses scalar timestep. This is the root cause of the persistent ~90 MAE gap, localised by 2026-05-28 evening experiments and confirmed by the Stage-1 direct forward probe. See §6.12b / §6.13. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
-**Implication for reference alignment:** The GPU run on 2026-05-27 produced MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame harness. That result is consistent with item 4 being functionally open: the model has no working camera-conditioning path, so the output is structurally unrelated to the official reference regardless of how accurate the GDN recurrence is. Items 1 and 4 must close before PSNR ≥ 30 / SSIM-Y ≥ 0.93 is achievable.
+**Implication for reference alignment:** The UCPE / camera-control module is now
+numerically aligned with NVlabs (§6.12a), but full Stage-1 forward parity is
+blocked by the timestep contract (§6.12b): NVlabs' real path accepts a
+per-frame timestep tensor, while native Stage-1 currently only runs the scalar
+timestep path. The 9-frame harness therefore remains in the ~90-100 MAE regime
+after the loader and cam-branch fixes.
 
 ---
 
@@ -40,16 +46,16 @@ Overall progress:
 Summary of recent commits since revision 10:
 
 ```text
-94dfaa3f  fix(sana-wm): stabilize cuda graph and camera tests         ← HEAD
-fe4f4c72  feat(sana-wm): implement B/C HA items — cuda graph, TP closure, serving tests
-b8815a1f  feat(sana-wm): add cuda graph helper
-291397fc  fix(sana-wm): stabilize correctness blocker tests
-f7e59121  feat(sana-wm): implement single-GPU correctness blockers A.1/A.2/A.3
+c57ba6bc  chore(sana-wm): localise §6.13 root cause to per-token timesteps  ← HEAD
+7aa39678  feat(sana-wm): cam branch — single-path + apply_fn_o + RMS renorm
+597801b4  fix(sana-wm): tighten use_official_backend gating to require USE_OFFICIAL_CLI
+bc5db3be  feat(sana-wm): add cam-branch escape hatch + document loader bug §6.11
+d34133d8  feat(sana-wm): port UCPE camera branch — replace SDPA with GDN+UCPE
 ```
 
 **A.1** — VAE encode first frame: `_preprocess_first_frame` + `_vae_encode_first_frame` in `pipeline_sana_wm.py`; replaces `torch.randn` placeholder.
 **A.2** — Real scheduler: `SanaWmFlowMatchScheduler` wraps `DPMSolverMultistepScheduler` with `flow_shift=9.8`; the shifted-Euler `SanaWmFlowDpmScheduler` is kept for backward-compat only.
-**A.3** — UCPE camera: `_forward_ucpe` SDPA cross-attention in `SanaWmSelfAttention`; `spatial_raymap` from `compute_raymap(use_plucker=False)` fused in `_camera_hidden_states_from_conditions`. **Reopened 2026-05-27:** `_forward_ucpe` uses the wrong operator (SDPA where NVlabs uses GDN recurrence with UCPE per-ray transforms) AND is never invoked from `SanaWmSelfAttention.forward` — `camera_hidden_states` is accepted but dropped. See §6.10.
+**A.3** — UCPE camera: reopened on 2026-05-27, then fixed by replacing the SDPA placeholder with the NVlabs-style GDN+UCPE camera branch. Direct GPU parity against NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` is verified in §6.12a.
 **B.1** — CUDA Graph: `SanaWmCudaGraphDenoiser` per-bucket replay wired into pipeline denoising loop; gated by `VLLM_OMNI_SANA_WM_CUDAGRAPH=1`.
 **C.1** — TP closure: `SanaWmCameraEmbedder.raymap.proj` now uses `ColumnParallelLinear` when TP layers available. Conv3d `plucker.proj` kept as-is (no parallel equivalent).
 
@@ -197,7 +203,7 @@ The fused GDN path runs in the pipeline; small/multi-shape parity is covered. Mu
 
 `/v1/videos/generations` and `/sync` aliases are covered by unit tests. A live `vllm serve` + `curl` smoke on GPU is still pending.
 
-### 6.10 Cam Branch Uses SDPA Instead of GDN+UCPE; Never Called From `forward()` ⚠️ FIX IN PROGRESS
+### 6.10 Cam Branch Uses SDPA Instead of GDN+UCPE; Never Called From `forward()` ✅ FIXED
 
 **Update 2026-05-27 (later same day):** P0 implementation landed in this
 branch. ucpe.py ported with 7/7 standalone unit tests passing on the
@@ -308,6 +314,106 @@ After porting all three plus the existing β-discount logic,
 LTX-2 refiner input distribution. fp32 attention discipline added
 on the recurrence accumulator to match NVlabs `fp32_attention=True`.
 
+### 6.12a NVlabs Camera-Control Module Parity ✅ VERIFIED 2026-05-28
+
+**Scope.** Ran a direct GPU module-alignment harness on
+`sana-wm-seeta` using:
+
+- native vLLM-Omni checkout synced to
+  `/root/autodl-tmp/vllm-omni-align-c57ba6bc-20260528`
+- NVlabs checkout at `/root/autodl-tmp/NVlabs-Sana`
+- clean venv `/root/autodl-tmp/venvs/vllm-omni-clean-pytest/bin/python3`
+- `TORCHDYNAMO_DISABLE=1 GDN_DISABLE_COMPILE=1`
+- GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition
+- torch: `2.11.0+cu130`
+
+The harness compared:
+
+1. NVlabs `sana_camctrl_blocks.prepare_prope_fns("UCPE", ...)`
+   against native `vllm_omni.diffusion.models.sana_wm.ucpe.prepare_prope_fns`
+   for `apply_q`, `apply_kv`, and `apply_o`.
+2. NVlabs
+   `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch`
+   against native `SanaWmSelfAttention._forward_cam_branch`.
+
+Both modules used identical random camera-branch weights, identical
+inputs, identical `(beta, decay)` gates, identical camera conditions,
+and identical rotary embeddings when enabled. Shape:
+`B=2, T=3, H=2, W=3, N=18, C=64, heads=4, head_dim=16`.
+`patch_size=(1, 1, 1)` was used so the NVlabs intrinsics contract
+matches the native latent-pixel camera-condition contract.
+
+| dtype | RoPE | conv kernel | UCPE apply-fn max abs | raw cam-branch max abs | raw cam-branch rel mean abs |
+|---|---:|---:|---:|---:|---:|
+| fp32 | off | 0 | `2.38e-7` | `1.79e-7` | `8.01e-8` |
+| fp32 | off | 4 | `2.38e-7` | `1.19e-7` | `8.91e-8` |
+| fp32 | on | 0 | `2.38e-7` | `1.49e-7` | `1.17e-7` |
+| fp32 | on | 4 | `2.38e-7` | `1.79e-7` | `1.01e-7` |
+| bf16 | off | 0 | `1.56e-2` | `1.17e-2` | `3.83e-3` |
+| bf16 | off | 4 | `1.56e-2` | `3.91e-3` | `2.85e-3` |
+| bf16 | on | 0 | `1.56e-2` | `3.91e-3` | `3.44e-3` |
+| bf16 | on | 4 | `1.56e-2` | `4.88e-3` | `3.97e-3` |
+
+**Conclusion.** The native camera-control module is numerically aligned
+with the NVlabs implementation at the UCPE-closure and raw camera-branch
+levels. fp32 differences are only roundoff (`~1e-7` max abs); bf16
+differences are within expected quantisation error. This closes the
+question of whether the remaining §6.13 MAE gap is caused by the
+camera branch's UCPE/QKV/O transform, single-path recurrence,
+PostUCPERenorm, or identity short-conv behavior. It is not.
+
+**Caveat.** This is module-level parity, not a full denoising parity
+test. It intentionally bypasses checkpoint loading, `out_proj_cam`,
+the shared `output_gate + proj`, text conditioning, scheduler stepping,
+and LTX-2 refinement. Those surfaces remain covered by the 9-frame
+reference-alignment harness and the §6.13 sampling-contract work.
+
+### 6.12b NVlabs Stage-1 Full Forward Probe ⚠️ BLOCKED 2026-05-28
+
+**Scope.** Ran a direct Stage-1 forward probe on `sana-wm-seeta` using
+the public `Efficient-Large-Model/SANA-WM_bidirectional` snapshot:
+
+- NVlabs checkout: `/root/autodl-tmp/NVlabs-Sana`
+- native checkout: `/root/autodl-tmp/vllm-omni-align-c57ba6bc-20260528`
+- clean venv: `/root/autodl-tmp/venvs/vllm-omni-clean-pytest/bin/python3`
+- GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition
+- torch: `2.11.0+cu130`
+- model config: `config.yaml`
+- Stage-1 weights: `dit/sana_wm_1600m_720p.safetensors`
+
+Synthetic but production-shaped miniature input:
+`latents=(1,128,2,2,3)`, `prompt=(1,300,2304)`,
+`raymap=(1,2,20)`, `chunk_plucker=(1,48,2,2,3)`,
+`spatial_raymap=(1,3,2,2,3)`.
+
+| Path | Timestep input | Result |
+|---|---|---|
+| NVlabs Stage-1 | `(B,1,F) = (1,1,2)` with `[0, 999]` | ✅ forward succeeds; output `(1,128,2,2,3)`, bf16, `min=-3.5`, `max=5.56`, `std=1.54` |
+| NVlabs Stage-1 | scalar `(1,)` | ❌ fails in the unexercised scalar branch: `UnboundLocalError: x_sa` |
+| native Stage-1 | `(B,1,F) = (1,1,2)` | ❌ fails at block modulation: `2240` vs `4480`, because timestep embedding is flattened as batch scalar embeddings |
+| native Stage-1 | scalar `(1,)` | ✅ forward succeeds; output `(1,128,2,2,3)`, bf16, `min=-1.91`, `max=2.42`, `std=0.64` |
+
+Weight loading is not the blocker: native consumed all Stage-1 weights
+(`872/872` loaded, `872/872` materialized, `0` unapplied/unmapped), and
+NVlabs loaded with only `pos_embed` missing as expected.
+
+For visibility only, comparing native scalar output against NVlabs
+per-frame output on the same tensors gives:
+
+| Metric | Value |
+|---|---:|
+| max abs | `5.0934` |
+| mean abs | `1.1852` |
+| RMSE | `1.4696` |
+| relative mean abs | `0.9719` |
+| cosine | `0.3163` |
+
+**Conclusion.** This is not yet a meaningful same-contract numeric
+parity failure. It confirms that NVlabs' exercised Stage-1 forward path
+is per-frame/per-token timestep aware, while the native Stage-1 forward
+can only execute a scalar-timestep contract. The next alignment step is
+therefore the §6.13 refactor, not more camera/GDN tuning.
+
 ### 6.13 Persistent ~90 MAE Baseline — Cam Hurts Slightly ❌ NEW
 
 **Symptom (2026-05-28, post §6.10/§6.11/§6.12 all closed).**
@@ -397,33 +503,128 @@ mis-interprets it and corrupts ALL frames via attention.
 
 Cross-ref: integration.md §3 (scheduler), §4a (embedder), §4b (UCPE branch).
 
-**Symptom.** Reference-alignment harness reports MAE=95.82 / PSNR=7.37 dB / SSIM-Y=0.0047 on the 9-frame smoke even after A.1–A.3 landed. That is essentially uncorrelated output — too large to be a recurrence-precision issue.
+### 6.13a Why Stage-1 Still Misaligns: Three Contract Breaks
 
-**Root cause.** What `f7e59121` A.3 actually delivered was the *camera embedder* (Plücker/raymap projections). The *per-block dual-branch attention* — which is the architectural distinguishing feature of SANA-WM vs vanilla SANA-Video — is not implemented:
+The remaining Stage-1 misalignment is not a generic "GDN precision"
+issue. It is a denoising-contract mismatch across three layers of the
+stack.
 
-1. [`SanaWmSelfAttention._forward_ucpe`](../../../vllm_omni/diffusion/models/sana_wm/sana_wm_transformer.py#L968-L993) uses `F.scaled_dot_product_attention`. NVlabs uses bidirectional GDN recurrence with UCPE per-ray Q/K/V transforms (see `sana_gdn_camctrl_blocks.py:_forward_cam_branch` and `_prepare_cam_qkv`). Different operator family.
+#### Break 1 — model input timestep rank
 
-2. [`SanaWmSelfAttention.forward`](../../../vllm_omni/diffusion/models/sana_wm/sana_wm_transformer.py#L995-L1003) accepts `camera_hidden_states` but only dispatches to `_forward_gdn(...)`. `_forward_ucpe` is **never called**. Verified by grep: no caller in tree.
+NVlabs `LTXFlowEuler.sample` builds a full latent-shaped timestep
+field, then passes the model a frame-indexed tensor:
 
-3. `out_proj_cam`, `q_proj_cam`, `k_proj_cam`, `v_proj_cam`, `q_norm_cam`, `k_norm_cam`, `conv_k_cam` are constructed and loaded from the checkpoint, but their forward contribution is never added to the block output.
+```text
+timestep: (B, C, F, H, W)
+model timestep argument: timestep[:, :1, :, 0, 0] -> (B, 1, F)
+```
 
-4. The reference fuses `main_raw + cam_contrib` BEFORE `output_gate` and `proj` (one shared application). Our `_forward_gdn` applies `output_gate * proj` directly on `main_raw`, leaving no insertion point for `cam_contrib`.
+For conditioning frame 0, that tensor is forced to `0`; for generated
+frames it carries the current sampling timestep. This means one forward
+call contains both "clean/conditioned" and "currently denoising" frames.
 
-5. UCPE per-ray transforms (`prepare_prope_fns` / `apply_fn_q` / `apply_fn_kv` / `apply_fn_o`), Dynamic Beta Discounting (β ÷ inflation_sq), and shared β/decay precomputation across the two branches are all absent.
+Native `_run_native_smoke_backend` always calls the transformer with a
+batch-scalar timestep:
 
-**What IS verified equivalent.** The main-branch GDN math itself is correct:
-- Recurrence (`_delta_scan`) matches `torch_recurrent_sana_gdn` line-for-line.
-- Bidirectional `flip_and_shift` (k/v shift=0, decay shift=1) matches.
-- Bidirectional short conv with center-tap subtraction matches.
-- `beta`/`decay` projection chain matches.
-- Triton kernel applies ReLU (default `SKIP_RELU=False`) and encodes RoPE pair-sign correctly via `prepare_rope_tables`.
-- `k_scale = D^-0.5 · S^-0.5`, RMSNorm over hidden_size — all match.
+```text
+timestep.expand(1) -> (B,)
+```
 
-**Conclusion.** Closing item 1 (GDN long-sequence parity) cannot bring PSNR ≥ 30. Item 4 must reopen and the cam branch must be ported as a real GDN+UCPE recurrence path before reference alignment is meaningful.
+Code references:
+- native scalar call: `pipeline_sana_wm.py:710-731`
+- native timestep embedding: `sana_wm_transformer.py:2005-2016`
+- NVlabs frame-aware model call: `flow_euler_sampler.py:153-160`
 
-**Fix scope (P0).** New `vllm_omni/diffusion/models/sana_wm/ucpe.py` (port `prepare_prope_fns`); rewrite `_forward_ucpe` to use the existing `reference_bidirectional_gated_delta_net` / fused Triton path (not SDPA); add `_prepare_cam_qkv` mirroring NVlabs ordering (project → mask → conv → norm → ReLU → scale → permute → UCPE); add inflation_sq → β discount; expose `apply_output_gate=False` mode in `_forward_gdn`; rewire `forward` to compute `main_raw + out_proj_cam(cam_raw)` then apply shared `output_gate` + `proj` once. Estimate: 4–5 person-days.
+The 2026-05-28 direct Stage-1 probe confirms the consequence:
+NVlabs per-frame `(B,1,F)` forward succeeds, while native per-frame
+forward fails at block modulation (`2240` vs `4480`). Native scalar
+forward succeeds only because it is running a different contract.
 
-Cross-ref: integration.md §1124 "Native Stage-1 Production Readiness Gap" items 1 and 4 (updated in same revision).
+#### Break 2 — block/final modulation must be per frame
+
+NVlabs blocks dispatch to `forward_frame_aware()` whenever
+`len(t.shape) > 2`. That path reshapes timestep modulation to:
+
+```text
+t0: (B, 1, F, 6*D)
+block t: (B, F, 6, D)
+hidden: (B, F, spatial_tokens, D)
+```
+
+So `shift/scale/gate` are applied per frame and then broadcast over
+that frame's spatial tokens. The final layer is also frame-aware: it
+applies `shift/scale` over `(B, F, spatial_tokens, D)`.
+
+Native currently flattens timestep input through
+`SanaWmTimestepEmbedder.sinusoidal_embedding(timestep.reshape(-1, 1))`,
+then reshapes block modulation as:
+
+```text
+timestep_modulation.reshape(batch_size, 6, -1)
+```
+
+This works for `(B,)`; for `(B,1,F)` it expands the hidden dimension
+by `F`, producing the observed `2240` vs `4480` mismatch when `F=2`.
+The native final layer likewise assumes `timestep_embed[:, None]`,
+i.e. batch scalar timestep only.
+
+Code references:
+- native embedder flattening: `sana_wm_transformer.py:330-345`
+- native block scalar reshape: `sana_wm_transformer.py:1547-1560`
+- native final scalar modulation: `sana_wm_transformer.py:1609-1612`
+- NVlabs frame-aware block: `sana_multi_scale_video_camctrl.py:315-424`
+- NVlabs frame-aware final layer: `sana_blocks.py:907-925`
+
+#### Break 3 — scheduler update is per token and mask-preserving
+
+NVlabs does not update the whole latent with a scalar scheduler step.
+It flattens video tokens to `(B, FHW, C)`, passes
+`per_token_timesteps=(B, FHW)`, and only writes back generated tokens:
+
+```text
+condition frame tokens: timestep = 0, preserved after step
+generated frame tokens: timestep = current t, updated after step
+```
+
+Native `SanaWmFlowMatchScheduler` wraps `DPMSolverMultistepScheduler`
+and exposes only:
+
+```text
+step(noise_pred, timestep, latents) -> prev_sample
+```
+
+There is no `per_token_timesteps`, no token flattening, no sign flip for
+the per-token FlowMatchEuler path, and no `tokens_to_denoise_mask`.
+
+Code references:
+- native scheduler wrapper: `scheduling_sana_wm.py:40-66`
+- native full-latent update: `pipeline_sana_wm.py:731`
+- NVlabs per-token update: `flow_euler_sampler.py:178-188`
+
+#### Secondary mismatch — first-frame noise schedule
+
+Native currently noises the encoded first frame once at the highest
+timestep before the denoising loop (`pipeline_sana_wm.py:673-676`).
+NVlabs keeps the original `init_latents`, then can re-inject
+timestep-dependent motion-continuity noise inside every step through
+`add_noise_to_image_conditioning_latents`. In the public config path
+`condition_frame_info={0: 0.0}`, so this term is disabled by default,
+but the native "noise once to highest t" behavior is still not the
+same as NVlabs' "place first latent in z and preserve it via mask"
+contract.
+
+#### Fix implication
+
+The fix is not to tune thresholds or change camera weights. The native
+Stage-1 path needs a new contract:
+
+1. build `condition_mask` over latent video tokens;
+2. pass `(B, 1, F)` timestep into the transformer;
+3. make `SanaWmTimestepEmbedder`, `SanaWmBlock`, and `SanaWmFinalLayer`
+   frame-aware;
+4. implement an LTX-style `FlowMatchEulerDiscreteScheduler` step using
+   `per_token_timesteps`;
+5. preserve conditioning-frame tokens after each step.
 
 ---
 
@@ -447,19 +648,19 @@ Cross-ref: integration.md §1124 "Native Stage-1 Production Readiness Gap" items
 
 9. **Architecture diagram** for PR description. Include a diagram of the Stage-1 DiT structure (input packing → camera branch → GDN block → cross-attn → FFN). This is a strong reviewer-attention signal.
 
-10. ~~**Port UCPE per-block attention (§6.10).** Add `vllm_omni/diffusion/models/sana_wm/ucpe.py` with `prepare_prope_fns` ported from NVlabs `sana_camctrl_blocks.py`. Rewrite `_forward_ucpe` to use bidirectional GDN recurrence (reuse `reference_bidirectional_gated_delta_net`) with `q_cam_trans`/`k_cam_trans` as the rotary inputs. Add `_prepare_cam_qkv` (project → mask → conv → norm → ReLU → scale → permute → UCPE). Add inflation_sq → β discount. Add `apply_output_gate=False` mode to `_forward_gdn`. Rewire `SanaWmSelfAttention.forward` to compute `main_raw + out_proj_cam(cam_raw)` then apply shared `output_gate` + `proj` once. Unit test against NVlabs `_GDNUCPEBase` block (atol=1e-4 fp32 single-block).~~ ✅ **Done 2026-05-27.** Module-level energy-preservation tests pass at 1e-7 precision. Single-block end-to-end NVlabs parity test still needs GPU run (moved to §8 item 1 sub-step).
+10. ~~**Port UCPE per-block attention (§6.10).** Add `vllm_omni/diffusion/models/sana_wm/ucpe.py` with `prepare_prope_fns` ported from NVlabs `sana_camctrl_blocks.py`. Rewrite `_forward_ucpe` to use bidirectional GDN recurrence (reuse `reference_bidirectional_gated_delta_net`) with `q_cam_trans`/`k_cam_trans` as the rotary inputs. Add `_prepare_cam_qkv` (project → mask → conv → norm → ReLU → scale → permute → UCPE). Add inflation_sq → β discount. Add `apply_output_gate=False` mode to `_forward_gdn`. Rewire `SanaWmSelfAttention.forward` to compute `main_raw + out_proj_cam(cam_raw)` then apply shared `output_gate` + `proj` once. Unit test against NVlabs `_GDNUCPEBase` block (atol=1e-4 fp32 single-block).~~ ✅ **Done 2026-05-27.** Module-level energy-preservation tests pass at 1e-7 precision; direct GPU parity against NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` is verified in §6.12a.
 
 11. ~~**Fix vLLM parallel linear weight loading (§6.11).**~~ ✅ **Done 2026-05-28** — fixed by tightening `use_official_backend` gating to require `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. `qkv.weight.norm()` now matches the checkpoint (7.21e+02 ≡ 7.20e+02), `out_proj_cam.weight.norm()` is now 10.78 (was 0). The MAE drop from this fix alone is small (98.31 → 95.25) because it exposed §6.12.
 
 12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). Cam branch rewritten to match NVlabs `BidirectionalGDNUCPESinglePathLiteLA`: single-path delta-rule recurrence (no Z denominator), `apply_fn_o` inverse output transform, and `_downscale_to_reference_rms` PostUCPERenorm. Latent at STAGE1_STEPS=1 dropped from `[-59, 61]` to `[-12.3, 11.8]`.
 
-13. **Refactor to per-frame timesteps (§6.13 root cause).** Localisation experiments on 2026-05-28 evening (plucker_proj disable, hard-conditioning) pointed to a fundamental sampling-contract mismatch: NVlabs' `LTXFlowEuler.sample` uses **per-token timesteps** where the conditioning frame's sigma is 0 and other frames carry the current sampling sigma, plus a `condition_mask` so only non-conditioning tokens are updated by `scheduler.step`. Our pipeline uses scalar timestep and simple noise+denoise. The hard-conditioning experiment (clean first frame without per-token timestep signal) made MAE 32 worse, confirming the model REQUIRES per-frame sigma signalling. Refactor `SanaWmTimestepEmbedder` + `t_block` + block forward to accept per-frame timesteps, switch the wrapped DPM scheduler to a per-token-timestep flow-matching step, and add `tokens_to_denoise_mask`. 1-2 person days. See §6.13.
+13. **Refactor to per-frame timesteps (§6.12b / §6.13 root cause).** Localisation experiments on 2026-05-28 evening (plucker_proj disable, hard-conditioning) and the direct Stage-1 forward probe pointed to a fundamental sampling-contract mismatch: NVlabs' `LTXFlowEuler.sample` uses **per-token timesteps** where the conditioning frame's sigma is 0 and other frames carry the current sampling sigma, plus a `condition_mask` so only non-conditioning tokens are updated by `scheduler.step`. Our pipeline uses scalar timestep and simple noise+denoise, and native Stage-1 currently fails on NVlabs' `(B,1,F)` timestep shape. Refactor `SanaWmTimestepEmbedder` + `t_block` + block forward to accept per-frame timesteps, switch the wrapped DPM scheduler to a per-token-timestep flow-matching step, and add `tokens_to_denoise_mask`. 1-2 person days. See §6.12b / §6.13.
 
 ---
 
 ## 8. Outstanding Work — GPU Required
 
-1. **Re-run reference-alignment harness** (`SANA_WM_E2E_REFERENCE_ALIGNMENT=1`). 2026-05-27 morning run produced MAE=95.82 / PSNR=7.37 / SSIM=0.0047 with the SDPA cam branch. UCPE port landed later same day (§7 item 10 ✅). Need a fresh GPU run to confirm MAE drops into the comparison-meaningful range. Also add a single-block parity test that compares our `SanaWmSelfAttention.forward(camera_conditions=...)` output against NVlabs `BidirectionalGDNUCPELiteLA.forward(..., camera_conditions=...)` at atol=1e-4 fp32 — this is the cheapest way to localise any remaining divergence before running the full 4-step e2e.
+1. **Re-run reference-alignment harness** (`SANA_WM_E2E_REFERENCE_ALIGNMENT=1`). 2026-05-27 morning run produced MAE=95.82 / PSNR=7.37 / SSIM=0.0047 with the SDPA cam branch. UCPE port landed later same day (§7 item 10 ✅), and direct NVlabs camera-module parity is now verified (§6.12a). Need a fresh e2e run after the §6.13 per-frame timestep refactor to confirm the full Stage-1 + refiner path drops into the comparison-meaningful range.
 
 2. **Wire PSNR ≥ 30 / SSIM-Y ≥ 0.93** once harness produces a qualifying result.
 
@@ -510,7 +711,7 @@ Cross-ref: integration.md §1124 "Native Stage-1 Production Readiness Gap" items
 > Full deep-dive in revision 9 (Kimi's analysis, retained in git history at `b57e96b5`).
 > Headline summary only here.
 
-All DiT attention/FFN/projection linear layers now use vLLM parallel layer primitives (`QKVParallelLinear`, `ColumnParallelLinear`, `RowParallelLinear`, `_maybe_make_vllm_rms_norm`). `quant_config` is threaded. `_sp_plan` is declared. `vllm_omni.diffusion.attention.layer.Attention` is used for softmax-attention blocks (SDPA cross-attn in UCPE). Quantized and TP checkpoint loading inherit automatically from the layer primitives.
+All DiT attention/FFN/projection linear layers now use vLLM parallel layer primitives (`QKVParallelLinear`, `ColumnParallelLinear`, `RowParallelLinear`, `_maybe_make_vllm_rms_norm`). `quant_config` is threaded. `_sp_plan` is declared. `vllm_omni.diffusion.attention.layer.Attention` is used for softmax-attention blocks; the UCPE camera branch now uses the ported GDN+UCPE recurrence path. Quantized and TP checkpoint loading inherit automatically from the layer primitives.
 
 What remains model-specific by design:
 - **GDN recurrence core** (`fused_gdn_chunkwise.py`): bidirectional frame-wise delta-rule, not standard attention. Cannot reuse vLLM Qwen3-Next's AR GDN backend.
