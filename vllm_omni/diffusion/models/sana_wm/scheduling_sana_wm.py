@@ -22,12 +22,22 @@ def shift_flow_timestep(
 
 
 class SanaWmFlowMatchScheduler:
-    """Production flow-DPM-Solver++ scheduler wrapping diffusers.
+    """Native flow-matching Euler scheduler matching NVlabs ``LTXFlowEuler``.
 
-    Replaces the shifted-Euler smoke with the production ``vis_sampler:
-    flow_dpm-solver`` path (``inference_flow_shift=9.8``, 20-30 steps).
-    Provides ``add_noise`` for first-frame latent conditioning (A.1).
+    Reproduces ``diffusers.FlowMatchEulerDiscreteScheduler(shift=shift)``
+    timestep + sigma tables (which NVlabs uses) without depending on
+    diffusers at runtime. The schedule has a subtle but load-bearing
+    quirk: ``sigma_min`` is set at construction time to the
+    shift-transformed ``1/num_train`` (not the raw ``1/num_train``), so
+    ``set_timesteps`` ends up applying the shift formula **twice** — once
+    implicitly via the shifted ``sigma_min`` linspace endpoint, once
+    explicitly. For ``shift=9.8, N=3`` this yields timesteps
+    ``[1000, 909.0, 87.7]`` (matches NVlabs) rather than the near-linear
+    ``[999, 951, 830]`` that the prior ``DPMSolverMultistep`` wrapper
+    produced (see audit §6.13k).
     """
+
+    NUM_TRAIN_TIMESTEPS = 1000
 
     def __init__(
         self,
@@ -37,26 +47,58 @@ class SanaWmFlowMatchScheduler:
         if num_inference_steps <= 0:
             raise ValueError("Sana-WM scheduler num_inference_steps must be positive.")
         self.num_inference_steps = num_inference_steps
-        self.shift = shift
-        from diffusers import DPMSolverMultistepScheduler
-
-        self._sched = DPMSolverMultistepScheduler(
-            prediction_type="flow_prediction",
-            use_flow_sigmas=True,
-            flow_shift=shift,
-            algorithm_type="dpmsolver++",
-            solver_order=2,
+        self.shift = float(shift)
+        self.num_train_timesteps = self.NUM_TRAIN_TIMESTEPS
+        # Shifted sigma_min: raw min is 1/num_train; the FlowMatchEuler
+        # __init__ shifts the full sigma array, so the persisted sigma_min
+        # is the shifted value. set_timesteps then linspaces from
+        # sigma_max=1.0 down to this shifted sigma_min.
+        raw_min = 1.0 / self.num_train_timesteps
+        self._sigma_min_shifted = (
+            self.shift * raw_min / (1.0 + (self.shift - 1.0) * raw_min)
         )
+        self._timesteps_tensor: torch.Tensor | None = None  # (N,)
+        self._sigmas_tensor: torch.Tensor | None = None     # (N+1,)
         self._timesteps_device: torch.device | None = None
 
+    def _build_schedule(self, device: torch.device) -> None:
+        # Replay diffusers FlowMatchEulerDiscreteScheduler.set_timesteps:
+        # ts_pre = linspace(num_train * sigma_max, num_train * sigma_min_shifted, N)
+        # sig_pre = ts_pre / num_train
+        # sigmas = shift * sig_pre / (1 + (shift-1) * sig_pre)   <-- second shift
+        # timesteps = sigmas * num_train
+        # sigmas = cat([sigmas, 0])
+        N = self.num_inference_steps
+        ts_pre = torch.linspace(
+            float(self.num_train_timesteps),
+            float(self.num_train_timesteps) * self._sigma_min_shifted,
+            N,
+            dtype=torch.float32,
+            device=device,
+        )
+        sig_pre = ts_pre / float(self.num_train_timesteps)
+        sigmas = self.shift * sig_pre / (1.0 + (self.shift - 1.0) * sig_pre)
+        timesteps = sigmas * float(self.num_train_timesteps)
+        sigmas_with_terminal = torch.cat(
+            [sigmas, torch.zeros(1, dtype=torch.float32, device=device)]
+        )
+        self._timesteps_tensor = timesteps
+        self._sigmas_tensor = sigmas_with_terminal
+
     def _ensure_timesteps(self, device: torch.device) -> None:
-        if self._timesteps_device != device:
-            self._sched.set_timesteps(self.num_inference_steps, device=device)
+        if self._timesteps_device != device or self._timesteps_tensor is None:
+            self._build_schedule(device)
             self._timesteps_device = device
 
     def timesteps(self, *, device: torch.device) -> torch.Tensor:
         self._ensure_timesteps(device)
-        return self._sched.timesteps
+        return self._timesteps_tensor
+
+    @property
+    def sigmas(self) -> torch.Tensor:
+        if self._sigmas_tensor is None:
+            self._build_schedule(torch.device("cpu"))
+        return self._sigmas_tensor
 
     def step(
         self,
@@ -64,18 +106,28 @@ class SanaWmFlowMatchScheduler:
         timestep: torch.Tensor,
         latents: torch.Tensor,
     ) -> torch.Tensor:
-        return self._sched.step(noise_pred, timestep, latents).prev_sample
+        """Single-token flow-matching Euler step.
+
+        ``prev = latents + (sigma_next - sigma_cur) * (-noise_pred)`` —
+        the NVlabs ``LTXFlowEuler`` sign convention. Used by the legacy
+        non-per-token path; the per-token path is
+        :meth:`step_flow_euler_per_token`.
+        """
+        self._ensure_timesteps(latents.device)
+        sigmas = self._sigmas_tensor
+        idx = self._sigma_index_for(timestep)
+        sigma_cur = sigmas[idx]
+        sigma_next = sigmas[idx + 1] if idx + 1 < sigmas.numel() else sigmas[-1]
+        dt = (sigma_next - sigma_cur).to(latents.dtype)
+        return (latents + dt * (-noise_pred.to(latents.dtype))).to(latents.dtype)
 
     def _sigma_index_for(self, timestep: torch.Tensor) -> int:
-        """Return the index ``i`` such that ``self._sched.timesteps[i] == timestep``.
+        """Return the index ``i`` such that ``self.timesteps_tensor[i] == timestep``.
 
-        The DPMSolverMultistepScheduler keeps a `(num_steps,)` ``timesteps``
-        tensor and a `(num_steps + 1,)` ``sigmas`` tensor; the terminal
-        sigma at index ``num_steps`` is the ``0`` we use as ``sigma_next``
-        for the last step. We use ``argmin(abs(diff))`` so the lookup
-        survives the fp16/bf16/fp32 round-trips of ``timestep``.
+        ``argmin(abs(diff))`` so the lookup survives fp16/bf16/fp32
+        round-trips of ``timestep``.
         """
-        ts = self._sched.timesteps
+        ts = self._timesteps_tensor
         t_val = timestep.to(device=ts.device, dtype=ts.dtype)
         return int((ts - t_val).abs().argmin().item())
 
@@ -100,9 +152,10 @@ class SanaWmFlowMatchScheduler:
         ``tokens_to_denoise_mask`` ``torch.where`` an exact no-op safety
         belt rather than a hard discontinuity.
 
-        Reuses the existing ``DPMSolverMultistepScheduler`` sigma table
-        (computed under ``use_flow_sigmas=True`` with the configured
-        ``flow_shift``) so this method does not re-implement scheduling.
+        Reads the native ``self._sigmas_tensor`` (built by
+        :meth:`_build_schedule` to match NVlabs ``FlowMatchEulerDiscrete``
+        with the configured ``flow_shift``) so this method does not
+        re-implement scheduling.
 
         Args:
             noise_pred: ``(B, C, F, H, W)`` model output.
@@ -124,7 +177,7 @@ class SanaWmFlowMatchScheduler:
                 f"Sana-WM per-token step expects (B, C, F, H, W); got {tuple(latents.shape)}."
             )
         self._ensure_timesteps(latents.device)
-        sigmas = self._sched.sigmas.to(device=latents.device, dtype=torch.float32)
+        sigmas = self._sigmas_tensor.to(device=latents.device, dtype=torch.float32)
         cur_idx = self._sigma_index_for(timestep)
         sigma_cur_scalar = sigmas[cur_idx]
         sigma_next_scalar = sigmas[cur_idx + 1] if cur_idx + 1 < sigmas.numel() else sigmas[-1]
@@ -183,7 +236,7 @@ class SanaWmFlowMatchScheduler:
         ``sigma = timestep / num_train_timesteps`` maps the scheduler's integer
         timestep (0–1000 range) back to the [0, 1] noise level.
         """
-        num_train = float(self._sched.config.num_train_timesteps)
+        num_train = float(self.num_train_timesteps)
         sigma = (timestep.float() / num_train).clamp(0.0, 1.0)
         while sigma.ndim < sample.ndim:
             sigma = sigma.unsqueeze(-1)

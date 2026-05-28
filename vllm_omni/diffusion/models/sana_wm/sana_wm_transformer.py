@@ -1321,7 +1321,46 @@ class SanaWmSelfAttention(nn.Module):
             )
             cam_contrib = _linear_output(self.out_proj_cam(cam_raw))
             combined = main_raw + cam_contrib.to(main_raw.dtype)
-            return self._apply_output_gate_and_proj(combined, hidden_states)
+            # Audit §6.13i probe hook: dump attn sub-stages for block-0.
+            # First call wins via file existence guard.
+            _attn_dump = os.environ.get("SANA_WM_DUMP_ATTN0", "")
+            if _attn_dump and not os.path.exists(f"{_attn_dump}_done.flag"):
+                torch.save(
+                    {
+                        "attn_in": hidden_states.detach().cpu(),
+                        "main_raw": main_raw.detach().cpu(),
+                        "cam_raw": cam_raw.detach().cpu(),
+                        "cam_contrib": cam_contrib.detach().cpu(),
+                        "combined": combined.detach().cpu(),
+                        "beta": beta.detach().cpu(),
+                        "decay": decay.detach().cpu(),
+                    },
+                    f"{_attn_dump}_internals.pt",
+                )
+            attn_out = self._apply_output_gate_and_proj(combined, hidden_states)
+            if _attn_dump and not os.path.exists(f"{_attn_dump}_done.flag"):
+                gate = F.silu(
+                    _linear_output(self.output_gate(hidden_states)).float()
+                ).to(combined.dtype)
+                torch.save(
+                    {
+                        "output_gate": gate.detach().cpu(),
+                        "pre_proj": (combined * gate).detach().cpu(),
+                        "attn_out": attn_out.detach().cpu(),
+                    },
+                    f"{_attn_dump}_post.pt",
+                )
+                with open(f"{_attn_dump}_done.flag", "w") as _f:
+                    _f.write("done\n")
+                print(
+                    f"[sana-wm probe] saved native attn-0 dump prefix={_attn_dump} "
+                    f"main_raw_norm={main_raw.float().norm().item():.2f} "
+                    f"cam_contrib_norm={cam_contrib.float().norm().item():.2f} "
+                    f"combined_norm={combined.float().norm().item():.2f} "
+                    f"attn_out_norm={attn_out.float().norm().item():.2f}",
+                    flush=True,
+                )
+            return attn_out
 
         # Softmax-attention path (every-N-th block in NVlabs config) — UCPE
         # is not yet ported for the softmax variant.
@@ -1510,22 +1549,72 @@ class SanaWmMbConvFfn(nn.Module):
         # so we need to apply the SiLU explicitly here — skipping it left
         # the expanded features unactivated and inflated the downstream
         # GLU output magnitude by ~12× (audit §6.13h block-0 probe).
-        x = self.glu_act(self.inverted_conv.conv(x))
-        x = self.depth_conv.conv(x)
-        value, gate = x.chunk(2, dim=1)
-        x = value * self.glu_act(gate)
-        x = self.point_conv.conv(x)  # (B*F, hidden, H, W)
+        x_inv = self.glu_act(self.inverted_conv.conv(x))
+        x_dep = self.depth_conv.conv(x_inv)
+        value, gate = x_dep.chunk(2, dim=1)
+        x_glu = value * self.glu_act(gate)
+        x_pt = self.point_conv.conv(x_glu)  # (B*F, hidden, H, W)
+        # Audit §6.13i probe hook: dump MLP sub-stages.
+        _mlp_dump = os.environ.get("SANA_WM_DUMP_MLP0", "")
+        if _mlp_dump and not os.path.exists(f"{_mlp_dump}_done.flag"):
+            torch.save(
+                {
+                    "mlp_in_4d": x.detach().cpu(),
+                    "after_inverted_silu": x_inv.detach().cpu(),
+                    "after_depth": x_dep.detach().cpu(),
+                    "after_glu": x_glu.detach().cpu(),
+                    "after_point": x_pt.detach().cpu(),
+                },
+                f"{_mlp_dump}_stages.pt",
+            )
+            with open(f"{_mlp_dump}_done.flag", "w") as _f:
+                _f.write("done\n")
+            print(
+                f"[sana-wm probe] saved native MLP-0 stage dump "
+                f"inv={x_inv.float().norm().item():.2f} "
+                f"depth={x_dep.float().norm().item():.2f} "
+                f"glu={x_glu.float().norm().item():.2f} "
+                f"point={x_pt.float().norm().item():.2f}",
+                flush=True,
+            )
+        x = x_pt
         # Temporal aggregation: (B*F, C, H, W) → (B, F, C, H*W) → (B, C, F, H*W)
         x_temporal = (
             x.reshape(batch, frames, hidden_size, spatial_tokens).permute(0, 2, 1, 3)
         )
-        x_temporal = x_temporal + self.t_conv(x_temporal)
+        t_conv_out = self.t_conv(x_temporal)
+        x_temporal = x_temporal + t_conv_out
         # → (B, F, H*W, C) → (B, N, C)
-        return (
+        final = (
             x_temporal.permute(0, 2, 3, 1)
             .reshape(batch, frames * spatial_tokens, hidden_size)
             .contiguous()
         )
+        # Extra dump: t_conv output + final mlp output for §6.13j parity.
+        _mlp_final_dump = os.environ.get("SANA_WM_DUMP_MLP_FINAL", "")
+        if _mlp_final_dump and not os.path.exists(f"{_mlp_final_dump}_done.flag"):
+            torch.save(
+                {
+                    "t_conv_in": x_temporal.detach().cpu()
+                    if t_conv_out is None
+                    else (x_temporal - t_conv_out).detach().cpu(),
+                    "t_conv_out": t_conv_out.detach().cpu(),
+                    "after_tconv_add": x_temporal.detach().cpu(),
+                    "final_mlp_out": final.detach().cpu(),
+                    "t_conv_weight_norm": float(self.t_conv.weight.detach().float().norm().item()),
+                },
+                f"{_mlp_final_dump}_final.pt",
+            )
+            with open(f"{_mlp_final_dump}_done.flag", "w") as _f:
+                _f.write("done\n")
+            print(
+                f"[sana-wm probe] native MLP-final dump "
+                f"t_conv_w_norm={self.t_conv.weight.float().norm().item():.4f} "
+                f"t_conv_out_norm={t_conv_out.float().norm().item():.2f} "
+                f"final_mlp_out_norm={final.float().norm().item():.2f}",
+                flush=True,
+            )
+        return final
 
 
 class SanaWmBlock(nn.Module):

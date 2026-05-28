@@ -910,6 +910,8 @@ class SanaWmPipeline(
             # noise_pred parity comparison vs the NVlabs LTXFlowEuler
             # step-0 dump (see flow_euler_sampler.py patch).
             _dump_path = os.environ.get("SANA_WM_DUMP_STEP0", "")
+            _dump_steps_path = os.environ.get("SANA_WM_DUMP_STEPS_PREFIX", "")
+            _dump_step_count = int(os.environ.get("SANA_WM_DUMP_STEP_COUNT", "1"))
             if _dump_path and _step_idx == 0:
                 torch.save(
                     {
@@ -930,6 +932,27 @@ class SanaWmPipeline(
                 print(
                     f"[sana-wm probe] saved native step-0 dump latent_in={tuple(latents.shape)} "
                     f"noise_pred={tuple(noise_pred.shape)} to {_dump_path}",
+                    flush=True,
+                )
+            if _dump_steps_path and _step_idx < _dump_step_count:
+                _step_path = f"{_dump_steps_path}_step{_step_idx}.pt"
+                torch.save(
+                    {
+                        "latent_in": latents.detach().cpu(),
+                        "timestep_per_frame": (
+                            model_timestep.detach().cpu()
+                            if hasattr(model_timestep, "detach")
+                            else model_timestep
+                        ),
+                        "noise_pred": noise_pred.detach().cpu(),
+                        "t_scalar": timestep.detach().cpu() if hasattr(timestep, "detach") else timestep,
+                    },
+                    _step_path,
+                )
+                print(
+                    f"[sana-wm probe] native step-{_step_idx} dump "
+                    f"latent_norm={latents.float().norm().item():.2f} "
+                    f"noise_pred_norm={noise_pred.float().norm().item():.2f} -> {_step_path}",
                     flush=True,
                 )
 

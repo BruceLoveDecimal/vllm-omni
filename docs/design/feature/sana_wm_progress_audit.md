@@ -721,7 +721,221 @@ noise_pred matches under controlled input, scheduler is the
 remaining gap. If not, we need a single-block parity test to
 find the diverging model layer.
 
-### 6.13h Block-0 Staged Parity Probe — Located 2 Layer Bugs ⚠️ 2026-05-28 night
+### 6.13l Native Scheduler Landed — Timestep Parity Achieved, Exposes Compounding noise_pred Drift ⚠️ 2026-05-29
+
+Rewrote `SanaWmFlowMatchScheduler` to reproduce
+`diffusers.FlowMatchEulerDiscreteScheduler(shift=9.8)` natively
+(no DPMSolver wrapper). The load-bearing quirk: `sigma_min` is
+established at `__init__` as the shift-transformed `1/num_train`
+(= `9.8 · 0.001 / (1 + 8.8 · 0.001) ≈ 0.00971`), then
+`set_timesteps` linspaces from that **already-shifted** value and
+applies the shift formula a **second time**. The double-shift
+produces the front-loaded "tiny early steps + huge final jump"
+schedule NVlabs uses.
+
+**Step-by-step parity (`/tmp/probe_steps.py`, 3 stage-1 steps, controlled input):**
+
+| Step | NVlabs t_scalar | Native t_scalar | latent_in cos | noise_pred cos | noise_pred ratio |
+|---|---:|---:|---:|---:|---:|
+| 0 | 1000.000 | **1000.000** ✓ | +1.0000 | +0.9506 | 1.033 |
+| 1 | 909.027 | **909.027** ✓ | +0.9978 | +0.8792 | 1.282 |
+| 2 | 87.7046 | **87.7046** ✓ | +0.4209 | +0.1999 | 2.030 |
+
+Timestep tables now match to fp32 precision. But latent and
+noise_pred cosines **degrade more aggressively than before** —
+because the now-correct giant step-2 dt (= −0.0877) propagates
+the noise_pred error fully into the stage-1 output (previously
+the wrong near-linear schedule had tiny dt ≈ −0.05 per step, so
+errors stayed bounded).
+
+**E2E benchmark (9-frame harness, 3+3 steps):**
+
+| Configuration | MAE | PSNR | SSIM-Y |
+|---|---:|---:|---:|
+| Prior (DPMSolver wrapper, wrong schedule) | 50.53 | 12.11 | -0.002 |
+| **Native FlowMatchEuler (correct schedule)** | **54.21** | **11.46** | **-0.002** |
+
+Numbers regressed slightly on MAE/PSNR. SSIM-Y unchanged. This
+is expected and informative — the scheduler was hiding the
+downstream model-forward drift; fixing it exposed the real
+remaining bug.
+
+**The real remaining bug.** At step-0 with controlled-input
+(identical latent + identical prompt + identical timestep),
+noise_pred has **cos 0.95 and norm ratio 1.03**. Block-0 sub-
+stages were verified clean (attn cos +0.9999, MLP cos +0.998 in
+§6.13j), so the 5% cosine drift comes from one of:
+
+1. **20-block compounding** of the 1.2% per-block norm-ratio
+   drift seen at MLP-final (§6.13j). Theoretical 1.012²⁰ ≈ 1.27×
+   in norm, but observed is 1.03× — so compounding alone
+   over-predicts, suggesting it's a real but partial contributor.
+2. **Final layer (`SanaWmFinalLayer`) + unpatchify** —
+   completely untested at the parity level.
+3. **Cross-attention / camera-fusion** at later blocks —
+   block-0's cross-attn was implicitly verified by the block-0
+   post-cross-attn cos +1.000 in §6.13h, but only at block-0.
+4. **Refiner stage** — entirely untested at sub-step level.
+
+**Next probe.** Multi-block compounding sweep:
+dump `block_output` at blocks 0/5/10/15/19 + `final_layer` +
+`noise_pred` (unpatchify out) on both sides at step-0 with
+controlled inputs. Cosine and norm-ratio trajectory will
+isolate which stage contributes most.
+
+**Acceptance for native scheduler work.** Timestep table parity
+achieved ✅. E2E parity unlocked but blocked on §6.13m
+(noise_pred drift). Removing diffusers `DPMSolverMultistepScheduler`
+dependency: ✅ done — `scheduling_sana_wm.py` no longer imports
+diffusers at runtime.
+
+**Repro.** `/tmp/probe_steps.py` (step parity),
+`/tmp/run_metrics.py` (e2e) on remote
+`/root/autodl-tmp/vllm-omni-feat-sana-wm-23ff624b` after syncing
+`vllm_omni/diffusion/models/sana_wm/scheduling_sana_wm.py`.
+
+### 6.13k Stage-1 Multi-Step Timestep Schedule Diverges — Native Scheduler Now Urgent 🔴 2026-05-28 night (RESOLVED — see §6.13l)
+
+With §6.13j confirming model forward is clean at block-0 (attn
+cos +0.9999, MLP cos +0.998), the natural next probe is whether
+the e2e MAE-50 gap comes from scheduler-side timestep drift or
+multi-block model-forward compounding. Extended the step-0 dump
+hook to dump steps 0/1/2 on both pipelines, controlled-input
+inject step-0 latent + prompt on the native side, then compare
+`latent_in`, `noise_pred`, and `timestep_per_frame` per step.
+
+**Result (`/tmp/probe_steps.py`, 3 stage-1 steps):**
+
+| Step | NVlabs t_scalar | Native t_scalar | latent_in cos | noise_pred cos | noise_pred ratio |
+|---|---:|---:|---:|---:|---:|
+| 0 | 1000.0 | 999.0 | **+1.0000** | +0.9435 | 1.030 |
+| 1 | 909.0 | 951.0 | +0.9993 | +0.9056 | 1.330 |
+| 2 | **87.7** | **830.0** | **+0.6450** | **+0.3173** | **2.049** |
+
+**Diagnosis.** Our `DPMSolverMultistep(use_flow_sigmas=True)`
+produces a near-linear schedule (999 → 951 → 830) over 3 steps.
+NVlabs `LTXFlowEuler` produces a flow-shifted schedule that
+front-loads tiny early steps then takes one huge final jump
+(1000 → 909 → 87.7). By step-2 the two pipelines are at
+completely different points on the flow trajectory, the latent
+cosine collapses to 0.645, and noise_pred cosine to 0.32.
+
+The model forward is **not** the bug. The scheduler timestep
+schedule **is**. Specifically:
+
+* Step-0 (controlled input): noise_pred cos 0.9435 — already
+  slightly off purely because `t_scalar` differs by 1 (999 vs
+  1000).
+* Step-1 latent_in cos 0.9993 — small Euler step took us
+  somewhere reasonable, but the divergence is growing.
+* Step-2 latent_in cos 0.6450 — catastrophic; we're at t=830
+  while NVlabs is at t=87.7 (~last step of the denoising
+  trajectory). The two pipelines are doing different things at
+  this point.
+
+**Implication for native scheduler work.** Native scheduler is
+no longer a code-cleanup / dependency-removal task — it is the
+**primary remaining correctness bug** for stage-1 alignment.
+Replacing the `DPMSolverMultistep` wrapper with a faithful port
+of `LTXFlowEuler`'s schedule (init sigmas + flow shift +
+per-step `t = sigma * num_train_timesteps`) should drop e2e MAE
+significantly in one shot, given that all upstream stages
+(model forward, controlled-input noise_pred, per-token Euler
+step formula) are already verified clean.
+
+**Acceptance.** After native scheduler lands, step-1 and step-2
+`t_scalar` should match NVlabs to within 1.0 (matching step-0's
+tolerance). `latent_in` cosine should hold ≥ 0.99 through all
+stage-1 steps. E2E MAE should drop from ~50 to the
+comparison-meaningful range (target ≥ 25 dB PSNR).
+
+**Repro.** `/tmp/probe_steps.py` on remote
+`/root/autodl-tmp/vllm-omni-feat-sana-wm-23ff624b`. Dump hooks
+gated by `SANA_WM_DUMP_STEPS_PREFIX` + `SANA_WM_DUMP_STEP_COUNT`.
+
+### 6.13j Block-0 Sub-stage Parity Re-verified — §6.13h Findings Were a Measurement Artifact ✅ 2026-05-28 night
+
+After §6.13h flagged `attn_out` (3× smaller, cos +0.26) and `mlp_out`
+(6× larger then 6× smaller, cos < 0) as the two block-0 layer bugs,
+a deeper drill-down with stage-by-stage dump hooks **retracts both
+findings**. Both modules are essentially correct; the §6.13h
+divergences were caused by an apples-to-oranges comparison where
+NVlabs's `forward_frame_aware` dumped the **gated** output
+(`gate_msa * attn_out`, `gate_mlp * mlp_out`) while our hooks dumped
+the **raw** sub-module output.
+
+**Attn sub-stage parity (controlled inputs, after fixing the
+gated/raw mismatch):**
+
+| Stage | NVlabs norm | Native norm | Cosine |
+|---|---:|---:|---:|
+| main_raw (post-`out_proj`, pre-gate) | match | match | **+0.9999** |
+| cam_raw | match | match | +0.9999 |
+| cam_contrib (after camera fusion) | match | match | +0.9999 |
+| combined | match | match | +0.9999 |
+| attn_out (final) | — | — | **+0.9999** |
+
+**MLP sub-stage parity (controlled inputs, same fix):**
+
+| Stage | NVlabs norm | Native norm | Cosine | Ratio |
+|---|---:|---:|---:|---:|
+| mlp_in (4D `(B*F,C,H,W)`) | match | match | +1.0000 | 1.000 |
+| after_inverted_silu | match | match | +1.0000 | 1.000 |
+| after_depth | match | match | +1.0000 | 1.000 |
+| after_glu | match | match | +1.0000 | 1.000 |
+| after_point | match | match | +1.0000 | 1.000 |
+| t_conv_in (5D `(B,C,F,H*W)`) | 1210.31 | 1220.75 | +0.9980 | 1.009 |
+| t_conv_out | 9093.37 | 9201.14 | +0.9981 | 1.012 |
+| after_tconv_add | 9491.44 | 9608.66 | +0.9982 | 1.012 |
+| **final_mlp_out** | **9491.44** | **9608.65** | **+0.9982** | **1.012** |
+
+`t_conv.weight.norm` is byte-identical on both sides (180.5021).
+
+**What this means.**
+
+* `SanaWmMbConvFfn` rewrite from §6.13h (per-frame `(B*F,C,H,W)`
+  reshape + post-`inverted_conv` SiLU) was correct. The spatial
+  MBConv pipeline is now numerically equivalent to NVlabs's
+  `GLUMBConvTemp`.
+* `SanaWmSelfAttention._forward_cam_branch` single-path delta rule
+  + `apply_fn_o` + RMS renorm is also correct. The §6.13h "3× too
+  small" was the gated-vs-raw artifact — NVlabs's
+  `forward_frame_aware` multiplies by `gate_msa` (~0.3 in block 0)
+  before the dump point we anchored on.
+* Block-0 has **no remaining layer bug**. The residual e2e
+  divergence (still ~50 MAE, 12 dB PSNR) must come from one of:
+  1. **Compounding** — the 1.2% per-block norm-ratio drift at
+     `final_mlp_out` (1.012²⁰ ≈ 1.27× by block 19). At bf16
+     precision this is plausibly within numerical tolerance, but
+     it compounds.
+  2. **Final layer / unpatchify** (untested).
+  3. **Multi-step scheduler** beyond step 0 (only step-0 noise_pred
+     was verified controlled-input parity).
+  4. **Stage-2 refiner** path (also untested at sub-stage level).
+
+**Action.** §6.13h's "two layer bugs" narrative is retracted. The
+MbConv reshape + SiLU fix from §6.13h still stands as a real
+correctness fix; the leftover negative cosine on the gated output
+seen in §6.13h was just gate dynamics. Next probe will be one of
+the four candidates above — see §9.
+
+**Repro.** `/tmp/probe_attn0.py`, `/tmp/probe_mlp0.py`,
+`/tmp/probe_mlp_final.py` on remote
+`/root/autodl-tmp/vllm-omni-feat-sana-wm-23ff624b`. Dump hooks
+gated by `SANA_WM_DUMP_ATTN0`, `SANA_WM_DUMP_MLP0`,
+`SANA_WM_DUMP_MLP_FINAL`; injection by `SANA_WM_LOAD_LATENT_FROM`
++ `SANA_WM_LOAD_PROMPT_FROM`.
+
+### 6.13h Block-0 Staged Parity Probe — Located 2 Layer Bugs ⚠️ 2026-05-28 night (SUPERSEDED — see §6.13j)
+
+> **2026-05-28 update:** Both "bugs" identified below are retracted
+> by §6.13j. The 3×-smaller `attn_out` and 6×-larger `mlp_out`
+> cosines were a measurement artifact (NVlabs dumped the gated
+> output; we dumped raw). The MbConv reshape + SiLU fix described
+> below is still a real correctness improvement, but the "remaining
+> single-block work" and "open questions" bullets at the end of
+> this section no longer apply.
+
 
 Added env-gated dump hooks at four points inside our
 `SanaWmBlock._forward_frame_aware` and at matching points in
