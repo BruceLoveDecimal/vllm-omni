@@ -743,6 +743,28 @@ class SanaWmPipeline(
             first_latent = None
             latents = noise
 
+        # Audit §6.13f probe hook: load the initial latent from a file
+        # (typically an NVlabs step-0 dump) so both pipelines start the
+        # sampling loop from byte-identical input. Lets us cleanly
+        # isolate `noise_pred` divergence due to model forward vs the
+        # RNG/init differences that previously caused cosine=+0.43 on
+        # latent_in between the two pipelines.
+        _load_latent_path = os.environ.get("SANA_WM_LOAD_LATENT_FROM", "")
+        if _load_latent_path and os.path.exists(_load_latent_path):
+            blob = torch.load(_load_latent_path, map_location=device, weights_only=True)
+            loaded = blob["latent_in"] if isinstance(blob, dict) and "latent_in" in blob else blob
+            if loaded.shape != latents.shape:
+                raise ValueError(
+                    f"SANA_WM_LOAD_LATENT_FROM shape mismatch: file={tuple(loaded.shape)}, "
+                    f"pipeline={tuple(latents.shape)}."
+                )
+            latents = loaded.to(device=device, dtype=dtype)
+            print(
+                f"[sana-wm probe] overrode initial latent from {_load_latent_path}; "
+                f"shape={tuple(latents.shape)} std={latents.float().std().item():.4f}",
+                flush=True,
+            )
+
         allow_hash_fallback = bool(extra_args.get("sana_wm_hash_prompt_smoke", False))
         prompt_embeds, prompt_source = self._native_smoke_prompt_embeds(
             prompt,
@@ -750,6 +772,37 @@ class SanaWmPipeline(
             dtype=dtype,
             allow_hash_fallback=allow_hash_fallback,
         )
+        # Audit §6.13f probe hook: override prompt_embeds from a file
+        # (typically the NVlabs step-0 dump's `prompt_embeds` field) so
+        # the model sees byte-identical text conditioning.
+        _load_prompt_path = os.environ.get("SANA_WM_LOAD_PROMPT_FROM", "")
+        if _load_prompt_path and os.path.exists(_load_prompt_path):
+            _blob = torch.load(_load_prompt_path, map_location=device, weights_only=True)
+            _loaded_prompt = _blob.get("prompt_embeds") if isinstance(_blob, dict) else _blob
+            if _loaded_prompt is None:
+                raise ValueError(f"SANA_WM_LOAD_PROMPT_FROM file missing 'prompt_embeds': {_load_prompt_path}")
+            _loaded_prompt = _loaded_prompt.to(device=device, dtype=dtype)
+            # NVlabs CFG-doubled dump (B=2): drop uncond/cond duplication and
+            # take the cond branch. If single-batch already, no-op.
+            if _loaded_prompt.shape[0] == 2 and prompt_embeds.shape[0] == 1:
+                _loaded_prompt = _loaded_prompt[1:]
+            # Match dim layout: NVlabs uses (B, 1, N, D), ours (B, N, D).
+            if _loaded_prompt.ndim == 4 and _loaded_prompt.shape[1] == 1 and prompt_embeds.ndim == 3:
+                _loaded_prompt = _loaded_prompt.squeeze(1)
+            if _loaded_prompt.shape != prompt_embeds.shape:
+                print(
+                    f"[sana-wm probe] WARNING prompt shape mismatch: "
+                    f"loaded={tuple(_loaded_prompt.shape)} vs pipeline={tuple(prompt_embeds.shape)}; "
+                    f"using loaded as-is, model must handle.",
+                    flush=True,
+                )
+            prompt_embeds = _loaded_prompt
+            prompt_source = f"loaded:{_load_prompt_path}"
+            print(
+                f"[sana-wm probe] overrode prompt_embeds from {_load_prompt_path}; "
+                f"shape={tuple(prompt_embeds.shape)} norm={prompt_embeds.float().norm().item():.3f}",
+                flush=True,
+            )
 
         camera = payload.get("camera") or {}
         condition = SanaWmCameraCondition(

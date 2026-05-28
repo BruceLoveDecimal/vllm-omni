@@ -721,6 +721,67 @@ noise_pred matches under controlled input, scheduler is the
 remaining gap. If not, we need a single-block parity test to
 find the diverging model layer.
 
+### 6.13g Step-0 Controlled-Input Probe — Bug Is In Model Forward ⚠️ 2026-05-28 late
+
+Added env-gated input-injection hooks to `_run_native_smoke_backend`:
+
+* `SANA_WM_LOAD_LATENT_FROM=path` — overrides the initial latent
+  with `latent_in` loaded from a saved dump (typically the
+  NVlabs LTXFlowEuler step-0 dump).
+* `SANA_WM_LOAD_PROMPT_FROM=path` — overrides `prompt_embeds`
+  with the `prompt_embeds` field of a saved dump; handles
+  NVlabs' `(B, 1, N, D)` shape and CFG-doubled batch.
+
+Re-ran the step-0 probe with BOTH `latent_in` and `prompt_embeds`
+injected from NVlabs into our pipeline. Verified the injection
+worked: native latent_in cosine vs NVlabs = `+0.999987`, native
+prompt_embeds norm = NVlabs norm (`2280.903 vs 2280.949`).
+
+**Result — model forward is anti-correlated even with identical
+inputs:**
+
+```
+NVlabs noise_pred: shape (1, 128, 2, 22, 40)  std=1.02  norm=487.6
+native noise_pred: shape (1, 128, 2, 22, 40)  std=0.81  norm=384.0
+MAE(noise_pred)     = 1.062
+cosine(noise_pred)  = -0.057
+  frame 0 cosine: -0.231
+  frame 1 cosine: +0.104
+```
+
+**Isolation: cam disabled gives WORSE cosine (-0.110)**, ruling
+out cam branch as the dominant bug. The shared
+model-forward components are the source. Most likely suspects:
+
+* main GDN attention path (`_forward_gdn_raw` + recurrence)
+* cross-attention with prompt
+* timestep modulation (`scale_shift_table` + `_modulate`)
+* patch embedding (`x_embedder.Conv3d`)
+* `attention_y_norm`
+* MLP / FFN (`SanaWmMbConvFfn`)
+* final layer modulation
+
+**Decisive rule-outs from this round:**
+
+1. ❌ Noise initialisation differences — controlled, cosine
+   +0.999987 on latent_in.
+2. ❌ Prompt encoding — controlled, NVlabs prompt injected with
+   matching shape and norm.
+3. ❌ Scheduler / sigma — model forward divergence happens
+   BEFORE any scheduler.step on step 0.
+4. ❌ Cam branch — disabling it makes cosine worse.
+
+**Next high-leverage diagnostic.** Single-block parity test:
+- Capture both pipelines' input to and output from `blocks[0]`
+  on the same control inputs.
+- If block-0 output matches → bug is in patch embedding /
+  `attention_y_norm` / final layer.
+- If block-0 output differs → bug is in shared block components
+  (GDN, cross-attn, MLP, modulation).
+
+This is the next 0.5–1 day work chunk and is the natural
+continuation of the §6.13f probe approach.
+
 ### 6.13e LTX-2 VAE Per-Channel Normalisation ✅ FIXED 2026-05-28 late
 
 **Symptom** (post-§6.13d): MAE/PSNR improved (80.74→69.06 MAE,
