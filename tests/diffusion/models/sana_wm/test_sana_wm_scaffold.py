@@ -467,6 +467,86 @@ def test_sana_wm_weight_mapping() -> None:
     )
     assert normalize_sana_wm_stage1_weight_name("unknown.weight") is None
 
+    # _ConvWrapper wraps nn.Conv2d under a .conv attribute, so checkpoint keys
+    # must include the extra .conv level — verify the mapping preserves it.
+    assert normalize_sana_wm_stage1_weight_name("blocks.0.mlp.inverted_conv.conv.weight") == (
+        "transformer.blocks.0.mlp.inverted_conv.conv.weight"
+    )
+    assert normalize_sana_wm_stage1_weight_name("blocks.0.mlp.inverted_conv.conv.bias") == (
+        "transformer.blocks.0.mlp.inverted_conv.conv.bias"
+    )
+    assert normalize_sana_wm_stage1_weight_name("blocks.0.mlp.depth_conv.conv.weight") == (
+        "transformer.blocks.0.mlp.depth_conv.conv.weight"
+    )
+    assert normalize_sana_wm_stage1_weight_name("blocks.0.mlp.point_conv.conv.weight") == (
+        "transformer.blocks.0.mlp.point_conv.conv.weight"
+    )
+    # A key missing the .conv level must NOT map to the same path — it would
+    # silently fail at materialize time because _ConvWrapper has no .weight.
+    assert normalize_sana_wm_stage1_weight_name("blocks.0.mlp.inverted_conv.weight") == (
+        "transformer.blocks.0.mlp.inverted_conv.weight"
+    )
+
+
+def test_sana_wm_weight_loading_no_unapplied() -> None:
+    """CPU-only round-trip: materialize → collect named_parameters → load
+    synthetic weights → assert unapplied_weights is empty.
+
+    This catches _ConvWrapper-style mismatches where string mapping succeeds
+    but the mapped key has no corresponding nn.Parameter in the model.
+    """
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmConfig, SanaWmTransformer3DModel
+
+    # num_blocks=4 with default softmax_every_n=4: blocks 0-2 are GDN blocks,
+    # block 3 is a softmax block. This ensures both attention variants and all
+    # _ConvWrapper mlp parameters are covered in the round-trip.
+    config = SanaWmConfig(
+        num_blocks=4,
+        hidden_size=8,
+        linear_head_dim=4,
+        mlp_ratio=1,
+        model_max_length=3,
+        chunk_plucker_channels=6,
+    )
+    # Materialize on CPU to collect ground-truth parameter shapes.
+    # latent_channels=4 and prompt_channels=6 must match what we pass to
+    # loader.materialize() below so that x_embedder/y_embedder shapes agree.
+    reference = SanaWmTransformer3DModel(
+        config=config,
+        materialize=True,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        latent_channels=4,
+        prompt_channels=6,
+    )
+    params = dict(reference.named_parameters())
+    buffers = dict(reference.named_buffers())
+
+    # Build synthetic checkpoint weights from named_parameters only.
+    # Buffers (e.g. _device_anchor) are internal bookkeeping and never appear
+    # in real checkpoints, so they are intentionally excluded here.
+    synthetic: list[tuple[str, torch.Tensor]] = []
+    for local_name, param in params.items():
+        synthetic.append((local_name, torch.zeros_like(param)))
+
+    # Load into a fresh (un-materialized) model with identical config.
+    loader = SanaWmTransformer3DModel(config=config)
+    loader.load_weights(iter(synthetic))
+    # Materialize triggers _apply_loaded_tensors_to_materialized which raises on
+    # unapplied weights — if it doesn't raise, every key was consumed.
+    loader.materialize(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        latent_channels=4,
+        prompt_channels=6,
+    )
+    report = loader.last_load_report
+    assert report.unapplied_weights == (), (
+        f"Some weights were not consumed after materialize: {report.unapplied_weights}"
+    )
+
 
 def test_sana_wm_pipeline_fails_fast_when_executed() -> None:
     from vllm_omni.diffusion.models.sana_wm import SANA_WM_SCAFFOLD_ERROR, SanaWmPipeline, SanaWmTwoStagesPipeline
