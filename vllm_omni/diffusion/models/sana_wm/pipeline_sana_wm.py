@@ -620,8 +620,17 @@ class SanaWmPipeline(
                 "Sana-WM Stage-1 Gemma hidden size mismatch: expected "
                 f"{SANA_WM_STAGE1_PROMPT_CHANNELS}, got {hidden_states.shape[-1]}."
             )
-        hidden_states = F.normalize(hidden_states.float(), dim=-1)
-        hidden_states = hidden_states * float(self.sana_wm_config.y_norm_scale_factor)
+        # Audit §6.13f: pass RAW Gemma hidden states; the model's
+        # internal ``attention_y_norm = RMSNorm(hidden_size,
+        # scale_factor=y_norm_scale_factor)`` (set in
+        # SanaWmTransformer3DModel) handles normalisation. The prior
+        # ``F.normalize(...) * y_norm_scale_factor`` step double-
+        # normalised and used the scale_factor as a multiplicative
+        # post-normalise gain rather than as the RMSNorm scale, which
+        # collapsed the prompt embed L2 norm to ~0.17 (vs the expected
+        # ~450 at this shape) and left the model effectively
+        # unconditioned on the prompt. Probed via
+        # tools/scripts/probe_step0.py.
         return hidden_states.to(device=device, dtype=dtype), "gemma2"
 
     def _decode_native_smoke_latents(
@@ -808,7 +817,7 @@ class SanaWmPipeline(
             # values come from the (B, 1, F) model timestep at each step.
             pass
 
-        for timestep in timesteps:
+        for _step_idx, timestep in enumerate(timesteps):
             if use_per_frame_timestep:
                 # (B, 1, F) per-frame timestep, frame 0 forced to 0.
                 # Keep fp32 to match NVlabs ``LTXFlowEuler.sample`` — the
@@ -842,6 +851,33 @@ class SanaWmPipeline(
                     plucker=plucker,
                     raymap=raymap,
                     spatial_raymap=spatial_raymap,
+                )
+            # Audit §6.13f probe hook: opt-in dump of native step-0
+            # (input latent, per-frame timestep, noise_pred) for the
+            # noise_pred parity comparison vs the NVlabs LTXFlowEuler
+            # step-0 dump (see flow_euler_sampler.py patch).
+            _dump_path = os.environ.get("SANA_WM_DUMP_STEP0", "")
+            if _dump_path and _step_idx == 0:
+                torch.save(
+                    {
+                        "latent_in": latents.detach().cpu(),
+                        "timestep_per_frame": (
+                            model_timestep.detach().cpu()
+                            if hasattr(model_timestep, "detach")
+                            else model_timestep
+                        ),
+                        "noise_pred": noise_pred.detach().cpu(),
+                        "raymap": raymap.detach().cpu() if hasattr(raymap, "detach") else raymap,
+                        "prompt_embeds_first_row": prompt_embeds[:, 0].detach().cpu(),
+                        "prompt_embeds_norm": prompt_embeds.float().norm().item(),
+                        "t_scalar": timestep.detach().cpu() if hasattr(timestep, "detach") else timestep,
+                    },
+                    _dump_path,
+                )
+                print(
+                    f"[sana-wm probe] saved native step-0 dump latent_in={tuple(latents.shape)} "
+                    f"noise_pred={tuple(noise_pred.shape)} to {_dump_path}",
+                    flush=True,
                 )
 
             if use_per_token_step:

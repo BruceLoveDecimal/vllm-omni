@@ -651,20 +651,75 @@ native scheduler refactor.
     looks right at decoded-image level is wrong at latent level
     and the refiner masks it via downstream re-normalisation.
 
-**Next test (single highest-leverage diagnostic).**
+**Step-0 probe results (`tools/scripts/probe_step0.py`, 2026-05-28
+late evening, same 9-frame harness):**
 
-Dump both pipelines' `noise_pred` at step 0 on the same noised
-input (same noise, same prompt, same camera). Compare.
+Both pipelines saved their step-0 `(latent_in, timestep, noise_pred)`
+via env-gated dump hooks (`SANA_WM_DUMP_STEP0_LTX` in NVlabs
+`LTXFlowEuler.sample`, `SANA_WM_DUMP_STEP0` in our
+`_run_native_smoke_backend`).
 
-* If `noise_pred` matches → bug is in `step_flow_euler_per_token`
-  (sigma or sign).
-* If `noise_pred` differs → bug is in model forward (which layer
-  diverges needs the single-block parity test we've been
-  deferring).
+| Item | NVlabs | Native | Compare |
+|---|---|---|---|
+| latent_in shape | (1, 128, 2, 22, 40) | same | shape match |
+| latent_in stats | std=0.94, min=-4.4, max=+4.8 | std=0.94, min=-4.2, max=+4.3 | **cosine=+0.43** |
+| timestep_per_frame | [0.0, 1000.0] | [0.0, 999.0] | off by one |
+| noise_pred shape | (1, 128, 2, 22, 40) | same | shape match |
+| noise_pred stats | std=1.02, min=-5.3, max=+5.6 | std=0.77, min=-2.9, max=+3.1 | **cosine=-0.06** |
+| prompt_embeds_norm | (not probed) | **0.17** | **expected ~450 at this shape** |
 
-This is the next 0.5-day work chunk and supersedes the
-softmax-UCPE / camera-embedder / native-scheduler refactor
-priorities.
+**Three independent issues localised:**
+
+1. **Prompt embedding is essentially zero (norm=0.17).** Our
+   `_native_smoke_prompt_embeds` did
+   `hidden_states = F.normalize(...) * y_norm_scale_factor`
+   (with `y_norm_scale_factor=0.01`). NVlabs passes RAW Gemma
+   hidden states directly; the model's internal
+   `attention_y_norm = RMSNorm(hidden_size,
+   scale_factor=y_norm_scale_factor)` handles normalisation.
+   Our external pre-normalisation collapses the prompt signal,
+   leaving the model effectively unconditioned on the prompt.
+2. **Input latent differs (cosine=+0.43).** Even with seed=0 on
+   both sides, the random noise sequence diverges (likely
+   different RNG consumption order in setup code paths). This is
+   a CONFOUND for the noise_pred comparison — we cannot cleanly
+   say whether noise_pred would match given identical input.
+3. **First-step timestep differs by 1** (1000 vs 999). The
+   scheduler's terminal timestep is `num_train_timesteps`; one
+   side uses `num_train_timesteps` exactly and the other uses
+   `num_train_timesteps - 1`. Minor schedule alignment issue.
+
+**Verdict on the three suspects from §6.13f:**
+
+* "Bug in model forward" — possible, but obscured by issue #2
+  (input mismatch). Need to inject identical input to test
+  cleanly.
+* "Bug in `step_flow_euler_per_token`" — possible, but not the
+  dominant one once #1 is fixed.
+* "Sigma table mismatch" — possible, but #3 hints at a smaller
+  endpoint issue rather than a wholesale schedule difference.
+
+**Prompt-embed fix landed.** Removed the `F.normalize + scale`
+step from `_native_smoke_prompt_embeds` (commit `<pending>`).
+GPU re-run shows:
+
+| Metric | Before fix | **After fix** | Δ |
+|---|---|---|---|
+| MAE | 47.35 | 51.06 | +3.71 (worse) |
+| PSNR | 13.14 | 12.43 | -0.71 (worse) |
+| SSIM-Y | +0.025 | **+0.046** | **+0.021 (better)** |
+
+SSIM-Y nearly doubled (which is the structural alignment
+metric) — that is the direction we want. MAE/PSNR getting worse
+suggests the prompt-conditioned output now exposes other
+mismatches (noise init, timestep, etc) that were previously
+masked by an unconditioned generation.
+
+**Next investigation chunk.** Force identical noise initialisation
+on both sides to control issue #2, then re-run step-0 probe. If
+noise_pred matches under controlled input, scheduler is the
+remaining gap. If not, we need a single-block parity test to
+find the diverging model layer.
 
 ### 6.13e LTX-2 VAE Per-Channel Normalisation ✅ FIXED 2026-05-28 late
 
