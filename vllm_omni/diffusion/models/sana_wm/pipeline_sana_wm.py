@@ -746,7 +746,13 @@ class SanaWmPipeline(
         for timestep in timesteps:
             if use_per_frame_timestep:
                 # (B, 1, F) per-frame timestep, frame 0 forced to 0.
-                model_timestep = timestep.to(latents.dtype).expand(
+                # Keep fp32 to match NVlabs ``LTXFlowEuler.sample`` — the
+                # sinusoidal-embedding inside ``SanaWmTimestepEmbedder``
+                # uses ``timestep.float()`` internally; casting through
+                # the latent dtype (bf16) first would quantise the
+                # timestep before the embed and inject a hidden
+                # precision variable into the contract.
+                model_timestep = timestep.float().expand(
                     cam_batch, 1, cam_frames
                 ).clone()
                 model_timestep[:, :, 0] = 0.0
