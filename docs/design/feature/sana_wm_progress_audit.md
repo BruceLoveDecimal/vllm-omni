@@ -24,7 +24,7 @@ the newly identified per-token/per-frame timestep sampling contract.
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Verified 2026-05-28** — UCPE math (`ucpe.py`) and native raw camera branch match NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` at fp32 `~1e-7` max abs. See §6.12a. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | Per-token timestep sampling contract | ⚠️ **Partial fix landed (2026-05-28 late)** — `SanaWmTimestepEmbedder` + `SanaWmBlock` + `SanaWmFinalLayer` now support per-frame `(B, 1, F)` timestep (Breaks 1+2 closed). Pipeline emits clean first frame + per-frame timestep with frame-0 forced to 0. MAE dropped `102.48 → 82.32` (-20.16), PSNR `6.57 → 8.20`. Break 3 (per-token flow Euler step + `tokens_to_denoise_mask`) still open. See §6.13b. |
+| 8 | Per-token timestep sampling contract | ⚠️ **Breaks 1+2 fixed (2026-05-28), Break 3 designed (§6.13c)** — model side `(B, 1, F)` per-frame timestep with fp32 lands; new default MAE=80.74, PSNR=8.34, SSIM-Y=0.020 (was 102.48 / 6.57 / -0.017). Native `step_flow_euler_per_token` on `SanaWmFlowMatchScheduler` is the next implementation chunk, with `condition_mask` to be re-enabled by default once it becomes a true no-op safety belt. See §6.13b, §6.13c. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The UCPE / camera-control module is now
@@ -533,24 +533,40 @@ The three breaks from §6.13a were partially closed in commit
 | Scalar t + main + cam (post §6.12) | 102.48 | 6.57 | -0.017 |
 | Per-frame t + main + cam + mask ON | 110.76 | 6.10 | 0.049 |
 | Per-frame t + main-only + mask ON | 101.18 | 6.84 | 0.083 |
-| **Per-frame t + main + cam + mask OFF (default)** | **82.32** | **8.20** | **0.016** |
-| Per-frame t + main-only + mask OFF | 80.10 | 8.55 | 0.011 |
+| Per-frame bf16 t + main + cam + mask OFF | 82.32 | 8.20 | 0.016 |
+| Per-frame bf16 t + main-only + mask OFF | 80.10 | 8.55 | 0.011 |
+| **Per-frame fp32 t + main + cam + mask OFF (new default)** | **80.74** | **8.34** | **0.020** |
+| Per-frame fp32 t + main-only + mask OFF | 79.99 | 8.56 | 0.011 |
 
-The mask-OFF entry is the new default. Headline: the per-frame
-timestep contract drops MAE from `102.48` to `82.32` (−20.16) and
-PSNR rises from `6.57` → `8.20` dB. Removing `condition_mask` post-
-step restore drops a further `28` MAE in our wrapped-DPMSolver
-setup because the mask creates a hard discontinuity that
-contaminates the multistep solver's stored model-output history. In
-NVlabs' LTXFlowEuler the mask is a no-op safety belt (the per-token
-sigma for the conditioning token is already 0 so the step doesn't
-change it); ours is not yet a true per-token scheduler.
+The fp32-mask-OFF entry is the current default. Headline: the
+per-frame timestep contract drops MAE from `102.48` to `80.74`
+(−21.74) and PSNR rises from `6.57` → `8.34` dB. The fp32 upgrade
+alone is worth `−1.58` MAE (commit `39168e08`): the previous
+default silently cast `timestep.to(latents.dtype)` to bf16 before
+the sinusoidal embedder, while NVlabs `LTXFlowEuler.sample` keeps
+the timestep in fp32 throughout.
 
-**Cam branch.** With per-frame t and no mask, cam-on (`82.32`) and
-cam-off (`80.10`) are within `~2` MAE. Cam is no longer dominant —
-the structural correctness from §6.12 holds but UCPE attention is
-marginally not helping in this regime. Diagnosable separately
-after the scheduler step lands.
+Removing `condition_mask` post-step restore drops a further `~28`
+MAE in our wrapped-DPMSolver setup because the mask creates a hard
+discontinuity that contaminates the multistep solver's stored
+model-output history. In NVlabs' LTXFlowEuler the mask is a no-op
+safety belt (the per-token sigma for the conditioning token is
+already 0 so the step doesn't change it); ours is not yet a true
+per-token scheduler.
+
+**Cam branch.** With per-frame fp32 t and no mask, cam-on (`80.74`)
+and cam-off (`79.99`) are within `~0.75` MAE. Cam is no longer
+dominant — the §6.12 structural correctness holds but UCPE
+attention is marginally not pulling its weight in this regime.
+Diagnosable separately after the scheduler step lands.
+
+> **Important caveat.** MAE ~80 / PSNR ~8 dB / SSIM-Y ~0.02 is
+> still firmly in the "weakly correlated" regime. The model side
+> contract change is structurally right (PSNR direction, multiple
+> independent ablations consistent), but should not be read as
+> "near aligned". Break 3 (per-token flow-matching Euler step + an
+> active `tokens_to_denoise_mask`) is the main lever for the next
+> chunk of headroom — see §6.13c.
 
 **Remaining work (still §6.13a "Break 3"):**
 - Port LTX flow-matching Euler step with `per_token_timesteps`
@@ -564,6 +580,91 @@ after the scheduler step lands.
   `add_noise_to_image_conditioning_latents` — gated by
   `image_cond_noise_scale > 0`; SANA-WM public config keeps it at
   `0` so it can ship later.
+
+### 6.13c Break 3 Design — Native Per-Token Flow-Matching Euler Step
+
+Break 3 from §6.13a (per-token scheduler step + active
+`tokens_to_denoise_mask`) is the next implementation chunk. The
+plan, before opening the editor, is captured here so reviewers can
+push back on the design before implementation.
+
+**Choice: native step, not full scheduler swap.** Three options
+were considered:
+
+| Option | Pros | Cons | Verdict |
+|---|---|---|---|
+| A — Add `step_flow_euler_per_token(...)` method on the existing `SanaWmFlowMatchScheduler` and reuse DPMSolver's sigma schedule | Full control, ~50–80 LOC, no diffusers version dependency, keeps the wrapper class as the single source of truth | Have to verify that DPMSolver's `use_flow_sigmas=True` sigma table matches NVlabs' FlowMatchEulerDiscrete sigma table | **Pick** |
+| B — Drop the wrapper and use diffusers `FlowMatchEulerDiscreteScheduler` directly | Less new code | `per_token_timesteps` is a newer-version API; we lock our diffusers floor higher | reject |
+| C — Vendor NVlabs' full sampler module | Exact parity | Too much surface area; pulls in their flow-matching infra | reject |
+
+**API.**
+
+```python
+# scheduling_sana_wm.py
+def step_flow_euler_per_token(
+    self,
+    noise_pred: torch.Tensor,         # (B, C, F, H, W) — model output
+    timestep: torch.Tensor,           # scalar current step
+    latents: torch.Tensor,            # (B, C, F, H, W)
+    per_token_timesteps: torch.Tensor,# (B, FHW) per-token t, 0 for conditioning
+) -> torch.Tensor:                    # (B, C, F, H, W) prev_sample
+```
+
+**Math.** NVlabs' `LTXFlowEuler.sample` passes `-noise_pred` to
+`FlowMatchEulerDiscreteScheduler.step`, whose update rule is
+`prev = sample - (sigma_next - sigma) * model_output`. Substituted:
+`prev = sample + (sigma_next - sigma) * noise_pred`. Per-token:
+
+```text
+sigma_token_t      = per_token_timesteps / 1000          # (B, FHW)
+sigma_token_next   = where(is_conditioning, sigma_token_t,
+                           sigma_next_scalar)             # (B, FHW)
+dt                 = sigma_token_next - sigma_token_t     # (B, FHW), negative
+prev_flat          = latents_flat + dt * (-noise_pred_flat)
+```
+
+Where `is_conditioning = per_token_timesteps < 1e-6`.
+Conditioning tokens get `dt = 0` and the step is a no-op for them
+by construction, so the `torch.where(condition_mask > 0.5, latents,
+stepped)` safety belt becomes the no-op it is in NVlabs.
+
+**Sigma source.** The existing `_sched = DPMSolverMultistepScheduler(use_flow_sigmas=True, flow_shift=...)` already
+produces `sigmas` of shape `(num_steps + 1,)` (terminal sigma is 0)
+matching the FlowMatchEuler schedule under flow-shift. We index
+into `_sched.sigmas` by finding the current step in
+`_sched.timesteps`. No need to instantiate a second scheduler.
+
+**Pipeline wiring** (in `_run_native_smoke_backend`):
+
+1. Build `per_token_timesteps` from the existing `(B, 1, F)`
+   model timestep by broadcasting over `H*W` for each frame and
+   flattening: `per_token = model_timestep.expand(B, 1, F).broadcast(...).reshape(B, F*H*W)`.
+2. Replace `scheduler.step(noise_pred, timestep, latents)` with
+   `scheduler.step_flow_euler_per_token(noise_pred, timestep,
+   latents, per_token_timesteps)` — only under the
+   `use_per_frame_timestep` path.
+3. Re-enable `condition_mask` `torch.where` post-step. With the
+   per-token step this is genuinely a no-op safety belt; switch
+   the default for `VLLM_OMNI_SANA_WM_ENABLE_COND_MASK` to ON
+   (and drop the env var or invert it to disable for ablation).
+
+**Risks and verification plan.**
+
+| Risk | A/B test | Expected signal |
+|---|---|---|
+| Sign convention wrong (`-noise_pred` vs `+noise_pred`) | one-line flip, re-run 9-frame harness | MAE either drops substantially or balloons; easy to tell |
+| `use_flow_sigmas` table not equal to NVlabs FlowMatchEuler | print first 4 sigmas vs NVlabs reference run | mismatched ≥ 2nd decimal would explain residual gap |
+| Removing DPMSolver `solver_order=2` extrapolation costs accuracy on the few real-denoise frames | re-run with `solver_order=1` (Euler) wrapper for comparison | should be small (~1 MAE) |
+
+**Estimate.** 0.5–1 person day: ~60 LOC scheduler method, ~10 LOC
+pipeline change, ~3 GPU runs to verify sign + sigma + final MAE.
+
+**Acceptance.** Same as the §6.13a "Fix implication" bullets,
+plus: 9-frame harness MAE drops below `60` (intermediate gate;
+the eventual `≤ 30` target also needs softmax-UCPE and the
+embedder work that are *not* on this commit).
+
+---
 
 Env-var escape hatches kept for debug:
 
@@ -725,7 +826,7 @@ Stage-1 path needs a new contract:
 
 12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). Cam branch rewritten to match NVlabs `BidirectionalGDNUCPESinglePathLiteLA`: single-path delta-rule recurrence (no Z denominator), `apply_fn_o` inverse output transform, and `_downscale_to_reference_rms` PostUCPERenorm. Latent at STAGE1_STEPS=1 dropped from `[-59, 61]` to `[-12.3, 11.8]`.
 
-13. ⚠️ **Per-frame timestep contract (§6.13b) — partial fix landed 2026-05-28 late.** Model side (Breaks 1+2 from §6.13a) is done: `SanaWmTimestepEmbedder` / `SanaWmBlock` / `SanaWmFinalLayer` dispatch to `_forward_frame_aware` when `t.ndim > 2`. Pipeline emits clean first frame + `(B, 1, F)` timestep with frame 0 forced to 0. New default 9-frame harness: **MAE=82.32, PSNR=8.20, SSIM-Y=0.016** (was 102.48 / 6.57 / -0.017). Remaining Break 3 work: port LTX per-token flow-matching Euler step (reuse NVlabs `flow_euler_sampler.py:178-188`) and add `tokens_to_denoise_mask`. Once the per-token scheduler lands, re-enable `condition_mask` post-step preservation (currently OFF by default because it hurts in the DPMSolver wrapper — see §6.13b for the why).
+13. ⚠️ **Per-frame timestep contract (§6.13b) — Breaks 1+2 landed 2026-05-28, Break 3 designed and ready (§6.13c).** Model side: `SanaWmTimestepEmbedder` / `SanaWmBlock` / `SanaWmFinalLayer` dispatch to `_forward_frame_aware` when `t.ndim > 2`. Pipeline emits clean first frame + `(B, 1, F)` fp32 timestep with frame 0 forced to 0. Current default 9-frame harness: **MAE=80.74, PSNR=8.34, SSIM-Y=0.020** (was 102.48 / 6.57 / -0.017). Remaining Break 3 work (designed in §6.13c, ~0.5–1 person day): add a `step_flow_euler_per_token` method on `SanaWmFlowMatchScheduler` that reuses the existing `use_flow_sigmas` schedule, replace the `scheduler.step` call in the pipeline, and re-enable `condition_mask` as a no-op safety belt by default.
 
 ---
 
