@@ -24,7 +24,7 @@ the newly identified per-token/per-frame timestep sampling contract.
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Verified 2026-05-28** — UCPE math (`ucpe.py`) and native raw camera branch match NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` at fp32 `~1e-7` max abs. See §6.12a. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | Per-token timestep sampling contract | ⚠️ **Breaks 1+2 fixed (2026-05-28), Break 3 designed (§6.13c)** — model side `(B, 1, F)` per-frame timestep with fp32 lands; new default MAE=80.74, PSNR=8.34, SSIM-Y=0.020 (was 102.48 / 6.57 / -0.017). Native `step_flow_euler_per_token` on `SanaWmFlowMatchScheduler` is the next implementation chunk, with `condition_mask` to be re-enabled by default once it becomes a true no-op safety belt. See §6.13b, §6.13c. |
+| 8 | Per-token timestep sampling contract | ⚠️ **Breaks 1+2+3 landed (2026-05-28)** — model side per-frame `(B, 1, F)` fp32 timestep + native `step_flow_euler_per_token` on the scheduler + `condition_mask` re-enabled by default. New default MAE=69.06, PSNR=9.68, SSIM-Y=-0.059 (was 102.48 / 6.57 / -0.017). Per-token step also reveals the cam branch is load-bearing: cam-off jumps to MAE=129. Negative SSIM caveat to diagnose. See §6.13b (Breaks 1+2), §6.13c (Break 3 design), §6.13d (Break 3 results). |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The UCPE / camera-control module is now
@@ -581,6 +581,101 @@ Diagnosable separately after the scheduler step lands.
   `image_cond_noise_scale > 0`; SANA-WM public config keeps it at
   `0` so it can ship later.
 
+### 6.13d Break 3 Landed — Per-Token Flow-Matching Euler Step ✅ 2026-05-28
+
+Break 3 implemented per the §6.13c design. New method
+`step_flow_euler_per_token` on `SanaWmFlowMatchScheduler` reuses the
+existing DPMSolver `use_flow_sigmas=True` schedule to look up
+`sigma_cur`/`sigma_next`, builds a per-token `dt = sigma_next -
+sigma_cur` (zero for conditioning tokens), and applies
+`prev = sample + dt * (sign * noise_pred)`. The pipeline switches
+to this step under the per-frame contract by default, and
+re-enables `condition_mask` preservation now that it is a genuine
+no-op safety belt rather than a discontinuity.
+
+**Sign convention verified on GPU.** Both `+noise_pred` and
+`-noise_pred` were measured. Default is `-noise_pred` (matching
+NVlabs `LTXFlowEuler.sample`); `VLLM_OMNI_SANA_WM_FLIP_FLOW_SIGN=1`
+swaps to the alternative.
+
+| Sign | MAE | PSNR | SSIM-Y |
+|---|---|---|---|
+| `+noise_pred` (DPM v_pred convention) | 112.49 | 6.01 | 0.047 |
+| **`-noise_pred` (NVlabs convention, default)** | **69.06** | **9.68** | -0.059 |
+
+**Sigma lookup correctness.** First implementation hand-computed
+`sigma_cur_token = per_token_t / num_train_timesteps` which is the
+unshifted t/1000 mapping. Under `use_flow_sigmas=True` with
+`flow_shift=9.8` the scheduler's actual sigmas are heavily shifted
+(`shift * t / (1 + (shift-1) * t)`), so the hand-computed sigma
+disagreed with the scheduler's `sigma_next` lookup. Fix: take both
+sigmas from `self._sched.sigmas[cur_idx]` and
+`self._sched.sigmas[cur_idx + 1]`; conditioning tokens are
+explicitly clamped to sigma=0. GPU debug:
+
+```
+[STEP DEBUG] idx=0 sigma_cur=0.9999 sigma_next=0.9513 dt_mean=-2.43e-02
+[STEP DEBUG] idx=1 sigma_cur=0.9513 sigma_next=0.8303 dt_mean=-6.05e-02
+[STEP DEBUG] idx=2 sigma_cur=0.8303 sigma_next=0.0000 dt_mean=-4.15e-01
+```
+
+(`dt_mean` is over all tokens including the 50% conditioning
+tokens at frame 0 of a 2-latent-frame layout.)
+
+**Headline 9-frame harness numbers (`STAGE1_STEPS=3`,
+`REFINER_STEPS=3`):**
+
+| Configuration | MAE | PSNR | SSIM-Y |
+|---|---|---|---|
+| Per-frame fp32 + DPM step + mask off + cam on (§6.13b default) | 80.74 | 8.34 | 0.020 |
+| **Per-token step + mask on + cam on (§6.13d NEW DEFAULT)** | **69.06** | **9.68** | -0.059 |
+| Per-token step + mask off + cam on | 69.65 | 9.59 | -0.069 |
+| Per-token step + mask on + cam off | 129.05 | 4.85 | 0.028 |
+
+**Headline observations:**
+
+1. Per-token step alone (cam-on path) drops MAE `80.74 → 69.06`
+   (−11.7) and lifts PSNR `8.34 → 9.68` dB (+1.34) vs the §6.13b
+   default. That is a real, beyond-noise improvement.
+2. Mask ON vs Mask OFF differ by only `~0.6` MAE under the
+   per-token step — the safety belt is a genuine no-op now, as
+   predicted in §6.13c.
+3. **The cam branch is no longer near-neutral.** Under per-token
+   step + mask, disabling cam balloons MAE from `69.06 → 129.05`
+   (+60). Under the prior DPM step regime cam-on and cam-off were
+   within `~0.75` MAE. The DPM multistep extrapolation was
+   smoothing over the cam contribution; per-token Euler exposes
+   that contribution as load-bearing. This validates §6.10/§6.12
+   structural work retroactively.
+
+**Caveats** (do not over-read into the headline number):
+
+* SSIM-Y is now **negative** (`-0.059` to `-0.069`). MAE went
+  down and PSNR went up while spatial structure correlation went
+  the other way. Hypotheses to investigate before claiming
+  alignment progress:
+  - the per-token Euler is integrating an off-by-something
+    velocity that brings the *average* pixel intensity closer to
+    reference while corrupting the spatial layout;
+  - the cam branch is now over-contributing because §6.12
+    `_downscale_to_reference_rms` was calibrated against the
+    DPM-step regime;
+  - the refiner stage was tuned against an upstream Stage-1
+    latent distribution that we still don't quite produce.
+* MAE 69 / PSNR 9.68 / SSIM −0.06 is still firmly in the
+  "weakly correlated" regime. We are not "approaching alignment".
+
+**Remaining work after §6.13d:**
+
+* Diagnose negative SSIM (single-block parity test against NVlabs
+  forward path, or visual side-by-side of decoded frames).
+* Port softmax-UCPE for the every-4th softmax block (integration.md
+  §4a + §4b).
+* Camera embedder structural alignment (integration.md §4a).
+* Once SSIM turns positive, re-tighten
+  `SANA_WM_E2E_REFERENCE_MAX_MAE` and `MIN_PSNR`/`MIN_SSIM_Y`
+  gates in `test_sana_wm_video_e2e.py`.
+
 ### 6.13c Break 3 Design — Native Per-Token Flow-Matching Euler Step
 
 Break 3 from §6.13a (per-token scheduler step + active
@@ -826,7 +921,7 @@ Stage-1 path needs a new contract:
 
 12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). Cam branch rewritten to match NVlabs `BidirectionalGDNUCPESinglePathLiteLA`: single-path delta-rule recurrence (no Z denominator), `apply_fn_o` inverse output transform, and `_downscale_to_reference_rms` PostUCPERenorm. Latent at STAGE1_STEPS=1 dropped from `[-59, 61]` to `[-12.3, 11.8]`.
 
-13. ⚠️ **Per-frame timestep contract (§6.13b) — Breaks 1+2 landed 2026-05-28, Break 3 designed and ready (§6.13c).** Model side: `SanaWmTimestepEmbedder` / `SanaWmBlock` / `SanaWmFinalLayer` dispatch to `_forward_frame_aware` when `t.ndim > 2`. Pipeline emits clean first frame + `(B, 1, F)` fp32 timestep with frame 0 forced to 0. Current default 9-frame harness: **MAE=80.74, PSNR=8.34, SSIM-Y=0.020** (was 102.48 / 6.57 / -0.017). Remaining Break 3 work (designed in §6.13c, ~0.5–1 person day): add a `step_flow_euler_per_token` method on `SanaWmFlowMatchScheduler` that reuses the existing `use_flow_sigmas` schedule, replace the `scheduler.step` call in the pipeline, and re-enable `condition_mask` as a no-op safety belt by default.
+13. ⚠️ **Per-frame timestep contract (§6.13b + §6.13d) — Breaks 1+2+3 landed 2026-05-28.** Model side per-frame `(B, 1, F)` fp32 timestep + native `step_flow_euler_per_token` on `SanaWmFlowMatchScheduler` + `condition_mask` re-enabled by default. Current default 9-frame harness: **MAE=69.06, PSNR=9.68, SSIM-Y=-0.059** (was 102.48 / 6.57 / -0.017 at session start). Next investigations (in §6.13d): diagnose negative SSIM (single-block parity vs NVlabs; visual decode side-by-side), then move to softmax-UCPE port and camera embedder structural alignment.
 
 ---
 

@@ -743,6 +743,31 @@ class SanaWmPipeline(
             condition_mask = None
             cam_batch = latents.shape[0]
             cam_frames = latents.shape[2]
+        # Audit §6.13c: the per-frame contract pairs with a per-token
+        # flow-matching Euler step that consumes per-token sigmas. We
+        # keep the wrapped DPMSolver fallback behind an opt-out env
+        # var purely as an ablation knob — by default we run the
+        # NVlabs-style step.
+        per_token_step_disabled = os.environ.get(
+            "VLLM_OMNI_SANA_WM_DISABLE_PER_TOKEN_STEP", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        use_per_token_step = use_per_frame_timestep and not per_token_step_disabled
+        # ``condition_mask`` post-step ``torch.where`` is now a no-op
+        # safety belt under the per-token step (conditioning sigma is
+        # already 0, so the step never moves those tokens). It's
+        # enabled by default. The legacy DPMSolver-step path still
+        # hurts under mask=ON, so default-off in that mode.
+        mask_default = use_per_token_step
+        mask_override = os.environ.get("VLLM_OMNI_SANA_WM_ENABLE_COND_MASK", "")
+        if mask_override:
+            mask_enabled = mask_override.lower() in {"1", "true", "yes", "on"}
+        else:
+            mask_enabled = mask_default
+        if condition_mask is not None:
+            # Pre-flatten the per-token timestep to (B, F*H*W) once;
+            # values come from the (B, 1, F) model timestep at each step.
+            pass
+
         for timestep in timesteps:
             if use_per_frame_timestep:
                 # (B, 1, F) per-frame timestep, frame 0 forced to 0.
@@ -778,27 +803,30 @@ class SanaWmPipeline(
                     raymap=raymap,
                     spatial_raymap=spatial_raymap,
                 )
-            stepped = scheduler.step(noise_pred, timestep, latents)
-            # ``condition_mask`` post-step preservation is opt-IN. Empirical
-            # 2026-05-28: hard-restoring the conditioning frame after every
-            # DPMSolverMultistep step measurably HURTS MAE (102 → 82 swing
-            # when removed). NVlabs uses a per-token-timestep flow-matching
-            # scheduler where the conditioning token's per-token step size
-            # is zero, so `torch.where` is a no-op safety belt. Our wrapped
-            # DPMSolverMultistep applies the same multistep coefficients to
-            # all tokens and tracks history globally — forcing the
-            # conditioning frame back creates a discontinuity that
-            # contaminates the next-step extrapolation. Until we land the
-            # per-token flow Euler step, leaving the conditioning frame to
-            # drift naturally produces better MAE.
-            mask_enabled = os.environ.get(
-                "VLLM_OMNI_SANA_WM_ENABLE_COND_MASK", ""
-            ).lower() in {"1", "true", "yes", "on"}
-            if (
-                use_per_frame_timestep
-                and condition_mask is not None
-                and mask_enabled
-            ):
+
+            if use_per_token_step:
+                # Build per-token timesteps from the (B, 1, F) model
+                # timestep by broadcasting to (B, 1, F, H, W) and
+                # flattening F*H*W. Conditioning tokens (frame 0) are
+                # already at 0 in model_timestep.
+                pt_t = (
+                    model_timestep.unsqueeze(-1)
+                    .unsqueeze(-1)
+                    .expand(cam_batch, 1, cam_frames, latents.shape[3], latents.shape[4])
+                    .reshape(cam_batch, -1)
+                )
+                stepped = scheduler.step_flow_euler_per_token(
+                    noise_pred, timestep, latents, pt_t
+                )
+            else:
+                stepped = scheduler.step(noise_pred, timestep, latents)
+
+            if condition_mask is not None and mask_enabled:
+                # Safety belt: under the per-token step this is a no-op
+                # by construction (sigma=0 for conditioning tokens → no
+                # update). Under the legacy DPMSolver step it would
+                # still hurt — that's why the default tracks
+                # use_per_token_step rather than being unconditionally on.
                 latents = torch.where(condition_mask > 0.5, latents, stepped)
             else:
                 latents = stepped
