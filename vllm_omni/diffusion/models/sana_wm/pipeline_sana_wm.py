@@ -660,6 +660,15 @@ class SanaWmPipeline(
             hasattr(first_frame_image, "convert")
             or isinstance(first_frame_image, (_np.ndarray, torch.Tensor))
         )
+        # Per-frame timestep contract (audit §6.13a) is enabled by default
+        # to match NVlabs ``LTXFlowEuler.sample``: frame 0 is the clean VAE-
+        # encoded conditioning latent and its timestep is held at 0 while
+        # the sampling loop drives the other frames from noise. Falls back
+        # to the legacy "noise first frame + scalar timestep" path when
+        # explicitly disabled, e.g. for back-compat smoke tests.
+        per_frame_timestep_disabled = os.environ.get(
+            "VLLM_OMNI_SANA_WM_DISABLE_PER_FRAME_TIMESTEP", ""
+        ).lower() in {"1", "true", "yes", "on"}
         if _is_image:
             first_latent = self._vae_encode_first_frame(
                 first_frame_image,
@@ -670,11 +679,19 @@ class SanaWmPipeline(
                 device=device,
                 dtype=dtype,
             )
-            # Noise first-frame latent to the highest timestep; remaining frames
-            # start as pure noise (the model generates them from scratch).
-            first_noised = scheduler.add_noise(first_latent, noise[:, :, :1], timesteps[0])
-            latents = torch.cat([first_noised, noise[:, :, 1:]], dim=2)
+            if per_frame_timestep_disabled:
+                # Legacy contract: noise the first-frame latent to the
+                # highest timestep before the denoising loop.
+                first_noised = scheduler.add_noise(first_latent, noise[:, :, :1], timesteps[0])
+                latents = torch.cat([first_noised, noise[:, :, 1:]], dim=2)
+            else:
+                # NVlabs contract: place the CLEAN VAE-encoded first frame
+                # at frame 0 and rely on per-frame timesteps + the
+                # `condition_mask` torch.where restore (below) to keep it
+                # invariant across denoising steps.
+                latents = torch.cat([first_latent, noise[:, :, 1:]], dim=2)
         else:
+            first_latent = None
             latents = noise
 
         allow_hash_fallback = bool(extra_args.get("sana_wm_hash_prompt_smoke", False))
@@ -707,12 +724,39 @@ class SanaWmPipeline(
         use_cudagraph = sana_wm_cudagraph_requested(extra_args)
         cudagraph_denoiser = SanaWmCudaGraphDenoiser() if use_cudagraph else None
         cudagraph_buckets = parse_sana_wm_cudagraph_buckets(extra_args) if use_cudagraph else ()
+
+        # Build a per-frame condition mask matching NVlabs ``LTXFlowEuler``:
+        # frame 0 is the conditioning frame at sigma=0 (preserved after
+        # each ``scheduler.step``), all other frames carry the current
+        # sampling sigma. We omit the legacy `add_noise_to_image_conditioning_latents`
+        # motion-continuity term because the public SANA-WM config sets
+        # ``condition_frame_info={0: 0.0}`` (image_cond_noise_scale=0).
+        use_per_frame_timestep = first_latent is not None and not per_frame_timestep_disabled
+        if use_per_frame_timestep:
+            cam_batch = latents.shape[0]
+            cam_frames = latents.shape[2]
+            condition_mask = torch.zeros(
+                cam_batch, 1, cam_frames, 1, 1, device=latents.device, dtype=latents.dtype
+            )
+            condition_mask[:, :, 0] = 1.0
+        else:
+            condition_mask = None
+            cam_batch = latents.shape[0]
+            cam_frames = latents.shape[2]
         for timestep in timesteps:
+            if use_per_frame_timestep:
+                # (B, 1, F) per-frame timestep, frame 0 forced to 0.
+                model_timestep = timestep.to(latents.dtype).expand(
+                    cam_batch, 1, cam_frames
+                ).clone()
+                model_timestep[:, :, 0] = 0.0
+            else:
+                model_timestep = timestep.expand(1)
             if cudagraph_denoiser is not None:
                 noise_pred, _ = cudagraph_denoiser.run(
                     self.transformer,
                     latents,
-                    timestep.expand(1),
+                    model_timestep,
                     encoder_hidden_states=prompt_embeds,
                     plucker=plucker,
                     spatial_raymap=spatial_raymap,
@@ -722,13 +766,36 @@ class SanaWmPipeline(
             else:
                 noise_pred = self.transformer(
                     latents,
-                    timestep.expand(1),
+                    model_timestep,
                     encoder_hidden_states=prompt_embeds,
                     plucker=plucker,
                     raymap=raymap,
                     spatial_raymap=spatial_raymap,
                 )
-            latents = scheduler.step(noise_pred, timestep, latents)
+            stepped = scheduler.step(noise_pred, timestep, latents)
+            # ``condition_mask`` post-step preservation is opt-IN. Empirical
+            # 2026-05-28: hard-restoring the conditioning frame after every
+            # DPMSolverMultistep step measurably HURTS MAE (102 → 82 swing
+            # when removed). NVlabs uses a per-token-timestep flow-matching
+            # scheduler where the conditioning token's per-token step size
+            # is zero, so `torch.where` is a no-op safety belt. Our wrapped
+            # DPMSolverMultistep applies the same multistep coefficients to
+            # all tokens and tracks history globally — forcing the
+            # conditioning frame back creates a discontinuity that
+            # contaminates the next-step extrapolation. Until we land the
+            # per-token flow Euler step, leaving the conditioning frame to
+            # drift naturally produces better MAE.
+            mask_enabled = os.environ.get(
+                "VLLM_OMNI_SANA_WM_ENABLE_COND_MASK", ""
+            ).lower() in {"1", "true", "yes", "on"}
+            if (
+                use_per_frame_timestep
+                and condition_mask is not None
+                and mask_enabled
+            ):
+                latents = torch.where(condition_mask > 0.5, latents, stepped)
+            else:
+                latents = stepped
 
         output_type = str(extra_args.get("sana_wm_output_type", "latent"))
         output = self._decode_native_smoke_latents(latents, output_type=output_type, device=device, dtype=dtype)

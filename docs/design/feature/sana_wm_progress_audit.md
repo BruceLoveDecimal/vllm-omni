@@ -24,7 +24,7 @@ the newly identified per-token/per-frame timestep sampling contract.
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Verified 2026-05-28** — UCPE math (`ucpe.py`) and native raw camera branch match NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` at fp32 `~1e-7` max abs. See §6.12a. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | Per-token timestep sampling contract | ❌ **NEW (2026-05-28)** — NVlabs uses per-frame sigma signalling (`condition_frame_info` → per-token timestep). Our pipeline uses scalar timestep. This is the root cause of the persistent ~90 MAE gap, localised by 2026-05-28 evening experiments and confirmed by the Stage-1 direct forward probe. See §6.12b / §6.13. |
+| 8 | Per-token timestep sampling contract | ⚠️ **Partial fix landed (2026-05-28 late)** — `SanaWmTimestepEmbedder` + `SanaWmBlock` + `SanaWmFinalLayer` now support per-frame `(B, 1, F)` timestep (Breaks 1+2 closed). Pipeline emits clean first frame + per-frame timestep with frame-0 forced to 0. MAE dropped `102.48 → 82.32` (-20.16), PSNR `6.57 → 8.20`. Break 3 (per-token flow Euler step + `tokens_to_denoise_mask`) still open. See §6.13b. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The UCPE / camera-control module is now
@@ -503,6 +503,77 @@ mis-interprets it and corrupts ALL frames via attention.
 
 Cross-ref: integration.md §3 (scheduler), §4a (embedder), §4b (UCPE branch).
 
+### 6.13b Per-Frame Timestep Contract — Partial Fix Landed 2026-05-28 ⚠️ IN PROGRESS
+
+The three breaks from §6.13a were partially closed in commit
+`<pending>`:
+
+* **Break 1 (model timestep rank)** ✅ — `SanaWmTimestepEmbedder` +
+  `t_block` now flatten/unflatten the timestep axes so both scalar
+  `(B,)` and per-frame `(B, 1, F)` contracts produce the right
+  `time_embed` / `timestep_modulation` shapes.
+* **Break 2 (block + final-layer modulation must be per frame)** ✅
+  — `SanaWmBlock.forward` and `SanaWmFinalLayer.forward` now
+  dispatch to `_forward_frame_aware` when `t.ndim > 2`, mirroring
+  NVlabs' `forward_frame_aware` modulation shapes
+  `(B, F, 6, D)` for blocks and `(B, F, 2, D)` for the final layer.
+* **Break 3 (per-token scheduler step + mask preservation)** ⚠️
+  Partial. The pipeline now builds a `(B, 1, F)` timestep, forces
+  frame 0 to 0, and places the CLEAN VAE-encoded first latent at
+  frame 0 (no `add_noise`). A `condition_mask` `torch.where` post-
+  step restore is implemented, but is OFF by default — see
+  empirical finding below.
+
+**Empirical 9-frame reference-alignment harness** (`STAGE1_STEPS=3`,
+`REFINER_STEPS=3`, real DPMSolver wrapper, no scheduler swap yet):
+
+| Configuration | MAE | PSNR | SSIM-Y |
+|---|---|---|---|
+| Scalar t + main-only (loader fix only) | 91.76 | 7.25 | 0.076 |
+| Scalar t + main + cam (post §6.12) | 102.48 | 6.57 | -0.017 |
+| Per-frame t + main + cam + mask ON | 110.76 | 6.10 | 0.049 |
+| Per-frame t + main-only + mask ON | 101.18 | 6.84 | 0.083 |
+| **Per-frame t + main + cam + mask OFF (default)** | **82.32** | **8.20** | **0.016** |
+| Per-frame t + main-only + mask OFF | 80.10 | 8.55 | 0.011 |
+
+The mask-OFF entry is the new default. Headline: the per-frame
+timestep contract drops MAE from `102.48` to `82.32` (−20.16) and
+PSNR rises from `6.57` → `8.20` dB. Removing `condition_mask` post-
+step restore drops a further `28` MAE in our wrapped-DPMSolver
+setup because the mask creates a hard discontinuity that
+contaminates the multistep solver's stored model-output history. In
+NVlabs' LTXFlowEuler the mask is a no-op safety belt (the per-token
+sigma for the conditioning token is already 0 so the step doesn't
+change it); ours is not yet a true per-token scheduler.
+
+**Cam branch.** With per-frame t and no mask, cam-on (`82.32`) and
+cam-off (`80.10`) are within `~2` MAE. Cam is no longer dominant —
+the structural correctness from §6.12 holds but UCPE attention is
+marginally not helping in this regime. Diagnosable separately
+after the scheduler step lands.
+
+**Remaining work (still §6.13a "Break 3"):**
+- Port LTX flow-matching Euler step with `per_token_timesteps`
+  argument support, applied per-token over the flattened
+  `(B, FHW, C)` token axis. NVlabs reference:
+  `flow_euler_sampler.py:178-188`.
+- Add `tokens_to_denoise_mask = t/1000 - 1e-6 < (1 - condition_mask)`
+  post-step. With a true per-token scheduler this becomes the
+  no-op safety belt; with the current wrapper it would still hurt.
+- Optional motion-continuity term
+  `add_noise_to_image_conditioning_latents` — gated by
+  `image_cond_noise_scale > 0`; SANA-WM public config keeps it at
+  `0` so it can ship later.
+
+Env-var escape hatches kept for debug:
+
+```
+VLLM_OMNI_SANA_WM_DISABLE_PER_FRAME_TIMESTEP=1  # back to scalar t
+VLLM_OMNI_SANA_WM_ENABLE_COND_MASK=1            # opt-in mask restore
+VLLM_OMNI_SANA_WM_DISABLE_CAM_BRANCH=1          # ablation
+VLLM_OMNI_SANA_WM_DISABLE_PLUCKER_PROJ=1        # ablation
+```
+
 ### 6.13a Why Stage-1 Still Misaligns: Three Contract Breaks
 
 The remaining Stage-1 misalignment is not a generic "GDN precision"
@@ -654,7 +725,7 @@ Stage-1 path needs a new contract:
 
 12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). Cam branch rewritten to match NVlabs `BidirectionalGDNUCPESinglePathLiteLA`: single-path delta-rule recurrence (no Z denominator), `apply_fn_o` inverse output transform, and `_downscale_to_reference_rms` PostUCPERenorm. Latent at STAGE1_STEPS=1 dropped from `[-59, 61]` to `[-12.3, 11.8]`.
 
-13. **Refactor to per-frame timesteps (§6.12b / §6.13 root cause).** Localisation experiments on 2026-05-28 evening (plucker_proj disable, hard-conditioning) and the direct Stage-1 forward probe pointed to a fundamental sampling-contract mismatch: NVlabs' `LTXFlowEuler.sample` uses **per-token timesteps** where the conditioning frame's sigma is 0 and other frames carry the current sampling sigma, plus a `condition_mask` so only non-conditioning tokens are updated by `scheduler.step`. Our pipeline uses scalar timestep and simple noise+denoise, and native Stage-1 currently fails on NVlabs' `(B,1,F)` timestep shape. Refactor `SanaWmTimestepEmbedder` + `t_block` + block forward to accept per-frame timesteps, switch the wrapped DPM scheduler to a per-token-timestep flow-matching step, and add `tokens_to_denoise_mask`. 1-2 person days. See §6.12b / §6.13.
+13. ⚠️ **Per-frame timestep contract (§6.13b) — partial fix landed 2026-05-28 late.** Model side (Breaks 1+2 from §6.13a) is done: `SanaWmTimestepEmbedder` / `SanaWmBlock` / `SanaWmFinalLayer` dispatch to `_forward_frame_aware` when `t.ndim > 2`. Pipeline emits clean first frame + `(B, 1, F)` timestep with frame 0 forced to 0. New default 9-frame harness: **MAE=82.32, PSNR=8.20, SSIM-Y=0.016** (was 102.48 / 6.57 / -0.017). Remaining Break 3 work: port LTX per-token flow-matching Euler step (reuse NVlabs `flow_euler_sampler.py:178-188`) and add `tokens_to_denoise_mask`. Once the per-token scheduler lands, re-enable `condition_mask` post-step preservation (currently OFF by default because it hurts in the DPMSolver wrapper — see §6.13b for the why).
 
 ---
 

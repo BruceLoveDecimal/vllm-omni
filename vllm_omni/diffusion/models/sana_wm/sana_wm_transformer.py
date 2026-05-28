@@ -1554,6 +1554,19 @@ class SanaWmBlock(nn.Module):
         camera_hidden_states: torch.Tensor | None = None,
         camera_conditions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # NVlabs dispatch convention (audit §6.13a): when timestep
+        # modulation carries a frame axis (ndim > 2), route through the
+        # frame-aware path so shift/scale/gate are applied per frame.
+        if timestep_modulation.ndim > 2:
+            return self._forward_frame_aware(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_modulation,
+                spatial_shape,
+                rotary_emb,
+                camera_hidden_states,
+                camera_conditions,
+            )
         batch_size = hidden_states.shape[0]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.scale_shift_table[None] + timestep_modulation.reshape(batch_size, 6, -1)
@@ -1573,6 +1586,73 @@ class SanaWmBlock(nn.Module):
         hidden_states = hidden_states + self.cross_attn(hidden_states, encoder_hidden_states)
         mlp_input = self._modulate(self.norm2(hidden_states), shift_mlp, scale_mlp)
         hidden_states = hidden_states + gate_mlp * self.mlp(mlp_input, spatial_shape)
+        return hidden_states
+
+    def _forward_frame_aware(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep_modulation: torch.Tensor,
+        spatial_shape: tuple[int, int, int],
+        rotary_emb: torch.Tensor | None,
+        camera_hidden_states: torch.Tensor | None,
+        camera_conditions: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Per-frame timestep modulation path matching NVlabs
+        ``SanaVideoMSCamCtrlBlock.forward_frame_aware``.
+
+        ``timestep_modulation`` is ``(B, 1, F, 6*D)``. We split into the
+        six per-frame ``(B, F, 1, D)`` chunks via ``scale_shift_table``
+        and apply ``shift/scale/gate`` per frame, broadcasting over the
+        spatial tokens within each frame.
+        """
+        batch_size, token_count, hidden_size = hidden_states.shape
+        frames, height, width = spatial_shape
+        spatial_tokens = height * width
+        if token_count != frames * spatial_tokens:
+            raise ValueError(
+                f"Sana-WM frame-aware block expects N=T*H*W, got N={token_count}, THW={spatial_shape}."
+            )
+        if timestep_modulation.shape[2] != frames:
+            raise ValueError(
+                "Sana-WM frame-aware block: timestep frame axis must match spatial frames, "
+                f"got modulation frames={timestep_modulation.shape[2]} vs spatial frames={frames}."
+            )
+
+        # (B, 1, F, 6*D) -> (B, F, 6, D), then add the (1, 1, 6, D) table.
+        t_per_frame = timestep_modulation.reshape(batch_size, frames, 6, -1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.scale_shift_table[None, None, :, :] + t_per_frame
+        ).chunk(6, dim=-2)  # each: (B, F, 1, D)
+
+        # Apply per-frame modulation by reshaping x to (B, F, S, D), broadcasting
+        # scale/shift over the spatial axis, then flattening back.
+        x_norm1 = self.norm1(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
+        x_msa_in = (x_norm1 * (1 + scale_msa) + shift_msa).reshape(batch_size, token_count, hidden_size)
+        attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, camera_conditions)
+        plucker_proj_disabled = os.environ.get(
+            "VLLM_OMNI_SANA_WM_DISABLE_PLUCKER_PROJ", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        if (
+            camera_hidden_states is not None
+            and self.plucker_proj is not None
+            and not plucker_proj_disabled
+        ):
+            attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
+        attn_output_4d = attn_output.reshape(batch_size, frames, spatial_tokens, hidden_size)
+        hidden_states = hidden_states + (gate_msa * attn_output_4d).reshape(
+            batch_size, token_count, hidden_size
+        )
+
+        hidden_states = hidden_states + self.cross_attn(hidden_states, encoder_hidden_states)
+
+        x_norm2 = self.norm2(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
+        x_mlp_in = (x_norm2 * (1 + scale_mlp) + shift_mlp).reshape(batch_size, token_count, hidden_size)
+        mlp_out = self.mlp(x_mlp_in, spatial_shape)
+        mlp_out_4d = mlp_out.reshape(batch_size, frames, spatial_tokens, hidden_size)
+        hidden_states = hidden_states + (gate_mlp * mlp_out_4d).reshape(
+            batch_size, token_count, hidden_size
+        )
         return hidden_states
 
 
@@ -1606,10 +1686,51 @@ class SanaWmFinalLayer(nn.Module):
         else:
             self.linear = nn.Linear(hidden_size, out_features)
 
-    def forward(self, hidden_states: torch.Tensor, timestep_embed: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep_embed: torch.Tensor,
+        spatial_shape: tuple[int, int, int] | None = None,
+    ) -> torch.Tensor:
+        # Per-frame timestep contract (audit §6.13a) dispatch.
+        if timestep_embed.ndim > 2:
+            return self._forward_frame_aware(hidden_states, timestep_embed, spatial_shape)
         shift, scale = (self.scale_shift_table[None] + timestep_embed[:, None]).chunk(2, dim=1)
         hidden_states = self.norm_final(hidden_states) * (1 + scale) + shift
         return _linear_output(self.linear(hidden_states))
+
+    def _forward_frame_aware(
+        self,
+        hidden_states: torch.Tensor,
+        timestep_embed: torch.Tensor,
+        spatial_shape: tuple[int, int, int] | None,
+    ) -> torch.Tensor:
+        """Per-frame final-layer modulation matching NVlabs
+        ``T2IFinalLayer.forward_frame_aware``.
+
+        ``timestep_embed`` is ``(B, 1, F, D)``. We transpose to
+        ``(B, F, 1, D)`` so it adds correctly to the ``(1, 1, 2, D)``
+        ``scale_shift_table`` and produces per-frame ``(B, F, 1, D)``
+        ``shift`` / ``scale`` that broadcast over the spatial tokens
+        within each frame.
+        """
+        batch_size, token_count, hidden_size = hidden_states.shape
+        frames = timestep_embed.shape[2]
+        if spatial_shape is not None:
+            spatial_tokens = spatial_shape[1] * spatial_shape[2]
+        else:
+            spatial_tokens = token_count // frames
+        if frames * spatial_tokens != token_count:
+            raise ValueError(
+                "Sana-WM frame-aware final layer: token count mismatch "
+                f"(N={token_count}, F={frames}, S={spatial_tokens})."
+            )
+        # (B, 1, F, D) -> (B, F, 1, D); add (1, 1, 2, D); chunk into shift/scale: each (B, F, 1, D).
+        t_per_frame = timestep_embed.transpose(1, 2)
+        shift, scale = (self.scale_shift_table[None, None, :, :] + t_per_frame).chunk(2, dim=-2)
+        x_norm = self.norm_final(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
+        x_mod = (x_norm * (1 + scale) + shift).reshape(batch_size, token_count, hidden_size)
+        return _linear_output(self.linear(x_mod))
 
 
 class SanaWmTransformer3DModel(nn.Module):
@@ -2009,11 +2130,24 @@ class SanaWmTransformer3DModel(nn.Module):
             timestep = timestep.expand(batch_size)
         elif timestep.ndim == 1 and timestep.shape[0] == 1 and batch_size > 1:
             timestep = timestep.expand(batch_size)
-        time_embed = self.t_embedder(timestep)
+        # Per-frame timestep contract (audit §6.13a): when ``timestep`` is
+        # rank > 1 (e.g. ``(B, 1, F)`` from the LTX flow-matching sampler),
+        # the per-frame embedding is computed on the flattened token axis
+        # and unflattened back to the input rank. ``time_embed`` then has
+        # an extra ``hidden_size`` axis appended (``(B, 1, F, D)``) and
+        # ``timestep_modulation`` has ``6*hidden_size`` (``(B, 1, F, 6*D)``).
+        # SanaWmBlock / SanaWmFinalLayer dispatch on ``ndim > 2`` to the
+        # frame-aware paths that broadcast per-frame modulation over the
+        # spatial tokens within each frame.
+        timestep_shape = tuple(timestep.shape)
+        time_embed = self.t_embedder(timestep)  # (numel, D)
         # t_block is Sequential(SiLU, Linear|ColumnParallelLinear); index explicitly
         # so _linear_output can unwrap the (tensor, None) tuple from parallel layers.
         _t_silu = self.t_block[0](time_embed)
         timestep_modulation = _linear_output(self.t_block[1](_t_silu)).to(hidden_states.dtype)
+        if len(timestep_shape) > 1:
+            time_embed = time_embed.unflatten(0, timestep_shape)
+            timestep_modulation = timestep_modulation.unflatten(0, timestep_shape)
 
         if camera_hidden_states is None:
             camera_hidden_states = self._camera_hidden_states_from_conditions(
@@ -2057,7 +2191,9 @@ class SanaWmTransformer3DModel(nn.Module):
                 camera_conditions,
             )
 
-        hidden_states = self.final_layer(hidden_states, time_embed.to(hidden_states.dtype))
+        hidden_states = self.final_layer(
+            hidden_states, time_embed.to(hidden_states.dtype), spatial_shape
+        )
         hidden_states = self._unpatchify(hidden_states, spatial_shape)
         if hidden_states.shape[2:] != latent_shape:
             hidden_states = F.interpolate(hidden_states, size=latent_shape, mode="trilinear", align_corners=False)
