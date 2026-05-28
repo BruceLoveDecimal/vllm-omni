@@ -24,7 +24,7 @@ the newly identified per-token/per-frame timestep sampling contract.
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Verified 2026-05-28** — UCPE math (`ucpe.py`) and native raw camera branch match NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` at fp32 `~1e-7` max abs. See §6.12a. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | Per-token timestep sampling contract | ⚠️ **Breaks 1+2+3 landed (2026-05-28)** — model side per-frame `(B, 1, F)` fp32 timestep + native `step_flow_euler_per_token` on the scheduler + `condition_mask` re-enabled by default. New default MAE=69.06, PSNR=9.68, SSIM-Y=-0.059 (was 102.48 / 6.57 / -0.017). Per-token step also reveals the cam branch is load-bearing: cam-off jumps to MAE=129. Negative SSIM caveat to diagnose. See §6.13b (Breaks 1+2), §6.13c (Break 3 design), §6.13d (Break 3 results). |
+| 8 | Per-token timestep sampling contract | ⚠️ **Breaks 1+2+3 + VAE-norm landed (2026-05-28)** — model side per-frame `(B, 1, F)` fp32 timestep + native `step_flow_euler_per_token` on the scheduler + `condition_mask` re-enabled by default + LTX-2 VAE per-channel normalisation in encode AND decode (closes §6.13e). New default MAE=47.35, PSNR=13.14, SSIM-Y=+0.025 (was 102.48 / 6.57 / -0.017 at session start). SSIM first time positive. Per-token step reveals the cam branch is load-bearing: cam-off jumps to MAE=129. See §6.13b/c/d/e. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The UCPE / camera-control module is now
@@ -580,6 +580,87 @@ Diagnosable separately after the scheduler step lands.
   `add_noise_to_image_conditioning_latents` — gated by
   `image_cond_noise_scale > 0`; SANA-WM public config keeps it at
   `0` so it can ship later.
+
+### 6.13e LTX-2 VAE Per-Channel Normalisation ✅ FIXED 2026-05-28 late
+
+**Symptom** (post-§6.13d): MAE/PSNR improved (80.74→69.06 MAE,
+8.34→9.68 PSNR) under the per-token Euler step, but SSIM-Y
+*flipped negative* (0.020 → -0.059). Per-frame and per-seed
+diagnostic ruled out alignment / noise: the seed had zero effect
+on output, and all 8 frames showed the same -0.05 to -0.10
+SSIM-Y band.
+
+**Root cause** localised by visual side-by-side dump of pred[0]
+vs ref[0]:
+
+```
+pred[0] RGB mean:  R=110.6  G=219.8  B=208.4   (cyan/green-heavy)
+ref[0]  RGB mean:  R=94.1   G=114.3  B=138.2   (neutral)
+```
+
+A systematic per-channel bias of +105 on G and +70 on B,
+consistent across all frames — clearly not noise, clearly a
+decoder-side bias.
+
+Reading NVlabs `diffusion/model/builder.py:vae_encode/vae_decode`
+revealed the LTX-2 diffusers VAE (`AutoencoderKLLTX2Video`,
+identified by `"LTX2VAE_diffusers" in name`) ships with **per-
+channel `latents_mean` and `latents_std` tensors** (128 channels)
+that NVlabs applies in BOTH encode and decode:
+
+```python
+# encode
+z = (z - latents_mean) * scaling_factor / latents_std
+
+# decode
+latent = latent * latents_std / scaling_factor + latents_mean
+samples = vae.decode(latent, temb=None, return_dict=False)[0]
+```
+
+Our pipeline was using the simpler diffusers convention with
+`* scaling_factor` on encode and *no* corresponding scaling on
+decode. That broke the round-trip identity and produced a
+systematic colour shift via the per-channel `latents_mean` drift.
+
+**Fix** (commit `<pending>`): new helpers
+`_vae_normalize_latent` / `_vae_denormalize_latent` on
+`SanaWmPipeline` matching the NVlabs formulae exactly. Encode
+path replaces the old `* scaling_factor` with full per-channel
+normalisation. Decode path drops the conditional zero-timestep
+arg in favour of NVlabs' unconditional `temb=None` and applies
+denormalisation before `vae.decode`.
+
+**GPU verification on the 9-frame harness** (`STAGE1_STEPS=3`,
+`REFINER_STEPS=3`):
+
+| Configuration | MAE | PSNR | SSIM-Y |
+|---|---|---|---|
+| §6.13d default (per-token step, missing VAE norm) | 69.06 | 9.68 | -0.059 |
+| **§6.13e new default (per-token step + VAE per-channel norm)** | **47.35** | **13.14** | **+0.025** |
+
+* MAE -21.71 (down 31%)
+* PSNR +3.46 dB (up 36%)
+* SSIM-Y crosses zero into positive territory — the structure is
+  no longer anti-correlated.
+
+Pred RGB after fix: `R=84.0 G=142.9 B=191.4` vs ref
+`R=94.1 G=114.3 B=138.2`. The +105 G bias is gone (now +29);
+B bias is reduced (was +70, now +53). A subtle blue cast
+remains, attributable to remaining content drift rather than
+decoder bias.
+
+Cumulative session progress (2026-05-28):
+
+```
+102.48 → 95.82 → 95.25 → 91.76 → 82.32 → 80.74 → 69.06 → 47.35  (MAE)
+  6.57 →  7.37 →  7.04 →  7.25 →  8.20 →  8.34 →  9.68 → 13.14  (PSNR)
+-0.017 → 0.005 → -.003 →  .076 →  .016 →  .020 → -.059 → +.025  (SSIM-Y)
+```
+
+Still firmly in "weakly correlated" regime (PSNR ~13 dB is far
+from a typical 25+ dB target), but the trajectory is now
+consistently positive across all three metrics for the first
+time in the session.
 
 ### 6.13d Break 3 Landed — Per-Token Flow-Matching Euler Step ✅ 2026-05-28
 

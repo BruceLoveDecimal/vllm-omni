@@ -489,6 +489,44 @@ class SanaWmPipeline(
         tensor = torch.from_numpy(arr.transpose(2, 0, 1)[np.newaxis, :, np.newaxis])
         return tensor.to(device=device, dtype=dtype)
 
+    def _vae_normalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        """LTX-2 VAE per-channel latent normalisation matching NVlabs.
+
+        ``z_norm = (z_raw - latents_mean) * scaling_factor / latents_std``
+
+        The LTX-2 VAE (``AutoencoderKLLTX2Video`` in diffusers) ships with
+        per-channel ``latents_mean`` and ``latents_std`` tensors that must be
+        applied alongside ``scaling_factor`` for the round-trip to be
+        identity. The legacy `* scaling_factor` only path produced
+        decoded videos with a systematic G/B colour shift (audit §6.13e
+        diagnosis: pred RGB means ~(110, 220, 208) vs ref ~(94, 114, 138)).
+
+        Returns the normalised latent in the same dtype as the input.
+        """
+        if self.vae is None:
+            raise RuntimeError("Sana-WM VAE did not initialize.")
+        latents_mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(
+            device=latent.device, dtype=latent.dtype
+        )
+        latents_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(
+            device=latent.device, dtype=latent.dtype
+        )
+        scaling = float(getattr(getattr(self.vae, "config", None), "scaling_factor", 1.0))
+        return (latent - latents_mean) * scaling / latents_std
+
+    def _vae_denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        """Inverse of :meth:`_vae_normalize_latent` — match NVlabs decode."""
+        if self.vae is None:
+            raise RuntimeError("Sana-WM VAE did not initialize.")
+        latents_mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(
+            device=latent.device, dtype=latent.dtype
+        )
+        latents_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(
+            device=latent.device, dtype=latent.dtype
+        )
+        scaling = float(getattr(getattr(self.vae, "config", None), "scaling_factor", 1.0))
+        return latent * latents_std / scaling + latents_mean
+
     def _vae_encode_first_frame(
         self,
         image: Any,
@@ -512,8 +550,7 @@ class SanaWmPipeline(
             encoded = self.vae.encode(frame)
             dist = getattr(encoded, "latent_dist", None)
             first_latent = dist.mean if dist is not None else encoded.latents
-            scaling = float(getattr(getattr(self.vae, "config", None), "scaling_factor", 1.0))
-            first_latent = (first_latent * scaling).to(device=device, dtype=dtype)
+            first_latent = self._vae_normalize_latent(first_latent.to(dtype=dtype))
         # VAE latent may differ from expected spatial size; resize if needed.
         if first_latent.shape[-2:] != (latent_height, latent_width):
             first_latent = F.interpolate(
@@ -600,10 +637,13 @@ class SanaWmPipeline(
         self._ensure_vae(device=device, dtype=dtype)
         if self.vae is None:
             raise RuntimeError("Sana-WM VAE did not initialize.")
-        timestep = None
-        if getattr(getattr(self.vae, "config", None), "timestep_conditioning", False):
-            timestep = torch.zeros(latents.shape[0], device=device, dtype=latents.dtype)
-        video = self.vae.decode(latents.to(getattr(self.vae, "dtype", dtype)), timestep, return_dict=False)[0]
+        # LTX-2 VAE denormalisation: see :meth:`_vae_denormalize_latent`.
+        # NVlabs always passes ``temb=None`` to ``vae.decode`` for this VAE
+        # (see ``builder.py::vae_decode -> LTX2VAE_diffusers``); we match
+        # that unconditionally rather than threading a zero timestep
+        # through ``timestep_conditioning`` like the older path did.
+        denorm = self._vae_denormalize_latent(latents.to(getattr(self.vae, "dtype", dtype)))
+        video = self.vae.decode(denorm, temb=None, return_dict=False)[0]
         try:
             from diffusers.video_processor import VideoProcessor
 
