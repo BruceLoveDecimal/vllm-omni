@@ -581,6 +581,91 @@ Diagnosable separately after the scheduler step lands.
   `image_cond_noise_scale > 0`; SANA-WM public config keeps it at
   `0` so it can ship later.
 
+### 6.13f Stage-1 Latent Parity Probe ⚠️ 2026-05-28 late evening — frame 1 (generated) is anti-correlated
+
+After §6.13e brought e2e MAE to 47.35, ran the long-deferred direct
+Stage-1 latent parity probe to find the *next* dominant error
+source before guessing between softmax-UCPE / camera embedder /
+native scheduler refactor.
+
+**Setup.**
+
+- New env-gated hook in `native_backend.py`:
+  `SANA_WM_DUMP_STAGE1_LATENT=/tmp/nvlabs_stage1.pt` makes the
+  in-process NVlabs path dump `output["latent"]` after
+  `pipeline.generate(...)` — the Stage-1 sample tensor returned by
+  `_sample_stage1`.
+- Probe script `tools/scripts/probe_stage1.py` runs both paths in
+  the same process, compares the (1, 128, 2, 22, 40) latents
+  channel- and frame-wise.
+
+**Headline.**
+
+| Metric | Global | Frame 0 (conditioning) | Frame 1 (generated) |
+|---|---|---|---|
+| MAE | 0.6313 | 0.3554 | 0.9072 |
+| RMSE | 0.8504 | 0.4576 | 1.1122 |
+| **Cosine** | **0.6292** | **+0.9669** | **-0.1653** |
+| nv std | 0.7109 | 0.874 | 0.493 |
+| nt std | 1.0931 | 1.244 | 0.910 |
+
+* **Frame 0 ≈ NVlabs (cosine 0.97).** The VAE encode + per-token
+  step + condition_mask preservation work correctly — the
+  conditioning frame's latent is essentially identical.
+* **Frame 1 is anti-correlated (cosine -0.17).** The denoising
+  of the generated frame is producing a latent whose spatial
+  structure is INVERTED relative to NVlabs.
+* Native magnitude is ~50% larger across frames (`nt_std` vs
+  `nv_std`). Generation is over-shooting.
+
+**Per-channel.**
+
+* 70 / 128 channels with cosine > 0.5 (mostly OK)
+* 26 / 128 channels with cosine < 0 (anti-correlated)
+* Median cosine across channels: +0.60
+* Worst channels show native means roughly 2× nvlabs in
+  magnitude (e.g. ch 25 nv=-1.06 nt=-2.60), pointing again at
+  generation step over-shoot.
+
+**Implications for the remaining work.**
+
+* **NOT camera embedder.** Frame 0 cosine 0.97 means camera info
+  propagates correctly. The simplified `SanaWmCameraEmbedder`
+  isn't the dominant gap.
+* **NOT softmax-UCPE port (in isolation).** If only 5 / 20
+  softmax blocks were skipping UCPE, we wouldn't see
+  -0.17 cosine on generated tokens.
+* **NOT loader / weights.** Frame 0 alignment confirms the
+  Stage-1 weights are correctly populated.
+* **IS the per-token Euler step interaction with our sigma table
+  / model output.** Two specific suspects:
+  - **Sigma schedule mismatch.** We reuse
+    `DPMSolverMultistepScheduler(use_flow_sigmas=True, flow_shift=9.8)`
+    for the sigma table; NVlabs' `LTXFlowEuler` uses
+    `FlowMatchEulerDiscreteScheduler`. Both *should* produce
+    matching sigmas under the same flow-shift, but this is not
+    yet verified.
+  - **Sign convention interacting with model output.** Default
+    `-noise_pred` produced better aggregate MAE/PSNR but
+    generated-frame structure is now wrong. Likely the sign that
+    looks right at decoded-image level is wrong at latent level
+    and the refiner masks it via downstream re-normalisation.
+
+**Next test (single highest-leverage diagnostic).**
+
+Dump both pipelines' `noise_pred` at step 0 on the same noised
+input (same noise, same prompt, same camera). Compare.
+
+* If `noise_pred` matches → bug is in `step_flow_euler_per_token`
+  (sigma or sign).
+* If `noise_pred` differs → bug is in model forward (which layer
+  diverges needs the single-block parity test we've been
+  deferring).
+
+This is the next 0.5-day work chunk and supersedes the
+softmax-UCPE / camera-embedder / native-scheduler refactor
+priorities.
+
 ### 6.13e LTX-2 VAE Per-Channel Normalisation ✅ FIXED 2026-05-28 late
 
 **Symptom** (post-§6.13d): MAE/PSNR improved (80.74→69.06 MAE,

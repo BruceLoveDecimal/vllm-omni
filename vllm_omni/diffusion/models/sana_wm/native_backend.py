@@ -474,6 +474,17 @@ def run_sana_wm_native_backend(
         sampling_algo=sampling_algo,
     )
     output = pipeline.generate(cropped, str(prompt.get("prompt") or ""), c2w, intrinsics, params)
+    # Audit §6.13f probe hook: opt-in dump of NVlabs Stage-1 latent for the
+    # parity probe in tools/scripts/probe_stage1.py. ``output["latent"]`` is
+    # the Stage-1 sample tensor returned by `_sample_stage1` (on CPU).
+    _dump_path = os.environ.get("SANA_WM_DUMP_STAGE1_LATENT", "")
+    if _dump_path and "latent" in output:
+        torch.save(output["latent"], _dump_path)
+        try:
+            shape = tuple(output["latent"].shape)
+        except Exception:
+            shape = "<unknown>"
+        print(f"[sana-wm probe] saved NVlabs Stage-1 latent shape={shape} to {_dump_path}", flush=True)
     frames = np.asarray(output["video"])
     return SanaWmNativeRunResult(
         frames=frames,
