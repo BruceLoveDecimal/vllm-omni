@@ -1478,16 +1478,54 @@ class SanaWmMbConvFfn(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, spatial_shape: tuple[int, int, int]) -> torch.Tensor:
+        """Match NVlabs ``GLUMBConvTemp.forward`` exactly (audit §6.13h):
+
+        1. Reshape ``(B, N=F*H*W, C) → (B*F, H, W, C) → (B*F, C, H, W)``
+           so the spatial MBConv runs PER FRAME with proper 2D (H, W)
+           geometry. Our previous reshape ``(B, C, F, H*W)`` made the
+           3×3 ``depth_conv`` span the (F, H*W) plane treating F as
+           height and the flattened H*W as a 1D width — wrong axis,
+           producing garbage (cosine ≈ 0.04 vs NVlabs in the
+           block-0 parity probe).
+        2. Apply expand → depthwise 3×3 → GLU → contract on per-frame
+           (B*F, C, H, W).
+        3. Temporal aggregation: reshape back to ``(B, C, F, H*W)``
+           and add ``t_conv`` (kernel ``(3, 1)``) along the F axis.
+        4. Reshape to ``(B, N, C)``.
+        """
         batch, _, hidden_size = hidden_states.shape
         frames, height, width = spatial_shape
-        x = hidden_states.transpose(1, 2).reshape(batch, hidden_size, frames, height * width)
-        x = self.inverted_conv.conv(x)
+        spatial_tokens = height * width
+        # (B, F*H*W, C) → (B*F, H, W, C) → (B*F, C, H, W)
+        x = (
+            hidden_states.reshape(batch * frames, spatial_tokens, hidden_size)
+            .reshape(batch * frames, height, width, hidden_size)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+        # NVlabs ``ConvLayer`` wraps Conv2d in `Conv → norm → act`. For SANA-WM
+        # `act=("silu", "silu", None)`: inverted_conv applies SiLU, depth_conv
+        # and point_conv don't. Our ``_ConvWrapper`` only stores the raw
+        # Conv2d to match the checkpoint key (`inverted_conv.conv.weight`),
+        # so we need to apply the SiLU explicitly here — skipping it left
+        # the expanded features unactivated and inflated the downstream
+        # GLU output magnitude by ~12× (audit §6.13h block-0 probe).
+        x = self.glu_act(self.inverted_conv.conv(x))
         x = self.depth_conv.conv(x)
         value, gate = x.chunk(2, dim=1)
         x = value * self.glu_act(gate)
-        x = self.point_conv.conv(x)
-        x = x + self.t_conv(x)
-        return x.reshape(batch, hidden_size, frames * height * width).transpose(1, 2)
+        x = self.point_conv.conv(x)  # (B*F, hidden, H, W)
+        # Temporal aggregation: (B*F, C, H, W) → (B, F, C, H*W) → (B, C, F, H*W)
+        x_temporal = (
+            x.reshape(batch, frames, hidden_size, spatial_tokens).permute(0, 2, 1, 3)
+        )
+        x_temporal = x_temporal + self.t_conv(x_temporal)
+        # → (B, F, H*W, C) → (B, N, C)
+        return (
+            x_temporal.permute(0, 2, 3, 1)
+            .reshape(batch, frames * spatial_tokens, hidden_size)
+            .contiguous()
+        )
 
 
 class SanaWmBlock(nn.Module):
@@ -1625,6 +1663,30 @@ class SanaWmBlock(nn.Module):
             self.scale_shift_table[None, None, :, :] + t_per_frame
         ).chunk(6, dim=-2)  # each: (B, F, 1, D)
 
+        # Audit §6.13h probe hook: dump block-0 intermediates for
+        # parity vs NVlabs. "First call wins" via file-existence guard
+        # so we only dump the first block invoked per pipeline run.
+        # Env var SANA_WM_DUMP_BLOCK0=/path/prefix writes four files:
+        #   {prefix}_input.pt {prefix}_post_attn.pt
+        #   {prefix}_post_cross_attn.pt {prefix}_output.pt
+        _dump_prefix = os.environ.get("SANA_WM_DUMP_BLOCK0", "")
+        _do_dump = bool(_dump_prefix) and not os.path.exists(f"{_dump_prefix}_input.pt")
+        if _do_dump:
+            torch.save(hidden_states.detach().cpu(), f"{_dump_prefix}_input.pt")
+            torch.save(
+                {
+                    "shift_msa": shift_msa.detach().cpu(),
+                    "scale_msa": scale_msa.detach().cpu(),
+                    "gate_msa": gate_msa.detach().cpu(),
+                    "shift_mlp": shift_mlp.detach().cpu(),
+                    "scale_mlp": scale_mlp.detach().cpu(),
+                    "gate_mlp": gate_mlp.detach().cpu(),
+                    "scale_shift_table": self.scale_shift_table.detach().cpu(),
+                    "encoder_hidden_states": encoder_hidden_states.detach().cpu(),
+                },
+                f"{_dump_prefix}_modulation.pt",
+            )
+
         # Apply per-frame modulation by reshaping x to (B, F, S, D), broadcasting
         # scale/shift over the spatial axis, then flattening back.
         x_norm1 = self.norm1(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
@@ -1643,8 +1705,19 @@ class SanaWmBlock(nn.Module):
         hidden_states = hidden_states + (gate_msa * attn_output_4d).reshape(
             batch_size, token_count, hidden_size
         )
+        if _do_dump:
+            torch.save(
+                {
+                    "x_msa_in": x_msa_in.detach().cpu(),
+                    "attn_output": attn_output.detach().cpu(),
+                    "post_attn_residual": hidden_states.detach().cpu(),
+                },
+                f"{_dump_prefix}_post_attn.pt",
+            )
 
         hidden_states = hidden_states + self.cross_attn(hidden_states, encoder_hidden_states)
+        if _do_dump:
+            torch.save(hidden_states.detach().cpu(), f"{_dump_prefix}_post_cross_attn.pt")
 
         x_norm2 = self.norm2(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_mlp_in = (x_norm2 * (1 + scale_mlp) + shift_mlp).reshape(batch_size, token_count, hidden_size)
@@ -1653,6 +1726,20 @@ class SanaWmBlock(nn.Module):
         hidden_states = hidden_states + (gate_mlp * mlp_out_4d).reshape(
             batch_size, token_count, hidden_size
         )
+        if _do_dump:
+            torch.save(
+                {
+                    "x_mlp_in": x_mlp_in.detach().cpu(),
+                    "mlp_out": mlp_out.detach().cpu(),
+                    "block_output": hidden_states.detach().cpu(),
+                },
+                f"{_dump_prefix}_output.pt",
+            )
+            print(
+                f"[sana-wm probe] saved native block-0 dump prefix={_dump_prefix} "
+                f"input_norm={torch.load(f'{_dump_prefix}_input.pt').float().norm().item():.3f}",
+                flush=True,
+            )
         return hidden_states
 
 

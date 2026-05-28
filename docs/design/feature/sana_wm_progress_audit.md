@@ -721,6 +721,103 @@ noise_pred matches under controlled input, scheduler is the
 remaining gap. If not, we need a single-block parity test to
 find the diverging model layer.
 
+### 6.13h Block-0 Staged Parity Probe — Located 2 Layer Bugs ⚠️ 2026-05-28 night
+
+Added env-gated dump hooks at four points inside our
+`SanaWmBlock._forward_frame_aware` and at matching points in
+NVlabs `SanaVideoMSCamCtrlBlock.forward_frame_aware`. Ran the
+probe with `SANA_WM_LOAD_LATENT_FROM` + `SANA_WM_LOAD_PROMPT_FROM`
+injecting NVlabs's step-0 state so both pipelines see byte-
+identical inputs.
+
+**Block-0 staged comparison (controlled inputs):**
+
+| Stage | NVlabs norm | Native norm | Cosine | Status |
+|---|---:|---:|---:|---|
+| block_input | 1165.6 | 1165.6 | **+1.000** | ✅ control works |
+| shift/scale/gate (msa+mlp, ×6) | match | match | **+1.000** | ✅ modulation OK |
+| scale_shift_table (param) | 73.52 | 73.52 | **+1.000** | ✅ loaded correctly |
+| x_msa_in (post-modulation, pre-attn) | 2174 | 2199 | +0.9999 | ✅ |
+| **attn_out** (self.attn output) | **191574** | **71134** | **+0.2574** | ❌ **3× smaller** |
+| post_attn_residual | 191600 | 192481 | +1.000 | OK (residual dominates) |
+| post_cross_attn | 192860 | 193457 | +1.000 | OK |
+| x_mlp_in | 117.1 | 117.5 | +1.000 | ✅ |
+| **mlp_out** (FFN output) | **55989** | **343716** | **+0.0373** | ❌ **6× larger, uncorrelated** |
+| block_output | 147975 | 654294 | +0.6241 | ❌ MLP-dominated |
+
+**Two layer bugs localised.** With control inputs identical and
+modulation correct, two specific sub-modules diverge:
+
+1. **`self.attn` (the GDN+UCPE main attention) output is 3×
+   smaller than NVlabs and only partially correlated** (cosine
+   +0.26). Could be wrong scale somewhere in the GDN
+   recurrence, a missing factor in `out_proj`, an over-eager
+   `_downscale_to_reference_rms`, or some sign issue. Hidden
+   by the post-attention residual at block 0 (the latent
+   itself dominates) but matters when compounded across 20
+   blocks.
+
+2. **`mlp_out` (SanaWmMbConvFfn) is 6× larger and essentially
+   uncorrelated** (cosine +0.04). This dominates the block
+   output divergence. Two root causes identified:
+
+   * **Wrong reshape layout.** Our code reshaped to
+     `(B, C, F, H*W)` and ran the 3×3 depthwise conv with its
+     kernel spanning `(F, H*W)` — treating F as height and the
+     flattened H*W as 1D width. NVlabs reshapes to
+     `(B*T, C, H, W)`, applying the 3×3 conv as a proper 2D
+     spatial convolution per frame.
+   * **Missing post-`inverted_conv` SiLU.** NVlabs `ConvLayer`
+     applies `act=act[0]="silu"` after the 1×1 conv inside
+     `inverted_conv`. We stored only the raw `nn.Conv2d` in
+     `_ConvWrapper.conv` (to match the checkpoint key
+     `mlp.inverted_conv.conv.weight`) and called `.conv(x)`
+     directly, skipping the SiLU.
+
+**Fix attempt (commit `<pending>`):** rewrote
+`SanaWmMbConvFfn.forward` to reshape per-frame as
+`(B*F, C, H, W)` and apply SiLU after `inverted_conv`. Result:
+
+| Configuration | block_0 mlp_out cos | block_0 output cos | e2e MAE | PSNR | SSIM-Y |
+|---|---|---|---|---|---|
+| Before fix | +0.04 | +0.6241 | 51.06 | 12.43 | +0.046 |
+| **After fix** | -0.29 | **+1.0000** | **50.53** | 12.11 | -0.002 |
+
+Block-0 OUTPUT now matches perfectly (cos +1.0000) but
+`mlp_out` flipped from 6× too large to 6× too small with a
+negative cosine. The block-output match comes from the
+post-cross-attn residual (norm 193k) dominating the small mlp
+contribution (residual-dominance argument).
+
+E2E MAE barely changed (-0.53) and SSIM regressed slightly to
+near zero. So the fix moves block-0 in the right direction but
+the deeper architectural alignment of the MLP is still off
+(likely a 3rd subtle difference — activation choice, norm
+position, or some scale factor). Compounding across 20 blocks
+prevents real e2e gains until both `mlp_out` and `attn_out`
+match more tightly.
+
+**Remaining single-block work:**
+
+* Find the third MLP discrepancy (compare per-step intermediate
+  inside MLP; possibly NVlabs uses different `norm` in
+  `ConvLayer`, or our SiLU position is wrong).
+* Diagnose `attn_out` — break down inside
+  `SanaWmSelfAttention._forward_gdn_raw + _forward_cam_branch`
+  to find which stage diverges. The 3×-smaller output suggests
+  a missing scale factor or an over-eager
+  `_downscale_to_reference_rms`.
+
+**Open questions for next session:**
+
+* Compare our and NVlabs's `attn_out` BEFORE the
+  `out_proj` Linear — isolate whether the bug is in the
+  attention compute or the output projection.
+* Print our and NVlabs's `mlp_out` standard deviation at
+  several intermediate points inside the MLP (post-inverted,
+  post-depth, post-glu, post-point) to localise the 6× scale
+  divergence.
+
 ### 6.13g Step-0 Controlled-Input Probe — Bug Is In Model Forward ⚠️ 2026-05-28 late
 
 Added env-gated input-injection hooks to `_run_native_smoke_backend`:
