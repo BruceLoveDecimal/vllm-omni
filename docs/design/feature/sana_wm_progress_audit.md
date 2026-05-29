@@ -1,8 +1,8 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-05-29 (revision 15 — Stage-1 long-sequence late-step drift probe)
+> **Audit date:** 2026-05-29 (revision 16 — Stage-1 late-step scheduler/forward decomposition)
 > **Branch:** `feat/sana_wm`
-> **Implementation snapshot:** remote 5090-synced worktree containing §6.13m softmax-UCPE + native scheduler fixes; refiner probes run on RTX PRO 6000 98GB
+> **Implementation snapshot:** remote 5090-synced worktree containing §6.13m softmax-UCPE + native scheduler fixes; late-step probes and refiner probes run on RTX PRO 6000 98GB
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
 > **Spec (single source of truth):**
 > [`sana_wm_integration.md`](sana_wm_integration.md)
@@ -14,9 +14,10 @@
 ## 0. Revision-9 Critical-Path Items — Updated Status
 
 Revision-9 blockers are mostly closed. Short-sequence Stage-1 alignment is now
-strong; the open Stage-1 correctness gap is 321-frame late-step drift in the
-denoising loop (§6.13o). The active short-sequence full-chain blocker remains
-the Stage-2 LTX-2 refiner contract (§6.14).
+strong; the open Stage-1 correctness gap is 321-frame trajectory-level drift in
+the denoising loop (§6.13p). Scheduler update semantics are now ruled out. The
+active short-sequence full-chain blocker remains the Stage-2 LTX-2 refiner
+contract (§6.14).
 
 | # | Item | Status |
 |---|---|---|
@@ -26,16 +27,16 @@ the Stage-2 LTX-2 refiner contract (§6.14).
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Verified 2026-05-28** — UCPE math (`ucpe.py`) and native raw camera branch match NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` at fp32 `~1e-7` max abs. See §6.12a. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | Per-token timestep sampling contract | ⚠️ **Short-sequence Stage-1 mostly closed; long-sequence still open** — per-frame `(B, 1, F)` timestep, native per-token FlowMatch Euler, condition-mask restore, VAE norm, and softmax-UCPE camera branch are landed. Short 9-frame Stage-1 parity stays strong at 20/60 steps (generated cos `0.9878` / `0.9861`). The 321-frame / 20-step drop is now localized to late-step drift after input camera tensors, `chunk_index`, step-0 latent/prompt/timestep, and initial model forward all check out; see §6.13n–§6.13o. |
+| 8 | Per-token timestep sampling contract | ⚠️ **Short-sequence Stage-1 mostly closed; long-sequence still open** — per-frame `(B, 1, F)` timestep, native per-token FlowMatch Euler, condition-mask restore, VAE norm, and softmax-UCPE camera branch are landed. Short 9-frame Stage-1 parity stays strong at 20/60 steps (generated cos `0.9878` / `0.9861`). The 321-frame / 20-step drop is now localized to trajectory-level accumulation after input camera tensors, `chunk_index`, step-0 latent/prompt/timestep, initial model forward, and scheduler update all check out; see §6.13n–§6.13p. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The UCPE / camera-control module is now
 numerically aligned with NVlabs (§6.12a), and the Stage-1 sampling contract has
 been tightened through native scheduler + softmax-UCPE fixes (§6.13m). However,
-§6.13n–§6.13o show a separate long-sequence Stage-1 gap at 321 frames before
+§6.13n–§6.13p show a separate long-sequence Stage-1 gap at 321 frames before
 Stage-2. For short 9-frame alignment the dominant full-chain blocker remains
 the LTX-2 refiner contract (§6.14); for production-length video, fix the
-321-frame late-step Stage-1 drift first.
+321-frame Stage-1 trajectory drift first.
 
 ---
 
@@ -983,6 +984,90 @@ Recommended targets:
   length-41 model-forward parity under late-step latents rather than
   more scheduler tuning or 321-frame / 60-step runs.
 
+#### 6.13p Late-Step Scheduler/Forward Decomposition — Scheduler Exact; Residual Accumulates ⚠️ 2026-05-29
+
+Ran the recommended late-step probes on the RTX PRO 6000 target, reusing the
+321-frame / 20-step dumps from §6.13o.
+
+Artifacts:
+
+- `/root/autodl-tmp/stage1_longseq_probe/scheduler_update_replay_probe_321f_20step.json`
+- `/root/autodl-tmp/stage1_longseq_probe/late_block_forward_probe_321f_steps15_18.json`
+- `/root/autodl-tmp/stage1_longseq_probe/teacher_forced_one_step_probe_321f_steps15_18.json`
+- `/root/autodl-tmp/stage1_longseq_probe/teacher_forced_native_on_official_trace_321f_20step.json`
+
+**Scheduler replay.** Using the actual dumped per-frame timestep table, the
+native per-token FlowMatch Euler update exactly reproduces both the NVlabs and
+native next latents from `(latent_in, noise_pred, timestep_per_frame)`.
+
+| Source | Step | Generated MAE vs dumped next latent | Generated cos |
+|---|---:|---:|---:|
+| NVlabs | 15 | `6.5e-09` | `0.99992` |
+| NVlabs | 18 | `0.0` | `0.99994` |
+| native | 15 | `0.0` | `0.99992` |
+| native | 18 | `0.0` | `0.99995` |
+
+So the late-step collapse is not a scheduler formula, sign convention,
+condition-mask, or timestep-table bug.
+
+**Same-latent model-forward probe.** Feeding the same late latent into both
+model implementations keeps `noise_pred` close even at steps 15/18:
+
+| Latent fed to both models | Step | Native-vs-NVlabs `noise_pred` generated MAE | Generated cos | Cross one-step latent MAE |
+|---|---:|---:|---:|---:|
+| NVlabs latent | 15 | `0.04047` | `0.99874` | `0.00288` |
+| NVlabs latent | 18 | `0.03347` | `0.99897` | `0.01020` |
+| native latent | 15 | `0.03992` | `0.99866` | `0.00284` |
+| native latent | 18 | `0.03387` | `0.99881` | `0.01032` |
+
+The "cross one-step" column applies the other implementation's direct
+`noise_pred` to the same latent with the exact scheduler update, then compares
+to that source trajectory's next latent. The local perturbation is small:
+roughly `|dt| * noise_pred_residual`, with the larger step-18 jump
+(`t≈392 → 87.7`) producing a `~0.010` generated-latent MAE.
+
+**Full teacher-forced native-on-official trace.** Running native forward on the
+NVlabs latent at every step confirms the local residual does not blow up late;
+it generally shrinks as `t` decreases. The per-step latent perturbation grows
+only where the schedule takes larger sigma jumps.
+
+| Step | `t` | Native-vs-NVlabs `noise_pred` generated MAE | Generated cos | One-step generated MAE |
+|---:|---:|---:|---:|---:|
+| 0 | `1000.0` | `0.16054` | `0.98110` | `0.00482` |
+| 5 | `965.3` | `0.07796` | `0.99443` | `0.00077` |
+| 10 | `900.0` | `0.05718` | `0.99745` | `0.00118` |
+| 15 | `732.3` | `0.04047` | `0.99874` | `0.00288` |
+| 16 | `661.2` | `0.03936` | `0.99880` | `0.00408` |
+| 17 | `557.6` | `0.03482` | `0.99901` | `0.00575` |
+| 18 | `392.4` | `0.03347` | `0.99897` | `0.01020` |
+| 19 | `87.7` | `0.02988` | `0.99880` | `0.00262` |
+
+This separates local model parity from self-feedback stability: if every step
+is reset to the NVlabs latent, native remains close; when native consumes its
+own previous latent, those small perturbations push it onto a different
+trajectory and the later `noise_pred` comparison degrades sharply (§6.13o).
+
+Block-level hidden tensors diverge in magnitude through the DiT stack
+(`block0` MAE `~0.31–0.37`, `block15` MAE `~11–18`, final-layer input MAE
+`~33–47`), but the final projection/unpatchify compresses this to a small
+`noise_pred` residual (`~0.033–0.040`, cos `>0.9986`) when the latent is held
+fixed. That makes a single block-18/conv implementation bug unlikely.
+
+**Interpretation.** The poor late-step `noise_pred` cosine from §6.13o
+(`0.7617` at step 18, `0.6778` at step 19) mostly compares different
+trajectories, not two model implementations on the same latent. The remaining
+Stage-1 problem is trajectory-level sensitivity: small local residuals are
+recursively fed back into the denoise loop and amplified over length-41 video
+tokens. The next high-leverage checks are:
+
+1. compare native torch fallback / Triton cam-branch / bf16-vs-fp32 execution to
+   see which numerical path shrinks the `~0.03–0.04` same-latent `noise_pred`
+   residual;
+2. run an oracle-correction sampler that uses native forward but periodically
+   snaps latent back to the NVlabs trajectory, measuring how much correction
+   frequency is needed to prevent the step-18/19 collapse;
+3. avoid more scheduler work unless a future probe breaks exact replay.
+
 ### 6.14 Refiner/VAE/RGB Photometric Chain Probe — Native Refiner Contract Dominates 🔴 2026-05-29
 
 After §6.13m tightened Stage-1 latent parity, the next question was
@@ -1924,7 +2009,7 @@ Stage-1 path needs a new contract:
 
 12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). Cam branch rewritten to match NVlabs `BidirectionalGDNUCPESinglePathLiteLA`: single-path delta-rule recurrence (no Z denominator), `apply_fn_o` inverse output transform, and `_downscale_to_reference_rms` PostUCPERenorm. Latent at STAGE1_STEPS=1 dropped from `[-59, 61]` to `[-12.3, 11.8]`.
 
-13. ⚠️ **Stage-1 native scheduler/softmax-UCPE alignment (§6.13m–§6.13o).** Controlled 3-step and 9-frame 20/60-step parity are strong (generated cos `0.986–0.988`). Production-length 321-frame / 20-step parity still drops to generated cos `~0.75`, but the gap is now localized: camera tensors, `chunk_index`, prompt/latent injection, timestep table, and step-0 model forward are aligned; divergence accumulates in late denoise steps, especially the step-18 update around `t≈392 → 87.7`.
+13. ⚠️ **Stage-1 native scheduler/softmax-UCPE alignment (§6.13m–§6.13p).** Controlled 3-step and 9-frame 20/60-step parity are strong (generated cos `0.986–0.988`). Production-length 321-frame / 20-step parity still drops to generated cos `~0.75`, but the gap is now localized: camera tensors, `chunk_index`, prompt/latent injection, timestep table, step-0 model forward, and scheduler update are aligned. Remaining divergence is trajectory-level accumulation of small same-latent `noise_pred` residuals, especially around the step-18 update (`t≈392 → 87.7`).
 
 14. ⚠️ **Stage-2 refiner contract alignment (§6.14).** The structural NVlabs contract is now ported: sink/current split, seed-42 current noise, per-token timestep, video-only streaming mask, x0/velocity loop, and terminal-zero sigma. Same-source native vs official-manual refiner is generated-frame latent MAE=0.3589 / cos=0.8912. Remaining gap is accumulated bf16 drift across vLLM-native vs diffusers LTX-2 layers, not scheduler, prompt connector, or missing weights.
 
@@ -1932,7 +2017,7 @@ Stage-1 path needs a new contract:
 
 ## 8. Outstanding Work — GPU Required
 
-1. **Fix 321-frame Stage-1 late-step drift (§6.13o).** Input camera tensors and `chunk_index` are ruled out, and step-0 controlled forward parity is high (`noise_pred` generated cos `0.9811`). The collapse appears late in 321-frame / 20-step denoise (`generated latent cos 0.9915 at step 15 → 0.7587 at step 19`). Next compare scheduler update semantics and block-level model internals at controlled late-step latents (steps 15/18) before spending GPU time on 321-frame / 60-step.
+1. **Fix 321-frame Stage-1 trajectory drift (§6.13p).** Input camera tensors, `chunk_index`, step-0 forward, scheduler update semantics, and full teacher-forced native-on-official trace are ruled out as single-point failures. Same-latent late-step `noise_pred` parity remains high (generated cos `0.9986–0.9990`), but small local residuals still accumulate into the 321-frame / 20-step trajectory collapse (`generated latent cos 0.9915 at step 15 → 0.7587 at step 19`). Next isolate whether torch fallback, Triton camera branch, bf16 accumulation, or final-layer dtype is responsible for the residual.
 
 2. **Regenerate same-source Stage-2 refiner acceptance artifacts (§6.14).** For short 9-frame alignment, the next correctness target is still native LTX-2 refiner parity against NVlabs on controlled Stage-1 latents. Regenerate the official refiner baseline and prompt-connector dump in one run, then decide whether strict cos ≥0.98 requires a diffusers-exact fallback or a refiner-specific torch-linear layer stack.
 
@@ -1962,7 +2047,7 @@ Stage-1 path needs a new contract:
 
 ### 9.2 Single-GPU correctness (GPU)
 
-6. Localize the 321-frame Stage-1 parity drop from §6.13n.
+6. Reduce the 321-frame Stage-1 trajectory residual from §6.13p.
 7. Re-run short 9-frame full-chain reference alignment after any Stage-1 fix.
 8. Wire PSNR/SSIM assertions once the short harness qualifies.
 9. GDN full-shape parity at 704×1280 (commit `tests/e2e/accuracy/` result as markdown).
