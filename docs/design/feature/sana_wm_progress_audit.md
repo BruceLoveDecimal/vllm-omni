@@ -1,8 +1,8 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-05-28 (revision 13 — camera-module parity + Stage-1 forward probe + per-token timestep root cause)
+> **Audit date:** 2026-05-29 (revision 15 — Stage-1 long-sequence late-step drift probe)
 > **Branch:** `feat/sana_wm`
-> **Implementation HEAD:** `c57ba6bc chore(sana-wm): localise §6.13 root cause to per-token timesteps`
+> **Implementation snapshot:** remote 5090-synced worktree containing §6.13m softmax-UCPE + native scheduler fixes; refiner probes run on RTX PRO 6000 98GB
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
 > **Spec (single source of truth):**
 > [`sana_wm_integration.md`](sana_wm_integration.md)
@@ -13,8 +13,10 @@
 
 ## 0. Revision-9 Critical-Path Items — Updated Status
 
-Revision-9 blockers are mostly closed. The active correctness blocker is now
-the newly identified per-token/per-frame timestep sampling contract.
+Revision-9 blockers are mostly closed. Short-sequence Stage-1 alignment is now
+strong; the open Stage-1 correctness gap is 321-frame late-step drift in the
+denoising loop (§6.13o). The active short-sequence full-chain blocker remains
+the Stage-2 LTX-2 refiner contract (§6.14).
 
 | # | Item | Status |
 |---|---|---|
@@ -24,15 +26,16 @@ the newly identified per-token/per-frame timestep sampling contract.
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Verified 2026-05-28** — UCPE math (`ucpe.py`) and native raw camera branch match NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` at fp32 `~1e-7` max abs. See §6.12a. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | Per-token timestep sampling contract | ⚠️ **Breaks 1+2+3 + VAE-norm landed (2026-05-28)** — model side per-frame `(B, 1, F)` fp32 timestep + native `step_flow_euler_per_token` on the scheduler + `condition_mask` re-enabled by default + LTX-2 VAE per-channel normalisation in encode AND decode (closes §6.13e). New default MAE=47.35, PSNR=13.14, SSIM-Y=+0.025 (was 102.48 / 6.57 / -0.017 at session start). SSIM first time positive. Per-token step reveals the cam branch is load-bearing: cam-off jumps to MAE=129. See §6.13b/c/d/e. |
+| 8 | Per-token timestep sampling contract | ⚠️ **Short-sequence Stage-1 mostly closed; long-sequence still open** — per-frame `(B, 1, F)` timestep, native per-token FlowMatch Euler, condition-mask restore, VAE norm, and softmax-UCPE camera branch are landed. Short 9-frame Stage-1 parity stays strong at 20/60 steps (generated cos `0.9878` / `0.9861`). The 321-frame / 20-step drop is now localized to late-step drift after input camera tensors, `chunk_index`, step-0 latent/prompt/timestep, and initial model forward all check out; see §6.13n–§6.13o. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The UCPE / camera-control module is now
-numerically aligned with NVlabs (§6.12a), but full Stage-1 forward parity is
-blocked by the timestep contract (§6.12b): NVlabs' real path accepts a
-per-frame timestep tensor, while native Stage-1 currently only runs the scalar
-timestep path. The 9-frame harness therefore remains in the ~90-100 MAE regime
-after the loader and cam-branch fixes.
+numerically aligned with NVlabs (§6.12a), and the Stage-1 sampling contract has
+been tightened through native scheduler + softmax-UCPE fixes (§6.13m). However,
+§6.13n–§6.13o show a separate long-sequence Stage-1 gap at 321 frames before
+Stage-2. For short 9-frame alignment the dominant full-chain blocker remains
+the LTX-2 refiner contract (§6.14); for production-length video, fix the
+321-frame late-step Stage-1 drift first.
 
 ---
 
@@ -846,10 +849,360 @@ input, selected blocks):
 This closes the earlier "softmax-UCPE port" item as a real native
 implementation, not just a probe. The remaining gap is now smaller
 and more specific: step-0 `noise_pred` is still only cosine ~0.90
-globally, and the 3-step generated-frame latent has MAE ~0.127. The
-next useful probe is no longer scheduler/softmax structure; it is
-late-block sub-stage parity (cross-attn vs MBConv/temporal conv vs
-final layer) under controlled inputs.
+globally, and the 3-step generated-frame latent has MAE ~0.127. For Stage-1-only work, the next useful probe is no longer
+scheduler/softmax structure; it is late-block sub-stage parity
+(cross-attn vs MBConv/temporal conv vs final layer) under controlled
+inputs. Full-chain alignment moves downstream to the refiner contract
+probe in §6.14.
+
+#### 6.13n Stage-1 Denoise Scaling Probe — Step Count OK, Long Sequence Breaks ⚠️ 2026-05-29
+
+Ran the planned Stage-1-only denoise scaling sweep on the RTX PRO 6000
+Blackwell target. The probe compares NVlabs Stage-1 `_sample_stage1`
+against vLLM-Omni native Stage-1 on the same synthetic first frame,
+prompt, straight camera trajectory, seed `0`, CFG `1.0`, and
+`flow_euler_ltx`. It records final Stage-1 latent parity before
+Stage-2 refiner or VAE decode.
+
+| Config | Latent shape | Global MAE | Global cos | Generated MAE | Generated cos | Runtime |
+|---|---|---:|---:|---:|---:|---:|
+| 9 frames / 20 steps | `(1,128,2,22,40)` | 0.0804 | 0.9918 | 0.1338 | 0.9878 | 82.7s |
+| 9 frames / 60 steps | `(1,128,2,22,40)` | 0.0919 | 0.9902 | 0.1568 | 0.9861 | 81.5s |
+| 321 frames / 20 steps | `(1,128,41,22,40)` | 0.3930 | 0.7647 | 0.4022 | 0.7575 | 156.4s |
+| 321 frames / 60 steps | — | — | — | — | — | aborted |
+
+Frame-0 stays aligned across all completed configs (`MAE=0.0271`,
+`cos=0.9978`), so the first-frame VAE encode / condition preservation
+path is not the cause of the long-sequence collapse.
+
+**Interpretation.** Increasing Stage-1 denoise steps from `20` to `60`
+at 9 frames barely changes generated-frame parity (`cos 0.9878 →
+0.9861`). The dominant new failure appears when moving from 2 latent
+frames to 41 latent frames: generated cosine falls to `0.7575` even at
+20 steps. That points away from the scheduler step count and toward a
+long-sequence contract difference: `chunk_index`, temporal
+GDN/softmax-UCPE sequence handling, camera trajectory conditioning, or
+chunk/stride layout.
+
+Per the "jump out on large deviation" rule, the 321-frame / 60-step
+run was stopped after `321f/20step` exposed the large latent-parity
+drop. Running 60 steps at the same long shape would be expensive and
+hard to interpret until the 321-frame / 20-step gap is localized.
+
+Artifacts:
+
+- `/root/autodl-tmp/stage1_denoise_probe/results.jsonl`
+- `/root/autodl-tmp/stage1_denoise_probe/official_stage1_9f_20step.pt`
+- `/root/autodl-tmp/stage1_denoise_probe/native_stage1_9f_20step.pt`
+- `/root/autodl-tmp/stage1_denoise_probe/official_stage1_9f_60step.pt`
+- `/root/autodl-tmp/stage1_denoise_probe/native_stage1_9f_60step.pt`
+- `/root/autodl-tmp/stage1_denoise_probe/official_stage1_321f_20step.pt`
+- `/root/autodl-tmp/stage1_denoise_probe/native_stage1_321f_20step.pt`
+
+
+#### 6.13o Long-Sequence Probe — Inputs Match; Collapse Is Late-Step Denoise Drift ⚠️ 2026-05-29
+
+Follow-up probes on the RTX PRO 6000 target localized the §6.13n
+321-frame failure further. The goal was to separate three suspects:
+long-sequence input contract, first model forward, and multi-step
+denoise accumulation.
+
+**Input-side parity (`/root/autodl-tmp/stage1_longseq_probe/input_probe.json`).**
+
+The native camera preparation is not the cause:
+
+| Config | Latent T | `chunk_index` | `raymap` MAE / cos | `chunk_plucker` MAE / cos |
+|---|---:|---|---:|---:|
+| 9 frames | 2 | `None` | `0.0 / 1.0000` | `0.0 / 1.0000` |
+| 321 frames | 41 | `None` | `0.0 / 1.0000` | `0.0 / 1.0000` |
+
+So the earlier `chunk_index` suspicion is ruled out for this config:
+NVlabs does not pass a chunk index at either latent length, and the
+camera tensors are byte-identical up to dtype/cosine noise.
+
+**Controlled step-0 model-forward parity
+(`/root/autodl-tmp/stage1_longseq_probe/step0_controlled_probe.json`).**
+
+Both native runs loaded NVlabs' `latent_in` and `prompt_embeds` before
+the first denoise step. Timesteps matched exactly.
+
+| Config | Latent cos | `noise_pred` global cos | `noise_pred` generated cos | Worst generated frame |
+|---|---:|---:|---:|---:|
+| 9 frames / 1 step | `0.99999` | `0.98218` | `0.98203` | frame 1: `0.98203` |
+| 321 frames / 1 step | `0.99991` | `0.98113` | `0.98112` | frame 38: `0.97772` |
+
+This rules out "long sequence breaks immediately at the first forward."
+The 321-frame first forward is no worse than 9-frame in aggregate, and
+late latent frames are still high-cosine at step 0.
+
+**Controlled 321-frame / 20-step multi-step probe
+(`/root/autodl-tmp/stage1_longseq_probe/multistep_controlled_probe_321f_20step.json`).**
+
+The native run again loaded NVlabs' initial latent/prompt and dumped
+every pre-step latent and `noise_pred`. The final generated latent still
+collapses (`MAE=0.4085`, `cos=0.7491`), matching the uncontrolled
+§6.13n result. Frame 0 remains exact (`MAE=0`, `cos=0.99999`), so the
+condition-frame path is not implicated.
+
+| Step | `t` | Pre-step generated latent cos | Generated latent MAE | Generated `noise_pred` cos | Generated `noise_pred` MAE |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1000.0 | `0.99990` | `0.0000` | `0.98112` | `0.1605` |
+| 1 | 994.4 | `0.99990` | `0.0000` | `0.98828` | `0.1226` |
+| 2 | 988.3 | `0.99989` | `0.0007` | `0.98471` | `0.1383` |
+| 5 | 965.3 | `0.99983` | `0.0040` | `0.97144` | `0.1836` |
+| 10 | 900.0 | `0.99949` | `0.0182` | `0.92909` | `0.2965` |
+| 15 | 732.3 | `0.99150` | `0.0742` | `0.86276` | `0.4172` |
+| 16 | 661.2 | `0.98191` | `0.1024` | `0.84028` | `0.4469` |
+| 17 | 557.6 | `0.95725` | `0.1466` | `0.81186` | `0.4726` |
+| 18 | 392.4 | `0.89055` | `0.2213` | `0.76167` | `0.5014` |
+| 19 | 87.7 | `0.75868` | `0.3686` | `0.67783` | `0.4725` |
+
+**Interpretation.**
+
+The long-sequence failure is not caused by camera packing, `chunk_index`,
+RNG, prompt embedding, timestep table, or a step-0 model-forward shape
+bug. It is a late-step accumulation problem: small-but-real
+`noise_pred` residuals at high timesteps are tolerated for many steps,
+then the low/mid-sigma section rapidly amplifies them. The largest
+collapse happens after the step-18 update (`t≈392 → 87.7`), where
+pre-step generated latent cosine falls from `0.8906` to `0.7587`.
+
+The next Stage-1 probe should therefore compare the native and NVlabs
+forward internals at late denoise states, not at clean step-0 inputs.
+Recommended targets:
+
+* Capture block-level outputs at controlled 321-frame step 15/18
+  (`latent_in` loaded from the NVlabs/native step dumps) to identify
+  whether the growing residual is in temporal GDN, softmax-UCPE camera
+  branch, cross-attn, MBConv/temporal conv, or final layer.
+* Compare the scheduler update numerically on the same
+  `(latent_in, noise_pred, per_token_timesteps)` triplet around steps
+  17–18. The scalar timestep sequence already matches, but this will
+  rule out a subtle low-sigma update/mask semantic mismatch.
+* If the update formula is exact, focus implementation effort on
+  length-41 model-forward parity under late-step latents rather than
+  more scheduler tuning or 321-frame / 60-step runs.
+
+### 6.14 Refiner/VAE/RGB Photometric Chain Probe — Native Refiner Contract Dominates 🔴 2026-05-29
+
+After §6.13m tightened Stage-1 latent parity, the next question was
+whether the remaining e2e MAE/PSNR/SSIM behavior was caused by VAE
+decode, simple RGB photometric bias, official-refiner amplification of
+small Stage-1 drift, or the native in-process refiner algorithm.
+
+**Hardware note.** The 5090 32GB instance is sufficient for Stage-1
+probes, but not for LTX-2 refiner: even loading the refiner transformer
+alone OOMs at ~31GB. The chain probes below were run on the restarted
+RTX PRO 6000 98GB instance using the same 5090-synced worktree. Probe
+artifacts are under `/root/autodl-tmp/refiner_photometric_probe/`:
+
+- `official_refiner_vae_photometric_metrics.json`
+- `prompt_connector_compare_metrics.json`
+- `native_refiner_algorithm_metrics.json`
+- `native_refiner_algorithm_rgb_metrics.json`
+
+#### 6.14a VAE/RGB decode is not the dominant error source
+
+Using the same official VAE decode on controlled Stage-1 latents:
+
+| Comparison | Scope | MAE | PSNR | SSIM-Y (global) |
+|---|---|---:|---:|---:|
+| native Stage-1 RGB vs official Stage-1 RGB | all frames | 2.90 | 35.96 | 0.9946 |
+| native Stage-1 RGB vs official Stage-1 RGB | generated only | 3.20 | 35.46 | 0.9777 |
+| after per-channel affine fit | generated only | 2.60 | 37.12 | 0.9779 |
+
+This makes pure VAE decode and simple brightness/contrast drift a
+secondary effect. Stage-1 direct RGB is visually/photometrically close
+once decoded by the same VAE.
+
+#### 6.14b Official refiner amplifies the remaining Stage-1 drift
+
+Feeding both Stage-1 latents into the same NVlabs official refiner and
+then the same official VAE decode gives:
+
+| Comparison | Scope | MAE | PSNR | SSIM-Y (global) |
+|---|---|---:|---:|---:|
+| official_refiner(native Stage-1) vs official_refiner(official Stage-1) | generated only | 25.86 | 16.29 | 0.4426 |
+| after per-channel affine fit | generated only | 23.70 | 17.49 | 0.3569 |
+
+Latent-side, the generated-frame comparison is MAE `0.7266`, cosine
+`0.6049`. The same Stage-1 residual that is only RGB MAE ~3 before
+refiner becomes RGB MAE ~26 after the official refiner. A simple
+photometric correction does not recover structure; it actually lowers
+SSIM-Y. This is refiner sensitivity, not just RGB calibration.
+
+> **Reconciliation with §6.13m.** §6.13m reported generated-frame
+> Stage-1 latent MAE `0.1266` / cosine `0.987` — that figure was measured
+> under a **controlled-input probe** where NVlabs' step-0 latent and
+> prompt embeddings were injected into the native pipeline. The
+> `0.7266` / `0.6049` here is from the **full e2e path** (native
+> generates its own initial noise and runs its own prompt-encoder
+> chain), which adds upstream divergence that the controlled probe
+> deliberately removes. Both numbers are correct for their respective
+> setups; the ~5× gap between them is the answer to "what does the
+> §6.13m improvement look like once upstream uncontrolled steps are
+> included".
+
+#### 6.14c Refiner prompt connector is effectively aligned
+
+The native prompt-connector path was compared against NVlabs packed
+Gemma hidden-state path before transformer denoising:
+
+| Connector output | MAE | RMSE | Max | Cosine | Mask |
+|---|---:|---:|---:|---:|---|
+| video prompt embeds | 0.000607 | 0.00245 | 0.25 | ~1.000 | equal |
+| audio prompt embeds | 0.001004 | 0.00281 | 0.375 | 0.9999 | equal |
+
+This rules out the text/refiner connector as the source of the large
+refiner-chain gap.
+
+#### 6.14d Current native refiner algorithm is structurally non-equivalent
+
+A probe-only native-like refiner run used the current in-process native
+algorithm on the same controlled Stage-1 latents, with TP mocked to
+single-card for offline comparison. Against NVlabs official refiner on
+the **same official Stage-1 input**:
+
+| Comparison | Scope | Latent MAE | Latent cos | RGB MAE | PSNR | SSIM-Y |
+|---|---|---:|---:|---:|---:|---:|
+| native-like refiner vs official refiner | generated only | 1.2622 | 0.4207 | 56.25 | 11.51 | 0.0087 |
+
+The native-like output has much larger generated-frame magnitude
+(`norm 565.35` vs `372.47`, `std 1.684` vs `1.110`). In contrast,
+native-like refiner sensitivity to native-vs-official Stage-1 input is
+small by comparison: latent generated-frame MAE `0.1924`, cosine
+`0.9906`; RGB generated-frame MAE `3.01`, PSNR `31.81`, SSIM-Y
+`0.8631`.
+
+> **Direction-flip clue.** Stage-1 block-19 controlled-input probes
+> in §6.13m showed native generated-frame norm was *below* NVlabs
+> (`block-19 output ratio ≈ 0.908`). After the native refiner runs,
+> the same generated frames come out *above* NVlabs
+> (`norm 565 / 372 ≈ 1.52×`, `std 1.684 / 1.110 ≈ 1.52×`). The sign
+> flips and the magnitude is amplified ~1.5×. That is consistent with
+> a missing per-token / sink-current update — without it, the native
+> refiner integrates over the wrong sigma table for the wrong tokens
+> and overshoots in the opposite direction.
+
+So the dominant refiner-side gap is not that Stage-1 is still slightly
+off; it is that the native refiner denoising contract is currently not
+NVlabs' contract.
+
+The specific contract breaks in `pipeline_sana_wm_two_stages.py` are:
+
+1. native refiner updates the packed full latent stream directly;
+2. NVlabs splits `sink = z[:, :, :sink_size]` and `current = z[:, :, sink_size:]`;
+3. NVlabs initializes current frames as `(1 - start_sigma) * current + start_sigma * eps` with seed 42;
+4. NVlabs uses per-token timestep: sink tokens at `0`, current tokens at `sigma`;
+5. NVlabs runs a video-only transformer path with sink/current streaming self-attention mask;
+6. NVlabs predicts current `x0` and updates via velocity `(noisy_tokens - denoised) / sigma`;
+7. native currently uses the public transformer forward with an audio stream and scalar timestep.
+
+#### 6.14e Native refiner contract port — structure fixed, parity now limited by accumulated bf16 drift ⚠️ 2026-05-29
+
+The native in-process refiner was updated to follow the NVlabs
+`DiffusersLTX2Refiner` denoising contract:
+
+1. split `sink` and `current` frames;
+2. seed-42 current-frame noise initialization;
+3. per-token refiner timestep with sink/context tokens at `0`;
+4. video-only transformer path with sink/current streaming self-attention;
+5. x0/velocity update loop;
+6. terminal `0.0` sigma appended when the installed diffusers
+   `STAGE_2_DISTILLED_SIGMA_VALUES` omits it.
+
+Initial contract-port probe against the old `official_refiner_*`
+artifact improved the old native-like baseline but exposed a probe
+consistency issue:
+
+| Probe | Reference | Generated latent MAE | Generated cos | Generated norm |
+|---|---|---:|---:|---:|
+| pre-port native-like | old official artifact | 1.2622 | 0.4207 | 565.35 vs 372.47 |
+| contract port, 2 effective steps | old official artifact | 0.5473 | 0.7759 | 263.95 vs 372.47 |
+| contract port, 3 steps + terminal zero | old official artifact | 0.7683 | 0.5630 | 370.60 vs 372.47 |
+
+The 3-step run fixes the generated-frame magnitude, but comparison
+against the old artifact gets worse because the saved prompt-connector
+artifact and the old official-refiner artifact are not same-source.
+Re-running the NVlabs official refiner manually with
+`prompt_connector_compare.pt` gives a different "official" result:
+
+| Comparison | Generated latent MAE | Generated cos | Note |
+|---|---:|---:|---|
+| official manual from `prompt_connector_compare.pt` vs old official artifact | 0.7754 | 0.5596 | baseline artifact mismatch |
+| native contract port vs same-source official manual | 0.3589 | 0.8912 | true current native-vs-official gap |
+
+Step-level same-source comparison:
+
+| Stage | MAE | Cosine |
+|---|---:|---:|
+| initial noisy current | 0.0000 | ~1.0000 |
+| step-0 predicted x0 | 0.1825 | 0.9703 |
+| after step-0 update | 0.0370 | 0.9976 |
+| step-1 predicted x0 | 0.3723 | 0.8888 |
+| after step-1 update | 0.1636 | 0.9538 |
+| final / after step-2 | 0.3589 | 0.8912 |
+
+Block-level isolation rules out gross structural or weight-load errors.
+All 3126 native refiner parameters load. Feeding the same official block
+input into native and NVlabs blocks gives close local agreement:
+
+| Same official input | Sub-stage | MAE | Cosine |
+|---|---|---:|---:|
+| block 25 | after self-attn | 0.0023 | ~1.000 |
+| block 25 | after ff | 0.0044 | ~1.000 |
+| block 37 | after self-attn | 0.0042 | ~1.000 |
+| block 37 | after ff | 0.0074 | ~1.000 |
+
+Full-chain e2e was re-run after the refiner contract port with the
+current 9-frame reference-alignment harness. The harness currently
+hard-codes Stage-1 `num_inference_steps=1`; Stage-2 was run with
+`REFINER_STEPS=3` (native in-process refiner vs NVlabs bridge):
+
+| Configuration | MAE | PSNR | SSIM-Y |
+|---|---:|---:|---:|
+| §6.13e full-chain baseline (`3+3` probe config) | 47.35 | 13.14 | +0.025 |
+| §6.13l native scheduler exposed drift (`3+3` probe config) | 54.21 | 11.46 | -0.002 |
+| **§6.14e native refiner contract port** | **22.55** | **17.72** | **+0.587** |
+
+Because the earlier table rows were collected under a `3+3` probe
+configuration, treat this as a strong smoke/alignment result rather
+than a strict apples-to-apples delta. It still confirms the refiner
+contract port moved the full decoded output into a much more correlated
+regime; a follow-up should add a Stage-1 step env override to the e2e
+harness and re-run exact `3+3` and normal-step comparisons.
+
+So the remaining gap is not scheduler, sink/current masking, prompt
+connector, or missing weights. It is accumulated bf16 numerical drift
+between the vLLM-native LTX-2 layers and diffusers' reference layers
+across 48 refiner blocks, then amplified by the 3-step distilled
+refiner loop.
+
+Artifacts:
+
+- `/root/autodl-tmp/refiner_photometric_probe/native_refiner_contract_fix_steps3_metrics.json`
+- `/root/autodl-tmp/refiner_photometric_probe/official_refiner_step_dump.pt`
+- `/root/autodl-tmp/refiner_photometric_probe/native_refiner_step_dump_official_prompt_sdpa.pt`
+- `/root/autodl-tmp/refiner_photometric_probe/native_vs_official_step_dump_sdpa_metrics.json`
+- `/root/autodl-tmp/refiner_photometric_probe/native_vs_official_block_detail_25_37_metrics.json`
+
+#### 6.14f Updated fix order
+
+Do **not** chase RGB photometric tuning first. The next correctness work
+is now narrower:
+
+1. regenerate the official refiner baseline and prompt-connector dump in
+   one run so acceptance compares same-source artifacts;
+2. decide whether strict `cos >= 0.98` parity requires a
+   diffusers-exact refiner fallback, or a refiner-specific torch-linear
+   layer stack instead of vLLM parallel layers;
+3. only after same-source latent parity clears should VAE/RGB
+   photometric checks become actionable again.
+
+Updated acceptance target: compare against a same-source official
+refiner run, not the stale `official_refiner_official_stage1.pt`
+artifact. Current same-source generated-frame latent is MAE `0.3589` /
+cos `0.8912`; the target remains cos `>=0.98`, MAE `<=0.20`.
 
 ### 6.13k Stage-1 Multi-Step Timestep Schedule Diverges — Native Scheduler Now Urgent 🔴 2026-05-28 night (RESOLVED — see §6.13l)
 
@@ -1571,25 +1924,29 @@ Stage-1 path needs a new contract:
 
 12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). Cam branch rewritten to match NVlabs `BidirectionalGDNUCPESinglePathLiteLA`: single-path delta-rule recurrence (no Z denominator), `apply_fn_o` inverse output transform, and `_downscale_to_reference_rms` PostUCPERenorm. Latent at STAGE1_STEPS=1 dropped from `[-59, 61]` to `[-12.3, 11.8]`.
 
-13. ⚠️ **Per-frame timestep contract (§6.13b + §6.13d) — Breaks 1+2+3 landed 2026-05-28.** Model side per-frame `(B, 1, F)` fp32 timestep + native `step_flow_euler_per_token` on `SanaWmFlowMatchScheduler` + `condition_mask` re-enabled by default. Current default 9-frame harness: **MAE=69.06, PSNR=9.68, SSIM-Y=-0.059** (was 102.48 / 6.57 / -0.017 at session start). Next investigations (in §6.13d): diagnose negative SSIM (single-block parity vs NVlabs; visual decode side-by-side), then move to softmax-UCPE port and camera embedder structural alignment.
+13. ⚠️ **Stage-1 native scheduler/softmax-UCPE alignment (§6.13m–§6.13o).** Controlled 3-step and 9-frame 20/60-step parity are strong (generated cos `0.986–0.988`). Production-length 321-frame / 20-step parity still drops to generated cos `~0.75`, but the gap is now localized: camera tensors, `chunk_index`, prompt/latent injection, timestep table, and step-0 model forward are aligned; divergence accumulates in late denoise steps, especially the step-18 update around `t≈392 → 87.7`.
+
+14. ⚠️ **Stage-2 refiner contract alignment (§6.14).** The structural NVlabs contract is now ported: sink/current split, seed-42 current noise, per-token timestep, video-only streaming mask, x0/velocity loop, and terminal-zero sigma. Same-source native vs official-manual refiner is generated-frame latent MAE=0.3589 / cos=0.8912. Remaining gap is accumulated bf16 drift across vLLM-native vs diffusers LTX-2 layers, not scheduler, prompt connector, or missing weights.
 
 ---
 
 ## 8. Outstanding Work — GPU Required
 
-1. **Re-run reference-alignment harness** (`SANA_WM_E2E_REFERENCE_ALIGNMENT=1`). 2026-05-27 morning run produced MAE=95.82 / PSNR=7.37 / SSIM=0.0047 with the SDPA cam branch. UCPE port landed later same day (§7 item 10 ✅), and direct NVlabs camera-module parity is now verified (§6.12a). Need a fresh e2e run after the §6.13 per-frame timestep refactor to confirm the full Stage-1 + refiner path drops into the comparison-meaningful range.
+1. **Fix 321-frame Stage-1 late-step drift (§6.13o).** Input camera tensors and `chunk_index` are ruled out, and step-0 controlled forward parity is high (`noise_pred` generated cos `0.9811`). The collapse appears late in 321-frame / 20-step denoise (`generated latent cos 0.9915 at step 15 → 0.7587 at step 19`). Next compare scheduler update semantics and block-level model internals at controlled late-step latents (steps 15/18) before spending GPU time on 321-frame / 60-step.
 
-2. **Wire PSNR ≥ 30 / SSIM-Y ≥ 0.93** once harness produces a qualifying result.
+2. **Regenerate same-source Stage-2 refiner acceptance artifacts (§6.14).** For short 9-frame alignment, the next correctness target is still native LTX-2 refiner parity against NVlabs on controlled Stage-1 latents. Regenerate the official refiner baseline and prompt-connector dump in one run, then decide whether strict cos ≥0.98 requires a diffusers-exact fallback or a refiner-specific torch-linear layer stack.
 
-3. **GDN multi-step parity** at full 704×1280 / 321 frames vs official NVlabs path.
+3. **Wire PSNR ≥ 30 / SSIM-Y ≥ 0.93** once harness produces a qualifying result.
 
-4. **CUDA Graph capture smoke** — confirm no regression vs fused-GDN e2e when bucket capture fires.
+4. **GDN multi-step parity** at full 704×1280 / 321 frames vs official NVlabs path.
 
-5. **Real USP run** to validate `_sp_plan` under multi-GPU sequence parallelism.
+5. **CUDA Graph capture smoke** — confirm no regression vs fused-GDN e2e when bucket capture fires.
 
-6. **HSDP + CFG-parallel sweeps** from `dfx/perf` config.
+6. **Real USP run** to validate `_sp_plan` under multi-GPU sequence parallelism.
 
-7. **Live server smoke** — `vllm serve … --omni` + `POST /v1/videos/generations` with SANA-WM camera payload.
+7. **HSDP + CFG-parallel sweeps** from `dfx/perf` config.
+
+8. **Live server smoke** — `vllm serve … --omni` + `POST /v1/videos/generations` with SANA-WM camera payload.
 
 ---
 
@@ -1605,9 +1962,10 @@ Stage-1 path needs a new contract:
 
 ### 9.2 Single-GPU correctness (GPU)
 
-6. Run reference-alignment harness; expect MAE < 30 on 24f 256×448 smoke.
-7. Wire PSNR/SSIM assertions.
-8. GDN full-shape parity at 704×1280 (commit `tests/e2e/accuracy/` result as markdown).
+6. Localize the 321-frame Stage-1 parity drop from §6.13n.
+7. Re-run short 9-frame full-chain reference alignment after any Stage-1 fix.
+8. Wire PSNR/SSIM assertions once the short harness qualifies.
+9. GDN full-shape parity at 704×1280 (commit `tests/e2e/accuracy/` result as markdown).
 
 ### 9.3 Throughput (GPU after correctness closes)
 
