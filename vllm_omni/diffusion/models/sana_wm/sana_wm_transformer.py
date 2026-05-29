@@ -974,8 +974,9 @@ class SanaWmSelfAttention(nn.Module):
         Centralised so the same shared gate/proj path is applied whether or
         not the camera branch contributes to ``combined``.
         """
-        gate = F.silu(_linear_output(self.output_gate(hidden_states)).float()).to(combined.dtype)
-        return _linear_output(self.proj((combined * gate).to(_linear_weight_dtype(self.proj))))
+        gate = F.silu(_linear_output(self.output_gate(hidden_states)).float())
+        gated = combined * gate
+        return _linear_output(self.proj(gated.to(_linear_weight_dtype(self.proj))))
 
     def _forward_gdn(
         self,
@@ -1016,6 +1017,144 @@ class SanaWmSelfAttention(nn.Module):
         tr_rms = transformed.square().mean(dim=-1, keepdim=True).add(eps).sqrt()
         scale = (ref_rms / tr_rms.clamp_min(eps)).clamp(max=1.0)
         return transformed * scale
+
+    @staticmethod
+    def _ucpe_rotary_freqs(rotary_emb: torch.Tensor | None) -> torch.Tensor | None:
+        if rotary_emb is None:
+            return None
+        rotary_emb_freqs = rotary_emb.squeeze(0).squeeze(0)
+        if rotary_emb_freqs.ndim == 3:
+            # vLLM-Omni packs RoPE as (1, 1, N, D//2) complex. Some
+            # call-sites may pass an already squeezed (N, D//2) tensor.
+            rotary_emb_freqs = rotary_emb_freqs.squeeze(0)
+        return rotary_emb_freqs
+
+    def _forward_softmax_raw(
+        self,
+        hidden_states: torch.Tensor,
+        spatial_shape: tuple[int, int, int],
+        rotary_emb: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Softmax self-attention raw output before output_gate/proj.
+
+        Mirrors NVlabs ``_forward_softmax_attn(..., apply_output_gate=False)``
+        for every-N-th hybrid blocks. GDN-specific gates are intentionally not
+        used here.
+        """
+        batch_size, token_count, hidden_size = hidden_states.shape
+        frames, height, width = spatial_shape
+        if token_count != frames * height * width:
+            raise ValueError(
+                f"Sana-WM softmax attention expects N=T*H*W, got N={token_count}, THW={spatial_shape}."
+            )
+
+        qkv = _linear_output(self.qkv(hidden_states))
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        query = self.q_norm(query).reshape(batch_size, token_count, self.num_heads, self.head_dim)
+        key = self.k_norm(key).reshape(batch_size, token_count, self.num_kv_heads, self.head_dim)
+        value = value.reshape(batch_size, token_count, self.num_kv_heads, self.head_dim)
+
+        if rotary_emb is not None:
+            query = self._apply_rotary_emb(query.permute(0, 2, 3, 1), rotary_emb).permute(0, 3, 1, 2)
+            key = self._apply_rotary_emb(key.permute(0, 2, 3, 1), rotary_emb).permute(0, 3, 1, 2)
+
+        query = query.transpose(1, 2)  # (B, H, N, D)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+
+        dtype_orig = hidden_states.dtype
+        if query.dtype == torch.float32:
+            query = query.bfloat16()
+            key = key.bfloat16()
+            value = value.bfloat16()
+        attn = F.scaled_dot_product_attention(query, key, value)
+        return attn.transpose(1, 2).reshape(batch_size, token_count, q_size).to(dtype_orig)
+
+    def _forward_softmax_cam_branch(
+        self,
+        hidden_states: torch.Tensor,
+        spatial_shape: tuple[int, int, int],
+        camera_conditions: torch.Tensor,
+        rotary_emb: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """UCPE camera branch for softmax hybrid blocks.
+
+        Matches NVlabs ``_forward_cam_branch_softmax``: camera Q/K/V are
+        projected from the same hidden stream, transformed by UCPE, run through
+        SDPA, inverse-transformed, then returned as raw ``cam_dim`` features.
+        """
+        batch_size, token_count, _ = hidden_states.shape
+        frames, height, width = spatial_shape
+        if token_count != frames * height * width:
+            raise ValueError(
+                f"Sana-WM softmax cam branch expects N=T*H*W, got N={token_count}, THW={spatial_shape}."
+            )
+
+        q_cam = _linear_output(self.q_proj_cam(hidden_states))
+        k_cam = _linear_output(self.k_proj_cam(hidden_states))
+        v_cam = _linear_output(self.v_proj_cam(hidden_states))
+
+        if self.conv_q_cam is not None:
+            q_cam = self._bidirectional_temporal_short_conv(q_cam, self.conv_q_cam, spatial_shape)
+        if self.conv_k_cam is not None:
+            k_cam = self._bidirectional_temporal_short_conv(k_cam, self.conv_k_cam, spatial_shape)
+        if self.conv_v_cam is not None:
+            v_cam = self._bidirectional_temporal_short_conv(v_cam, self.conv_v_cam, spatial_shape)
+
+        q_cam = self.q_norm_cam(q_cam).reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
+        k_cam = self.k_norm_cam(k_cam).reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
+        v_cam = v_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
+
+        q_cam = q_cam.transpose(1, 2).contiguous()  # (B, H_cam, N, D)
+        k_cam = k_cam.transpose(1, 2).contiguous()
+        v_cam = v_cam.transpose(1, 2).contiguous()
+
+        apply_fn_q, apply_fn_kv, apply_fn_o = prepare_prope_fns(
+            head_dim=self.cam_head_dim,
+            camera_conditions=camera_conditions,
+            HW=spatial_shape,
+            rotary_emb=self._ucpe_rotary_freqs(rotary_emb),
+        )
+        q_cam_trans = apply_fn_q(q_cam)
+        kv_cam_trans = apply_fn_kv(torch.cat([k_cam, v_cam], dim=1))
+        k_cam_trans, v_cam_trans = torch.chunk(kv_cam_trans, chunks=2, dim=1)
+
+        q_cam_trans = self._downscale_to_reference_rms(q_cam, q_cam_trans)
+        k_cam_trans = self._downscale_to_reference_rms(k_cam, k_cam_trans)
+        v_cam_trans = self._downscale_to_reference_rms(v_cam, v_cam_trans)
+
+        dtype_orig = hidden_states.dtype
+        query = q_cam_trans
+        key = k_cam_trans
+        value = v_cam_trans
+        if getattr(self, "fp32_attention", True):
+            query = query.float()
+            key = key.float()
+            value = value.float()
+        if query.dtype == torch.float32:
+            query = query.bfloat16()
+            key = key.bfloat16()
+            value = value.bfloat16()
+
+        head_dim = query.shape[-1]
+        needs_pad = head_dim not in (32, 64, 128, 256) and head_dim < 256
+        if needs_pad:
+            pad_to = 128 if head_dim <= 128 else 256
+            pad_size = pad_to - head_dim
+            query = F.pad(query, (0, pad_size))
+            key = F.pad(key, (0, pad_size))
+            value = F.pad(value, (0, pad_size))
+
+        out = F.scaled_dot_product_attention(query, key, value)
+        if needs_pad:
+            out = out[..., :head_dim]
+        if out.dtype != dtype_orig:
+            out = out.to(dtype_orig)
+        out = apply_fn_o(out)
+        return out.transpose(1, 2).reshape(batch_size, token_count, self.cam_dim)
 
     @staticmethod
     def _cam_single_path_delta_scan(
@@ -1178,11 +1317,7 @@ class SanaWmSelfAttention(nn.Module):
         # Build the UCPE apply closures once per call. Future optimisation:
         # hoist this to the block level so the same closures are reused
         # across all 20 transformer blocks (NVlabs caches via prope_fns).
-        rotary_emb_freqs = rotary_emb.squeeze(0).squeeze(0) if rotary_emb is not None else None
-        if rotary_emb_freqs is not None and rotary_emb_freqs.ndim == 3:
-            # vLLM-Omni packs the rotary embedding as (1, 1, N, D//2) complex.
-            # Caller may also pass an already-squeezed (N, D//2) tensor.
-            rotary_emb_freqs = rotary_emb_freqs.squeeze(0)
+        rotary_emb_freqs = self._ucpe_rotary_freqs(rotary_emb)
         apply_fn_q, apply_fn_kv, apply_fn_o = prepare_prope_fns(
             head_dim=self.cam_head_dim,
             camera_conditions=camera_conditions,
@@ -1362,21 +1497,27 @@ class SanaWmSelfAttention(nn.Module):
                 )
             return attn_out
 
-        # Softmax-attention path (every-N-th block in NVlabs config) — UCPE
-        # is not yet ported for the softmax variant.
+        if spatial_shape is not None:
+            cam_disabled = os.environ.get("VLLM_OMNI_SANA_WM_DISABLE_CAM_BRANCH", "").lower() in {
+                "1", "true", "yes", "on",
+            }
+            main_raw = self._forward_softmax_raw(hidden_states, spatial_shape, rotary_emb)
+            if camera_conditions is not None and self.q_proj_cam is not None and not cam_disabled:
+                cam_raw = self._forward_softmax_cam_branch(
+                    hidden_states,
+                    spatial_shape,
+                    camera_conditions,
+                    rotary_emb,
+                )
+                cam_contrib = _linear_output(self.out_proj_cam(cam_raw))
+                main_raw = main_raw + cam_contrib.to(main_raw.dtype)
+            return self._apply_output_gate_and_proj(main_raw, hidden_states)
+
+        # Shape-only fallback for legacy callers that do not provide THW.
         qkv = _linear_output(self.qkv(hidden_states))
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
-        if self.softmax_attn is not None:
-            query = self._reshape_to_seq_heads(self.q_norm(query))
-            key = self._reshape_to_seq_heads(self.k_norm(key))
-            value = self._reshape_to_seq_heads(value)
-            if rotary_emb is not None:
-                query = self._apply_rotary_emb_to_sdpa(query.transpose(1, 2), rotary_emb).transpose(1, 2)
-                key = self._apply_rotary_emb_to_sdpa(key.transpose(1, 2), rotary_emb).transpose(1, 2)
-            attn = self.softmax_attn(query, key, value)
-            return _linear_output(self.proj(attn.flatten(2, 3)))
         query = self._split_heads(self.q_norm(query))
         key = self._split_heads(self.k_norm(key))
         value = self._split_heads(value)
@@ -1384,7 +1525,7 @@ class SanaWmSelfAttention(nn.Module):
             query = self._apply_rotary_emb_to_sdpa(query, rotary_emb)
             key = self._apply_rotary_emb_to_sdpa(key, rotary_emb)
         attn = F.scaled_dot_product_attention(query, key, value)
-        return _linear_output(self.proj(self._merge_heads(attn)))
+        return self._apply_output_gate_and_proj(self._merge_heads(attn), hidden_states)
 
 
 class SanaWmCrossAttention(nn.Module):
@@ -1554,9 +1695,23 @@ class SanaWmMbConvFfn(nn.Module):
         value, gate = x_dep.chunk(2, dim=1)
         x_glu = value * self.glu_act(gate)
         x_pt = self.point_conv.conv(x_glu)  # (B*F, hidden, H, W)
-        # Audit §6.13i probe hook: dump MLP sub-stages.
+        # Audit §6.13i/§6.13n probe hook: dump MLP sub-stages, optionally
+        # for a specific block index (SANA_WM_DUMP_MLP_BLOCK_IDX, default 0).
+        # File name suffixed with _block{idx} so concurrent dumps don't collide.
         _mlp_dump = os.environ.get("SANA_WM_DUMP_MLP0", "")
-        if _mlp_dump and not os.path.exists(f"{_mlp_dump}_done.flag"):
+        _mlp_target_idx = int(os.environ.get("SANA_WM_DUMP_MLP_BLOCK_IDX", "0"))
+        _mlp_idx = getattr(self, "block_idx", 0)
+        _mlp_per = f"{_mlp_dump}_block{_mlp_idx}" if _mlp_dump and _mlp_idx == _mlp_target_idx else ""
+        if _mlp_per and not os.path.exists(f"{_mlp_per}_done.flag"):
+            # Also include min/max/has_nan/has_inf per stage to catch overflow.
+            def _stats(t):
+                tf = t.float()
+                return {
+                    "norm": float(tf.norm().item()),
+                    "absmax": float(tf.abs().max().item()),
+                    "has_nan": bool(tf.isnan().any().item()),
+                    "has_inf": bool(tf.isinf().any().item()),
+                }
             torch.save(
                 {
                     "mlp_in_4d": x.detach().cpu(),
@@ -1564,17 +1719,26 @@ class SanaWmMbConvFfn(nn.Module):
                     "after_depth": x_dep.detach().cpu(),
                     "after_glu": x_glu.detach().cpu(),
                     "after_point": x_pt.detach().cpu(),
+                    "stats": {
+                        "mlp_in_4d": _stats(x),
+                        "after_inverted_silu": _stats(x_inv),
+                        "after_depth": _stats(x_dep),
+                        "after_glu": _stats(x_glu),
+                        "after_point": _stats(x_pt),
+                    },
+                    "block_idx": _mlp_idx,
+                    "dtype_input": str(x.dtype),
                 },
-                f"{_mlp_dump}_stages.pt",
+                f"{_mlp_per}_stages.pt",
             )
-            with open(f"{_mlp_dump}_done.flag", "w") as _f:
+            with open(f"{_mlp_per}_done.flag", "w") as _f:
                 _f.write("done\n")
             print(
-                f"[sana-wm probe] saved native MLP-0 stage dump "
-                f"inv={x_inv.float().norm().item():.2f} "
-                f"depth={x_dep.float().norm().item():.2f} "
-                f"glu={x_glu.float().norm().item():.2f} "
-                f"point={x_pt.float().norm().item():.2f}",
+                f"[sana-wm probe] block{_mlp_idx} MLP stage dump "
+                f"inv_norm={x_inv.float().norm().item():.2f} absmax={x_inv.float().abs().max().item():.2f} "
+                f"depth_absmax={x_dep.float().abs().max().item():.2f} "
+                f"glu_absmax={x_glu.float().abs().max().item():.2f} "
+                f"point_absmax={x_pt.float().abs().max().item():.2f}",
                 flush=True,
             )
         x = x_pt
@@ -1590,26 +1754,35 @@ class SanaWmMbConvFfn(nn.Module):
             .reshape(batch, frames * spatial_tokens, hidden_size)
             .contiguous()
         )
-        # Extra dump: t_conv output + final mlp output for §6.13j parity.
+        # Extra dump: t_conv output + final mlp output (§6.13j/§6.13n).
+        # Gated by SANA_WM_DUMP_MLP_FINAL prefix + SANA_WM_DUMP_MLP_BLOCK_IDX
+        # (default 0). Per-block filename suffix so concurrent dumps don't collide.
         _mlp_final_dump = os.environ.get("SANA_WM_DUMP_MLP_FINAL", "")
-        if _mlp_final_dump and not os.path.exists(f"{_mlp_final_dump}_done.flag"):
+        _mlpf_target = int(os.environ.get("SANA_WM_DUMP_MLP_BLOCK_IDX", "0"))
+        _mlpf_idx = getattr(self, "block_idx", 0)
+        _mlpf_per = (
+            f"{_mlp_final_dump}_block{_mlpf_idx}"
+            if _mlp_final_dump and _mlpf_idx == _mlpf_target
+            else ""
+        )
+        if _mlpf_per and not os.path.exists(f"{_mlpf_per}_done.flag"):
             torch.save(
                 {
-                    "t_conv_in": x_temporal.detach().cpu()
-                    if t_conv_out is None
-                    else (x_temporal - t_conv_out).detach().cpu(),
+                    "t_conv_in": (x_temporal - t_conv_out).detach().cpu(),
                     "t_conv_out": t_conv_out.detach().cpu(),
                     "after_tconv_add": x_temporal.detach().cpu(),
                     "final_mlp_out": final.detach().cpu(),
                     "t_conv_weight_norm": float(self.t_conv.weight.detach().float().norm().item()),
+                    "block_idx": _mlpf_idx,
                 },
-                f"{_mlp_final_dump}_final.pt",
+                f"{_mlpf_per}_final.pt",
             )
-            with open(f"{_mlp_final_dump}_done.flag", "w") as _f:
+            with open(f"{_mlpf_per}_done.flag", "w") as _f:
                 _f.write("done\n")
             print(
-                f"[sana-wm probe] native MLP-final dump "
+                f"[sana-wm probe] block{_mlpf_idx} MLP-final dump "
                 f"t_conv_w_norm={self.t_conv.weight.float().norm().item():.4f} "
+                f"t_conv_in_norm={(x_temporal - t_conv_out).float().norm().item():.2f} "
                 f"t_conv_out_norm={t_conv_out.float().norm().item():.2f} "
                 f"final_mlp_out_norm={final.float().norm().item():.2f}",
                 flush=True,
@@ -1628,6 +1801,9 @@ class SanaWmBlock(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.block_idx = block_idx
+        # Attach block_idx to attn/mlp so per-block probes can read it.
+        # (Set after they're created below — see end of __init__.)
         hidden_size = config.hidden_size
         use_gdn = config.softmax_every_n <= 0 or (block_idx + 1) % config.softmax_every_n != 0
         use_plucker_proj = config.use_chunk_plucker_post_attn and (
@@ -1649,6 +1825,8 @@ class SanaWmBlock(nn.Module):
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp = SanaWmMbConvFfn(config)
+        self.mlp.block_idx = block_idx
+        self.attn.block_idx = block_idx
         if use_plucker_proj:
             if use_vllm_parallel_layers and _vllm_parallel_layers_available() and ColumnParallelLinear is not None:
                 self.plucker_proj: nn.Module | None = ColumnParallelLinear(
@@ -1752,16 +1930,27 @@ class SanaWmBlock(nn.Module):
             self.scale_shift_table[None, None, :, :] + t_per_frame
         ).chunk(6, dim=-2)  # each: (B, F, 1, D)
 
-        # Audit §6.13h probe hook: dump block-0 intermediates for
-        # parity vs NVlabs. "First call wins" via file-existence guard
-        # so we only dump the first block invoked per pipeline run.
-        # Env var SANA_WM_DUMP_BLOCK0=/path/prefix writes four files:
-        #   {prefix}_input.pt {prefix}_post_attn.pt
-        #   {prefix}_post_cross_attn.pt {prefix}_output.pt
+        # Audit §6.13h/§6.13m probe hook: dump per-block intermediates for
+        # parity vs NVlabs. Gated by SANA_WM_DUMP_BLOCK0 (env path prefix)
+        # plus SANA_WM_DUMP_BLOCK_IDXS (comma-separated indices; defaults
+        # to "0" for backwards compat). Writes per-block files:
+        #   {prefix}_block{idx}_input.pt {prefix}_block{idx}_post_attn.pt
+        #   {prefix}_block{idx}_post_cross_attn.pt {prefix}_block{idx}_output.pt
         _dump_prefix = os.environ.get("SANA_WM_DUMP_BLOCK0", "")
-        _do_dump = bool(_dump_prefix) and not os.path.exists(f"{_dump_prefix}_input.pt")
+        _dump_idxs_env = os.environ.get("SANA_WM_DUMP_BLOCK_IDXS", "0")
+        _dump_idx_set = {int(s) for s in _dump_idxs_env.split(",") if s.strip()}
+        _per_block_prefix = (
+            f"{_dump_prefix}_block{self.block_idx}"
+            if _dump_prefix and self.block_idx in _dump_idx_set
+            else ""
+        )
+        # First-write-wins so we only capture the first stage-1 step (the
+        # only step with clean controlled input).
+        _do_dump = bool(_per_block_prefix) and not os.path.exists(
+            f"{_per_block_prefix}_input.pt"
+        )
         if _do_dump:
-            torch.save(hidden_states.detach().cpu(), f"{_dump_prefix}_input.pt")
+            torch.save(hidden_states.detach().cpu(), f"{_per_block_prefix}_input.pt")
             torch.save(
                 {
                     "shift_msa": shift_msa.detach().cpu(),
@@ -1773,7 +1962,7 @@ class SanaWmBlock(nn.Module):
                     "scale_shift_table": self.scale_shift_table.detach().cpu(),
                     "encoder_hidden_states": encoder_hidden_states.detach().cpu(),
                 },
-                f"{_dump_prefix}_modulation.pt",
+                f"{_per_block_prefix}_modulation.pt",
             )
 
         # Apply per-frame modulation by reshaping x to (B, F, S, D), broadcasting
@@ -1801,12 +1990,12 @@ class SanaWmBlock(nn.Module):
                     "attn_output": attn_output.detach().cpu(),
                     "post_attn_residual": hidden_states.detach().cpu(),
                 },
-                f"{_dump_prefix}_post_attn.pt",
+                f"{_per_block_prefix}_post_attn.pt",
             )
 
         hidden_states = hidden_states + self.cross_attn(hidden_states, encoder_hidden_states)
         if _do_dump:
-            torch.save(hidden_states.detach().cpu(), f"{_dump_prefix}_post_cross_attn.pt")
+            torch.save(hidden_states.detach().cpu(), f"{_per_block_prefix}_post_cross_attn.pt")
 
         x_norm2 = self.norm2(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_mlp_in = (x_norm2 * (1 + scale_mlp) + shift_mlp).reshape(batch_size, token_count, hidden_size)
@@ -1822,11 +2011,14 @@ class SanaWmBlock(nn.Module):
                     "mlp_out": mlp_out.detach().cpu(),
                     "block_output": hidden_states.detach().cpu(),
                 },
-                f"{_dump_prefix}_output.pt",
+                f"{_per_block_prefix}_output.pt",
             )
             print(
-                f"[sana-wm probe] saved native block-0 dump prefix={_dump_prefix} "
-                f"input_norm={torch.load(f'{_dump_prefix}_input.pt').float().norm().item():.3f}",
+                f"[sana-wm probe] saved native block-{self.block_idx} dump "
+                f"input_norm={torch.load(f'{_per_block_prefix}_input.pt').float().norm().item():.3f} "
+                f"attn_out_norm={attn_output.float().norm().item():.3f} "
+                f"mlp_out_norm={mlp_out.float().norm().item():.3f} "
+                f"block_out_norm={hidden_states.float().norm().item():.3f}",
                 flush=True,
             )
         return hidden_states
@@ -2268,6 +2460,29 @@ class SanaWmTransformer3DModel(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.ndim != 5:
             raise ValueError("Sana-WM transformer expects latent input shaped [B, C, F, H, W].")
+        # Audit §6.13n: env-gated force-fp32 transformer forward for the
+        # bf16-precision-drift upper-bound experiment. Casts inputs to fp32,
+        # also upcasts model params (one-shot), and casts noise_pred back to
+        # the original input dtype before returning.
+        _force_fp32 = os.environ.get("SANA_WM_FORCE_FP32_TRANSFORMER", "").lower() in {
+            "1", "true", "yes", "on",
+        }
+        _input_dtype = hidden_states.dtype
+        if _force_fp32:
+            if not getattr(self, "_fp32_upcasted", False):
+                self.to(torch.float32)
+                self._fp32_upcasted = True
+            hidden_states = hidden_states.float()
+            if encoder_hidden_states is not None:
+                encoder_hidden_states = encoder_hidden_states.float()
+            if camera_hidden_states is not None:
+                camera_hidden_states = camera_hidden_states.float()
+            if plucker is not None:
+                plucker = plucker.float()
+            if raymap is not None:
+                raymap = raymap.float()
+            if spatial_raymap is not None:
+                spatial_raymap = spatial_raymap.float()
         if not self._is_materialized:
             prompt_channels = (
                 int(encoder_hidden_states.shape[-1])
@@ -2356,7 +2571,38 @@ class SanaWmTransformer3DModel(nn.Module):
                 camera_conditions = camera_conditions.expand(batch_size, -1, -1)
             camera_conditions = camera_conditions.to(device=hidden_states.device, dtype=hidden_states.dtype)
 
-        for block in self.blocks:
+        # Audit §6.13n runtime weight probe: env-gated one-time dump of
+        # block.mlp.* parameter norms for load_weights verification.
+        _rtw_path = os.environ.get("SANA_WM_RUNTIME_WEIGHT_DUMP", "")
+        if _rtw_path and not os.path.exists(_rtw_path):
+            _rtw_dump: dict = {}
+            for _bi, _blk in enumerate(self.blocks):
+                for _pn, _pp in _blk.mlp.named_parameters():
+                    _rtw_dump[f"block{_bi}.mlp.{_pn}"] = float(
+                        _pp.detach().float().norm().item()
+                    )
+                    _rtw_dump[f"block{_bi}.mlp.{_pn}.shape"] = tuple(_pp.shape)
+            torch.save(_rtw_dump, _rtw_path)
+            print(
+                f"[runtime weight probe] dumped {len(_rtw_dump)//2} mlp params -> {_rtw_path}",
+                flush=True,
+            )
+
+        # Audit §6.13m compounding probe: env-gated dump of block-N outputs
+        # (default 0,5,10,15,19), final-layer in/out, and unpatchify output.
+        # Hooks are no-ops unless SANA_WM_DUMP_BLOCKS_PREFIX is set.
+        _blocks_prefix = os.environ.get("SANA_WM_DUMP_BLOCKS_PREFIX", "")
+        _blocks_target = os.environ.get("SANA_WM_DUMP_BLOCKS_INDICES", "0,5,10,15,19")
+        _blocks_idx_set = (
+            {int(s) for s in _blocks_target.split(",") if s.strip()}
+            if _blocks_prefix
+            else set()
+        )
+        _blocks_done_flag = f"{_blocks_prefix}_done.flag" if _blocks_prefix else ""
+        _blocks_active = bool(_blocks_prefix) and not os.path.exists(_blocks_done_flag)
+        _blocks_dump: dict = {}
+
+        for block_i, block in enumerate(self.blocks):
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -2366,13 +2612,32 @@ class SanaWmTransformer3DModel(nn.Module):
                 camera_hidden_states,
                 camera_conditions,
             )
+            if _blocks_active and block_i in _blocks_idx_set:
+                _blocks_dump[f"block{block_i}_out"] = hidden_states.detach().cpu()
 
+        if _blocks_active:
+            _blocks_dump["final_layer_in"] = hidden_states.detach().cpu()
         hidden_states = self.final_layer(
             hidden_states, time_embed.to(hidden_states.dtype), spatial_shape
         )
+        if _blocks_active:
+            _blocks_dump["final_layer_out"] = hidden_states.detach().cpu()
         hidden_states = self._unpatchify(hidden_states, spatial_shape)
+        if _blocks_active:
+            _blocks_dump["unpatchify_out"] = hidden_states.detach().cpu()
+            torch.save(_blocks_dump, f"{_blocks_prefix}_blocks.pt")
+            with open(_blocks_done_flag, "w") as _bf:
+                _bf.write("done\n")
+            print(
+                f"[sana-wm probe] native blocks dump idx={sorted(_blocks_idx_set)} -> "
+                f"{_blocks_prefix}_blocks.pt (final_out_norm="
+                f"{hidden_states.float().norm().item():.2f})",
+                flush=True,
+            )
         if hidden_states.shape[2:] != latent_shape:
             hidden_states = F.interpolate(hidden_states, size=latent_shape, mode="trilinear", align_corners=False)
+        if _force_fp32 and hidden_states.dtype != _input_dtype:
+            hidden_states = hidden_states.to(_input_dtype)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:

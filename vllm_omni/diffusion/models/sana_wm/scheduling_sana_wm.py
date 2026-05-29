@@ -140,22 +140,15 @@ class SanaWmFlowMatchScheduler:
     ) -> torch.Tensor:
         """Per-token flow-matching Euler step matching NVlabs ``LTXFlowEuler.sample``.
 
-        NVlabs invokes the diffusers ``FlowMatchEulerDiscreteScheduler.step``
-        with the noise prediction sign-flipped:
-
-            prev = sample - (sigma_next - sigma) * (-noise_pred)
-                 = sample + (sigma_next - sigma) * noise_pred
-
-        For conditioning tokens (``per_token_timesteps[i] == 0``), the
-        per-token sigma is already 0, so ``sigma_next - sigma = 0`` and
-        the step is a no-op for them by construction. That makes the
-        ``tokens_to_denoise_mask`` ``torch.where`` an exact no-op safety
-        belt rather than a hard discontinuity.
-
-        Reads the native ``self._sigmas_tensor`` (built by
-        :meth:`_build_schedule` to match NVlabs ``FlowMatchEulerDiscrete``
-        with the configured ``flow_shift``) so this method does not
-        re-implement scheduling.
+        NVlabs invokes diffusers
+        ``FlowMatchEulerDiscreteScheduler.step`` with the noise prediction
+        sign-flipped and ``per_token_timesteps``. In that branch, diffusers
+        does not use ``self.sigmas[step_index]`` as the current sigma; it
+        derives the current sigma directly from each token's timestep
+        (``per_token_t / num_train_timesteps``), then selects the largest
+        scheduler sigma strictly below it as the next sigma. This matters at
+        ``t=1000``: the first full-noise step advances the scheduler index,
+        but NVlabs' post-step token mask can still discard the update.
 
         Args:
             noise_pred: ``(B, C, F, H, W)`` model output.
@@ -178,36 +171,20 @@ class SanaWmFlowMatchScheduler:
             )
         self._ensure_timesteps(latents.device)
         sigmas = self._sigmas_tensor.to(device=latents.device, dtype=torch.float32)
-        cur_idx = self._sigma_index_for(timestep)
-        sigma_cur_scalar = sigmas[cur_idx]
-        sigma_next_scalar = sigmas[cur_idx + 1] if cur_idx + 1 < sigmas.numel() else sigmas[-1]
-        # Use the SCHEDULER's actual sigma value for the current step, not
-        # a hand-computed `t/num_train`. Under `use_flow_sigmas=True` the
-        # sigmas have a flow-shift baked in (shift=9.8 for SANA-WM) so the
-        # mapping t → sigma is not the identity. Tokens whose per-token
-        # timestep is 0 are conditioning tokens at sigma=0; everything
-        # else carries this step's `sigma_cur_scalar`.
-        is_cond = per_token_timesteps.float().to(latents.device) < 1e-6
-        sigma_cur_token = torch.where(
-            is_cond,
-            torch.zeros_like(is_cond, dtype=torch.float32),
-            sigma_cur_scalar.expand_as(is_cond).to(torch.float32),
+        per_token_sigmas = (
+            per_token_timesteps.to(device=latents.device, dtype=torch.float32)
+            / float(self.num_train_timesteps)
         )
-        sigma_next_token = torch.where(
-            is_cond,
-            sigma_cur_token,
-            sigma_next_scalar.expand_as(is_cond).to(torch.float32),
-        )
-        # dt is negative for denoising (sigma decreases from 1 toward 0).
-        dt = (sigma_next_token - sigma_cur_token)  # (B, FHW)
+        scheduler_sigmas = sigmas[:, None, None]
+        lower_mask = scheduler_sigmas < per_token_sigmas[None] - 1e-6
+        lower_sigmas = (lower_mask * scheduler_sigmas).max(dim=0).values
+        # Matches diffusers' per-token branch: dt is positive and
+        # ``model_output`` already carries the sign selected by the caller.
+        dt = per_token_sigmas - lower_sigmas  # (B, FHW)
 
         # Sign convention follows NVlabs `LTXFlowEuler.sample`, which calls
-        # the diffusers FlowMatchEulerDiscrete step with `-noise_pred`. The
-        # diffusers step is `prev = sample - (sigma_next - sigma) * model_output`,
-        # so substituting `-noise_pred` for model_output gives
-        # `prev = sample + (sigma_next - sigma) * noise_pred`. The direct
-        # form below applies the negation explicitly so the math line is
-        # `latents + dt * (-noise_pred)`.
+        # diffusers with `model_output=-noise_pred`. Diffusers then applies
+        # `prev = sample + dt * model_output`.
         #
         # 2026-05-28 GPU A/B (audit §6.13c verification): the
         # `-noise_pred` direction gives MAE=69.06 / PSNR=9.68 on the

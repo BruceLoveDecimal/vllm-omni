@@ -974,12 +974,19 @@ class SanaWmPipeline(
                 stepped = scheduler.step(noise_pred, timestep, latents)
 
             if condition_mask is not None and mask_enabled:
-                # Safety belt: under the per-token step this is a no-op
-                # by construction (sigma=0 for conditioning tokens → no
-                # update). Under the legacy DPMSolver step it would
-                # still hurt — that's why the default tracks
-                # use_per_token_step rather than being unconditionally on.
-                latents = torch.where(condition_mask > 0.5, latents, stepped)
+                if use_per_token_step:
+                    # Match NVlabs LTXFlowEuler exactly. This is stricter
+                    # than a plain condition-frame restore: with bf16 latents,
+                    # the `t=1000` comparison rounds `1 - 1e-6` to `1`, so
+                    # the first full-noise step is discarded for generated
+                    # tokens as well.
+                    tokens_to_denoise_mask = (
+                        timestep / float(scheduler.num_train_timesteps) - 1e-6
+                        < (1.0 - condition_mask)
+                    )
+                    latents = torch.where(tokens_to_denoise_mask, stepped, latents)
+                else:
+                    latents = torch.where(condition_mask > 0.5, latents, stepped)
             else:
                 latents = stepped
 

@@ -96,7 +96,7 @@ def test_flow_match_scheduler_add_noise_blending() -> None:
 
     sched = SanaWmFlowMatchScheduler(num_inference_steps=3, shift=9.8)
     sched.timesteps(device=torch.device("cpu"))  # populate internal state
-    num_train = sched._sched.config.num_train_timesteps  # typically 1000
+    num_train = sched.num_train_timesteps  # typically 1000
 
     sample = torch.ones(1, 4)
     noise = torch.zeros(1, 4)
@@ -143,6 +143,104 @@ def test_flow_match_scheduler_step_sequence_decreasing() -> None:
     ts = sched.timesteps(device=torch.device("cpu"))
 
     assert all(ts[i] > ts[i + 1] for i in range(len(ts) - 1))
+
+
+def test_flow_match_scheduler_per_token_step_matches_diffusers_formula() -> None:
+    """Native per-token step mirrors FlowMatchEulerDiscreteScheduler.step.
+
+    The diffusers per-token branch derives the current sigma from
+    ``per_token_timesteps / num_train_timesteps`` and selects the largest
+    scheduler sigma strictly below it as ``next_sigma``.
+    """
+    import torch
+
+    from vllm_omni.diffusion.models.sana_wm import SanaWmFlowMatchScheduler
+
+    sched = SanaWmFlowMatchScheduler(num_inference_steps=3, shift=9.8)
+    timesteps = sched.timesteps(device=torch.device("cpu"))
+    latents = torch.randn(1, 4, 2, 2, 3)
+    noise_pred = torch.randn_like(latents)
+    per_frame_t = timesteps[0].expand(1, 1, 2).clone()
+    per_frame_t[:, :, 0] = 0.0
+    per_token_t = per_frame_t.unsqueeze(-1).unsqueeze(-1).expand(1, 1, 2, 2, 3).reshape(1, -1)
+
+    out = sched.step_flow_euler_per_token(noise_pred, timesteps[0], latents, per_token_t)
+
+    sigmas = sched.sigmas.float()
+    per_token_sigmas = per_token_t.float() / float(sched.num_train_timesteps)
+    lower_mask = sigmas[:, None, None] < per_token_sigmas[None] - 1e-6
+    lower_sigmas = (lower_mask * sigmas[:, None, None]).max(dim=0).values
+    dt = per_token_sigmas - lower_sigmas
+    latents_flat = latents.permute(0, 2, 3, 4, 1).reshape(1, -1, 4).float()
+    noise_flat = noise_pred.permute(0, 2, 3, 4, 1).reshape(1, -1, 4).float()
+    expected = latents_flat - dt.unsqueeze(-1) * noise_flat
+    expected = expected.reshape(1, 2, 2, 3, 4).permute(0, 4, 1, 2, 3).contiguous()
+
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_flow_match_condition_mask_matches_nvlabs_bf16_boundary() -> None:
+    """NVlabs' post-step mask intentionally skips t=1000 under bf16.
+
+    This is the exact expression from ``LTXFlowEuler.sample``. With bf16
+    latents, ``1 - 1e-6`` rounds to ``1``, so generated tokens are not
+    updated at the first full-noise step.
+    """
+    import torch
+
+    condition_mask = torch.zeros(1, 1, 2, 1, 1, dtype=torch.bfloat16)
+    condition_mask[:, :, 0] = 1.0
+
+    first_step = torch.tensor(1000.0)
+    first_mask = first_step / 1000.0 - 1e-6 < (1.0 - condition_mask)
+    assert not bool(first_mask[:, :, 0].item())
+    assert not bool(first_mask[:, :, 1].item())
+
+    later_step = torch.tensor(909.0270)
+    later_mask = later_step / 1000.0 - 1e-6 < (1.0 - condition_mask)
+    assert not bool(later_mask[:, :, 0].item())
+    assert bool(later_mask[:, :, 1].item())
+
+
+# ===========================================================================
+# A.2b — Hybrid softmax blocks
+# ===========================================================================
+
+
+def test_softmax_self_attention_applies_shared_output_gate() -> None:
+    """Every-N-th softmax blocks still use the GDN output_gate + proj path."""
+    import torch
+    import torch.nn.functional as F
+
+    from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
+    from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import SanaWmSelfAttention
+
+    cfg = SanaWmConfig(
+        **_tiny_cfg_kwargs(
+            qk_norm=False,
+            cross_norm=False,
+            conv_kernel_size=0,
+        )
+    )
+    attn = SanaWmSelfAttention(cfg, use_gdn=False, use_vllm_parallel_layers=False)
+    attn.eval()
+
+    with torch.no_grad():
+        attn.qkv.weight.zero_()
+        # q = 0, k = 0 -> uniform softmax; v = identity(hidden).
+        attn.qkv.weight[16:24].copy_(torch.eye(8))
+        attn.output_gate.weight.zero_()
+        attn.output_gate.bias.fill_(1.0)
+        attn.proj.weight.copy_(torch.eye(8))
+        attn.proj.bias.zero_()
+
+    hidden = (torch.arange(32, dtype=torch.float32).reshape(1, 4, 8) / 10.0)
+    out = attn(hidden, spatial_shape=(1, 2, 2), rotary_emb=None, camera_conditions=None)
+
+    raw_uniform = hidden.mean(dim=1, keepdim=True).expand_as(hidden)
+    expected = raw_uniform * F.silu(torch.tensor(1.0))
+    assert torch.allclose(out.float(), expected, atol=1e-2, rtol=1e-2)
+    assert not torch.allclose(out.float(), raw_uniform, atol=1e-2, rtol=1e-2)
 
 
 # ===========================================================================

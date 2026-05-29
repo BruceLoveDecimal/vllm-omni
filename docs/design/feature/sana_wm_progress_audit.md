@@ -794,6 +794,63 @@ diffusers at runtime.
 `/root/autodl-tmp/vllm-omni-feat-sana-wm-23ff624b` after syncing
 `vllm_omni/diffusion/models/sana_wm/scheduling_sana_wm.py`.
 
+### 6.13m Softmax-UCPE Native Path Landed — Stage-1 Latent Parity Tightened ✅ 2026-05-29
+
+The multi-block probe after §6.13l found a structural omission in
+the every-4th hybrid blocks (`3/7/11/15/19`): native softmax blocks
+were running plain RoPE SDPA and `proj`, while NVlabs runs
+`main_raw + out_proj_cam(cam_raw)` followed by the shared
+`output_gate + proj`. That means two pieces were missing:
+
+1. the softmax UCPE camera branch (`_forward_cam_branch_softmax`),
+   including post-UCPE RMS downscale and inverse `apply_fn_o`;
+2. the shared GDN `output_gate` path for softmax blocks.
+
+Native now mirrors NVlabs' `_SoftmaxUCPESinglePathLiteLA` structure:
+`_forward_softmax_raw(...)` returns raw SDPA output, optional
+`_forward_softmax_cam_branch(...)` contributes UCPE camera output,
+and both GDN and softmax paths use the same
+`_apply_output_gate_and_proj(...)` helper. The helper also matches
+NVlabs' dtype order more closely: output-gate linear is promoted to
+fp32 before `silu` and multiply, then cast to projection weight dtype.
+
+**Controlled DiT+scheduler verification on 5090** (identical
+initial latent, prompt embedding, and per-frame timestep; `PYTHONPATH`
+explicitly points at the synced worktree):
+
+| Probe | Before §6.13m | After §6.13m |
+|---|---:|---:|
+| 2-step final latent MAE | 0.013053 | **0.002798** |
+| 2-step final latent cosine | 0.999674 | **0.999972** |
+| 3-step final latent MAE | 0.131467 | **0.063287** |
+| 3-step final latent cosine | 0.968252 | **0.992491** |
+| Generated-frame channels with cosine < 0 at step-0 | 3 | **0** |
+
+Frame-level 3-step result:
+
+| Frame | MAE | Cosine | Note |
+|---|---:|---:|---|
+| frame 0 (conditioning) | 0.000000 | 0.999991 | condition mask + per-token step preserve it exactly |
+| frame 1 (generated) | 0.126575 | 0.986724 | remaining drift is generated-frame only |
+
+**Block-output probe after softmax-UCPE port** (step-0 controlled
+input, selected blocks):
+
+| Block | Before output MAE | After output MAE | After cosine |
+|---:|---:|---:|---:|
+| 3 | 5.22 | **3.89** | 1.0003 |
+| 7 | 11.84 | **9.98** | 0.9997 |
+| 15 | 114.17 | **71.86** | 0.9963 |
+| 19 | 455.80 | **321.67** | 0.9042 |
+
+This closes the earlier "softmax-UCPE port" item as a real native
+implementation, not just a probe. The remaining gap is now smaller
+and more specific: step-0 `noise_pred` is still only cosine ~0.90
+globally, and the 3-step generated-frame latent has MAE ~0.127. The
+next useful probe is no longer scheduler/softmax structure; it is
+late-block sub-stage parity (cross-attn vs MBConv/temporal conv vs
+final layer) under controlled inputs.
+
 ### 6.13k Stage-1 Multi-Step Timestep Schedule Diverges — Native Scheduler Now Urgent 🔴 2026-05-28 night (RESOLVED — see §6.13l)
 
 With §6.13j confirming model forward is clean at block-0 (attn
