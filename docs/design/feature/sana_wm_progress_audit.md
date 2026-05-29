@@ -1,8 +1,8 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-05-29 (revision 16 — Stage-1 late-step scheduler/forward decomposition)
+> **Audit date:** 2026-05-29 (revision 17 — Stage-1 path ablation and oracle correction probe)
 > **Branch:** `feat/sana_wm`
-> **Implementation snapshot:** remote 5090-synced worktree containing §6.13m softmax-UCPE + native scheduler fixes; late-step probes and refiner probes run on RTX PRO 6000 98GB
+> **Implementation snapshot:** clean fork worktree at `250433e0` for Stage-1 path probes; late-step probes and refiner probes run on RTX PRO 6000 98GB
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
 > **Spec (single source of truth):**
 > [`sana_wm_integration.md`](sana_wm_integration.md)
@@ -15,9 +15,10 @@
 
 Revision-9 blockers are mostly closed. Short-sequence Stage-1 alignment is now
 strong; the open Stage-1 correctness gap is 321-frame trajectory-level drift in
-the denoising loop (§6.13p). Scheduler update semantics are now ruled out. The
-active short-sequence full-chain blocker remains the Stage-2 LTX-2 refiner
-contract (§6.14).
+the denoising loop (§6.13p). Scheduler update semantics, cam-branch Triton
+dispatch, and full-transformer fp32 precision are now ruled out as primary
+causes. The active short-sequence full-chain blocker remains the Stage-2 LTX-2
+refiner contract (§6.14).
 
 | # | Item | Status |
 |---|---|---|
@@ -27,7 +28,7 @@ contract (§6.14).
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Verified 2026-05-28** — UCPE math (`ucpe.py`) and native raw camera branch match NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` at fp32 `~1e-7` max abs. See §6.12a. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | Per-token timestep sampling contract | ⚠️ **Short-sequence Stage-1 mostly closed; long-sequence still open** — per-frame `(B, 1, F)` timestep, native per-token FlowMatch Euler, condition-mask restore, VAE norm, and softmax-UCPE camera branch are landed. Short 9-frame Stage-1 parity stays strong at 20/60 steps (generated cos `0.9878` / `0.9861`). The 321-frame / 20-step drop is now localized to trajectory-level accumulation after input camera tensors, `chunk_index`, step-0 latent/prompt/timestep, initial model forward, and scheduler update all check out; see §6.13n–§6.13p. |
+| 8 | Per-token timestep sampling contract | ⚠️ **Short-sequence Stage-1 mostly closed; long-sequence still open** — per-frame `(B, 1, F)` timestep, native per-token FlowMatch Euler, condition-mask restore, VAE norm, and softmax-UCPE camera branch are landed. Short 9-frame Stage-1 parity stays strong at 20/60 steps (generated cos `0.9878` / `0.9861`). The 321-frame / 20-step drop is now localized to trajectory-level accumulation after input camera tensors, `chunk_index`, step-0 latent/prompt/timestep, initial model forward, scheduler update, cam Triton/Python scan, and fp32 precision all check out; see §6.13n–§6.13p. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The UCPE / camera-control module is now
@@ -995,6 +996,9 @@ Artifacts:
 - `/root/autodl-tmp/stage1_longseq_probe/late_block_forward_probe_321f_steps15_18.json`
 - `/root/autodl-tmp/stage1_longseq_probe/teacher_forced_one_step_probe_321f_steps15_18.json`
 - `/root/autodl-tmp/stage1_longseq_probe/teacher_forced_native_on_official_trace_321f_20step.json`
+- `/root/autodl-tmp/stage1_longseq_probe/native_path_ablation_teacher_forced_321f_full.json`
+- `/root/autodl-tmp/stage1_longseq_probe/native_path_ablation_teacher_forced_321f_steps_15_18_main_only.json`
+- `/root/autodl-tmp/stage1_longseq_probe/oracle_correction_sampler_321f_20step.json`
 
 **Scheduler replay.** Using the actual dumped per-frame timestep table, the
 native per-token FlowMatch Euler update exactly reproduces both the NVlabs and
@@ -1047,6 +1051,44 @@ is reset to the NVlabs latent, native remains close; when native consumes its
 own previous latent, those small perturbations push it onto a different
 trajectory and the later `noise_pred` comparison degrades sharply (§6.13o).
 
+**Path ablation.** Re-ran the same teacher-forced 321-frame trace on a clean
+fork worktree at `250433e0`, comparing three native execution paths:
+
+| Variant | Step15 noise MAE / one-step MAE | Step18 noise MAE / one-step MAE | Interpretation |
+|---|---:|---:|---|
+| torch bf16 default | `0.04047 / 0.00288` | `0.03347 / 0.01020` | baseline |
+| cam Triton bf16 | `0.04049 / 0.00288` | `0.03347 / 0.01020` | Triton loaded successfully; no material accuracy change |
+| full transformer fp32 | `0.04092 / 0.00291` | `0.03285 / 0.01001` | mixed, very small improvement only at step18 |
+| main-only bf16 (cam branch disabled) | `0.05397 / 0.00384` | `0.04013 / 0.01223` | worse; native cam branch helps rather than hurts |
+
+This rules out three tempting explanations for the remaining `~0.03–0.04`
+same-latent `noise_pred` residual: the NVlabs cam Triton kernel, ordinary bf16
+rounding, and the camera branch being directionally harmful. The residual is
+more likely a structural per-block arithmetic difference in the native DiT
+path, not a single precision or dispatch switch.
+
+**Oracle-correction sampler.** Ran native free-running denoise from the official
+step-0 latent, but periodically snapped the current latent back to the NVlabs
+trajectory before selected steps:
+
+| Snap schedule | Final generated MAE | Final generated cos | Notes |
+|---|---:|---:|---|
+| none | `0.53488` | `0.63222` | direct fallback self-feedback collapse; same trend as §6.13o native engine |
+| every 8 steps (`8,16`) | `0.02385` | `0.99911` | late-window drift mostly contained |
+| every 4 steps (`4,8,12,16`) | `0.02385` | `0.99911` | same final as every-8 because last snap is still step16 |
+| every 2 steps | `0.01179` | `0.99973` | step18 snap helps, but step19 still propagates residual |
+| step18 only | `0.01179` | `0.99973` | nearly same as every-2; step18 is the key correction point |
+| tail steps `15–19` | `0.00262` | `0.99991` | reaches teacher-forced lower bound |
+| every step | `0.00262` | `0.99991` | same lower bound as tail-only correction |
+
+The important conclusion is that early accumulated error is reversible: even
+after free-run reaches generated MAE `0.10675` at step14, snapping only steps
+15–19 recovers the teacher-forced lower bound. Conversely, if step18 is not
+corrected, the large sigma jump (`t≈392 → 87.7`) converts a small local
+`noise_pred` residual into a much larger trajectory displacement. The next
+localization target is therefore not the scheduler, but the source of the small
+same-latent DiT residual before the late-window self-feedback loop.
+
 Block-level hidden tensors diverge in magnitude through the DiT stack
 (`block0` MAE `~0.31–0.37`, `block15` MAE `~11–18`, final-layer input MAE
 `~33–47`), but the final projection/unpatchify compresses this to a small
@@ -1060,12 +1102,12 @@ Stage-1 problem is trajectory-level sensitivity: small local residuals are
 recursively fed back into the denoise loop and amplified over length-41 video
 tokens. The next high-leverage checks are:
 
-1. compare native torch fallback / Triton cam-branch / bf16-vs-fp32 execution to
-   see which numerical path shrinks the `~0.03–0.04` same-latent `noise_pred`
-   residual;
-2. run an oracle-correction sampler that uses native forward but periodically
-   snaps latent back to the NVlabs trajectory, measuring how much correction
-   frequency is needed to prevent the step-18/19 collapse;
+1. split the same-latent residual inside the DiT block path (`main_raw`,
+   `cam_raw`, `cam_contrib`, `combined`, output gate/proj, final layer) at
+   steps 15/18;
+2. compare native fallback layers against NVlabs on the same block inputs,
+   especially softmax-UCPE blocks and final-layer modulation, because
+   scheduler, cam scan dispatch, and broad fp32 precision are now ruled out;
 3. avoid more scheduler work unless a future probe breaks exact replay.
 
 ### 6.14 Refiner/VAE/RGB Photometric Chain Probe — Native Refiner Contract Dominates 🔴 2026-05-29
@@ -2009,7 +2051,7 @@ Stage-1 path needs a new contract:
 
 12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). Cam branch rewritten to match NVlabs `BidirectionalGDNUCPESinglePathLiteLA`: single-path delta-rule recurrence (no Z denominator), `apply_fn_o` inverse output transform, and `_downscale_to_reference_rms` PostUCPERenorm. Latent at STAGE1_STEPS=1 dropped from `[-59, 61]` to `[-12.3, 11.8]`.
 
-13. ⚠️ **Stage-1 native scheduler/softmax-UCPE alignment (§6.13m–§6.13p).** Controlled 3-step and 9-frame 20/60-step parity are strong (generated cos `0.986–0.988`). Production-length 321-frame / 20-step parity still drops to generated cos `~0.75`, but the gap is now localized: camera tensors, `chunk_index`, prompt/latent injection, timestep table, step-0 model forward, and scheduler update are aligned. Remaining divergence is trajectory-level accumulation of small same-latent `noise_pred` residuals, especially around the step-18 update (`t≈392 → 87.7`).
+13. ⚠️ **Stage-1 native scheduler/softmax-UCPE alignment (§6.13m–§6.13p).** Controlled 3-step and 9-frame 20/60-step parity are strong (generated cos `0.986–0.988`). Production-length 321-frame / 20-step parity still drops to generated cos `~0.75`, but the gap is now localized: camera tensors, `chunk_index`, prompt/latent injection, timestep table, step-0 model forward, scheduler update, cam Triton/Python scan, and full-transformer fp32 are aligned or non-decisive. Remaining divergence is trajectory-level accumulation of small same-latent `noise_pred` residuals, especially around the step-18 update (`t≈392 → 87.7`).
 
 14. ⚠️ **Stage-2 refiner contract alignment (§6.14).** The structural NVlabs contract is now ported: sink/current split, seed-42 current noise, per-token timestep, video-only streaming mask, x0/velocity loop, and terminal-zero sigma. Same-source native vs official-manual refiner is generated-frame latent MAE=0.3589 / cos=0.8912. Remaining gap is accumulated bf16 drift across vLLM-native vs diffusers LTX-2 layers, not scheduler, prompt connector, or missing weights.
 
@@ -2017,7 +2059,7 @@ Stage-1 path needs a new contract:
 
 ## 8. Outstanding Work — GPU Required
 
-1. **Fix 321-frame Stage-1 trajectory drift (§6.13p).** Input camera tensors, `chunk_index`, step-0 forward, scheduler update semantics, and full teacher-forced native-on-official trace are ruled out as single-point failures. Same-latent late-step `noise_pred` parity remains high (generated cos `0.9986–0.9990`), but small local residuals still accumulate into the 321-frame / 20-step trajectory collapse (`generated latent cos 0.9915 at step 15 → 0.7587 at step 19`). Next isolate whether torch fallback, Triton camera branch, bf16 accumulation, or final-layer dtype is responsible for the residual.
+1. **Fix 321-frame Stage-1 trajectory drift (§6.13p).** Input camera tensors, `chunk_index`, step-0 forward, scheduler update semantics, cam Triton/Python dispatch, full-transformer fp32, and full teacher-forced native-on-official trace are ruled out as single-point failures. Same-latent late-step `noise_pred` parity remains high (generated cos `0.9986–0.9990`), but small local residuals still accumulate into the 321-frame / 20-step trajectory collapse (`generated latent cos 0.9915 at step 15 → 0.7587 at step 19`). Next split the same-latent residual inside the DiT block path (`main_raw`, `cam_raw`, `cam_contrib`, output gate/proj, final layer) at steps 15/18.
 
 2. **Regenerate same-source Stage-2 refiner acceptance artifacts (§6.14).** For short 9-frame alignment, the next correctness target is still native LTX-2 refiner parity against NVlabs on controlled Stage-1 latents. Regenerate the official refiner baseline and prompt-connector dump in one run, then decide whether strict cos ≥0.98 requires a diffusers-exact fallback or a refiner-specific torch-linear layer stack.
 
