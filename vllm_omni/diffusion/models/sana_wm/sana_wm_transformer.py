@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import sys
 from dataclasses import dataclass, field, replace
 from functools import reduce
 from operator import mul
@@ -141,6 +142,32 @@ def _maybe_make_vllm_rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
     if VllmRMSNorm is None:
         return SanaWmRMSNorm(hidden_size, eps=eps)
     return VllmRMSNorm(hidden_size, eps=eps)
+
+
+_CAM_TRITON_SENTINEL: object = object()
+_cam_triton_fn: Any = _CAM_TRITON_SENTINEL
+
+
+def _import_nvlabs_cam_scan_bidi() -> Any:
+    """Lazy import of NVlabs ``cam_scan_bidi_chunkwise``. Cached after first call.
+
+    Requires ``VLLM_OMNI_SANA_WM_OFFICIAL_REPO`` to point at the NVlabs source
+    tree. Returns ``None`` on import failure (caller falls back to Python path).
+    """
+    global _cam_triton_fn
+    if _cam_triton_fn is not _CAM_TRITON_SENTINEL:
+        return _cam_triton_fn
+    repo = os.environ.get("VLLM_OMNI_SANA_WM_OFFICIAL_REPO", "")
+    if repo and repo not in sys.path:
+        sys.path.insert(0, repo)
+    try:
+        from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_bidi_chunkwise  # type: ignore
+        _cam_triton_fn = cam_scan_bidi_chunkwise
+        print(f"[sana-wm cam-triton] imported from {repo}", flush=True)
+    except Exception as exc:
+        print(f"[sana-wm cam-triton] import failed ({exc}); falling back to Python path", flush=True)
+        _cam_triton_fn = None
+    return _cam_triton_fn
 
 
 def _is_sana_wm_transformer_block(name: str, module: Any) -> bool:
@@ -1231,7 +1258,33 @@ class SanaWmSelfAttention(nn.Module):
         Backward direction shifts K/V/beta by one frame (with zero pad) and
         the decay by one frame (with neutral 1.0 pad), matching NVlabs
         ``flip_and_shift`` conventions.
+
+        Set ``SANA_WM_CAM_TRITON=1`` to dispatch to NVlabs
+        ``cam_scan_bidi_chunkwise`` from
+        ``diffusion.model.ops.fused_gdn_chunkwise``; falls back to the
+        Python reference path on import failure.
         """
+        if os.environ.get("SANA_WM_CAM_TRITON", "").lower() in {"1", "true", "yes", "on"}:
+            triton_fn = _import_nvlabs_cam_scan_bidi()
+            if triton_fn is not None:
+                dtype_orig = q_rot.dtype
+                B, H, D, N = q_rot.shape
+                F = beta.shape[2]
+                if N != F * spatial_tokens:
+                    raise ValueError(
+                        f"cam triton path: N={N} != F*S={F * spatial_tokens}"
+                    )
+                # NVlabs requires fp32 contiguous q/k/v, beta (B,H,F,S), decay (B,H,F).
+                q_f = q_rot.float().contiguous()
+                k_f = k_rot.float().contiguous()
+                v_f = value.float().contiguous()
+                if beta.ndim == 3:
+                    beta_f = beta.unsqueeze(-1).expand(B, H, F, spatial_tokens).contiguous()
+                else:
+                    beta_f = beta.float().contiguous()
+                decay_f = decay.float().contiguous()
+                out = triton_fn(q_f, k_f, v_f, beta_f, decay_f)
+                return out.to(dtype_orig)
         batch_size, num_heads, head_dim, token_count = q_rot.shape
         frames = beta.shape[2]
 
