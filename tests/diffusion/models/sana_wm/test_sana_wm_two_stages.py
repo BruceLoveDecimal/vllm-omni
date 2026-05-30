@@ -116,25 +116,99 @@ def test_sana_wm_two_stage_inprocess_refiner_step_runs_with_fake_components(monk
         def prepare_video_coords(self, batch_size, num_frames, height, width, device, fps=24.0):
             return torch.zeros(batch_size, 3, num_frames * height * width, 2, device=device)
 
-        def prepare_audio_coords(self, batch_size, num_frames, device):
-            return torch.zeros(batch_size, 1, num_frames, 2, device=device)
+        def __call__(self, coords, device):
+            tokens = coords.shape[2]
+            return torch.ones(1, tokens, 4, device=device), torch.zeros(1, tokens, 4, device=device)
+
+    class FakeTimeEmbed(torch.nn.Module):
+        def forward(self, timestep, *, batch_size, hidden_dtype):
+            return (
+                torch.zeros(timestep.numel(), 24, dtype=hidden_dtype),
+                torch.zeros(timestep.numel(), 4, dtype=hidden_dtype),
+            )
+
+    class FakeSelfAttention(torch.nn.Module):
+        heads = 1
+        head_dim = 4
+        rope_type = "interleaved"
+        to_gate_logits = None
+
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.norm_q = torch.nn.Identity()
+            self.norm_k = torch.nn.Identity()
+            self.to_out = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity()])
+            self.attn = self._attn
+
+        def to_qkv(self, hidden_states):
+            return torch.cat([hidden_states, hidden_states, hidden_states], dim=-1), None
+
+        def _attn(self, query, key, value, attn_metadata):
+            del key, value, attn_metadata
+            self.calls += 1
+            return torch.zeros_like(query)
+
+    class FakeCrossAttention(torch.nn.Module):
+        heads = 1
+        to_gate_logits = None
+
+        def __init__(self):
+            super().__init__()
+            self.norm_q = torch.nn.Identity()
+            self.norm_k = torch.nn.Identity()
+            self.to_out = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity()])
+
+        def to_q(self, hidden_states):
+            return hidden_states
+
+        def to_k(self, hidden_states):
+            return hidden_states
+
+        def to_v(self, hidden_states):
+            return hidden_states
+
+        def forward(self, hidden_states, **kwargs):
+            assert kwargs["encoder_hidden_states"].shape[-1] == 4
+            return torch.zeros_like(hidden_states)
+
+    class FakeBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale_shift_table = torch.nn.Parameter(torch.zeros(6, 4))
+            self.norm1 = torch.nn.Identity()
+            self.norm2 = torch.nn.Identity()
+            self.norm3 = torch.nn.Identity()
+            self.attn1 = FakeSelfAttention()
+            self.attn2 = FakeCrossAttention()
+            self.ff = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Identity())
+            torch.nn.init.zeros_(self.ff[0].weight)
+            torch.nn.init.zeros_(self.ff[0].bias)
+
+        @staticmethod
+        def get_mod_params(scale_shift_table, temb, batch_size):
+            values = scale_shift_table[None, None] + temb.reshape(batch_size, temb.shape[1], 6, -1)
+            return values.unbind(dim=2)
 
     class FakeTransformer(torch.nn.Module):
-        config = types.SimpleNamespace(patch_size=1, patch_size_t=1, audio_in_channels=4)
+        config = types.SimpleNamespace(patch_size=1, patch_size_t=1, timestep_scale_multiplier=1000.0)
 
         def __init__(self):
             super().__init__()
             self.rope = FakeRope()
-            self.audio_rope = FakeRope()
-            self.calls = 0
-
-        def forward(self, hidden_states, audio_hidden_states, **kwargs):
-            self.calls += 1
-            assert kwargs["encoder_hidden_states"].shape[-1] == 4
-            return torch.zeros_like(hidden_states), torch.zeros_like(audio_hidden_states)
+            self.proj_in = torch.nn.Identity()
+            self.time_embed = FakeTimeEmbed()
+            self.caption_projection = torch.nn.Identity()
+            self.transformer_blocks = torch.nn.ModuleList([FakeBlock()])
+            self.scale_shift_table = torch.nn.Parameter(torch.zeros(2, 4))
+            self.norm_out = torch.nn.Identity()
+            self.proj_out = torch.nn.Linear(4, 4)
+            torch.nn.init.zeros_(self.proj_out.weight)
+            torch.nn.init.zeros_(self.proj_out.bias)
 
     pipe = SanaWmTwoStagesPipeline(od_config=None)
     pipe.refiner_transformer = FakeTransformer()
+    monkeypatch.setattr(pipe, "_runtime_device_dtype", lambda: (torch.device("cpu"), torch.float32))
     monkeypatch.setattr(pipe, "ensure_refiner_components", lambda **kwargs: None)
     monkeypatch.setattr(
         pipe,
@@ -146,7 +220,7 @@ def test_sana_wm_two_stage_inprocess_refiner_step_runs_with_fake_components(monk
         ),
     )
 
-    latents = torch.ones(1, 4, 1, 2, 2)
+    latents = torch.ones(1, 4, 2, 2, 2)
     output = pipe._run_inprocess_refiner(
         latents=latents,
         prompt_text="drive forward",
@@ -162,4 +236,4 @@ def test_sana_wm_two_stage_inprocess_refiner_step_runs_with_fake_components(monk
     assert output.custom_output["sana_wm_backend"] == "native_inprocess_refiner"
     assert output.custom_output["sana_wm_refiner_steps"] == 2
     assert output.output.shape == latents.shape
-    assert pipe.refiner_transformer.calls == 2
+    assert pipe.refiner_transformer.transformer_blocks[0].attn1.calls == 0

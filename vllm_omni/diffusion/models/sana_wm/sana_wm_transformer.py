@@ -74,6 +74,7 @@ SANA_WM_STAGE1_LATENT_CHANNELS = 128
 SANA_WM_STAGE1_PROMPT_CHANNELS = 2304
 SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
 SANA_WM_STAGE1_GDN_STATE_SIZE = 20
+SANA_WM_DISABLE_VLLM_OPS_ENV = "VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS"
 
 
 def _get_tp_rank() -> int:
@@ -104,7 +105,13 @@ def _vllm_tp_group_ready() -> bool:
     return True
 
 
+def _sana_wm_disable_vllm_ops() -> bool:
+    return os.environ.get(SANA_WM_DISABLE_VLLM_OPS_ENV, "").lower() in {"1", "true", "yes", "on"}
+
+
 def _vllm_parallel_layers_available() -> bool:
+    if _sana_wm_disable_vllm_ops():
+        return False
     return (
         ColumnParallelLinear is not None
         and QKVParallelLinear is not None
@@ -114,6 +121,8 @@ def _vllm_parallel_layers_available() -> bool:
 
 
 def _vllm_attention_available() -> bool:
+    if _sana_wm_disable_vllm_ops():
+        return False
     return Attention is not None
 
 
@@ -139,7 +148,7 @@ def _linear_weight_dtype(module: nn.Module) -> torch.dtype:
 
 
 def _maybe_make_vllm_rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
-    if VllmRMSNorm is None:
+    if VllmRMSNorm is None or _sana_wm_disable_vllm_ops():
         return SanaWmRMSNorm(hidden_size, eps=eps)
     return VllmRMSNorm(hidden_size, eps=eps)
 
@@ -572,6 +581,7 @@ class SanaWmSelfAttention(nn.Module):
         self.use_vllm_attention = (not self.use_gdn) and _vllm_attention_available()
         self.k_conv_only = config.k_conv_only
         self.conv_kernel_size = config.conv_kernel_size
+        self.patch_size = _to_3tuple(config.patch_size)
         self.uses_vllm_parallel_layers = use_vllm_parallel_layers and _vllm_parallel_layers_available()
         # cam_dim must be known before the TP/fallback branch uses it for layer sizes.
         self.cam_dim = hidden_size // max(config.cam_attn_compress, 1)
@@ -1143,6 +1153,7 @@ class SanaWmSelfAttention(nn.Module):
             head_dim=self.cam_head_dim,
             camera_conditions=camera_conditions,
             HW=spatial_shape,
+            patch_size=self.patch_size,
             rotary_emb=self._ucpe_rotary_freqs(rotary_emb),
         )
         q_cam_trans = apply_fn_q(q_cam)
@@ -1330,12 +1341,12 @@ class SanaWmSelfAttention(nn.Module):
         *,
         precomputed_gates: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        """UCPE camera branch — matches NVlabs ``BidirectionalGDNUCPESinglePathLiteLA``
-        which is the variant declared in the SANA-WM 1600M release config
-        (``camctrl_type: BidirectionalGDNUCPESinglePathLiteLABothTriton``).
+        """UCPE camera branch — matches the NVlabs production
+        ``BidirectionalGDNUCPESinglePathLiteLABothTriton`` variant declared
+        in the SANA-WM 1600M release config.
 
-        Pipeline (mirrors ``_GDNUCPEBase._prepare_cam_qkv`` +
-        ``BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch``):
+        Pipeline (mirrors the released NVlabs
+        ``BidirectionalGDNUCPESinglePathLiteLABothTriton`` path):
 
         1. Project Q/K/V from ``hidden_states`` (all three from x — UCPE is
            NOT cross-attention; camera info enters via per-pixel projection
@@ -1346,14 +1357,14 @@ class SanaWmSelfAttention(nn.Module):
         5. UCPE per-token block-diagonal transforms via ``apply_fn_q`` and
            ``apply_fn_kv`` (per-ray 4x4 projection on first half + sliced
            complex RoPE on second half).
-        6. **PostUCPERenorm**: ``_downscale_to_reference_rms`` shrinks the
-           UCPE-transformed Q/K/V back to their pre-UCPE per-token RMS
-           envelope. Without this the cam branch output magnitude is ~10×
-           too large for the LTX-2 refiner.
-        7. Dynamic Beta Discounting: β_cam = β / frame_inflation_sq.clamp_min(1).
-        8. **Single-path** delta-rule recurrence (numerator only, no Z
+        6. Dynamic Beta Discounting: β_cam = β / frame_inflation_sq.clamp_min(1).
+           The released NVlabs ``BothTriton`` cam path does not apply the
+           Python ``PostUCPERenorm`` shrink step before the scan; it uses the
+           raw UCPE-transformed Q/K/V and discounts beta from their raw K
+           inflation.
+        7. **Single-path** delta-rule recurrence (numerator only, no Z
            denominator) — forward + backward, simple sum.
-        9. **Inverse output transform**: ``apply_fn_o`` brings the recurrence
+        8. **Inverse output transform**: ``apply_fn_o`` brings the recurrence
            output from the per-ray frame back to the world frame.
 
         Returns ``(B, N, cam_dim)`` raw — caller applies ``out_proj_cam`` and
@@ -1375,6 +1386,7 @@ class SanaWmSelfAttention(nn.Module):
             head_dim=self.cam_head_dim,
             camera_conditions=camera_conditions,
             HW=spatial_shape,
+            patch_size=self.patch_size,
             rotary_emb=rotary_emb_freqs,
         )
 
@@ -1414,17 +1426,10 @@ class SanaWmSelfAttention(nn.Module):
         kv_cam_trans = apply_fn_kv(kv_cam)
         k_cam_trans, v_cam_trans = torch.chunk(kv_cam_trans, chunks=2, dim=1)
 
-        # 6. PostUCPERenorm — clip the UCPE-transformed Q/K/V to their
-        # pre-UCPE per-token RMS envelope. Without this the per-ray 4x4
-        # projection inflates magnitudes by ~6-10× and the downstream
-        # refiner cannot denoise the resulting latent.
-        q_cam_trans = self._downscale_to_reference_rms(q_cam, q_cam_trans)
-        k_cam_trans = self._downscale_to_reference_rms(k_cam, k_cam_trans)
-        v_cam_trans = self._downscale_to_reference_rms(v_cam, v_cam_trans)
-
-        # inflation_sq is computed from the *unstabilised* post-UCPE K norm
-        # to match NVlabs' behaviour (`inflation_sq` is captured before
-        # `_stabilize_cam_transforms` runs).
+        # 6. Match NVlabs' production BothTriton path: do not apply the
+        # Python PostUCPERenorm shrink here. `cam_prep_func` feeds raw
+        # UCPE-transformed Q/K/V into `cam_scan_bidi_chunkwise` and computes
+        # beta discounting from the raw K inflation.
         post_ucpe_k_norm = torch.linalg.vector_norm(k_cam_trans, dim=-1, keepdim=True).clamp_min(1e-6)
         inflation_sq = (post_ucpe_k_norm / pre_ucpe_k_norm) ** 2  # (B, H, N, 1)
 

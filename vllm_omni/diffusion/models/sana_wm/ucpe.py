@@ -128,19 +128,16 @@ def _world_to_ray_mats(
 def _process_camera_conditions(
     camera_conditions: torch.Tensor,  # (B, T, 20)
     HW: tuple[int, int, int],
+    patch_size: tuple[int, int, int] = (1, 1, 1),
 ) -> torch.Tensor:
     """Convert ``(B, T, 20)`` SANA-WM camera conditions to ``(B, T, H, W, 4, 4)``
     ``ray <- world`` transforms.
 
     Layout of the last axis is ``[c2w_flat (16), fx, fy, cx, cy]``.
-    Intrinsics are expected in **latent-pixel units** — matching the output
-    of ``camera_control._pack_camera_conditions`` which scales the original
-    image-pixel intrinsics by ``latent_width / image_width`` and
-    ``latent_height / image_height`` before packing into the ``raymap``
-    tensor. The mathematics is identical to the NVlabs reference: NVlabs
-    accepts image-pixel intrinsics and converts to latent via a FoV
-    round-trip, but the FoV round-trip is a no-op when both ``fx`` and
-    ``width`` scale together.
+    Intrinsics follow the NVlabs UCPE contract: the packed camera payload is
+    expressed on the pre-patch latent image grid, while ``HW`` is the
+    transformer token grid. ``patch_size`` maps those units to the token grid
+    before unprojection. The released SANA-WM P1 config uses ``(1, 1, 1)``.
 
     Args:
         camera_conditions: ``(B, T, 20)`` from ``_pack_camera_conditions``.
@@ -155,10 +152,12 @@ def _process_camera_conditions(
             f"SANA-WM camera_conditions frames {T_cond} != latent frames {T_latent}."
         )
     c2w = camera_conditions[..., :16].reshape(B, T_latent, 4, 4)
-    fx = camera_conditions[..., 16]
-    fy = camera_conditions[..., 17]
-    cx = camera_conditions[..., 18]
-    cy = camera_conditions[..., 19]
+    patch_t, patch_h, patch_w = patch_size
+    del patch_t
+    fx = camera_conditions[..., 16] / float(patch_w)
+    fy = camera_conditions[..., 17] / float(patch_h)
+    cx = camera_conditions[..., 18] / float(patch_w)
+    cy = camera_conditions[..., 19] / float(patch_h)
     d_cam = _unproject_pinhole(fx, fy, cx, cy, H_latent, W_latent)
     raymats = _world_to_ray_mats(d_cam, c2w)
     return raymats
@@ -317,6 +316,7 @@ def prepare_prope_fns(
     head_dim: int,
     camera_conditions: torch.Tensor,
     HW: tuple[int, int, int],
+    patch_size: tuple[int, int, int] = (1, 1, 1),
     rotary_emb: torch.Tensor | None = None,
 ) -> tuple[Callable, Callable, Callable]:
     """Precompute the UCPE ``(apply_q, apply_kv, apply_o)`` callables once
@@ -325,9 +325,11 @@ def prepare_prope_fns(
 
     Args:
         head_dim: per-head channel count. Must be divisible by 4.
-        camera_conditions: ``(B, T, 20)`` SANA-WM camera payload with
-            intrinsics in latent-pixel units (see ``_process_camera_conditions``).
+        camera_conditions: ``(B, T, 20)`` SANA-WM camera payload.
         HW: ``(T_latent, H_latent, W_latent)`` latent-grid shape.
+        patch_size: 3D transformer patch size. The spatial patch size maps
+            the packed camera intrinsics to the token grid, matching NVlabs
+            ``_process_camera_conditions_ucpe``.
         rotary_emb: complex rotary embeddings ``(1, 1, N, D//2)`` produced
             by the main-branch RoPE module, or ``None`` to skip the rope
             block in the block-diagonal transform.
@@ -335,7 +337,7 @@ def prepare_prope_fns(
     if head_dim % 4 != 0:
         raise ValueError(f"UCPE head_dim must be divisible by 4, got {head_dim}.")
     B = camera_conditions.shape[0]
-    raymats = _process_camera_conditions(camera_conditions, HW)
+    raymats = _process_camera_conditions(camera_conditions, HW, patch_size=patch_size)
     raymats_flat = raymats.reshape(B, -1, 4, 4)
     P = raymats_flat
     P_T = P.transpose(-1, -2)

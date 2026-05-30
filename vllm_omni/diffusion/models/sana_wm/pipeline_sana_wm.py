@@ -443,6 +443,21 @@ class SanaWmPipeline(
                 torch_dtype=dtype,
                 local_files_only=True,
             ).to(device)
+        # Match NVlabs' inference_video_scripts/inference_sana_wm.py VAE
+        # construction. Long videos (e.g. 321 frames -> 41 latent frames)
+        # otherwise decode as one large 3D volume and OOM on a 98GB RTX 6000.
+        if hasattr(self.vae, "enable_tiling"):
+            self.vae.enable_tiling()
+        if hasattr(self.vae, "use_framewise_encoding"):
+            self.vae.use_framewise_encoding = True
+            self.vae.use_framewise_decoding = True
+            vae_config = getattr(self.vae, "config", None)
+            self.vae.tile_sample_stride_num_frames = int(
+                getattr(vae_config, "tile_sample_stride_num_frames", 64)
+            )
+            self.vae.tile_sample_min_num_frames = int(
+                getattr(vae_config, "tile_sample_min_num_frames", 96)
+            )
 
     def _ensure_camera_encoder(self, *, device: torch.device, dtype: torch.dtype) -> SanaWmCameraEmbedder:
         if self.camera_encoder is None or self.camera_encoder.hidden_size != self.sana_wm_config.hidden_size:
@@ -912,6 +927,44 @@ class SanaWmPipeline(
             _dump_path = os.environ.get("SANA_WM_DUMP_STEP0", "")
             _dump_steps_path = os.environ.get("SANA_WM_DUMP_STEPS_PREFIX", "")
             _dump_step_count = int(os.environ.get("SANA_WM_DUMP_STEP_COUNT", "1"))
+            # Audit §6.13t engine-vs-standalone probe: opt-in full transformer
+            # input dump so a separate harness can re-call transformer.forward
+            # with byte-identical inputs and measure dispatch-level drift.
+            _dump_engine_path = os.environ.get(
+                "SANA_WM_DUMP_ENGINE_STEP0_INPUTS", ""
+            )
+            if _dump_engine_path and _step_idx == 0:
+                def _to_cpu(t):
+                    return t.detach().cpu() if hasattr(t, "detach") else t
+
+                torch.save(
+                    {
+                        "latents": _to_cpu(latents),
+                        "model_timestep": _to_cpu(model_timestep),
+                        "prompt_embeds": _to_cpu(prompt_embeds),
+                        "plucker": _to_cpu(plucker),
+                        "raymap": _to_cpu(raymap),
+                        "spatial_raymap": _to_cpu(spatial_raymap),
+                        "noise_pred": _to_cpu(noise_pred),
+                        "t_scalar": _to_cpu(timestep),
+                        "num_frames": int(params.num_frames),
+                        "use_cudagraph": cudagraph_denoiser is not None,
+                        "condition_mask": (
+                            _to_cpu(condition_mask) if condition_mask is not None else None
+                        ),
+                    },
+                    _dump_engine_path,
+                )
+                print(
+                    f"[sana-wm probe] saved engine step-0 transformer inputs "
+                    f"latents={tuple(latents.shape)} "
+                    f"prompt_embeds={tuple(prompt_embeds.shape)} "
+                    f"raymap={tuple(raymap.shape) if hasattr(raymap, 'shape') else None} "
+                    f"plucker={tuple(plucker.shape) if hasattr(plucker, 'shape') else None} "
+                    f"spatial_raymap={tuple(spatial_raymap.shape) if hasattr(spatial_raymap, 'shape') else None} "
+                    f"-> {_dump_engine_path}",
+                    flush=True,
+                )
             if _dump_path and _step_idx == 0:
                 torch.save(
                     {
@@ -989,6 +1042,18 @@ class SanaWmPipeline(
                     latents = torch.where(condition_mask > 0.5, latents, stepped)
             else:
                 latents = stepped
+
+        # Audit §6.13o probe hook: opt-in dump of native Stage-1 final latent
+        # (post per-token Euler loop, pre refiner+VAE). Mirrors NVlabs's
+        # SANA_WM_DUMP_STAGE1_LATENT for direct stage-1 latent parity probes.
+        _stage1_dump = os.environ.get("SANA_WM_DUMP_NATIVE_STAGE1_LATENT", "")
+        if _stage1_dump:
+            torch.save(latents.detach().cpu(), _stage1_dump)
+            print(
+                f"[sana-wm probe] saved native Stage-1 latent shape={tuple(latents.shape)} "
+                f"norm={latents.float().norm().item():.2f} -> {_stage1_dump}",
+                flush=True,
+            )
 
         output_type = str(extra_args.get("sana_wm_output_type", "latent"))
         output = self._decode_native_smoke_latents(latents, output_type=output_type, device=device, dtype=dtype)
