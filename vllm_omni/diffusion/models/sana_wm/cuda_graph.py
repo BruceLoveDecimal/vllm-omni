@@ -61,6 +61,7 @@ class _SanaWmCudaGraphEntry:
     latents: torch.Tensor
     timestep: torch.Tensor
     encoder_hidden_states: torch.Tensor
+    encoder_attention_mask: torch.Tensor | None
     plucker: torch.Tensor
     spatial_raymap: torch.Tensor | None
     output: torch.Tensor
@@ -89,6 +90,7 @@ class SanaWmCudaGraphDenoiser:
         timestep: torch.Tensor,
         *,
         encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None = None,
         plucker: torch.Tensor,
         spatial_raymap: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -96,6 +98,7 @@ class SanaWmCudaGraphDenoiser:
             latents,
             timestep,
             encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
             plucker=plucker,
             spatial_raymap=spatial_raymap,
         )
@@ -107,6 +110,7 @@ class SanaWmCudaGraphDenoiser:
         latents: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None,
         plucker: torch.Tensor,
         spatial_raymap: torch.Tensor | None,
         transformer: torch.nn.Module,
@@ -120,6 +124,7 @@ class SanaWmCudaGraphDenoiser:
             tuple(latents.shape),
             tuple(timestep.shape),
             tuple(encoder_hidden_states.shape),
+            tuple(encoder_attention_mask.shape) if encoder_attention_mask is not None else None,
             tuple(plucker.shape),
             tuple(spatial_raymap.shape) if spatial_raymap is not None else None,
         )
@@ -131,6 +136,7 @@ class SanaWmCudaGraphDenoiser:
         timestep: torch.Tensor,
         *,
         encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None = None,
         plucker: torch.Tensor,
         spatial_raymap: torch.Tensor | None,
         num_frames: int,
@@ -144,6 +150,7 @@ class SanaWmCudaGraphDenoiser:
                     latents,
                     timestep,
                     encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
                     plucker=plucker,
                     spatial_raymap=spatial_raymap,
                 ),
@@ -155,6 +162,7 @@ class SanaWmCudaGraphDenoiser:
             latents=latents,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
             plucker=plucker,
             spatial_raymap=spatial_raymap,
             transformer=transformer,
@@ -166,6 +174,7 @@ class SanaWmCudaGraphDenoiser:
                     latents,
                     timestep,
                     encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
                     plucker=plucker,
                     spatial_raymap=spatial_raymap,
                 ),
@@ -180,6 +189,7 @@ class SanaWmCudaGraphDenoiser:
                     latents,
                     timestep,
                     encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
                     plucker=plucker,
                     spatial_raymap=spatial_raymap,
                 )
@@ -194,6 +204,7 @@ class SanaWmCudaGraphDenoiser:
                         latents,
                         timestep,
                         encoder_hidden_states=encoder_hidden_states,
+                        encoder_attention_mask=encoder_attention_mask,
                         plucker=plucker,
                         spatial_raymap=spatial_raymap,
                     ),
@@ -203,6 +214,8 @@ class SanaWmCudaGraphDenoiser:
             entry.latents.copy_(latents)
             entry.timestep.copy_(timestep)
             entry.encoder_hidden_states.copy_(encoder_hidden_states)
+            if entry.encoder_attention_mask is not None and encoder_attention_mask is not None:
+                entry.encoder_attention_mask.copy_(encoder_attention_mask)
             entry.plucker.copy_(plucker)
             if entry.spatial_raymap is not None and spatial_raymap is not None:
                 entry.spatial_raymap.copy_(spatial_raymap)
@@ -218,12 +231,16 @@ class SanaWmCudaGraphDenoiser:
         timestep: torch.Tensor,
         *,
         encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None = None,
         plucker: torch.Tensor,
         spatial_raymap: torch.Tensor | None,
     ) -> _SanaWmCudaGraphEntry:
         static_latents = latents.detach().clone()
         static_timestep = timestep.detach().clone()
         static_encoder_hidden_states = encoder_hidden_states.detach().clone()
+        static_encoder_attention_mask = (
+            encoder_attention_mask.detach().clone() if encoder_attention_mask is not None else None
+        )
         static_plucker = plucker.detach().clone()
         static_spatial_raymap = spatial_raymap.detach().clone() if spatial_raymap is not None else None
 
@@ -233,6 +250,7 @@ class SanaWmCudaGraphDenoiser:
                 static_latents,
                 static_timestep,
                 encoder_hidden_states=static_encoder_hidden_states,
+                encoder_attention_mask=static_encoder_attention_mask,
                 plucker=static_plucker,
                 spatial_raymap=static_spatial_raymap,
             )
@@ -244,6 +262,7 @@ class SanaWmCudaGraphDenoiser:
                     static_latents,
                     static_timestep,
                     encoder_hidden_states=static_encoder_hidden_states,
+                    encoder_attention_mask=static_encoder_attention_mask,
                     plucker=static_plucker,
                     spatial_raymap=static_spatial_raymap,
                 )
@@ -255,6 +274,7 @@ class SanaWmCudaGraphDenoiser:
             latents=static_latents,
             timestep=static_timestep,
             encoder_hidden_states=static_encoder_hidden_states,
+            encoder_attention_mask=static_encoder_attention_mask,
             plucker=static_plucker,
             spatial_raymap=static_spatial_raymap,
             output=static_output,

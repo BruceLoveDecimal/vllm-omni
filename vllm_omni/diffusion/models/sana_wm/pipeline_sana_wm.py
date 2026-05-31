@@ -593,6 +593,7 @@ class SanaWmPipeline(
     ) -> tuple[torch.Tensor, str]:
         shape = (1, self.sana_wm_config.model_max_length, SANA_WM_STAGE1_PROMPT_CHANNELS)
         if not prompt_text:
+            self._last_prompt_attention_mask = torch.zeros(shape[:2], device=device, dtype=torch.float32)
             return torch.zeros(shape, device=device, dtype=dtype), "empty"
 
         import hashlib
@@ -603,6 +604,7 @@ class SanaWmPipeline(
         generator.manual_seed(seed)
         prompt_embeds = torch.randn(shape, generator=generator, dtype=torch.float32)
         prompt_embeds = prompt_embeds * float(self.sana_wm_config.y_norm_scale_factor)
+        self._last_prompt_attention_mask = torch.ones(shape[:2], device=device, dtype=torch.float32)
         return prompt_embeds.to(device=device, dtype=dtype), "hash_smoke"
 
     def _native_smoke_prompt_embeds(
@@ -638,9 +640,11 @@ class SanaWmPipeline(
         ).to(device)
         outputs = self.text_encoder(**encoded, output_hidden_states=True)
         hidden_states = outputs.hidden_states[-1]
+        attention_mask = encoded.attention_mask
         if chi_prompt:
             select_index = [0] + list(range(-model_max_length + 1, 0))
             hidden_states = hidden_states[:, select_index]
+            attention_mask = attention_mask[:, select_index]
         if hidden_states.shape[-1] != SANA_WM_STAGE1_PROMPT_CHANNELS:
             raise ValueError(
                 "Sana-WM Stage-1 Gemma hidden size mismatch: expected "
@@ -657,6 +661,7 @@ class SanaWmPipeline(
         # ~450 at this shape) and left the model effectively
         # unconditioned on the prompt. Probed via
         # tools/scripts/probe_step0.py.
+        self._last_prompt_attention_mask = attention_mask.to(device=device, dtype=torch.float32)
         return hidden_states.to(device=device, dtype=dtype), "gemma2"
 
     def _decode_native_smoke_latents(
@@ -830,6 +835,8 @@ class SanaWmPipeline(
                 flush=True,
             )
 
+        prompt_attention_mask = getattr(self, "_last_prompt_attention_mask", None)
+
         camera = payload.get("camera") or {}
         condition = SanaWmCameraCondition(
             poses=camera.get("poses") if isinstance(camera, dict) else None,
@@ -917,6 +924,7 @@ class SanaWmPipeline(
                     latents,
                     model_timestep,
                     encoder_hidden_states=prompt_embeds,
+                    encoder_attention_mask=prompt_attention_mask,
                     plucker=plucker,
                     spatial_raymap=spatial_raymap,
                     num_frames=params.num_frames,
@@ -927,6 +935,7 @@ class SanaWmPipeline(
                     latents,
                     model_timestep,
                     encoder_hidden_states=prompt_embeds,
+                    encoder_attention_mask=prompt_attention_mask,
                     plucker=plucker,
                     raymap=raymap,
                     spatial_raymap=spatial_raymap,

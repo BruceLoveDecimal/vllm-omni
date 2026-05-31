@@ -1674,20 +1674,37 @@ class SanaWmCrossAttention(nn.Module):
         batch, _, seq_len, _ = tensor.shape
         return tensor.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
 
-    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         query = self.q_norm(_linear_output(self.q_linear(hidden_states)))
         key, value = _linear_output(self.kv_linear(encoder_hidden_states)).chunk(2, dim=-1)
         key = self.k_norm(key)
-        if self.softmax_attn is not None:
+        if self.softmax_attn is not None and attention_mask is None:
             query = self._reshape_to_seq_heads(query)
             key = self._reshape_to_seq_heads(key)
             value = self._reshape_to_seq_heads(value)
             attn = self.softmax_attn(query, key, value)
             return _linear_output(self.proj(attn.flatten(2, 3)))
+        # vLLM Attention path does not currently take the SANA-WM prompt
+        # padding mask; fall back to SDPA for exact NVlabs semantics when a
+        # mask is supplied.
         query = self._split_heads(query)
         key = self._split_heads(key)
         value = self._split_heads(value)
-        attn = F.scaled_dot_product_attention(query, key, value)
+        attn_mask = None
+        if attention_mask is not None:
+            if attention_mask.ndim != 2:
+                raise ValueError(
+                    "Sana-WM cross-attention mask must be shaped [B, text_len], "
+                    f"got {tuple(attention_mask.shape)}."
+                )
+            attn_mask = (1 - attention_mask.to(query.dtype)) * -10000.0
+            attn_mask = attn_mask[:, None, None].repeat(1, self.num_heads, 1, 1)
+        attn = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
         return _linear_output(self.proj(self._merge_heads(attn)))
 
 
@@ -1916,6 +1933,7 @@ class SanaWmBlock(nn.Module):
         rotary_emb: torch.Tensor | None = None,
         camera_hidden_states: torch.Tensor | None = None,
         camera_conditions: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # NVlabs dispatch convention (audit §6.13a): when timestep
         # modulation carries a frame axis (ndim > 2), route through the
@@ -1929,6 +1947,7 @@ class SanaWmBlock(nn.Module):
                 rotary_emb,
                 camera_hidden_states,
                 camera_conditions,
+                encoder_attention_mask,
             )
         batch_size = hidden_states.shape[0]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -1946,7 +1965,11 @@ class SanaWmBlock(nn.Module):
         ):
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         hidden_states = hidden_states + gate_msa * attn_output
-        hidden_states = hidden_states + self.cross_attn(hidden_states, encoder_hidden_states)
+        hidden_states = hidden_states + self.cross_attn(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_attention_mask,
+        )
         mlp_input = self._modulate(self.norm2(hidden_states), shift_mlp, scale_mlp)
         hidden_states = hidden_states + gate_mlp * self.mlp(mlp_input, spatial_shape)
         return hidden_states
@@ -1960,6 +1983,7 @@ class SanaWmBlock(nn.Module):
         rotary_emb: torch.Tensor | None,
         camera_hidden_states: torch.Tensor | None,
         camera_conditions: torch.Tensor | None,
+        encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-frame timestep modulation path matching NVlabs
         ``SanaVideoMSCamCtrlBlock.forward_frame_aware``.
@@ -2051,7 +2075,11 @@ class SanaWmBlock(nn.Module):
                 f"{_per_block_prefix}_post_attn.pt",
             )
 
-        hidden_states = hidden_states + self.cross_attn(hidden_states, encoder_hidden_states)
+        hidden_states = hidden_states + self.cross_attn(
+            hidden_states,
+            encoder_hidden_states,
+            encoder_attention_mask,
+        )
         if _do_dump:
             torch.save(hidden_states.detach().cpu(), f"{_per_block_prefix}_post_cross_attn.pt")
 
@@ -2516,6 +2544,7 @@ class SanaWmTransformer3DModel(nn.Module):
         timestep: torch.Tensor | float | int,
         *,
         encoder_hidden_states: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
         camera_hidden_states: torch.Tensor | None = None,
         camera_encoder: SanaWmCameraEmbedder | None = None,
         plucker: torch.Tensor | None = None,
@@ -2539,6 +2568,8 @@ class SanaWmTransformer3DModel(nn.Module):
             hidden_states = hidden_states.float()
             if encoder_hidden_states is not None:
                 encoder_hidden_states = encoder_hidden_states.float()
+            if encoder_attention_mask is not None:
+                encoder_attention_mask = encoder_attention_mask.to(device=hidden_states.device)
             if camera_hidden_states is not None:
                 camera_hidden_states = camera_hidden_states.float()
             if plucker is not None:
@@ -2577,6 +2608,19 @@ class SanaWmTransformer3DModel(nn.Module):
             dtype=hidden_states.dtype,
         )
         encoder_hidden_states = self.attention_y_norm(encoder_hidden_states)
+        if encoder_attention_mask is None:
+            encoder_attention_mask = torch.ones(
+                encoder_hidden_states.shape[:2],
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+        else:
+            encoder_attention_mask = encoder_attention_mask.to(device=hidden_states.device)
+            if encoder_attention_mask.shape != encoder_hidden_states.shape[:2]:
+                raise ValueError(
+                    "Sana-WM encoder_attention_mask must match text tokens "
+                    f"{tuple(encoder_hidden_states.shape[:2])}, got {tuple(encoder_attention_mask.shape)}."
+                )
 
         if not torch.is_tensor(timestep):
             timestep = torch.tensor([timestep], device=hidden_states.device, dtype=torch.float32)
@@ -2675,6 +2719,7 @@ class SanaWmTransformer3DModel(nn.Module):
                 rotary_emb,
                 camera_hidden_states,
                 camera_conditions,
+                encoder_attention_mask,
             )
             if _blocks_active and block_i in _blocks_idx_set:
                 _blocks_dump[f"block{block_i}_out"] = hidden_states.detach().cpu()
