@@ -418,6 +418,7 @@ class SanaWmPipeline(
             raise OSError("Could not load SANA-WM Stage-1 text encoder. Tried: " + "; ".join(errors))
         if getattr(self.tokenizer, "pad_token", None) is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "right"
         with torch.device("cpu"):
             self.text_encoder = AutoModelForCausalLM.from_pretrained(
                 text_encoder_model_id,
@@ -577,11 +578,11 @@ class SanaWmPipeline(
         return first_latent  # [1, 128, 1, lh, lw]
 
     def _stage1_prompt_text(self, prompt: dict[str, Any]) -> str:
-        parts = [part for part in self.sana_wm_config.chi_prompt if part]
         user_prompt = str(prompt.get("prompt") or "")
-        if user_prompt:
-            parts.append(user_prompt)
-        return "\n".join(parts)
+        chi_prompt = "\n".join(part for part in self.sana_wm_config.chi_prompt if part)
+        if chi_prompt:
+            return chi_prompt + user_prompt
+        return user_prompt
 
     def _hash_smoke_prompt_embeds(
         self,
@@ -620,16 +621,26 @@ class SanaWmPipeline(
         tokenizer = getattr(self, "tokenizer", None)
         if tokenizer is None or self.text_encoder is None:
             raise RuntimeError("Sana-WM Stage-1 text encoder did not initialize.")
+        chi_prompt = "\n".join(part for part in self.sana_wm_config.chi_prompt if part)
+        model_max_length = int(self.sana_wm_config.model_max_length)
+        max_length_all = model_max_length
+        if chi_prompt:
+            # NVlabs encodes the chi-prompt-prefixed text with extra room for
+            # the chi tokens, then keeps BOS plus the final model window.
+            max_length_all = len(tokenizer.encode(chi_prompt)) + model_max_length - 2
         encoded = tokenizer(
             [prompt_text],
             padding="max_length",
-            max_length=self.sana_wm_config.model_max_length,
+            max_length=max_length_all,
             truncation=True,
             add_special_tokens=True,
             return_tensors="pt",
         ).to(device)
         outputs = self.text_encoder(**encoded, output_hidden_states=True)
         hidden_states = outputs.hidden_states[-1]
+        if chi_prompt:
+            select_index = [0] + list(range(-model_max_length + 1, 0))
+            hidden_states = hidden_states[:, select_index]
         if hidden_states.shape[-1] != SANA_WM_STAGE1_PROMPT_CHANNELS:
             raise ValueError(
                 "Sana-WM Stage-1 Gemma hidden size mismatch: expected "

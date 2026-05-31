@@ -649,12 +649,16 @@ def test_sana_wm_native_smoke_prompt_embeddings_can_use_real_encoder(monkeypatch
         pad_token = None
         eos_token = "<eos>"
 
+        def encode(self, text):
+            return [0, 1, 2] if text else []
+
         def __call__(self, *args, **kwargs):
             class FakeBatch(dict):
                 def to(self, device):
                     return self
 
-            return FakeBatch(input_ids=torch.zeros(1, 2, dtype=torch.long))
+            max_length = int(kwargs.get("max_length", 2))
+            return FakeBatch(input_ids=torch.zeros(1, max_length, dtype=torch.long))
 
     class FakeModel(torch.nn.Module):
         @classmethod
@@ -662,7 +666,8 @@ def test_sana_wm_native_smoke_prompt_embeddings_can_use_real_encoder(monkeypatch
             return cls()
 
         def forward(self, *args, **kwargs):
-            return types.SimpleNamespace(hidden_states=[torch.ones(1, 2, 2304)])
+            length = int(kwargs["input_ids"].shape[1])
+            return types.SimpleNamespace(hidden_states=[torch.ones(1, length, 2304)])
 
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: FakeTokenizer())

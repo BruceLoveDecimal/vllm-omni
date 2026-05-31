@@ -2469,8 +2469,14 @@ class SanaWmTransformer3DModel(nn.Module):
         expected_tokens = spatial_shape[0] * spatial_shape[1] * spatial_shape[2]
         camera_hidden_states = self._match_tokens(camera_hidden_states, expected_tokens)
 
-        # Fuse per-pixel ray-direction map via raymap_embedder when available.
-        if spatial_raymap is not None and hasattr(self, "raymap_embedder"):
+        # Fuse per-pixel ray-direction map via raymap_embedder only on the
+        # non-plucker path. NVlabs skips the absmap/raymap embedder whenever
+        # chunk-plucker input or post-attention injection is enabled.
+        use_chunk_plucker = bool(
+            getattr(self.config, "use_chunk_plucker_input", False)
+            or getattr(self.config, "use_chunk_plucker_post_attn", False)
+        )
+        if spatial_raymap is not None and not use_chunk_plucker and hasattr(self, "raymap_embedder"):
             if spatial_raymap.ndim == 4:  # [C, F, H, W] → [1, C, F, H, W]
                 spatial_raymap = spatial_raymap.unsqueeze(0)
             spatial_raymap = spatial_raymap.to(device=device, dtype=dtype)
