@@ -1,8 +1,8 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-06-01 (revision 22 — engine-entered input parity and Stage-1 prompt fix)
+> **Audit date:** 2026-06-01 (revision 23 — step-0 transformer-body activation split)
 > **Branch:** `feat/sana_wm`
-> **Implementation snapshot:** fork worktree at `985e3a07` plus native BothTriton/VAE/e2e-harness/prompt diagnostic patches; late-step probes, frame-aligned e2e gates, and engine-entered input parity probes run on RTX PRO 6000 98GB
+> **Implementation snapshot:** fork worktree at `b5519311` plus native BothTriton/VAE/e2e-harness/prompt/activation diagnostic patches; late-step probes, frame-aligned e2e gates, engine-entered input parity probes, and prompt-fixed step-0 activation splits run on RTX PRO 6000 98GB
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
 > **Spec (single source of truth):**
 > [`sana_wm_integration.md`](sana_wm_integration.md)
@@ -15,11 +15,13 @@
 
 Revision-9 blockers are mostly closed. Short-sequence Stage-1 alignment is now
 strong; the open Stage-1 correctness gap is 321-frame trajectory-level drift in
-the controlled denoising loop (§6.13p-§6.13v). Scheduler update semantics,
+the controlled denoising loop (§6.13p-§6.13w). Scheduler update semantics,
 isolated block-local GDN/cam math, full-transformer fp32 precision, and the
 engine-entered transformer call site are now ruled out as primary causes. §6.13v
-also fixed a real Stage-1 prompt-tokenization mismatch; the remaining gap is
-inside native transformer-body parity under aligned step-0 inputs.
+also fixed a real Stage-1 prompt-tokenization mismatch. §6.13w localises the
+first material step-0 divergence to block-0 self-attention after tiny raw
+main/camera numeric deltas pass through the output projection; projection
+weights, bias, and implementation are exact under the same input.
 Long-sequence full e2e no longer shows an obvious
 321-vs-9 degradation after the VAE memory-mode and frame-index fixes
 (§6.14g-§6.14j), but strict NVlabs RGB parity is still far from the
@@ -27,24 +29,26 @@ PSNR/SSIM target.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | GDN Triton — long-sequence + multi-card parity vs. NVlabs | ⚠️ **Open** — main-branch GDN math verified equivalent (see §6.10); divergence is length-dependent. `chunk_size` hypothesis (§6.13q) was refuted (§6.13r). §6.13s found a real GDN cam-path mismatch: native applied Python PostUCPERenorm while NVlabs BothTriton does not. §6.13t then corrected an official-side probe artifact and showed same-input block-local math is close: block-0/block-18 `main_raw` MAE is `~1e-7/~1e-6`, block-18 `cam_raw` MAE is `0.0035-0.0055`, and late direct-transformer `noise_pred` MAE is only `~0.029`. §6.13v clears generic engine-entered call-site dispatch and fixes prompt-tokenization parity; the remaining step-0 residual is native transformer-body parity under aligned inputs, not an isolated GDN block. Frame-aligned full e2e 321f/20 did **not** degrade vs 9f/20 (§6.14j). |
+| 1 | GDN Triton — long-sequence + multi-card parity vs. NVlabs | ⚠️ **Open** — main-branch GDN math verified equivalent (see §6.10); divergence is length-dependent. `chunk_size` hypothesis (§6.13q) was refuted (§6.13r). §6.13s found a real GDN cam-path mismatch: native applied Python PostUCPERenorm while NVlabs BothTriton does not. §6.13t then corrected an official-side probe artifact and showed same-input block-local math is close: block-0/block-18 `main_raw` MAE is `~1e-7/~1e-6`, block-18 `cam_raw` MAE is `0.0035-0.0055`, and late direct-transformer `noise_pred` MAE is only `~0.029`. §6.13v clears generic engine-entered call-site dispatch and fixes prompt-tokenization parity. §6.13w shows the first step-0 divergence starts in block-0 attention internals at very small raw deltas (`main_raw` `5e-7`, `cam_raw` `1e-5`, `pre_proj` `6e-5`) and becomes visible after the exact output projection (`attn_out` `0.0228`). Frame-aligned full e2e 321f/20 did **not** degrade vs 9f/20 (§6.14j). |
 | 2 | First-frame VAE encode for I2V conditioning | ✅ **Closed** — commit `f7e59121` A.1 |
 | 3 | NVlabs flow-DPM solver | ✅ **Closed** — commit `f7e59121` A.2 (`DPMSolverMultistepScheduler`) |
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Verified 2026-05-28** — UCPE math (`ucpe.py`) and native raw camera branch match NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` at fp32 `~1e-7` max abs. See §6.12a. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | Per-token timestep sampling contract | ⚠️ **Short-sequence Stage-1 mostly closed; long-sequence transformer parity still open** — per-frame `(B, 1, F)` timestep, native per-token FlowMatch Euler, condition-mask restore, VAE norm, and softmax-UCPE camera branch are landed. Short 9-frame Stage-1 parity stays strong at 20/60 steps (generated cos `0.9878` / `0.9861`). The 321-frame / 20-step controlled-latent drop is **not** scheduler/step-count/fp32 (§6.13n–§6.13p), **not** missing `chunk_size` (§6.13r), and no longer points at isolated block-0/block-18 math under same-input direct-transformer probing (§6.13t). §6.13v clears the engine-entered call site: same dumped inputs reproduce engine output at generated cos `0.9999`; it also fixes a real Stage-1 prompt-tokenization mismatch. Frame-aligned full e2e 321f/20 and 321f/60 now run through refiner+VAE (§6.14j); the next Stage-1 target is remaining transformer-body parity at step 0 / early blocks. |
+| 8 | Per-token timestep sampling contract | ⚠️ **Short-sequence Stage-1 mostly closed; long-sequence transformer parity still open** — per-frame `(B, 1, F)` timestep, native per-token FlowMatch Euler, condition-mask restore, VAE norm, and softmax-UCPE camera branch are landed. Short 9-frame Stage-1 parity stays strong at 20/60 steps (generated cos `0.9878` / `0.9861`). The 321-frame / 20-step controlled-latent drop is **not** scheduler/step-count/fp32 (§6.13n–§6.13p), **not** missing `chunk_size` (§6.13r), and no longer points at isolated block-0/block-18 math under same-input direct-transformer probing (§6.13t). §6.13v clears the engine-entered call site: same dumped inputs reproduce engine output at generated cos `0.9999`; it also fixes a real Stage-1 prompt-tokenization mismatch. §6.13w then localises the first material divergence to block-0 self-attention output after tiny raw GDN/cam deltas are projected. Frame-aligned full e2e 321f/20 and 321f/60 now run through refiner+VAE (§6.14j); the next Stage-1 target is reducing this accumulated transformer numeric drift. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The UCPE / camera-control module is now
 numerically aligned with NVlabs (§6.12a), and the Stage-1 sampling contract has
 been tightened through native scheduler + softmax-UCPE fixes (§6.13m). However,
-§6.13n-§6.13v show a separate long-sequence Stage-1 gap at 321 frames before
-Stage-2. The engine-entered call site and raw inputs now mostly clear; the next
-work is prompt-fixed transformer-body parity at step 0 / early blocks. Full-chain
-321f/20 no longer degrades relative to 9f/20 under the frame-aligned e2e gate
-(§6.14j), but the absolute RGB metrics are still well below the acceptance
-target, so the next work remains numeric parity rather than photometric tuning.
+§6.13n-§6.13w show a separate long-sequence Stage-1 gap at 321 frames before
+Stage-2. The engine-entered call site, raw inputs, prompt path, projection
+weights, and projection implementation now clear; the remaining Stage-1 work is
+reducing accumulated transformer numeric drift that begins inside block-0
+attention raw branches. Full-chain 321f/20 no longer degrades relative to 9f/20
+under the frame-aligned e2e gate (§6.14j), but the absolute RGB metrics are
+still well below the acceptance target, so the next work remains numeric parity
+rather than photometric tuning.
 
 ---
 
@@ -1666,6 +1670,88 @@ residual is already visible at step 0, the next probe should split
 early-block activations under this prompt-fixed, cam-triton-importable
 setup rather than continuing to diff generic engine layers.
 
+#### 6.13w Prompt-fixed step-0 transformer activation split — first material divergence is block-0 attention projection output ⚠️ 2026-06-01
+
+Follow-up to §6.13v. The probe reuses aligned step-0 latents,
+per-frame timestep, prompt embeddings, and camera tensors, then compares
+NVlabs vs native activations inside the Stage-1 transformer.
+
+Artifacts:
+
+- `/root/autodl-tmp/stage1_longseq_probe/attn_split_probe_321f_steps0_promptfix_step0_blocks0_5_tritonmain.json`
+- `/root/autodl-tmp/stage1_longseq_probe/attn_split_probe_321f_steps0_promptfix_step0_block0_projcheck.json`
+- local/remote probe script:
+  `tools/sana_wm_attn_split_probe.py`
+
+Important instrumentation correction: the first block0-5 split used the
+older official-side hook that calls `BidirectionalGDN.forward(...)`,
+bypassing NVlabs' production Triton main path. That reproduces the
+§6.13t artifact and inflates block-0 `main_raw` to MAE `0.0075`. The
+accepted run below calls `BidirectionalGDNTriton.forward(...)` for
+NVlabs non-softmax blocks, matching the production path.
+
+**Step-0 block-0 isolated attention split, production Triton main path.**
+
+| Stage | Cosine | MAE | Max abs | Notes |
+|---|---:|---:|---:|---|
+| `attn_in` | 1.000000 | 0.000000 | 0.0000 | block input is exact |
+| `main_raw` | 1.000000 | 0.0000005 | 0.0625 | production Triton main path clears |
+| `cam_raw` | 0.999822 | 0.0000126 | 0.4063 | residual exists but tiny |
+| `cam_contrib` | 0.999931 | 0.0000197 | 0.0146 | after `out_proj_cam` |
+| `combined` | 1.000000 | 0.0000190 | 0.0625 | `main_raw + cam_contrib` |
+| `output_gate` | 1.000000 | 0.000000 | 0.0000 | exact |
+| `pre_proj` | 1.000000 | 0.0000599 | 0.2500 | tiny drift before output projection |
+| `attn_out` | 0.999998 | 0.0227748 | 4.0000 | first material amplification |
+
+The full forward shows the same first jump and then accumulation:
+
+| Signal | Cosine | MAE | Notes |
+|---|---:|---:|---|
+| block-0 `attn_out` | 0.999998 | 0.02277 | isolated and full are identical |
+| block-1 `attn_in` | 0.99221 | 0.01208 | block-0 residual has entered the next block |
+| step-0 `noise_pred` | 0.98881 | 0.12383 | same residual scale as §6.13v |
+
+**Projection check.**
+
+The block-0 output projection itself is not the cause:
+
+| Check | MAE | Result |
+|---|---:|---|
+| native `proj.weight` vs NVlabs `proj.weight` | 0.0 | exact |
+| native `proj.bias` vs NVlabs `proj.bias` | 0.0 | exact |
+| official `F.linear(official_pre_proj)` vs official module output | 0.0 | exact |
+| native `F.linear(official_pre_proj)` vs official `F.linear(official_pre_proj)` | 0.0 | exact |
+| native module vs native `F.linear(official_pre_proj)` | 0.0 | exact |
+
+Setting `VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS=1` does not change the
+block-0 numbers, so this is not a vLLM `RowParallelLinear` dispatch
+issue. With identical `pre_proj`, both sides produce identical
+`attn_out`. The observed `0.0228` output delta is therefore the
+projection of the tiny upstream `pre_proj` delta, not a projection
+weight or implementation mismatch.
+
+**Current localisation.**
+
+The first non-zero difference is already inside block-0 attention raw
+math at very small magnitude:
+
+- GDN main branch: `main_raw` MAE `5.1e-7`;
+- camera branch: `cam_raw` MAE `1.26e-5`, `cam_contrib` MAE `1.97e-5`;
+- shared gate is exact;
+- output projection is exact for identical input.
+
+This points at accumulated bf16/fused-kernel numeric drift between the
+native and NVlabs GDN/camera kernels, not a remaining scheduler, prompt,
+camera tensor, engine dispatch, or linear weight-loading bug. The next
+useful probe is either:
+
+1. run a block-0 raw-branch micro-split (`qkv`, `conv_k`, `q_norm/k_norm`,
+   `beta/decay`, Triton scan output, cam prep/scan) to identify which
+   small raw delta appears first; or
+2. quantify whether these tiny raw deltas alone explain final
+   `noise_pred` MAE by teacher-forcing official block-0 `pre_proj` or
+   `attn_out` into the native trajectory.
+
 ### 6.14 Refiner/VAE/RGB Photometric Chain Probe — Native Refiner Contract Dominates 🔴 2026-05-29
 
 After §6.13m tightened Stage-1 latent parity, the next question was
@@ -2776,21 +2862,21 @@ Stage-1 path needs a new contract:
 
 12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). The first fix matched NVlabs' Python `BidirectionalGDNUCPESinglePathLiteLA` path with single-path recurrence, `apply_fn_o`, and PostUCPERenorm, dropping STAGE1_STEPS=1 from `[-59, 61]` to `[-12.3, 11.8]`. §6.13s later corrected the production GDN path to match the loaded NVlabs BothTriton class, where GDN cam Q/K/V are **not** PostUCPERenorm-shrunk before the scan.
 
-13. ⚠️ **Stage-1 native scheduler/softmax-UCPE/BothTriton alignment (§6.13m-§6.13v).** Controlled 3-step and 9-frame 20/60-step parity are strong (generated cos `0.986-0.988`). Production-length 321-frame / 20-step parity previously dropped to generated cos `~0.75`; §6.13s found a real long-sequence bug in the GDN cam branch: native matched the Python camera baseline, while NVlabs loads the BothTriton path with no PostUCPERenorm before `cam_scan_bidi_chunkwise`. §6.13t corrected the official-side probe to keep NVlabs' production Triton main path and showed isolated block-0/block-18 math is now close (`main_raw` `~1e-7/~1e-6`, block-18 `cam_raw` `0.0035-0.0055`, late direct-transformer `noise_pred` `~0.029`). §6.13v then cleared the engine-entered call site: same dumped inputs reproduce engine output at generated cos `0.9999`, and a real Stage-1 prompt-tokenization mismatch was fixed to prompt MAE `0.0`. The remaining 321f step-0 gap is now native transformer-body parity under aligned inputs (`noise_pred` MAE `~0.124`), not scheduler, weight loading, prompt embeddings, camera tensors, or generic engine dispatch.
+13. ⚠️ **Stage-1 native scheduler/softmax-UCPE/BothTriton alignment (§6.13m-§6.13w).** Controlled 3-step and 9-frame 20/60-step parity are strong (generated cos `0.986-0.988`). Production-length 321-frame / 20-step parity previously dropped to generated cos `~0.75`; §6.13s found a real long-sequence bug in the GDN cam branch: native matched the Python camera baseline, while NVlabs loads the BothTriton path with no PostUCPERenorm before `cam_scan_bidi_chunkwise`. §6.13t corrected the official-side probe to keep NVlabs' production Triton main path and showed isolated block-0/block-18 math is now close (`main_raw` `~1e-7/~1e-6`, block-18 `cam_raw` `0.0035-0.0055`, late direct-transformer `noise_pred` `~0.029`). §6.13v then cleared the engine-entered call site and fixed prompt-tokenization parity. §6.13w localises the remaining 321f step-0 gap to accumulated transformer numeric drift that begins inside block-0 attention raw branches (`main_raw` `5e-7`, `cam_raw` `1e-5`, `pre_proj` `6e-5`) and is first materially amplified at exact output projection (`attn_out` `0.0228`), not scheduler, weight loading, prompt embeddings, camera tensors, generic engine dispatch, or projection weights.
 
-14. ⚠️ **Stage-2 refiner/VAE contract alignment (§6.14).** The structural NVlabs refiner contract is now ported: sink/current split, seed-42 current noise, per-token timestep, video-only streaming mask, x0/velocity loop, and terminal-zero sigma. Same-source native vs official-manual refiner is generated-frame latent MAE=0.3589 / cos=0.8912. §6.14g also aligns the LTX-2 VAE memory-mode contract (`enable_tiling` + framewise decoding), allowing native 321-frame decode on 98GB; this is upstream-native memory behavior, not an OOM workaround. §6.14h/§6.14i fix the local e2e harness controls for action length, Stage-1 steps, metrics JSON, frame-index alignment, and frame-0 sanity, and §6.14j records the frame-aligned 9f/321f e2e rerun. Remaining gap is accumulated bf16 drift across vLLM-native vs diffusers LTX-2 layers plus the unresolved Stage-1 transformer-body parity issue, not scheduler, prompt connector, missing weights, generic engine dispatch, or VAE OOM.
+14. ⚠️ **Stage-2 refiner/VAE contract alignment (§6.14).** The structural NVlabs refiner contract is now ported: sink/current split, seed-42 current noise, per-token timestep, video-only streaming mask, x0/velocity loop, and terminal-zero sigma. Same-source native vs official-manual refiner is generated-frame latent MAE=0.3589 / cos=0.8912. §6.14g also aligns the LTX-2 VAE memory-mode contract (`enable_tiling` + framewise decoding), allowing native 321-frame decode on 98GB; this is upstream-native memory behavior, not an OOM workaround. §6.14h/§6.14i fix the local e2e harness controls for action length, Stage-1 steps, metrics JSON, frame-index alignment, and frame-0 sanity, and §6.14j records the frame-aligned 9f/321f e2e rerun. Remaining gap is accumulated bf16 drift across vLLM-native vs diffusers LTX-2 layers plus the unresolved Stage-1 block-0 raw-branch numeric drift, not scheduler, prompt connector, missing weights, generic engine dispatch, projection weights, or VAE OOM.
 
 ---
 
 ## 8. Outstanding Work — GPU Required
 
-1. **Fix remaining 321-frame Stage-1 transformer-body residual after §6.13v.** The block-18 split found and fixed a concrete production-path mismatch: native GDN cam branch was applying Python PostUCPERenorm while NVlabs BothTriton feeds raw UCPE-transformed Q/K/V into `cam_scan_bidi_chunkwise`. A later true-production probe showed isolated block-0/block-18 math is close under the same `attn_in`. §6.13v then verified that the engine-entered call site recalls at generated cos `0.9999`, fixed prompt embeddings to exact parity, and confirmed raw step-0 latents/timestep/prompt/camera tensors align. The current residual is inside native transformer-body parity under aligned inputs; split prompt-fixed early-block activations (`x_embedder`, camera projection, `attn_in`, `main_raw`, `cam_raw`, `attn_out`, cross-attn/text path) against NVlabs at full 321-frame shape.
+1. **Reduce remaining 321-frame Stage-1 block-0 raw-branch drift after §6.13w.** The block-18 split found and fixed a concrete production-path mismatch: native GDN cam branch was applying Python PostUCPERenorm while NVlabs BothTriton feeds raw UCPE-transformed Q/K/V into `cam_scan_bidi_chunkwise`. §6.13v verified that the engine-entered call site recalls at generated cos `0.9999`, fixed prompt embeddings to exact parity, and confirmed raw step-0 latents/timestep/prompt/camera tensors align. §6.13w then showed block-0 `attn_in`, output gate, projection weights, and projection implementation are exact; the remaining drift begins inside the block-0 raw GDN/camera branches and is amplified by the output projection. Next split should target raw sub-stages (`qkv`, `conv_k`, `q_norm/k_norm`, `beta/decay`, Triton scan output, cam prep/scan) or teacher-force official block-0 `pre_proj`/`attn_out` into native to quantify downstream accumulation.
 
 2. **Regenerate same-source Stage-2 refiner acceptance artifacts (§6.14).** The 321-frame e2e gate now runs through native refiner+VAE after the VAE memory-mode and frame-index fixes (§6.14g-§6.14j), but strict refiner latent parity is still not closed. Regenerate the official refiner baseline and prompt-connector dump in one run, then decide whether strict cos ≥0.98 requires a diffusers-exact fallback or a refiner-specific torch-linear layer stack.
 
 3. **Wire PSNR ≥ 30 / SSIM-Y ≥ 0.93** once harness produces a qualifying result.
 
-4. **GDN multi-step parity** at full 704×1280 / 321 frames vs official NVlabs path. Frame-aligned full e2e 321f/20 and 321f/60 now run, same-input block-local GDN math is close after §6.13t, and §6.13v proves the native engine path can feed the same tensors into the same standalone transformer path. The next parity target is the first transformer sub-stage that diverges under the prompt-fixed full-shape step-0 inputs.
+4. **GDN multi-step parity** at full 704×1280 / 321 frames vs official NVlabs path. Frame-aligned full e2e 321f/20 and 321f/60 now run, same-input block-local GDN math is close after §6.13t, §6.13v proves the native engine path can feed the same tensors into the same standalone transformer path, and §6.13w localises the first material residual to block-0 raw-branch numeric drift amplified through an exact projection.
 
 5. **CUDA Graph capture smoke** — confirm no regression vs fused-GDN e2e when bucket capture fires.
 
@@ -2814,7 +2900,7 @@ Stage-1 path needs a new contract:
 
 ### 9.2 Single-GPU correctness (GPU)
 
-6. Reduce the remaining 321-frame Stage-1 transformer-body residual after the §6.13v engine-entered input parity probe.
+6. Reduce the remaining 321-frame Stage-1 block-0 raw-branch drift after the §6.13w activation split.
 7. Re-run short 9-frame full-chain reference alignment after any Stage-1 fix.
 8. Wire PSNR/SSIM assertions once the short harness qualifies.
 9. GDN full-shape parity at 704×1280 (commit `tests/e2e/accuracy/` result as markdown).
