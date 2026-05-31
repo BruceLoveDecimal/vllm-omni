@@ -1,8 +1,8 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-06-01 (revision 24 — prompt-mask cross-attn fix + step-0 parity collapse)
+> **Audit date:** 2026-06-01 (revision 26 — cam-prep + post-mask trajectory rerun)
 > **Branch:** `feat/sana_wm`
-> **Implementation snapshot:** fork worktree at `b5519311` plus native BothTriton/VAE/e2e-harness/prompt/activation diagnostic patches; late-step probes, frame-aligned e2e gates, engine-entered input parity probes, and prompt-fixed step-0 activation splits run on RTX PRO 6000 98GB
+> **Implementation snapshot:** fork worktree at `d3ed5411` plus native BothTriton/VAE/e2e-harness/prompt/activation diagnostic patches, native `cam_prep_func` port, late-step probes, frame-aligned e2e gates, engine-entered input parity probes, prompt-fixed step-0 activation splits, post-prompt-mask 4-row full e2e gate, and current-workdir 321f/20 Stage-1 trajectory rerun on RTX PRO 6000 98GB
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
 > **Spec (single source of truth):**
 > [`sana_wm_integration.md`](sana_wm_integration.md)
@@ -15,7 +15,7 @@
 
 Revision-9 blockers are mostly closed. Short-sequence Stage-1 alignment is now
 strong; the open Stage-1 correctness gap is 321-frame trajectory-level drift in
-the controlled denoising loop (§6.13p-§6.13x). Scheduler update semantics,
+the controlled denoising loop (§6.13p-§6.14l). Scheduler update semantics,
 isolated block-local GDN/cam math, full-transformer fp32 precision, and the
 engine-entered transformer call site are now ruled out as primary causes. §6.13v
 also fixed a real Stage-1 prompt-tokenization mismatch. §6.13w localised the
@@ -23,31 +23,39 @@ first material step-0 divergence to block-0 self-attention; §6.13x then found
 the dominant downstream error was native cross-attn ignoring the prompt padding
 mask. Passing the NVlabs prompt mask through native cross-attn collapses
 321-frame step-0 `noise_pred` MAE from `0.12383` to `0.01211`.
-Long-sequence full e2e no longer shows an obvious
-321-vs-9 degradation after the VAE memory-mode and frame-index fixes
-(§6.14g-§6.14j), but strict NVlabs RGB parity is still far from the
-PSNR/SSIM target.
+Native `cam_prep_func` has now replaced the Python Q/K/V UCPE prep path
+(§6.14l); this is e2e-neutral on 9f/20 (`generated MAE 61.17 -> 61.70`,
+SSIM-Y unchanged). The corrected current-workdir 321f/20 Stage-1 trajectory
+rerun improves final generated latent MAE from the stale-probe `0.4085` to
+`0.1177` with cosine `0.9751`; masked teacher-forced one-step replay shows
+the scheduler update formula is not the first-order issue. Long-sequence full
+e2e no longer shows an obvious 321-vs-9 degradation after the VAE memory-mode
+and frame-index fixes (§6.14g-§6.14l). The post-prompt-mask rerun improves
+321f/20 to generated MAE `39.32` / PSNR `14.30` / SSIM-Y `0.244`, but strict
+NVlabs RGB parity is still far from the PSNR/SSIM target.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | GDN Triton — long-sequence + multi-card parity vs. NVlabs | ⚠️ **Mostly numeric-only now** — §6.13x shows raw Q/K/V, K conv, Q/K inv-RMS, beta/decay are exact. Native Python UCPE prep still differs from NVlabs `cam_prep_func`, but replacing it closes `cam_raw` to `~1e-9`. The larger step-0 gap was native cross-attn missing prompt padding mask; fixing that drops baseline 321f step-0 `noise_pred` MAE `0.12383 -> 0.01211` (cos `0.999887`). Remaining attention deltas are GDN/cam fused numeric residuals (`attn_out` MAE `0.0228`) rather than scheduler/weight/prompt/call-site semantic bugs. Frame-aligned full e2e 321f/20 did **not** degrade vs 9f/20 (§6.14j). |
+| 1 | GDN Triton — long-sequence + multi-card parity vs. NVlabs | ⚠️ **Mostly numeric-only now** — §6.13x shows raw Q/K/V, K conv, Q/K inv-RMS, beta/decay are exact. Native `cam_prep_func` now ports the NVlabs fused camera-prep contract (§6.14l); direct kernel parity passes and 9f/20 e2e is essentially neutral. The larger step-0 gap was native cross-attn missing prompt padding mask; fixing that drops baseline 321f step-0 `noise_pred` MAE `0.12383 -> 0.01211` (cos `0.999887`). Remaining attention deltas are trajectory-feedback numeric residuals rather than scheduler/weight/prompt/call-site semantic bugs. Frame-aligned full e2e 321f/20 did **not** degrade vs 9f/20 and improves again after the prompt-mask fix (§6.14k). |
 | 2 | First-frame VAE encode for I2V conditioning | ✅ **Closed** — commit `f7e59121` A.1 |
 | 3 | NVlabs flow-DPM solver | ✅ **Closed** — commit `f7e59121` A.2 (`DPMSolverMultistepScheduler`) |
 | 4 | UCPE branch decomposition + numeric Plücker reference test | ✅ **Verified 2026-05-28** — UCPE math (`ucpe.py`) and native raw camera branch match NVlabs `prepare_prope_fns` + `BidirectionalGDNUCPESinglePathLiteLA._forward_cam_branch` at fp32 `~1e-7` max abs. See §6.12a. |
 | 6 | vLLM parallel linear weight loading | ✅ **Fixed 2026-05-28** — `use_official_backend` gating tightened to require explicit `VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`. Loaded weight norms verified on GPU. See §6.11. |
 | 7 | Stage-1 latent magnitude vs LTX-2 refiner | ✅ **Fixed 2026-05-28** — cam branch rewritten as `BidirectionalGDNUCPESinglePathLiteLA` (single-path + apply_fn_o + RMS renorm). Latent in normal range now. See §6.12. |
-| 8 | Per-token timestep sampling contract | ✅ **Stage-1 step-0 semantic path mostly closed** — per-frame `(B, 1, F)` timestep, native per-token FlowMatch Euler, condition-mask restore, VAE norm, softmax-UCPE, prompt tokenization, and prompt padding mask are landed. §6.13x collapses 321f step-0 baseline `noise_pred` MAE from `0.12383` to `0.01211`; with official main+cam attention ablation it is `0.01280`, showing the remaining gap is no longer dominated by scheduler or cross-attn mask semantics. Full 20/60-step and e2e gates should be rerun after this mask fix. |
+| 8 | Per-token timestep sampling contract | ✅ **Stage-1 step-0 semantic path mostly closed** — per-frame `(B, 1, F)` timestep, native per-token FlowMatch Euler, condition-mask restore, VAE norm, softmax-UCPE, prompt tokenization, and prompt padding mask are landed. §6.13x collapses 321f step-0 baseline `noise_pred` MAE from `0.12383` to `0.01211`; with official main+cam attention ablation it is `0.01280`, showing the remaining gap is no longer dominated by scheduler or cross-attn mask semantics. §6.14l reruns controlled 321f/20 with the corrected current workdir and native cam prep: final generated latent MAE is `0.1177` / cos `0.9751`, and masked teacher-forced replay confirms the scheduler update formula is aligned. 321f/60 remains pending. |
 | 5 | TP layers → HSDP+USP → CUDA Graphs → Cache-DiT (ordered DAG) | ⚠️ **Partial** — TP + CUDA Graphs done; HSDP+USP CPU-static only; Cache-DiT not registered |
 
 **Implication for reference alignment:** The UCPE / camera-control module is now
 numerically aligned with NVlabs (§6.12a), and the Stage-1 sampling contract has
 been tightened through native scheduler + softmax-UCPE fixes (§6.13m). However,
-§6.13n-§6.13x show the 321-frame Stage-1 gap before Stage-2 was mostly a
-cross-attn prompt-mask semantic miss, with smaller remaining GDN/cam fused
-numeric residuals. The engine-entered call site, raw inputs, prompt path,
-projection weights, projection implementation, and prompt mask now clear.
+§6.13n-§6.14l show the 321-frame Stage-1 gap before Stage-2 was mostly a
+cross-attn prompt-mask semantic miss, followed by trajectory-feedback
+amplification of small per-step residuals. The engine-entered call site, raw
+inputs, prompt path, projection weights, projection implementation, prompt
+mask, native camera-prep contract, and scheduler update replay now clear.
 Full-chain 321f/20 no longer degrades relative to 9f/20
-under the frame-aligned e2e gate (§6.14j), but the absolute RGB metrics are
+under the frame-aligned e2e gate (§6.14j-§6.14l), and the post-mask
+321f/20 rerun improves generated MAE to `39.32`. The absolute RGB metrics are
 still well below the acceptance target, so the next work remains numeric parity
 rather than photometric tuning.
 
@@ -1840,8 +1848,8 @@ semantic bug. The next target is the smaller numeric tail:
   UCPE prep path;
 - continue reducing the main GDN fused-scan residual (`main_raw`
   `5.1e-7`, amplified by the output projection);
-- rerun 321f 20/60-step controlled denoise and full e2e gates after the
-  prompt-mask fix.
+- rerun 321f 20/60-step controlled denoise after the prompt-mask fix
+  (full e2e gate rerun is recorded in §6.14k).
 
 ### 6.14 Refiner/VAE/RGB Photometric Chain Probe — Native Refiner Contract Dominates 🔴 2026-05-29
 
@@ -2232,6 +2240,280 @@ Interpretation:
   the next numeric probes should target prompt-fixed Stage-1 early-block
   transformer parity and same-source refiner latent parity before
   photometric tuning.
+
+#### 6.14k Post-prompt-mask full e2e rerun — 321f/20 improves, 60-step still trades MAE for SSIM ✅ 2026-06-01
+
+After the §6.13x prompt-mask fix, reran the full-chain gate on the RTX
+PRO 6000 target for all four requested rows:
+
+- reference: NVlabs in-process backend through `SanaWmTwoStagesPipeline`;
+- candidate: vLLM-Omni native Stage-1 + native in-process refiner/VAE;
+- Stage-2 refiner steps: `3`;
+- `SANA_WM_CAM_TRITON=1`;
+- `SANA_WM_E2E_MODEL_CLASS=SanaWmTwoStagesPipeline`;
+- native token cap lifted with `SANA_WM_E2E_NATIVE_SMOKE_MAX_TOKENS=40000`;
+- default frame alignment: `SANA_WM_E2E_FRAME_ALIGNMENT=auto`.
+
+One harness pitfall was caught before accepting the row: leaving
+`SANA_WM_E2E_MODEL_CLASS` at its default `SanaWmPipeline` made both
+the reference and candidate calls use the same NVlabs in-process backend,
+producing a false `0.0` MAE. The valid rows below all use
+`SanaWmTwoStagesPipeline`.
+
+Artifacts:
+
+- `/root/autodl-tmp/stage1_longseq_probe/e2e_gate_promptmask_20260601_twostage/metrics_9f_20s_promptmask_twostage.json`
+- `/root/autodl-tmp/stage1_longseq_probe/e2e_gate_promptmask_20260601_twostage/metrics_9f_60s_promptmask_twostage.json`
+- `/root/autodl-tmp/stage1_longseq_probe/e2e_gate_promptmask_20260601_twostage/metrics_321f_20s_promptmask_twostage.json`
+- `/root/autodl-tmp/stage1_longseq_probe/e2e_gate_promptmask_20260601_twostage/metrics_321f_60s_promptmask_twostage.json`
+- `/root/autodl-tmp/stage1_longseq_probe/e2e_gate_promptmask_20260601_twostage/run_9f_20s_promptmask_twostage.log`
+- `/root/autodl-tmp/stage1_longseq_probe/e2e_gate_promptmask_20260601_twostage/run_9f_60s_promptmask_twostage.log`
+- `/root/autodl-tmp/stage1_longseq_probe/e2e_gate_promptmask_20260601_twostage/run_321f_20s_promptmask_twostage.log`
+- `/root/autodl-tmp/stage1_longseq_probe/e2e_gate_promptmask_20260601_twostage/run_321f_60s_promptmask_twostage.log`
+
+Frame-aligned RGB metrics:
+
+| Config | Pred frames | Ref frames | Alignment | Frame0 PSNR | Generated frames | Generated MAE | Generated PSNR | Generated SSIM-Y | Global MAE | Global PSNR | Global SSIM-Y |
+|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 9f / 20-step | 9 | 8 | `auto_prepend_reference_frame0` | 35.78 | 8 | 61.1686 | 9.75 | 0.1050 | 54.7352 | 10.26 | 0.1882 |
+| 9f / 60-step | 9 | 8 | `auto_prepend_reference_frame0` | 35.98 | 8 | 68.1117 | 9.02 | 0.0346 | 60.8908 | 9.53 | 0.1271 |
+| 321f / 20-step | 321 | 320 | `auto_prepend_reference_frame0` | 32.85 | 320 | **39.3226** | **14.30** | 0.2438 | **39.2151** | **14.31** | 0.2458 |
+| 321f / 60-step | 321 | 320 | `auto_prepend_reference_frame0` | 33.25 | 320 | 49.3557 | 12.26 | **0.2968** | 49.2166 | 12.27 | **0.2987** |
+
+Interpretation:
+
+- Frame-0 sanity passes on every valid row (`32.85-35.98 dB`), so the
+  frame-index contract is still correct.
+- The prompt-mask fix improves the production-length 20-step full chain:
+  `321f/20` generated MAE improves from `41.7494` (§6.14j) to
+  `39.3226`, generated PSNR from `13.82` to `14.30`, and generated
+  SSIM-Y from `0.1947` to `0.2438`.
+- `321f/60` also improves versus §6.14j (`53.0073 -> 49.3557` generated
+  MAE, `0.2313 -> 0.2968` generated SSIM-Y), but it still worsens MAE/PSNR
+  versus `321f/20`. More Stage-1 steps remain a structure-vs-photometric
+  tradeoff, not a strict RGB-parity win.
+- `9f/60` is worse than `9f/20` across generated MAE/PSNR/SSIM-Y, so the
+  60-step issue is not only a long-sequence phenomenon.
+- The long-sequence degradation hypothesis remains unsupported: `321f/20`
+  is substantially better than `9f/20` on generated MAE, PSNR, and SSIM-Y.
+  Strict RGB acceptance is still far away; next numeric work should focus on
+  controlled post-mask Stage-1 20/60-step latent parity and same-source
+  Stage-2 refiner latent parity.
+
+#### 6.14l Native cam-prep + post-mask Stage-1 trajectory replay — scheduler update ruled out ⚠️ 2026-06-01
+
+Implemented a native PyTorch `cam_prep_func` port matching NVlabs'
+`diffusion.model.ops.fused_cam_gdn.cam_prep_func` contract:
+
+- full-channel Q/K RMSNorm, ReLU, and K scale;
+- UCPE 4x4 ray projection on the first half of each head;
+- interleaved-pair RoPE on the second half;
+- V transform without Q/K RMSNorm/ReLU;
+- K norm inflation reporting for dynamic beta discounting;
+- output layout `(B, H, D, N)`, matching the fused kernel.
+
+Validation:
+
+- local compile / diff checks passed;
+- remote RTX PRO 6000 unit parity against NVlabs CUDA `cam_prep_func`
+  passed (`tests/diffusion/models/sana_wm/test_sana_wm_cam_prep.py`);
+- camera-branch smoke and UCPE/blocker subset passed on GPU.
+
+**9f / 20-step full-chain e2e after native cam-prep.**
+
+Same harness contract as §6.14k:
+
+- reference: NVlabs in-process backend through `SanaWmTwoStagesPipeline`;
+- candidate: vLLM-Omni native Stage-1 + native in-process refiner/VAE;
+- Stage-1 steps: `20`;
+- Stage-2 refiner steps: `3`;
+- `SANA_WM_CAM_TRITON=1`;
+- `SANA_WM_E2E_MODEL_CLASS=SanaWmTwoStagesPipeline`;
+- frame alignment: `auto_prepend_reference_frame0`.
+
+Artifact:
+
+- `/root/autodl-tmp/stage1_longseq_probe/e2e_cam_prep_20260601_031344/metrics_9f_20s_cam_prep.json`
+
+| Config | Global MAE | Global PSNR | Global SSIM-Y | Frame0 PSNR | Generated MAE | Generated PSNR | Generated SSIM-Y |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| §6.14k 9f/20 pre-cam-prep | 54.7352 | 10.26 | 0.1882 | 35.78 | 61.1686 | 9.75 | 0.1050 |
+| native `cam_prep_func` | 55.2057 | 10.22 | 0.1889 | 35.91 | 61.7005 | 9.71 | 0.1051 |
+
+Interpretation: the native cam-prep port is e2e-neutral on the short
+full-chain gate (`+0.53` generated MAE, SSIM unchanged). This is not a new
+RGB-parity lever; it closes the camera-prep semantic contract and keeps the
+remaining error in Stage-1 trajectory/refiner sensitivity.
+
+**Probe harness caveat fixed.**
+
+The existing remote `run_multistep_current.py` wrapper only changed the
+outer probe workdir. The imported
+`/root/autodl-tmp/stage1_denoise_probe/run_stage1_denoise_probe.py` still had
+a module-level `WORKDIR` pointing to the stale
+`/root/autodl-tmp/synced-from-5090/vllm-omni-5090-stage1-align` checkout.
+That stale path reproduced old pre-prompt-mask behavior and produced an
+incorrect post-mask free-run final generated MAE `0.4085` / cosine `0.7491`.
+
+Added a small wrapper:
+
+- local: `tools/sana_wm_multistep_current_fixed.py`;
+- remote synced copy:
+  `/root/autodl-tmp/probe-vllm-omni-feat-sana-wm/tools/sana_wm_multistep_current_fixed.py`.
+
+The wrapper fixes both the outer multistep probe workdir and the inner
+stage-1 probe module's `WORKDIR` / `sys.path` before running the existing
+controlled probe.
+
+**Corrected current-workdir 321f / 20-step Stage-1 free-run.**
+
+Artifacts:
+
+- `/root/autodl-tmp/stage1_longseq_probe/multistep_controlled_probe_321f_20step.json`
+- `/root/autodl-tmp/stage1_longseq_probe/run_multistep_current_fixed_file_cam_prep_*.log`
+
+| Step | `t` | Pre-step generated latent MAE | Generated `noise_pred` MAE | Generated `noise_pred` cos |
+|---:|---:|---:|---:|---:|
+| 0 | 1000.0000 | 0.000000 | 0.011681 | 0.999835 |
+| 1 | 994.4205 | 0.000000 | 0.017176 | 0.999705 |
+| 5 | 965.2842 | 0.000714 | 0.038419 | 0.998628 |
+| 10 | 900.0266 | 0.004103 | 0.076625 | 0.994394 |
+| 15 | 732.2700 | 0.018916 | 0.122004 | 0.986119 |
+| 18 | 392.4376 | 0.061878 | 0.152962 | 0.973940 |
+| 19 | 87.7046 | 0.106024 | 0.143141 | 0.965639 |
+
+Final generated latent:
+
+| Metric | Value |
+|---|---:|
+| MAE | 0.117717 |
+| RMSE | 0.174175 |
+| Cosine | 0.975069 |
+
+This materially improves on the stale-probe row (`MAE 0.4085`, cosine
+`0.7491`) and shows the post-prompt-mask Stage-1 trajectory is much closer,
+but not closed.
+
+**Masked teacher-forced per-step replay.**
+
+To separate local transformer residuals from trajectory feedback, reran the
+teacher-forced probe with two fixes:
+
+1. use the current workdir;
+2. explicitly pass the prompt `encoder_attention_mask` reconstructed from
+   the same Gemma tokenizer contract. The mask has shape `(1, 300)` and
+   `mask_sum=12.0`.
+
+Artifacts:
+
+- `/root/autodl-tmp/stage1_longseq_probe/teacher_forced_native_on_official_trace_321f_20step_masked_cam_prep.json`
+- `/root/autodl-tmp/stage1_longseq_probe/run_teacher_forced_masked_cam_prep_*.log`
+
+| Step | `t` | Native-vs-NVlabs `noise_pred` MAE | `noise_pred` cos | Native one-step MAE vs official next | Official source replay MAE |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1000.0000 | 0.011657 | 0.999836 | 0.004797 | 0.0048 |
+| 1 | 994.4205 | 0.017074 | 0.999707 | 0.000093 | 0 |
+| 5 | 965.2842 | 0.013703 | 0.999800 | 0.000134 | 7.69e-11 |
+| 10 | 900.0266 | 0.012166 | 0.999846 | 0.000250 | 1.44e-08 |
+| 15 | 732.2700 | 0.011668 | 0.999865 | 0.000829 | 6.54e-09 |
+| 18 | 392.4376 | 0.016033 | 0.999690 | 0.004886 | 0 |
+| 19 | 87.7046 | 0.018768 | 0.999478 | 0.001647 | 0 |
+
+Interpretation:
+
+- The scheduler update formula is effectively aligned. Official
+  `noise_pred` replay reaches the official next latent at zero or near-zero
+  error for all non-step-0 rows; step 0's `0.0048` is the known conditioning
+  first-step edge and matches native one-step scale.
+- Native local `noise_pred` residual on the official trajectory is small
+  (`~0.012-0.019` generated MAE, cos `>0.99947`), and one-step latent
+  perturbation is usually `<=0.001`, rising to `0.0049` at the large
+  low-sigma step 18.
+- The free-run gap (`final generated MAE 0.1177`) is therefore a
+  trajectory-feedback / manifold-sensitivity issue: small per-step residuals
+  compound once the native latent leaves the official trajectory, and the
+  feedback becomes visible in later denoise steps (`step15+`), rather than a
+  scheduler-sign or timestep-update formula bug.
+
+Next useful Stage-1 probe: run block/attention split on the corrected
+current-workdir free-run latents at steps `15`, `18`, and `19`, where the
+feedback-amplified `noise_pred` MAE reaches `0.122-0.153`, and compare it
+against masked teacher-forced residuals. The target is to identify which
+block/path is most sensitive to off-manifold latent drift, not to change the
+scheduler formula.
+
+#### 6.14m Refiner same-source diff + 48-block cliff localisation ⚠️ 2026-06-01
+
+Reconfirmed §6.14e same-source refiner gap from the existing May-29
+artifacts (refiner code unchanged across commits `985e3a07..d3ed5411`):
+
+| Stage | cos | MAE | max |
+|---|---:|---:|---:|
+| `initial_noisy` | **+1.0000** | 0.0000 | 0.0 |
+| `denoised_step0` | +0.9703 | 0.183 | 3.57 |
+| `velocity_step0` | +0.9781 | 0.201 | 3.93 |
+| `noisy_after_step0` | +0.9976 | 0.037 | 0.72 |
+| `denoised_step1` | +0.8888 | 0.372 | 5.55 |
+| `velocity_step1` | +0.8908 | 0.501 | 7.36 |
+| `noisy_after_step1` | +0.9538 | 0.164 | 2.44 |
+| `denoised_step2` | +0.8912 | 0.359 | 5.20 |
+| `final` (full) | +0.9326 | 0.179 | 5.20 |
+| `final` frame 0 (sink) | **+1.0000** | 0.0000 | 0.0 |
+| `final` frame 1 (generated) | **+0.8912** | 0.359 | 5.20 |
+
+Source dumps:
+`/root/autodl-tmp/refiner_photometric_probe/official_refiner_step_dump.pt`,
+`native_refiner_step_dump_official_prompt_sdpa.pt`.
+
+Confirms: (a) sink/current mask is bit-exact, (b) refiner-forward divergence
+appears already at the first denoise call (`denoised_step0` cos `0.97`), then
+feedback compounds to `0.89` over the remaining two steps. Same structural
+pattern as the Stage-1 §6.13t engine-vs-standalone forward residual.
+
+**Step-0 48-block diff** (from `native_vs_official_step0_block_metrics.json`,
+all blocks fed real cumulative native state):
+
+| Phase | Blocks | `cos` | `MAE` | `max` |
+|---|---|---:|---:|---:|
+| Smooth precision floor | `0-22` | `~1.0` | `0.001 → 0.022` | `4-8` |
+| **First sparse spike** | **`23`** | `+1.002` | `0.028` | **`104`** (25× jump) |
+| Mid drift | `24-25` | `+0.999` | `0.04 → 0.06` | `120 → 788` |
+| Sustained mid | `26-36` | `0.994-1.000` | `0.08 → 0.18` | `~1k` |
+| **Cliff (amplifier)** | **`37`** | **`+0.853`** | `0.205` | **`16380`** |
+| Cliff persistent | `38-45` | `0.84-0.89` | `0.22 → 0.76` | `~19k` |
+| Direction self-correct | `46-47` | `+0.99` | `1.45` (mag only) | `~2k` |
+
+Two distinct events:
+
+1. **Block 23 — first sparse-element divergence.** Up through block 22 the
+   residual stream has uniform max=4 (bf16 ULP / fp16 boundary floor). At
+   block 23 a single residual element diverges to max=104. Cos stays ~1.0
+   because the diff is sparse. Block_25 detail dump shows all sub-stages
+   (`self_attn / cross / ff / after_*`) cos `>0.9999` when fed identical
+   NVlabs input, so the divergence at block 23+ is from cumulative input
+   drift hitting a threshold, not a fresh op bug at that block.
+2. **Block 37 — cliff amplifier.** First block where `after_self` and
+   `after_ff` show large modulated residual contributions (in detail-dump:
+   `self_attn max=0.5 → after_self max=8`, `ff max=8 → after_ff max=128`,
+   consistent with `scale_msa`/`scale_mlp ≈ 16`). Under the real cumulative
+   drift this `~16×` modulation amplifies sparse single-element drift to
+   max=16380, dropping cos to `0.853`. Late blocks 46-47 partially
+   re-project direction (`cos → 0.99`) while magnitude still differs.
+
+**Implication.** Refiner per-block ops are correct in isolation. The
+`final generated MAE 0.359 / cos 0.8912` is dominated by:
+
+- accumulated bf16 / numeric drift across blocks 0-22 reaching a critical
+  threshold at block 23;
+- nonlinear scale-modulation amplification at block 37+;
+- 3-step feedback compounding `denoised_step0` cos `0.97 → 0.89`.
+
+This is the refiner analog of Stage-1 §6.13o → §6.13s: the first scalar
+sub-op responsible is not yet localised; the cleanest next experiment is a
+**block-22/23 sub-stage drill with NATIVE accumulated input** (the
+existing block_25/37 detail used official input and therefore cannot show
+the drift-onset op). High-value because the entire downstream cliff is
+downstream of block 23.
 
 ### 6.13k Stage-1 Multi-Step Timestep Schedule Diverges — Native Scheduler Now Urgent 🔴 2026-05-28 night (RESOLVED — see §6.13l)
 
@@ -2953,21 +3235,21 @@ Stage-1 path needs a new contract:
 
 12. ~~**Fix Stage-1 latent magnitude (§6.12).**~~ ✅ **Done 2026-05-28** — root cause localised to the cam branch (main-only latent was always in normal range). The first fix matched NVlabs' Python `BidirectionalGDNUCPESinglePathLiteLA` path with single-path recurrence, `apply_fn_o`, and PostUCPERenorm, dropping STAGE1_STEPS=1 from `[-59, 61]` to `[-12.3, 11.8]`. §6.13s later corrected the production GDN path to match the loaded NVlabs BothTriton class, where GDN cam Q/K/V are **not** PostUCPERenorm-shrunk before the scan.
 
-13. ⚠️ **Stage-1 native scheduler/softmax-UCPE/BothTriton/prompt-mask alignment (§6.13m-§6.13x).** Controlled 3-step and 9-frame 20/60-step parity are strong (generated cos `0.986-0.988`). Production-length 321-frame / 20-step parity previously dropped to generated cos `~0.75`; §6.13s found a real long-sequence GDN cam-branch bug, §6.13v cleared engine-entered input parity and fixed prompt tokenization, and §6.13w localised the first non-zero attention residual. §6.13x then found the dominant downstream gap: native cross-attn ignored the prompt padding mask. Passing `encoder_attention_mask` drops 321f step-0 baseline `noise_pred` MAE `0.12383 -> 0.01211` (cos `0.999887`). Remaining work is the smaller GDN/cam fused numeric tail and post-mask 20/60-step/e2e reruns.
+13. ⚠️ **Stage-1 native scheduler/softmax-UCPE/BothTriton/prompt-mask/cam-prep alignment (§6.13m-§6.14l).** Controlled 3-step and 9-frame 20/60-step parity are strong (generated cos `0.986-0.988`). Production-length 321-frame / 20-step parity previously dropped to generated cos `~0.75`; §6.13s found a real long-sequence GDN cam-branch bug, §6.13v cleared engine-entered input parity and fixed prompt tokenization, and §6.13w localised the first non-zero attention residual. §6.13x then found the dominant downstream gap: native cross-attn ignored the prompt padding mask. Passing `encoder_attention_mask` drops 321f step-0 baseline `noise_pred` MAE `0.12383 -> 0.01211` (cos `0.999887`). §6.14l ports native `cam_prep_func`, confirms 9f/20 e2e neutrality, fixes a stale-workdir trajectory-probe pitfall, and reruns corrected 321f/20 Stage-1: final generated latent MAE is `0.1177` / cos `0.9751`. Masked teacher-forced replay rules out scheduler update formula as the first-order issue; remaining Stage-1 work is feedback-amplified late-step transformer/path sensitivity and 321f/60 rerun.
 
-14. ⚠️ **Stage-2 refiner/VAE contract alignment (§6.14).** The structural NVlabs refiner contract is now ported: sink/current split, seed-42 current noise, per-token timestep, video-only streaming mask, x0/velocity loop, and terminal-zero sigma. Same-source native vs official-manual refiner is generated-frame latent MAE=0.3589 / cos=0.8912. §6.14g also aligns the LTX-2 VAE memory-mode contract (`enable_tiling` + framewise decoding), allowing native 321-frame decode on 98GB; this is upstream-native memory behavior, not an OOM workaround. §6.14h/§6.14i fix the local e2e harness controls for action length, Stage-1 steps, metrics JSON, frame-index alignment, and frame-0 sanity, and §6.14j records the frame-aligned 9f/321f e2e rerun. Stage-1 changed materially in §6.13x, so full e2e/refiner gates should be regenerated before attributing remaining RGB error to Stage-2.
+14. ⚠️ **Stage-2 refiner/VAE contract alignment (§6.14).** The structural NVlabs refiner contract is now ported: sink/current split, seed-42 current noise, per-token timestep, video-only streaming mask, x0/velocity loop, and terminal-zero sigma. Same-source native vs official-manual refiner is generated-frame latent MAE=0.3589 / cos=0.8912. §6.14g also aligns the LTX-2 VAE memory-mode contract (`enable_tiling` + framewise decoding), allowing native 321-frame decode on 98GB; this is upstream-native memory behavior, not an OOM workaround. §6.14h/§6.14i fix the local e2e harness controls for action length, Stage-1 steps, metrics JSON, frame-index alignment, and frame-0 sanity; §6.14j/§6.14k record frame-aligned 9f/321f e2e reruns before and after the prompt-mask fix. Strict refiner latent parity still needs a same-source rerun before attributing the remaining RGB error to photometric tuning.
 
 ---
 
 ## 8. Outstanding Work — GPU Required
 
-1. **Rerun 321-frame 20/60-step Stage-1 after §6.13x.** The prompt-mask fix collapsed step-0 `noise_pred` MAE to `0.01211`; the next gate is whether the full denoising trajectory remains close at 20/60 steps. Record generated-frame latent MAE/RMSE/cos and compare against the pre-mask 321f numbers.
+1. **Rerun 321-frame 60-step Stage-1 after §6.14l.** The corrected current-workdir 321f/20 run now clears final generated latent MAE `0.1177` / cos `0.9751`; 321f/60 still needs the same corrected-workdir treatment. Record generated-frame latent MAE/RMSE/cos and compare against the 20-step row before drawing conclusions about step count.
 
-2. **Regenerate same-source Stage-2 refiner acceptance artifacts (§6.14).** The 321-frame e2e gate now runs through native refiner+VAE after the VAE memory-mode and frame-index fixes (§6.14g-§6.14j), but strict refiner latent parity is still not closed. Regenerate the official refiner baseline and prompt-connector dump in one run, then decide whether strict cos ≥0.98 requires a diffusers-exact fallback or a refiner-specific torch-linear layer stack.
+2. **Regenerate same-source Stage-2 refiner acceptance artifacts (§6.14).** The 321-frame e2e gate now runs through native refiner+VAE after the VAE memory-mode, frame-index, and prompt-mask fixes (§6.14g-§6.14k), but strict refiner latent parity is still not closed. Regenerate the official refiner baseline and prompt-connector dump in one run, then decide whether strict cos ≥0.98 requires a diffusers-exact fallback or a refiner-specific torch-linear layer stack.
 
 3. **Wire PSNR ≥ 30 / SSIM-Y ≥ 0.93** once harness produces a qualifying result.
 
-4. **GDN/cam numeric tail** at full 704×1280 / 321 frames vs official NVlabs path. §6.13x shows the semantic prompt-mask issue is fixed; remaining attention work is porting `cam_prep_func` semantics and reducing the main fused-scan residual (`main_raw` `5.1e-7`, projected to `attn_out` `0.0228`).
+4. **Late-step transformer/path sensitivity** at full 704×1280 / 321 frames vs official NVlabs path. §6.14l shows the scheduler update formula and cam-prep semantics are no longer the first-order issue. Run block/attention split on corrected current-workdir free-run latents at steps `15`, `18`, and `19`, where generated `noise_pred` MAE reaches `0.122-0.153`, and contrast with masked teacher-forced residuals (`~0.012-0.019`).
 
 5. **CUDA Graph capture smoke** — confirm no regression vs fused-GDN e2e when bucket capture fires.
 
@@ -2991,8 +3273,8 @@ Stage-1 path needs a new contract:
 
 ### 9.2 Single-GPU correctness (GPU)
 
-6. Rerun 321-frame Stage-1 20/60-step controlled denoise after the §6.13x prompt-mask fix.
-7. Re-run short 9-frame and 321-frame full-chain reference alignment after the Stage-1 mask fix.
+6. Rerun corrected-workdir 321-frame Stage-1 60-step controlled denoise after §6.14l.
+7. Probe corrected-workdir late-step block/attention sensitivity at steps 15/18/19.
 8. Wire PSNR/SSIM assertions once the short harness qualifies.
 9. GDN full-shape parity at 704×1280 (commit `tests/e2e/accuracy/` result as markdown).
 
