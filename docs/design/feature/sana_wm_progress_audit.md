@@ -2515,6 +2515,55 @@ existing block_25/37 detail used official input and therefore cannot show
 the drift-onset op). High-value because the entire downstream cliff is
 downstream of block 23.
 
+#### 6.14n Refiner RMSNorm replacement — REFUTED (byte-identical output) ❌ 2026-06-01
+
+Source-diffed `vllm_omni.diffusion.models.ltx2.ltx2_transformer` vs upstream
+`diffusers.models.transformers.transformer_ltx2`. The two implementations of
+`LTX2VideoTransformerBlock` are textually almost identical; the only
+documented divergence is the per-block weightless RMSNorms (`norm1/norm2/norm3`):
+vllm_omni uses `vllm.model_executor.layers.layernorm.RMSNorm`, diffusers uses
+its own `diffusers.models.normalization.RMSNorm`. Hypothesis: vllm fused
+kernel reduction order differs from diffusers' pure-PyTorch fp32-promote,
+ULP drift compounds across `3 × 48 = 144` calls per refiner step.
+
+Replaced `_make_rms_norm` with `_DiffusersStyleRMSNorm` (verbatim port of the
+diffusers forward) and reran the same-source probe with `TORCHDYNAMO_DISABLE=1`,
+identical `initial_noisy` + `official_video` prompt connector outputs + sigmas.
+
+Result: **byte-identical** to the prior baseline.
+
+| Stage | Pre-fix (§6.14m) | Post-RMSNorm-swap |
+|---|---:|---:|
+| `denoised_step0` cos / MAE | 0.9703 / 0.183 | 0.9703 / 0.183 |
+| `denoised_step1` cos / MAE | 0.8888 / 0.372 | 0.8888 / 0.372 |
+| `denoised_step2` cos / MAE | 0.8912 / 0.359 | 0.8912 / 0.359 |
+| `final` frame 1 (generated) | **0.8912 / 0.359** | **0.8912 / 0.359** |
+
+Root cause: pipeline log shows
+`IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])`.
+The vllm `RMSNorm.forward_cuda` short-circuits to `forward_native`, which
+dispatches to `ir.ops.rms_norm` — a pure PyTorch path equivalent to
+diffusers' `RMSNorm.forward` to the bit. The kernel-divergence hypothesis is
+therefore wrong under this priority config; the 0.0089 cos / 0.359 MAE
+generated-frame gap is **not** RMSNorm precision drift.
+
+Remaining `LTX2VideoTransformerBlock` ↔ diffusers divergence surface narrows to:
+
+1. `LTX2Attention` — the local class uses `QKVParallelLinear` (with explicit
+   TP fallback), a custom rotary apply (`apply_interleaved_rotary_emb` /
+   `apply_split_rotary_emb` with explicit fp32 promote), and a SDPA call
+   wrapper. Diffusers uses `nn.Linear` + processor pattern.
+2. `LTX2FeedForward` — `ColumnParallelApproxGELU` + `RowParallelLinear` vs
+   diffusers' standard `FeedForward(nn.Linear→GELU→nn.Linear)`.
+3. Attention backend selection: probe log shows
+   `Resolved diffusion attention backend 'SDPA' for role='self'`; whether
+   diffusers' processor uses the same SDPA call or another path is unverified.
+
+Next high-ROI A/B: swap `LTX2FeedForward` and/or `LTX2Attention` with
+diffusers' equivalents and rerun the same probe.
+
+Artifact: `/root/autodl-tmp/refiner_photometric_probe/native_refiner_step_dump_post_rmsnorm_fix.pt`.
+
 ### 6.13k Stage-1 Multi-Step Timestep Schedule Diverges — Native Scheduler Now Urgent 🔴 2026-05-28 night (RESOLVED — see §6.13l)
 
 With §6.13j confirming model forward is clean at block-0 (attn

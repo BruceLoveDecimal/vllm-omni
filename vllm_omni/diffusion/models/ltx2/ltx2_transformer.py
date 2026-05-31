@@ -50,16 +50,37 @@ logger = init_logger(__name__)
 _RMSNORM_INIT_PARAMS = inspect.signature(RMSNorm.__init__).parameters
 
 
+class _DiffusersStyleRMSNorm(nn.Module):
+    """RMSNorm mirroring `diffusers.models.normalization.RMSNorm` element-for-element.
+
+    The block-level `norm1/norm2/norm3` in LTX-2 are weightless RMSNorms. The
+    vllm `RMSNorm` here was previously dispatching through a fused IR op whose
+    reduction order does not match diffusers' pure-PyTorch path, producing
+    per-call bf16 ULP drift that compounds across the 48-block refiner
+    (3 RMSNorm calls per block, 144 per step). See audit §6.14m / §6.14n.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6, elementwise_affine: bool = False):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size)) if elementwise_affine else None
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        if self.weight is not None:
+            if self.weight.dtype in (torch.float16, torch.bfloat16):
+                hidden_states = hidden_states.to(self.weight.dtype)
+            hidden_states = hidden_states * self.weight
+        else:
+            hidden_states = hidden_states.to(input_dtype)
+        return hidden_states
+
+
 def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) -> nn.Module:
-    """Bridge diffusers' RMSNorm API onto vLLM's `has_weight` variant."""
-    kwargs: dict[str, Any] = {"eps": eps}
-    if "elementwise_affine" in _RMSNORM_INIT_PARAMS:
-        kwargs["elementwise_affine"] = elementwise_affine
-    elif "has_weight" in _RMSNORM_INIT_PARAMS:
-        kwargs["has_weight"] = elementwise_affine
-    elif not elementwise_affine:
-        raise TypeError("RMSNorm backend does not support disabling affine weights.")
-    return RMSNorm(hidden_size, **kwargs)
+    """Block-level RMSNorm; use diffusers-equivalent pure-PyTorch path."""
+    return _DiffusersStyleRMSNorm(hidden_size, eps=eps, elementwise_affine=elementwise_affine)
 
 
 def apply_interleaved_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
