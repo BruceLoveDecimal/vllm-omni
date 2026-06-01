@@ -2652,6 +2652,41 @@ confirmation.
    port and focus on Stage-1 latent parity first since refiner is not
    the 9f bottleneck.
 
+#### 6.14q Apples-to-apples refiner A/B at 9f/20 — refiner port effectively 0 MAE on e2e RGB ✅ 2026-06-01
+
+§6.14p left "is refiner the e2e bottleneck?" as an open question (the
+9f/20 number after the diffusers swap was MAE `63.67` but couldn't be
+directly compared to §6.14k's `54.74` because of differing
+frame-alignment). Ran a clean same-harness A/B (same probe script
+`run_one_side.py`, no frame alignment, common-prefix 8 frames):
+
+| Pred path | MAE | PSNR | SSIM-Y |
+|---|---:|---:|---:|
+| vllm_omni LTX-2 refiner (`SANA_WM_USE_DIFFUSERS_REFINER=0`) vs reference | **63.43** | 8.92 | 0.173 |
+| diffusers LTX-2 refiner (`SANA_WM_USE_DIFFUSERS_REFINER=1`) vs reference | **63.67** | 9.00 | 0.176 |
+| vllm_omni refiner vs diffusers refiner (both native) | 18.66 | 17.38 | 0.865 |
+
+Artifacts:
+`/tmp/ref_9_20.npy`, `/tmp/nat_9_20_omni.npy`, `/tmp/nat_9_20_diffusers.npy`.
+
+**Conclusion.** Refiner port choice contributes **`0.24` MAE / `0.08` PSNR
+/ `0.003` SSIM-Y** to 9f/20 e2e RGB — effectively zero. Both refiners
+land at `~63` MAE from reference. The two native outputs do differ from
+each other by MAE `18.66` (so the refiner *does* produce a structurally
+different latent), but both are equidistant from the NVlabs reference.
+
+Interpretation: even a byte-exact refiner (diffusers, §6.14p) fed a
+slightly-wrong Stage-1 latent (cos `0.975`, §6.14l) produces a wrong
+final RGB by the same magnitude as the imperfect refiner fed the same
+wrong latent. The 63-MAE 9f/20 gap is dominated by **Stage-1 (+ VAE +
+pre-refiner path)**, not refiner port.
+
+**ROI implication.** Stage-1 latent parity (cos `0.975 -> 0.99+`) is the
+highest-leverage Stage-2 reliant work for e2e RGB at this video length.
+Refiner port (§6.14p) is a real numeric port bug but is **not** the e2e
+bottleneck at 9f. 321f e2e impact still unverified due to diffusers
+refiner OOM.
+
 #### 6.14o Stage-1 late-step block/attention split — MLP stride parity fixed, trajectory drift remains ⚠️ 2026-06-01
 
 Ran the §6.14l follow-up on the corrected current workdir at 321 frames /
