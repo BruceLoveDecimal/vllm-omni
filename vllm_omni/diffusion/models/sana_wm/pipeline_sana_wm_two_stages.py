@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from copy import copy
 from pathlib import Path
@@ -122,7 +123,6 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             get_current_vllm_config,
             set_current_vllm_config,
         )
-        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import create_transformer_from_config
 
         try:
             get_current_vllm_config()
@@ -134,13 +134,38 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             )
             vllm_config_context = set_current_vllm_config(vllm_config)
 
-        with vllm_config_context, torch.device("cpu"):
-            self.refiner_transformer = create_transformer_from_config(self._load_refiner_transformer_config())
+        # When SANA_WM_USE_DIFFUSERS_REFINER=1, swap vllm_omni's local LTX-2 port
+        # for the upstream diffusers `LTX2VideoTransformer3DModel`. §6.14o probe
+        # showed this makes refiner same-source bit-exact (cos 0.8912 -> 1.0000).
+        use_diffusers_refiner = os.environ.get("SANA_WM_USE_DIFFUSERS_REFINER", "0") == "1"
+        config_dict = self._load_refiner_transformer_config()
         state_dict = load_file(str(self.release_paths.refiner_transformer_weights), device="cpu")
-        if hasattr(self.refiner_transformer, "load_weights"):
-            self.refiner_transformer.load_weights(state_dict.items())
-        else:
+        if use_diffusers_refiner:
+            from diffusers.models.transformers.transformer_ltx2 import LTX2VideoTransformer3DModel as _DiffRefiner
+            import inspect as _inspect
+            allowed = set(_inspect.signature(_DiffRefiner.__init__).parameters.keys())
+            filtered = {k: v for k, v in config_dict.items() if k in allowed and k != "self"}
+            with torch.device("cpu"):
+                self.refiner_transformer = _DiffRefiner(**filtered)
             self.refiner_transformer.load_state_dict(state_dict, strict=False)
+            self.refiner_transformer.eval()
+            for _p in self.refiner_transformer.parameters():
+                _p.requires_grad_(False)
+            # Disable any caching from CacheMixin to keep activation memory bounded.
+            if hasattr(self.refiner_transformer, "_disable_caching"):
+                try:
+                    self.refiner_transformer._disable_caching()
+                except Exception:
+                    pass
+        else:
+            from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import create_transformer_from_config
+
+            with vllm_config_context, torch.device("cpu"):
+                self.refiner_transformer = create_transformer_from_config(config_dict)
+            if hasattr(self.refiner_transformer, "load_weights"):
+                self.refiner_transformer.load_weights(state_dict.items())
+            else:
+                self.refiner_transformer.load_state_dict(state_dict, strict=False)
         self.refiner_transformer.to(device=device, dtype=dtype)
         self._force_module_tensors_to(self.refiner_transformer, device=device, dtype=dtype)
 
@@ -327,6 +352,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         schedule = values[: steps + 1]
         return torch.tensor(schedule, device=device, dtype=dtype)
 
+    @torch.inference_mode()
     def _predict_refiner_current_x0(
         self,
         *,
