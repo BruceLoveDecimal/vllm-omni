@@ -27,6 +27,26 @@ def _looks_like_bagel(model_name: str) -> bool:
         return False
 
 
+def _looks_like_sana_wm(model_name: str) -> bool:
+    """Best-effort detection for the hybrid SANA-WM HF layout."""
+
+    stage1_weight = os.path.join("dit", "sana_wm_1600m_720p.safetensors")
+    if os.path.isdir(model_name):
+        return os.path.exists(os.path.join(model_name, "config.yaml")) and os.path.exists(
+            os.path.join(model_name, stage1_weight)
+        )
+    try:
+        from vllm.transformers_utils.repo_utils import file_or_path_exists
+
+        return file_or_path_exists(model_name, "config.yaml", revision=None) and file_or_path_exists(
+            model_name,
+            stage1_weight,
+            revision=None,
+        )
+    except Exception:
+        return "sana-wm" in model_name.lower() or "sana_wm" in model_name.lower()
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.
@@ -74,4 +94,4 @@ def is_diffusion_model(model_name: str) -> bool:
 
         # Bagel is not a diffusers pipeline (no model_index.json), but is still a
         # diffusion-style model in vllm-omni. Detect it via config.json.
-    return _looks_like_bagel(model_name)
+    return _looks_like_bagel(model_name) or _looks_like_sana_wm(model_name)

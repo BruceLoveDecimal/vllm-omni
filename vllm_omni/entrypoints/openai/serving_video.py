@@ -53,6 +53,15 @@ class VideoGenerationArtifacts:
 class OmniOpenAIServingVideo:
     """OpenAI-style video generation handler for omni diffusion models."""
 
+    _SANA_WM_EXTRA_PARAM_KEYS = {
+        "action",
+        "camera",
+        "intrinsics",
+        "translation_speed",
+        "rotation_speed_deg",
+        "coordinate_system",
+    }
+
     def __init__(
         self,
         engine_client: EngineClient,
@@ -141,6 +150,10 @@ class OmniOpenAIServingVideo:
         if "boundary_ratio" in provided_fields and request.boundary_ratio is not None:
             gen_params.boundary_ratio = request.boundary_ratio
 
+        sana_wm_payload = self._build_sana_wm_payload(request, vp)
+        if sana_wm_payload:
+            prompt["sana_wm"] = sana_wm_payload
+
         logger.info(
             "Boundary ratio parse: request=%s gen_params=%s",
             request.boundary_ratio,
@@ -183,6 +196,32 @@ class OmniOpenAIServingVideo:
             stage_durations=self._extract_stage_durations(result),
             peak_memory_mb=self._extract_peak_memory_mb(result),
         )
+
+    @classmethod
+    def _build_sana_wm_payload(cls, request: VideoGenerationRequest, vp: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if isinstance(request.sana_wm, dict):
+            payload.update(request.sana_wm)
+
+        extra_params = request.extra_params if isinstance(request.extra_params, dict) else {}
+        extra_sana_wm = extra_params.get("sana_wm")
+        if isinstance(extra_sana_wm, dict):
+            payload.update(extra_sana_wm)
+        for key in cls._SANA_WM_EXTRA_PARAM_KEYS:
+            if key in extra_params and key not in payload:
+                payload[key] = extra_params[key]
+
+        if not payload:
+            return {}
+        if vp.width is not None:
+            payload.setdefault("width", vp.width)
+        if vp.height is not None:
+            payload.setdefault("height", vp.height)
+        if vp.num_frames is not None:
+            payload.setdefault("num_frames", vp.num_frames)
+        if vp.fps is not None:
+            payload.setdefault("fps", vp.fps)
+        return payload
 
     async def generate_videos(
         self,

@@ -151,6 +151,16 @@ _DIFFUSION_MODELS = {
         "pipeline_ming_imagegen",
         "MingImagePipeline",
     ),
+    "SanaWmPipeline": (
+        "sana_wm",
+        "pipeline_sana_wm",
+        "SanaWmPipeline",
+    ),
+    "SanaWmTwoStagesPipeline": (
+        "sana_wm",
+        "pipeline_sana_wm_two_stages",
+        "SanaWmTwoStagesPipeline",
+    ),
     "InternVLAA1Pipeline": (
         "internvla_a1",
         "pipeline_internvla_a1",
@@ -503,6 +513,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
+    "SanaWmPipeline": "get_sana_wm_post_process_func",
+    "SanaWmTwoStagesPipeline": "get_sana_wm_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
 }
@@ -528,6 +540,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
+    "SanaWmPipeline": "get_sana_wm_pre_process_func",
+    "SanaWmTwoStagesPipeline": "get_sana_wm_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
 }
 
