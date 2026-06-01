@@ -424,6 +424,98 @@ Do not mark Sana-WM as supported until all of these pass:
 
 ---
 
+## NVlabs-Recommended Production Inference Config
+
+Single source of truth for "production-mode" inference defaults, mirrored from
+upstream NVlabs Sana-WM
+([`inference_video_scripts/inference_sana_wm.py`](https://github.com/NVlabs/Sana)
+`GenerationParams` + `argparse` defaults + `configs/sana_wm/sana_wm_1600m_720p.yaml`).
+These are the values to use when benchmarking realistic end-user generation
+quality; do not deviate from these in published metrics unless explicitly
+noting the deviation. Internal latent-parity probes may use cheaper configs
+(e.g. `num_frames=9`, `step=20`, `cfg_scale=1.0`) for iteration speed; those
+absolute RGB numbers are not production-representative.
+
+### Stage-1 (DiT) generation knobs
+
+| Knob | Production value | Notes |
+|---|---|---|
+| `num_frames` | **161** | 10 s @ 16 fps; the default production length. `321` is a ~20 s stress configuration that NVlabs's model card example demonstrates but is not the recommended default. |
+| `fps` | **16** | |
+| `step` (DiT sampling steps) | **60** | NVlabs `GenerationParams.step` default. Smaller step counts (e.g. 20) trade quality for speed and **must not** be reported as production results. |
+| `cfg_scale` | **5.0** | Classifier-free guidance scale. `1.0` disables guidance and is *not* production. |
+| `sampling_algo` | `flow_euler_ltx` | NVlabs default; also supports `flow_euler` and `flow_dpm-solver` but `flow_euler_ltx` is the production path. |
+| `flow_shift` (inference) | **9.8** | From `configs/sana_wm/sana_wm_1600m_720p.yaml::scheduler.inference_flow_shift`. Training-time `flow_shift` is `9.95`; inference uses the shifted value. Setting `None` falls back to the scheduler default which already encodes `9.8`. |
+| `seed` | **42** | NVlabs `GenerationParams.seed` default. |
+| `negative_prompt` | `""` (empty) | |
+
+### Stage-2 (LTX-2 refiner) knobs
+
+| Knob | Production value | Notes |
+|---|---|---|
+| `STAGE_2_DISTILLED_SIGMA_VALUES` | `[0.909375, 0.725, 0.421875, 0.0]` | 3-step Euler refiner; sigmas hard-coded as a distilled schedule. Imported from `diffusers.pipelines.ltx2.utils.STAGE_2_DISTILLED_SIGMA_VALUES`. |
+| `sink_size` | **1** | Number of leading frames preserved bit-exact through the refiner (the conditioning image). |
+| `seed` | **42** | Refiner noise seed (separate from Stage-1 seed; happens to be the same value). |
+
+### VAE knobs
+
+| Knob | Production value | Notes |
+|---|---|---|
+| `vae_type` | `LTX2VAE_diffusers` | |
+| `use_framewise_encoding` / `use_framewise_decoding` | `true` / `true` | |
+| `tile_sample_stride_num_frames` | **64** | Required for tiled long-sequence decoding (321 f path). |
+| `tile_sample_min_num_frames` | **96** | |
+
+### vLLM-Omni wiring
+
+In `OmniDiffusionSamplingParams`:
+
+```python
+OmniDiffusionSamplingParams(
+    height=704,
+    width=1280,
+    num_frames=161,
+    seed=42,
+    fps=16,
+    num_inference_steps=60,
+    guidance_scale=5.0,
+    guidance_scale_provided=True,
+    extra_args={
+        "sana_wm_sampling_algo": "flow_euler_ltx",
+        "sana_wm_inprocess_refiner": True,
+        "sana_wm_inprocess_refiner_steps": 3,
+        "sana_wm_refiner_sink_size": 1,
+        "sana_wm_refiner_seed": 42,
+        # Long-sequence VAE memory contract:
+        "sana_wm_offload_vae": True,
+    },
+)
+```
+
+E2E harness env vars to match (for `tests/e2e/accuracy/test_sana_wm_video_e2e.py`
+and the `sana_wm_321_metrics_*.py` family):
+
+```bash
+SANA_WM_E2E_NUM_FRAMES=161
+SANA_WM_E2E_STAGE1_STEPS=60
+SANA_WM_E2E_REFINER_STEPS=3
+SANA_WM_E2E_ACTION=w-160         # 161 frames - 1 conditioning frame
+SANA_WM_E2E_PREDICTION_OUTPUT_TYPE=np
+SANA_WM_E2E_NATIVE_MAX_TOKENS=50000
+```
+
+If a probe deviates from any of these knobs (e.g. for fast iteration or for
+memory budget), it must:
+
+1. State the deviation explicitly in the experiment writeup.
+2. Treat any absolute MAE / PSNR / SSIM result as *non-production*; only
+   relative deltas between paired runs at the same deviation are admissible
+   as evidence for design decisions.
+3. Re-validate the design decision under production config before landing
+   the change.
+
+---
+
 ## Confirmed Release Inventory (2026-05-19)
 
 Repo: <https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional>

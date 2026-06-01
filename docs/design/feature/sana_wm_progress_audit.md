@@ -1,6 +1,6 @@
 # Sana-WM Integration — Progress Audit
 
-> **Audit date:** 2026-06-01 (revision 27 — late-step block/attention + MLP stride probe)
+> **Audit date:** 2026-06-01 (revision 28 — refiner port A/B + oracle correction sweep + NVlabs production config snapshot)
 > **Branch:** `feat/sana_wm`
 > **Implementation snapshot:** fork worktree at `d3ed5411` plus native BothTriton/VAE/e2e-harness/prompt/activation diagnostic patches, native `cam_prep_func` port, MLP memory-layout parity patch, late-step probes, frame-aligned e2e gates, engine-entered input parity probes, prompt-fixed step-0 activation splits, post-prompt-mask 4-row full e2e gate, and current-workdir 321f/20 Stage-1 trajectory reruns on RTX PRO 6000 98GB
 > **Pushed to:** `fork/feat/sana_wm` (`BruceLoveDecimal/vllm-omni`)
@@ -8,6 +8,45 @@
 > [`sana_wm_integration.md`](sana_wm_integration.md)
 > **Tracking issue:**
 > [vllm-project/vllm-omni#3656](https://github.com/vllm-project/vllm-omni/issues/3656)
+
+---
+
+## NVlabs Production Inference Config (single source of truth)
+
+Until now, the e2e harness (`sana_wm_321_metrics_b188a15c.py`, the §6.14j-q
+runs, etc.) defaulted to `num_inference_steps=20`, `guidance_scale=1.0`,
+`seed=0`, and either `num_frames=9` or `321`. **None of these are the NVlabs
+production-recommended values.** Absolute MAE/PSNR/SSIM numbers reported
+under those configs are *not* representative of production-grade output
+quality. The recommended production knobs (mirrored to
+[`sana_wm_integration.md`](sana_wm_integration.md) as the authoritative copy,
+sourced from
+`NVlabs-Sana/inference_video_scripts/inference_sana_wm.py::GenerationParams`
+and `configs/sana_wm/sana_wm_1600m_720p.yaml`):
+
+| Knob | Production | What we ran in §6.14j-q | Drift |
+|---|---:|---:|---|
+| `num_frames` | **161** | 9 or 321 | Length |
+| `step` (Stage-1 DiT) | **60** | 20 | Severe undersampling |
+| `cfg_scale` | **5.0** | 1.0 | **Guidance effectively off** |
+| `flow_shift` | 9.8 | scheduler default (also 9.8) | OK |
+| `seed` | 42 | 0 | Different sample, but apples-to-apples within paired runs |
+| Refiner steps / sigmas | 3 / `[0.909, 0.725, 0.422, 0]` | same | OK |
+| Refiner `sink_size` | 1 | same | OK |
+| Refiner `seed` | 42 | same | OK |
+
+**Implication for prior reported numbers.** §6.14k generated MAE `39.32`
+(321f/20-step) and §6.14q apples-to-apples MAE `~63` (9f/20-step) are
+*relative* diagnostic data points, not production quality targets.
+Same-source latent parity work (§6.13s-x, §6.14e-q) is independent of these
+knobs and remains valid as latent-level analysis. The Stage-1 free-run cos
+`0.975` (§6.14l) measured under `num_frames=321`, `step=20`, `cfg=1.0` is
+still informative as a "vllm_omni native vs NVlabs same-config" latent
+parity number, but is not the same configuration end users will run.
+
+All new e2e RGB benchmarks in this audit must list which production knobs
+they deviate from. Net-new RGB acceptance gates are only meaningful under
+the production config.
 
 ---
 
@@ -2686,6 +2725,76 @@ highest-leverage Stage-2 reliant work for e2e RGB at this video length.
 Refiner port (§6.14p) is a real numeric port bug but is **not** the e2e
 bottleneck at 9f. 321f e2e impact still unverified due to diffusers
 refiner OOM.
+
+#### 6.14r Oracle correction sensitivity sweep — trajectory feedback dominates per-step residual ⚠️ 2026-06-01
+
+To disentangle "per-step ULP residual" from "trajectory feedback
+amplification" for the Stage-1 free-run gap, ran a free-run loop on 321 f
+/ 20 step starting from the official step-0 latent. Every `N` steps the
+native latent is snapped back to the official trajectory's latent (oracle
+correction). `N=1` = always-corrected (teacher-forced); `N=20` = pure
+free-run. Probe: `/tmp/oracle_correction_sweep.py`; artifact:
+`/root/autodl-tmp/stage1_longseq_probe/oracle_correction_sweep_321f_20step.json`.
+
+| `N` (correction interval) | final generated cos | final generated MAE | final generated RMSE |
+|---:|---:|---:|---:|
+| 1 | **0.999915** | 0.0026 | 0.0038 |
+| 2 | 0.999732 | 0.0118 | 0.0152 |
+| 4 | 0.999113 | 0.0238 | 0.0316 |
+| 8 | 0.999113 | 0.0238 | 0.0316 |
+| 10 | 0.989522 | 0.0817 | 0.1131 |
+| 20 (free-run) | **0.632190** | 0.5350 | 0.7021 |
+
+Per-step cos vs official for the `N=20` free-run trace:
+
+```
+step:  1   2   3 ... 8    9    10   11   12   13   14   15   16   17    18    19
+cos: 1.0 1.0 1.0 ... 1.0 .999 .999 .998 .997 .995 .991 .983 .966 .924 .822 .644 .632
+                                                                            ↑↑↑↑
+                                                                            cliff
+```
+
+Two conclusions:
+
+1. **The cliff is concentrated at the late steps 17-19**, matching
+   §6.13k's earlier observation that the inference flow-shift schedule
+   takes a huge sigma jump at step 18 (`392 -> 87.7`). At that step the
+   per-token `dt` is enormous and tiny `noise_pred` residuals get
+   amplified into large latent perturbations.
+2. **Feedback amplification, not per-step residual, dominates.** Even
+   one oracle correction at step 10 (`N=10`) brings generated MAE from
+   `0.535` to `0.082` (6.5× reduction); two corrections at steps 5/10
+   (`N=8`) brings it to `0.024` (22×); always-corrected (`N=1`) reaches
+   `0.0026`. The per-step transformer residual itself is small enough
+   that with light correction the trajectory recovers.
+
+**Caveat on absolute numbers.** This probe is a bare
+`transformer.forward` + manual `latent + dt * noise_pred` loop, not the
+full engine path with `step_flow_euler_per_token` + condition-mask
+restore. The `N=20` cos `0.632` is therefore worse than §6.14l's full
+engine free-run cos `0.975` for the same 321 f / 20 step configuration.
+The internal **relative** ordering across `N` values is still valid as
+a sensitivity profile — but absolute production-side cos is captured by
+§6.14l, not this probe.
+
+**Strategic implication.** Pushing Stage-1 cos `0.975 -> 0.99+` in the
+production free-run path will require either:
+
+- shrinking the per-step residual at steps 17-19 specifically (e.g.
+  selective fp32 promotion of softmax / RMSNorm / modulation around
+  the big-`dt` step) so that the amplified product is smaller, or
+- attacking the schedule itself (subdividing the big sigma jump, but
+  this breaks NVlabs-equivalent step semantics — already ruled out by
+  §6.13s),
+- or revisiting whether vllm_omni's engine path adds any sources of
+  drift not present in NVlabs reference at this step (engine-vs-bare
+  probe in this section motivates one).
+
+Recommended next experiment: **selective fp32 promotion at late steps
+(15-19)** under the same probe (or full engine path), comparing free-run
+final cos against the §6.14l baseline. If the cos drops below `0.95` cliff
+with fp32 promotion, that confirms the per-step residual at low-sigma
+steps is the leverage point.
 
 #### 6.14o Stage-1 late-step block/attention split — MLP stride parity fixed, trajectory drift remains ⚠️ 2026-06-01
 
