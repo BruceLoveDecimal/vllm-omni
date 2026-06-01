@@ -215,6 +215,13 @@ class VideoGenerationRequest(BaseModel):
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args. "),
     )
+    sana_wm: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional SANA-WM camera-control payload. This is forwarded to "
+            "prompt['sana_wm'] for image-to-video generation."
+        ),
+    )
 
     def resolve_video_params(self) -> VideoParams:
         vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)

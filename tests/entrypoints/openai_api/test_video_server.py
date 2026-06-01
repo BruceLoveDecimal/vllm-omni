@@ -1022,6 +1022,8 @@ def test_video_request_validation():
     assert req.generate_sound is False
     assert req.sound_duration is None
     assert VideoGenerationRequest(prompt="test", generate_sound=True, sound_duration=1.5).generate_sound is True
+    sana_req = VideoGenerationRequest(prompt="test", sana_wm={"action": "w-1"})
+    assert sana_req.sana_wm == {"action": "w-1"}
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", size="invalid")
 
@@ -1519,6 +1521,78 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.num_inference_steps == 30
     assert captured.guidance_scale == 6.5
     assert captured.seed == 42
+
+
+def test_sync_sana_wm_payload_passes_to_engine_prompt(test_client, mocker: MockerFixture):
+    _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "drive forward",
+            "width": "1280",
+            "height": "704",
+            "num_frames": "9",
+            "fps": "16",
+            "sana_wm": json.dumps(
+                {
+                    "action": "w-16",
+                    "translation_speed": 0.055,
+                    "intrinsics": {"fx": 640, "fy": 640, "cx": 640, "cy": 352},
+                }
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured_prompt = engine.captured_prompt
+    assert captured_prompt["sana_wm"]["action"] == "w-16"
+    assert captured_prompt["sana_wm"]["translation_speed"] == 0.055
+    assert captured_prompt["sana_wm"]["intrinsics"]["cx"] == 640
+    assert captured_prompt["sana_wm"]["width"] == 1280
+    assert captured_prompt["sana_wm"]["height"] == 704
+    assert captured_prompt["sana_wm"]["num_frames"] == 9
+    assert captured_prompt["sana_wm"]["fps"] == 16
+
+
+def test_video_generations_alias_accepts_sana_wm_payload(test_client, mocker: MockerFixture):
+    _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos/generations/sync",
+        data={
+            "prompt": "drive forward",
+            "sana_wm": json.dumps({"action": "w-8", "num_frames": 9}),
+        },
+    )
+
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    assert engine.captured_prompt["sana_wm"]["action"] == "w-8"
+    assert engine.captured_prompt["sana_wm"]["num_frames"] == 9
+
+
+def test_sync_sana_wm_extra_params_payload_passes_to_engine_prompt(test_client, mocker: MockerFixture):
+    _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "drive forward",
+            "extra_params": json.dumps(
+                {
+                    "sana_wm": {"action": "d-4", "rotation_speed_deg": 1.5},
+                    "sana_wm_inprocess_refiner": True,
+                }
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured_prompt = engine.captured_prompt
+    captured_params = engine.captured_sampling_params_list[0]
+    assert captured_prompt["sana_wm"]["action"] == "d-4"
+    assert captured_prompt["sana_wm"]["rotation_speed_deg"] == 1.5
+    assert captured_params.extra_args["sana_wm_inprocess_refiner"] is True
 
 
 def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):
