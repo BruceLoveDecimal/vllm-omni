@@ -2934,6 +2934,93 @@ have now been ruled out. The remaining Stage-1 leverage paths are:
    acceptance criteria (define what RGB MAE/SSIM is "good enough"
    without strict NVlabs bit-parity).
 
+#### 6.14u Classifier-Free Guidance (CFG) was silently disabled in native path ✅ 2026-06-01
+
+Source reading revealed a major functional gap: the native sana-wm path
+(`_run_native_smoke_backend` in
+[pipeline_sana_wm.py](../../vllm_omni/diffusion/models/sana_wm/pipeline_sana_wm.py))
+**never ran CFG**. `SanaWmPipeline` inherits `CFGParallelMixin` but
+`predict_noise_maybe_with_cfg` is not invoked anywhere in the package, the
+negative prompt is never encoded
+(`_native_smoke_prompt_embeds` only handles positive), each step issues a
+single `self.transformer(...)` call with `encoder_hidden_states=prompt_embeds`,
+and the `guidance_scale` sampling parameter is silently dropped. The audit
+trail confirms this — line 816 comment explicitly says "NVlabs CFG-doubled
+dump (B=2): drop uncond/cond duplication and **take the cond branch**".
+
+This means every prior e2e RGB comparison (§6.14k/q/s) was an
+**apples-to-oranges** pairing:
+
+| Run | Reference (NVlabs subprocess CLI) | Native (vllm_omni) |
+|---|---|---|
+| §6.14k 9f/20 cfg=1.0 | cfg=1.0 ✓ | cfg=1.0 ✓ (matches by coincidence) |
+| §6.14q 9f/20 cfg=1.0 | cfg=1.0 ✓ | cfg=1.0 ✓ |
+| §6.14s production 161f/60 cfg=5.0 | **cfg=5.0** with negative branch + 5× combine | **cfg=1.0** (param ignored, only cond branch) |
+
+Implication: §6.14s's MAE `49.97` / PSNR `11.79` / SSIM `0.315` measured
+NVlabs-with-real-CFG against vllm_omni-without-CFG. The "production
+config rerun" did not actually use production CFG on the native side.
+
+**Fix.** Wired the missing CFG path into the native sana-wm pipeline:
+
+- `SanaWmNativeSmokeParams` now carries `cfg_scale: float = 1.0` and
+  `negative_prompt: str = ""`, parsed from
+  `sampling_params.guidance_scale` (when `guidance_scale_provided=True`)
+  with an `sana_wm_native_smoke_*` extra-args override path for tests.
+- `_run_native_smoke_backend` encodes the negative prompt via the same
+  `_native_smoke_prompt_embeds` helper when `cfg_scale > 1.0`, stashes
+  its attention mask separately, and restores the cond mask on the
+  `_last_prompt_attention_mask` instance attribute so downstream probes
+  keep seeing the positive-branch mask.
+- Per-step denoise loop now runs the transformer twice when CFG is on
+  (cond + uncond, both with the same `latents` / `model_timestep` /
+  `plucker` / `raymap` / `spatial_raymap`) and combines:
+  `noise_pred = noise_uncond + cfg_scale * (noise_cond - noise_uncond)`.
+- Single-branch behavior (`cfg_scale <= 1.0`) is unchanged, so
+  earlier probes (§6.14k/q) and tests that intentionally pass `cfg=1.0`
+  still take the legacy single-forward fast path.
+
+**Apples-to-apples production rerun.** Reran 161 f / 60 step / cfg=5.0
+/ seed=42 native with the CFG fix in place, against the same
+`ref_161_60_prod.npy` from §6.14s (NVlabs full pipeline, cfg=5.0):
+
+| Config | MAE | PSNR | SSIM-Y |
+|---|---:|---:|---:|
+| §6.14s native, **pre-fix** (cfg param ignored, only cond branch) | 49.97 | 11.79 | 0.3145 |
+| **§6.14u native, post-fix** (real CFG=5.0 with uncond branch + combine) | **28.99** | **15.69** | **0.6582** |
+| Delta | **-21.0** (-42%) | **+3.9 dB** (+33%) | **+0.344** (+109%) |
+
+SSIM-Y more than doubled (`0.315 -> 0.658`). PSNR up `~4 dB`. MAE shaved
+by `21`. This is the **single largest** e2e RGB improvement recorded
+in the audit, and was hiding behind the cfg=1.0 testing convention.
+
+**Caveats.**
+
+- `0.658` SSIM-Y is still below the `>= 0.93` acceptance gate; PSNR `15.69`
+  dB is below `>= 30` dB. Production-quality RGB parity is closer but
+  not closed.
+- All earlier "Stage-1 e2e bottleneck" interpretations need to be
+  re-validated under real CFG. The §6.14q apples-to-apples conclusion
+  ("refiner port contributes ~0 MAE to 9f e2e RGB") was at cfg=1.0;
+  under cfg=5.0 the refiner contribution may be different (every cond
+  / uncond residual gets 5× amplified). §6.14q should be rerun at
+  cfg=5.0 if a precise refiner-vs-stage-1 attribution is needed.
+- Native is now 2× per-step transformer forward cost when CFG is on.
+  For 161 f / 60 step this still fits the 98 GB target and runs in
+  comparable wall time to the previous cfg=1.0 native, because
+  `expandable_segments=True` and the explicit cleanup in
+  `_run_native_smoke_backend` keep activation memory bounded.
+
+Artifact: `/tmp/nat_161_60_prod_cfg5.npy` (production-config native with CFG).
+
+**Implication for next work.** The remaining `~29` MAE gap is now the
+production target. Stage-1 latent cos `0.975` parity work and refiner
+port (§6.14p) are still candidate leverage points — but their relative
+weight under cfg=5.0 needs to be re-measured. Specifically, the
+§6.14q-style apples-to-apples should be repeated at cfg=5.0 to confirm
+which axis (Stage-1 / refiner / VAE / frame-align) dominates the
+remaining gap.
+
 #### 6.14o Stage-1 late-step block/attention split — MLP stride parity fixed, trajectory drift remains ⚠️ 2026-06-01
 
 Ran the §6.14l follow-up on the corrected current workdir at 321 frames /

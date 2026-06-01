@@ -139,6 +139,12 @@ class SanaWmNativeSmokeParams:
     num_frames: int
     num_inference_steps: int
     seed: int
+    # Classifier-free guidance: NVlabs Sana-WM video runs cfg_scale=5.0 by
+    # default. The native path defaults to 1.0 (no CFG) for back-compat with
+    # earlier probes; pipelines that pass ``guidance_scale > 1.0`` with
+    # ``guidance_scale_provided=True`` get a true two-branch CFG forward.
+    cfg_scale: float = 1.0
+    negative_prompt: str = ""
 
 
 def build_sana_wm_download_patterns(*, include_refiner: bool = True) -> tuple[str, ...]:
@@ -368,12 +374,26 @@ class SanaWmPipeline(
         steps = int(extra_args.get("sana_wm_native_smoke_steps", steps))
         if min(height, width, num_frames, steps) <= 0:
             raise ValueError("Sana-WM native smoke height, width, num_frames, and steps must be positive.")
+        # CFG: only enable when the caller explicitly opts in via
+        # ``guidance_scale_provided=True`` AND guidance_scale > 1. This keeps
+        # the legacy single-branch behavior for tests/probes that pass cfg=1.0
+        # (e.g. §6.14k/q probes) while restoring NVlabs production semantics
+        # (cfg=5.0 by default for sana-wm video).
+        cfg_scale = 1.0
+        if sampling_params is not None and getattr(sampling_params, "guidance_scale_provided", False):
+            cfg_scale = float(getattr(sampling_params, "guidance_scale", 1.0) or 1.0)
+        cfg_scale = float(extra_args.get("sana_wm_native_smoke_cfg_scale", cfg_scale))
+        # Negative prompt for CFG uncond branch; defaults to empty string
+        # matching NVlabs `GenerationParams.negative_prompt = ""`.
+        negative_prompt = str(extra_args.get("sana_wm_native_smoke_negative_prompt", "") or "")
         return SanaWmNativeSmokeParams(
             height=height,
             width=width,
             num_frames=num_frames,
             num_inference_steps=steps,
             seed=seed,
+            cfg_scale=cfg_scale,
+            negative_prompt=negative_prompt,
         )
 
     def _native_smoke_dtype(self, device: torch.device) -> torch.dtype:
@@ -837,6 +857,29 @@ class SanaWmPipeline(
 
         prompt_attention_mask = getattr(self, "_last_prompt_attention_mask", None)
 
+        # Classifier-Free Guidance (NVlabs sana-wm video runs cfg=5.0 in
+        # production). The native path previously omitted the uncond branch
+        # entirely, so ``guidance_scale`` was silently dropped. When the
+        # caller opts in to cfg > 1, encode the negative prompt now and run
+        # a two-branch transformer forward per denoise step (see below).
+        do_cfg = params.cfg_scale > 1.0
+        if do_cfg:
+            negative_prompt_obj = {"prompt": params.negative_prompt}
+            negative_prompt_embeds, _ = self._native_smoke_prompt_embeds(
+                negative_prompt_obj,
+                device=device,
+                dtype=dtype,
+                allow_hash_fallback=allow_hash_fallback,
+            )
+            negative_prompt_attention_mask = self._last_prompt_attention_mask
+            # Restore the cond mask on the instance attribute so callers
+            # inspecting `_last_prompt_attention_mask` after this method
+            # (e.g. dump probes) still see the positive-branch mask.
+            self._last_prompt_attention_mask = prompt_attention_mask
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_attention_mask = None
+
         camera = payload.get("camera") or {}
         condition = SanaWmCameraCondition(
             poses=camera.get("poses") if isinstance(camera, dict) else None,
@@ -919,7 +962,7 @@ class SanaWmPipeline(
             else:
                 model_timestep = timestep.expand(1)
             if cudagraph_denoiser is not None:
-                noise_pred, _ = cudagraph_denoiser.run(
+                noise_pred_cond, _ = cudagraph_denoiser.run(
                     self.transformer,
                     latents,
                     model_timestep,
@@ -931,7 +974,7 @@ class SanaWmPipeline(
                     buckets=cudagraph_buckets,
                 )
             else:
-                noise_pred = self.transformer(
+                noise_pred_cond = self.transformer(
                     latents,
                     model_timestep,
                     encoder_hidden_states=prompt_embeds,
@@ -940,6 +983,32 @@ class SanaWmPipeline(
                     raymap=raymap,
                     spatial_raymap=spatial_raymap,
                 )
+            if do_cfg:
+                if cudagraph_denoiser is not None:
+                    noise_pred_uncond, _ = cudagraph_denoiser.run(
+                        self.transformer,
+                        latents,
+                        model_timestep,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_attention_mask=negative_prompt_attention_mask,
+                        plucker=plucker,
+                        spatial_raymap=spatial_raymap,
+                        num_frames=params.num_frames,
+                        buckets=cudagraph_buckets,
+                    )
+                else:
+                    noise_pred_uncond = self.transformer(
+                        latents,
+                        model_timestep,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_attention_mask=negative_prompt_attention_mask,
+                        plucker=plucker,
+                        raymap=raymap,
+                        spatial_raymap=spatial_raymap,
+                    )
+                noise_pred = noise_pred_uncond + params.cfg_scale * (noise_pred_cond - noise_pred_uncond)
+            else:
+                noise_pred = noise_pred_cond
             # Audit §6.13f probe hook: opt-in dump of native step-0
             # (input latent, per-frame timestep, noise_pred) for the
             # noise_pred parity comparison vs the NVlabs LTXFlowEuler
