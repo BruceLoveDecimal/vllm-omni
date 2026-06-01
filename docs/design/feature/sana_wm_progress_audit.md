@@ -2796,6 +2796,63 @@ final cos against the §6.14l baseline. If the cos drops below `0.95` cliff
 with fp32 promotion, that confirms the per-step residual at low-sigma
 steps is the leverage point.
 
+#### 6.14s Production-config e2e rerun — first apples-to-apples NVlabs-recommended numbers ⚠️ 2026-06-01
+
+First e2e RGB measurement under the NVlabs-recommended production knobs
+(`num_frames=161`, `step=60`, `cfg_scale=5.0`, `seed=42`, `flow_shift=9.8`,
+`fps=16`, refiner 3 steps, sink_size 1, refiner seed 42). Same `run_one_side.py`
+harness as §6.14q, common-prefix 160 frames, no frame alignment. Both
+reference and native at production config.
+
+| Artifact | Path |
+|---|---|
+| Reference (NVlabs full pipeline) | `/tmp/ref_161_60_prod.npy` (432 MB uint8) |
+| Native (vllm_omni full pipeline) | `/tmp/nat_161_60_prod.npy` (1.74 GB float32) |
+
+| Metric | Value |
+|---|---:|
+| `MAE` | **49.97** |
+| `PSNR` | **11.79** dB |
+| `SSIM-Y` | **0.3145** |
+
+**Comparison to prior non-production runs:**
+
+| Config | MAE | PSNR | SSIM-Y | Notes |
+|---|---:|---:|---:|---|
+| **Production (this)** — 161f / 60 / cfg=5.0 / seed=42 | **49.97** | **11.79** | **0.315** | NVlabs-recommended |
+| §6.14q non-prod — 9f / 20 / cfg=1.0 / seed=0 | 63.43 | 8.92 | 0.173 | undersampled + no guidance |
+| §6.14q diffusers refiner — same as above | 63.67 | 9.00 | 0.176 | refiner swap, e2e barely moves |
+| §6.14k non-prod — 321f / 20 / cfg=1.0 / seed=0 (frame-align Global) | 39.22 | 14.31 | 0.246 | stress-test, uses `auto_prepend_reference_frame0` alignment |
+
+Production config is **better than 9f/20 non-prod** (MAE 49.97 vs 63.43,
+SSIM 0.315 vs 0.173) but **worse than 321f/20 non-prod with frame alignment**
+(MAE 49.97 vs 39.22). The 321f number is not apples-to-apples (different
+length, different alignment), so the meaningful comparison is to 9f/20:
+moving to production config improves SSIM-Y by **+82%** (`0.173 -> 0.315`)
+and shaves MAE by `~13`.
+
+**Caveats.**
+
+1. SSIM-Y `0.315` is still far from the `>= 0.93` acceptance gate, and
+   PSNR `11.79` dB is far from `>= 30` dB. Production-quality RGB parity
+   is not yet achieved.
+2. The 5.0× guidance and 60-step trajectory amplify *both* sides
+   equally. Same-source latent parity (cos `0.975`, §6.14l) is still the
+   underlying limiter — guidance and step count amplify whatever
+   per-step residual exists into a stronger final signal.
+3. Reference run completed in ~3 min for 321f/20; 161f/60 production
+   reference took a similar duration. Native side is slower due to
+   per-step transformer forwards on long sequences.
+
+**Implication for next work.** The production-config gap (MAE `49.97`,
+SSIM `0.315`) is the new baseline for ROI decisions. Closing Stage-1 latent
+parity (§6.14r ROI lead) is expected to drop pixel-space MAE the most;
+refiner port (§6.14p/q) and VAE alignment remain second-order at this
+gap level.
+
+Probe artifacts: `/tmp/ref_161_60_prod.npy`, `/tmp/nat_161_60_prod.npy`,
+`/tmp/compute_metrics.py /tmp/nat_161_60_prod.npy /tmp/ref_161_60_prod.npy`.
+
 #### 6.14o Stage-1 late-step block/attention split — MLP stride parity fixed, trajectory drift remains ⚠️ 2026-06-01
 
 Ran the §6.14l follow-up on the corrected current workdir at 321 frames /
