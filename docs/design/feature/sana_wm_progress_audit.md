@@ -2853,6 +2853,87 @@ gap level.
 Probe artifacts: `/tmp/ref_161_60_prod.npy`, `/tmp/nat_161_60_prod.npy`,
 `/tmp/compute_metrics.py /tmp/nat_161_60_prod.npy /tmp/ref_161_60_prod.npy`.
 
+#### 6.14t fp32 attention "fix" — REFUTED (NVlabs also runs bf16 SDPA) ❌ 2026-06-01
+
+Hypothesis: vllm_omni `_forward_softmax_raw` and `_forward_softmax_cam_branch`
+in [sana_wm_transformer.py](../../vllm_omni/diffusion/models/sana_wm/sana_wm_transformer.py)
+contained an apparent bug where Q/K/V were promoted to fp32 only to be
+immediately demoted back to bf16 before SDPA, contradicting `fp32_attention=True`
+intent. The NVlabs config for Sana-WM Video (`sana_wm_1600m_720p.yaml`) sets
+`fp32_attention: true`. Looking at the image-side wrapper
+(`app/sana_pipeline.py`) this flag is *masked off* under `bf16` mixed
+precision, but the **video** pipeline (`inference_video_scripts/inference_sana_wm.py:553`)
+does not apply that mask: `use_fp32_attention=self.config.model.get("fp32_attention", False)`.
+That suggested vllm_omni's promote-then-demote pattern was diverging from
+NVlabs's actual fp32 attention.
+
+**Refutation.** Reading NVlabs's softmax SDPA path itself
+(`diffusion/model/nets/sana_gdn_camctrl_blocks.py::_forward_softmax_attn_sdpa`
+around line 1468) shows **the same promote-then-demote pattern**, with an
+explicit comment:
+
+```python
+if getattr(self, "fp32_attention", True):
+    q_sdpa, k_sdpa, v_sdpa = q_sdpa.float(), k_sdpa.float(), v_sdpa.float()
+# SDPA / FlashAttention only supports bf16/fp16; fp32 falls back to math backend.
+if q_sdpa.dtype == torch.float32:
+    q_sdpa, k_sdpa, v_sdpa = q_sdpa.bfloat16(), k_sdpa.bfloat16(), v_sdpa.bfloat16()
+```
+
+So NVlabs deliberately chose **bf16 SDPA** for performance (FlashAttention
+requires bf16/fp16; fp32 would dispatch to the slow math backend). The
+`fp32_attention=True` flag in the video pipeline is cosmetic for the SDPA path
+— it triggers a no-op promote-then-demote that vllm_omni was already
+mirroring.
+
+**Empirical verification.** Ran two teacher-forced 321 f / 20 step probes
+side-by-side on the unmasked-cam-prep trace
+(`run_teacher_forced_native_on_official_trace.py`):
+
+- After my "fix" (no demote, real fp32 SDPA via math backend):
+  step-0 `noise_pred` gen MAE `0.12428`, cos `0.988822`;
+  step-18 MAE `0.02918`, cos `0.999197`;
+  step-19 MAE `0.02857`, cos `0.998898`.
+- After revert (original promote-then-demote bf16 SDPA, matching NVlabs):
+  step-0 MAE `0.12446`, cos `0.988788`;
+  step-18 MAE `0.02919`, cos `0.999194`;
+  step-19 MAE `0.02858`, cos `0.998895`.
+
+Numerically identical at the 4th decimal. The two only differ in the 5
+`softmax_every_n=4` hybrid blocks' attention precision, and at this
+unmasked-cross-attn baseline (MAE 0.12 dominated by §6.13x prompt-mask
+issue) the precision change is buried under the dominant error source.
+Even if it had a tiny clean effect, it was in the *wrong* direction —
+moving away from NVlabs's bf16 SDPA reference makes vllm_omni's
+output less faithful to the official trajectory, not more.
+
+Artifacts:
+`/root/autodl-tmp/stage1_longseq_probe/teacher_forced_after_fp32_fix_321f_20step.json`,
+`/root/autodl-tmp/stage1_longseq_probe/teacher_forced_after_revert_321f_20step.json`.
+
+**Net effect on the code.** Kept the revert in place (reaffirming the
+promote-then-demote pattern in both `_forward_softmax_raw` and
+`_forward_softmax_cam_branch`), with an updated comment that documents
+*why* it matches NVlabs. This is the audit equivalent of §6.14n's
+RMSNorm refutation: a precision-promotion fix that looked correct on
+its face but turned out to be NVlabs-incompatible.
+
+**Implication for "push Stage-1 to cos 0.99+".** Both candidate
+"precision-promotion" fixes (RMSNorm in §6.14n; attention SDPA here)
+have now been ruled out. The remaining Stage-1 leverage paths are:
+
+1. **Stage-1 transformer-level NVlabs reference swap** — analog of
+   §6.14p's refiner-vs-diffusers swap. Sana-WM has no clean upstream
+   transformer class outside the NVlabs research repo, so this needs
+   wrapper plumbing.
+2. **VAE / frame-align side investigations** — refiner is provably not
+   the e2e bottleneck (§6.14q); Stage-1 latent gap is small (cos
+   0.975) and may be a "structural" residual that absorbs less of the
+   pixel-space MAE than expected.
+3. **Accept the Stage-1 latent floor** at cos 0.975 and pivot to
+   acceptance criteria (define what RGB MAE/SSIM is "good enough"
+   without strict NVlabs bit-parity).
+
 #### 6.14o Stage-1 late-step block/attention split — MLP stride parity fixed, trajectory drift remains ⚠️ 2026-06-01
 
 Ran the §6.14l follow-up on the corrected current workdir at 321 frames /

@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm_omni.diffusion.models.sana_wm.cam_prep import cam_prep_func, prepare_cam_prep_context
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.gated_deltanet_triton import (
     SANA_WM_REQUIRE_TRITON_GDN_ENV,
@@ -1103,6 +1104,14 @@ class SanaWmSelfAttention(nn.Module):
         value = value.transpose(1, 2)
 
         dtype_orig = hidden_states.dtype
+        # NVlabs runs SDPA in bf16 even when ``fp32_attention=True`` because
+        # FlashAttention only supports bf16/fp16; fp32 falls back to the
+        # math backend. Match that semantics: if the upstream code path
+        # promoted Q/K/V to fp32 (e.g. q/k_norm in fp32), demote back to
+        # bf16 before SDPA. See
+        # ``NVlabs-Sana/diffusion/model/nets/sana_gdn_camctrl_blocks.py``
+        # ``_forward_softmax_attn_sdpa`` (the comment "SDPA / FlashAttention
+        # only supports bf16/fp16; fp32 falls back to math backend.").
         if query.dtype == torch.float32:
             query = query.bfloat16()
             key = key.bfloat16()
@@ -1168,6 +1177,14 @@ class SanaWmSelfAttention(nn.Module):
         query = q_cam_trans
         key = k_cam_trans
         value = v_cam_trans
+        # Match NVlabs ``_forward_softmax_attn_sdpa``: promote to fp32 to honor
+        # ``fp32_attention=True``, then demote back to bf16 for SDPA so we
+        # get FlashAttention instead of the fp32 math-backend fallback. The
+        # net SDPA math is therefore bf16 (matching NVlabs), but Q/K/V are
+        # composed in fp32 prior to the demote. See the comment in
+        # ``sana_gdn_camctrl_blocks.py::_forward_softmax_attn_sdpa``:
+        # "SDPA / FlashAttention only supports bf16/fp16; fp32 falls back to
+        # math backend."
         if getattr(self, "fp32_attention", True):
             query = query.float()
             key = key.float()
@@ -1378,16 +1395,15 @@ class SanaWmSelfAttention(nn.Module):
                 f"Sana-WM cam branch expects N=T*H*W, got N={token_count}, THW={spatial_shape}."
             )
 
-        # Build the UCPE apply closures once per call. Future optimisation:
-        # hoist this to the block level so the same closures are reused
-        # across all 20 transformer blocks (NVlabs caches via prope_fns).
-        rotary_emb_freqs = self._ucpe_rotary_freqs(rotary_emb)
-        apply_fn_q, apply_fn_kv, apply_fn_o = prepare_prope_fns(
-            head_dim=self.cam_head_dim,
+        # Build the cam-prep context once per call. This mirrors NVlabs'
+        # fused ``cam_prep_func`` input contract instead of routing through
+        # the Python ``prepare_prope_fns`` Q/K/V closures.
+        cam_prep_context = prepare_cam_prep_context(
             camera_conditions=camera_conditions,
-            HW=spatial_shape,
+            spatial_shape=spatial_shape,
             patch_size=self.patch_size,
-            rotary_emb=rotary_emb_freqs,
+            head_dim=self.cam_head_dim,
+            rotary_emb=self._ucpe_rotary_freqs(rotary_emb),
         )
 
         # 1. Projections (all from x).
@@ -1403,41 +1419,33 @@ class SanaWmSelfAttention(nn.Module):
         if self.conv_v_cam is not None:
             v_cam = self._bidirectional_temporal_short_conv(v_cam, self.conv_v_cam, spatial_shape)
 
-        # 3. Q/K norm on flattened channel dim.
-        q_cam = self.q_norm_cam(q_cam)
-        k_cam = self.k_norm_cam(k_cam)
-
-        # Reshape to (B, N, H_cam, D_cam) then to (B, H_cam, N, D_cam) for
-        # UCPE apply (UCPE closures expect (B, num_heads, N, D)).
-        q_cam = q_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).transpose(1, 2)
-        k_cam = k_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).transpose(1, 2)
-        v_cam = v_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).transpose(1, 2)
-
-        # 4. ReLU kernel + k_scale.
-        q_cam = F.relu(q_cam)
-        k_cam = F.relu(k_cam)
+        # 3-6. Fused cam-prep semantics: RMSNorm/ReLU/K-scale, UCPE
+        # projection, RoPE, and K inflation tracking. Outputs already use
+        # NVlabs' ``(B, H, D, N)`` scan layout.
+        q_raw = q_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).contiguous()
+        k_raw = k_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).contiguous()
+        v_raw = v_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).contiguous()
         k_scale = (self.cam_head_dim**-0.5) * (spatial_tokens**-0.5)
-        k_cam = k_cam * k_scale
-
-        # 5. UCPE per-token transforms.
-        pre_ucpe_k_norm = torch.linalg.vector_norm(k_cam, dim=-1, keepdim=True).clamp_min(1e-6)
-        q_cam_trans = apply_fn_q(q_cam)
-        kv_cam = torch.cat([k_cam, v_cam], dim=1)
-        kv_cam_trans = apply_fn_kv(kv_cam)
-        k_cam_trans, v_cam_trans = torch.chunk(kv_cam_trans, chunks=2, dim=1)
-
-        # 6. Match NVlabs' production BothTriton path: do not apply the
-        # Python PostUCPERenorm shrink here. `cam_prep_func` feeds raw
-        # UCPE-transformed Q/K/V into `cam_scan_bidi_chunkwise` and computes
-        # beta discounting from the raw K inflation.
-        post_ucpe_k_norm = torch.linalg.vector_norm(k_cam_trans, dim=-1, keepdim=True).clamp_min(1e-6)
-        inflation_sq = (post_ucpe_k_norm / pre_ucpe_k_norm) ** 2  # (B, H, N, 1)
+        norm_eps_val = float(
+            getattr(self.q_norm_cam, "eps", getattr(self.q_norm_cam, "variance_epsilon", 1e-6))
+        )
+        q_rot_bhdn, k_rot_bhdn, v_bhdn, inflation_sq = cam_prep_func(
+            q_raw,
+            k_raw,
+            v_raw,
+            q_norm_weight=self.q_norm_cam.weight.float().contiguous(),
+            k_norm_weight=self.k_norm_cam.weight.float().contiguous(),
+            proj_q=cam_prep_context.proj_q,
+            proj_kv=cam_prep_context.proj_kv,
+            rope_cos=cam_prep_context.rope_cos,
+            rope_sin=cam_prep_context.rope_sin,
+            k_scale=k_scale,
+            norm_eps=norm_eps_val,
+        )
 
         # 7. Dynamic Beta Discounting (per-frame mean over spatial tokens).
         beta, decay = precomputed_gates
-        inflation_per_token = inflation_sq.squeeze(-1).reshape(
-            batch_size, self.cam_heads, frames, spatial_tokens
-        )
+        inflation_per_token = inflation_sq.reshape(batch_size, self.cam_heads, frames, spatial_tokens)
         frame_inflation_sq = inflation_per_token.mean(dim=-1)  # (B, H_cam, T)
         if beta.shape[1] != self.cam_heads:
             repeat_factor = self.cam_heads // beta.shape[1]
@@ -1455,9 +1463,6 @@ class SanaWmSelfAttention(nn.Module):
 
         # 8. Single-path bidirectional delta-rule recurrence on the UCPE-
         # transformed Q/K/V (no Z denominator, no final divide).
-        q_rot_bhdn = q_cam_trans.permute(0, 1, 3, 2).contiguous()
-        k_rot_bhdn = k_cam_trans.permute(0, 1, 3, 2).contiguous()
-        v_bhdn = v_cam_trans.permute(0, 1, 3, 2).contiguous()
         cam_out_bhdn = self._bidi_single_path(
             q_rot_bhdn, k_rot_bhdn, v_bhdn, beta_cam, decay_cam, spatial_tokens=spatial_tokens
         )
@@ -1466,7 +1471,7 @@ class SanaWmSelfAttention(nn.Module):
         # ``apply_fn_o`` expects (B, H, N, D); we currently have
         # (B, H, D, N) — transpose, apply, transpose back.
         cam_out_bhnd = cam_out_bhdn.transpose(-1, -2).contiguous()
-        cam_out_bhnd = apply_fn_o(cam_out_bhnd)
+        cam_out_bhnd = cam_prep_context.apply_output(cam_out_bhnd)
         cam_out_bhdn = cam_out_bhnd.transpose(-1, -2).contiguous()
 
         # (B, H_cam, D_cam, N) → (B, N, cam_dim)
@@ -1756,8 +1761,10 @@ class SanaWmMbConvFfn(nn.Module):
             hidden_states.reshape(batch * frames, spatial_tokens, hidden_size)
             .reshape(batch * frames, height, width, hidden_size)
             .permute(0, 3, 1, 2)
-            .contiguous()
         )
+        # NVlabs leaves this NHWC-derived NCHW view non-contiguous. On bf16
+        # CUDA convs that selects a different kernel/layout than a contiguous
+        # copy; preserving the stride is required for late-step parity.
         # NVlabs ``ConvLayer`` wraps Conv2d in `Conv → norm → act`. For SANA-WM
         # `act=("silu", "silu", None)`: inverted_conv applies SiLU, depth_conv
         # and point_conv don't. Our ``_ConvWrapper`` only stores the raw
