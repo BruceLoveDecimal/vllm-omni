@@ -4,6 +4,14 @@
 # model_index.json; data.py detects the layout heuristically but allows the
 # yaml to override.  skip_mm_profiling is required because diffusion_engine.py
 # skips dummy_run for SanaWmTwoStagesPipeline.
+#
+# default_sampling_params mirror the NVlabs-recommended production inference
+# config (see docs/design/feature/sana_wm_integration.md
+# "NVlabs-Recommended Production Inference Config"):
+#   num_frames=161 (10 s @ 16 fps), num_inference_steps=60, guidance_scale=5.0,
+#   seed=42, fps=16. CFG=5.0 is the real production knob; the native pipeline
+#   now honors guidance_scale via the §6.14u CFG implementation. Callers can
+#   override any of these per-request; defaults apply only when unset.
 async_chunk: false
 
 stages:
@@ -19,5 +27,7 @@ stages:
       seed: 42
       height: 704
       width: 1280
-      num_frames: 321
-      num_inference_steps: 20
+      num_frames: 161
+      fps: 16
+      num_inference_steps: 60
+      guidance_scale: 5.0
