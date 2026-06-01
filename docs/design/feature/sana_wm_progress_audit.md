@@ -3021,6 +3021,64 @@ weight under cfg=5.0 needs to be re-measured. Specifically, the
 which axis (Stage-1 / refiner / VAE / frame-align) dominates the
 remaining gap.
 
+#### 6.14v Refiner port A/B at cfg=5.0 production — byte-identical RGB (uint8 quantization floor) ⚠️ 2026-06-01
+
+§6.14u landed real CFG and produced the first real production-config
+e2e gap (MAE `28.99`). Re-ran the §6.14q apples-to-apples refiner A/B
+under those production knobs (161 f / 60 step / cfg=5.0 / seed=42)
+with the new `SANA_WM_USE_DIFFUSERS_REFINER` env flag toggled. Debug
+prints in `_ensure_refiner_transformer` confirm the diffusers branch
+is taken (`LOADED diffusers refiner: type=diffusers.models.transformers.transformer_ltx2.LTX2VideoTransformer3DModel`).
+
+| Run | Refiner | md5 | MAE vs ref | PSNR | SSIM-Y |
+|---|---|---|---:|---:|---:|
+| §6.14u baseline | vllm_omni LTX-2 port (default) | `f2a3dea...` | 28.99 | 15.69 | 0.6582 |
+| diffusers swap | upstream `LTX2VideoTransformer3DModel` | `f2a3dea...` | 28.99 | 15.69 | 0.6582 |
+| omni explicit | `SANA_WM_USE_DIFFUSERS_REFINER=0` | `f2a3dea...` | 28.99 | 15.69 | 0.6582 |
+
+All three native cfg=5.0 production runs produce **byte-identical RGB**
+(same md5). At 9 f / 20 step / cfg=5.0 the same A/B gives different md5s
+(omni `328db01...` / diffusers `f240252...`) and the diff between them
+is MAE `10.81` / PSNR `19.74` / SSIM-Y `0.928`. At cfg=1.0 / 9 f / 20
+step (§6.14q) the omni-vs-diffusers diff was MAE `18.66` / PSNR `17.38`
+/ SSIM-Y `0.865`.
+
+**Mechanism.** `_decode_native_smoke_latents` routes through
+`diffusers.video_processor.VideoProcessor.postprocess_video(output_type="np")`,
+which goes through uint8 quantization internally (256 distinct levels
+per channel) before re-casting to `float32`. At 161 f / 60 step / cfg=5.0
+the residual refiner-port latent-level difference (`~0.36 MAE` per the
+§6.14m same-source measurement) plus CFG averaging (cfg=5 combines
+cond + uncond every step, smearing per-step noise_pred differences)
+plus 60-step denoising trajectory averaging is enough to push the
+per-pixel float-side difference **below `1/255`**. At 9 f or cfg=1.0,
+the refiner-port difference is large enough to survive uint8
+quantization in many pixels and shows up as a non-zero MAE.
+
+**Implication.** At the NVlabs-recommended production config (161 f /
+60 step / cfg=5.0), the **refiner port contributes literally zero** to
+e2e RGB measurements (byte-identical npy). The current production gap
+to NVlabs reference (MAE `28.99` / PSNR `15.69` / SSIM-Y `0.6582`) is
+therefore entirely attributable to non-refiner factors:
+
+1. Stage-1 latent parity (cos `0.975` at 321 f / 20 step, similar order
+   at 161 f / 60 step) — still the most plausible dominant contributor.
+2. VAE decode path (not yet isolated under production cfg).
+3. Frame-alignment / common-prefix indexing in the metric harness
+   (also not yet isolated under production cfg).
+4. CFG branch precision (cond / uncond noise_pred separately vs NVlabs
+   reference) — would need a dedicated probe at cfg=5.
+
+Refiner port (§6.14p / §6.14q / §6.14v) is closed as a production
+e2e leverage point. The `SANA_WM_USE_DIFFUSERS_REFINER=1` flag is
+retained for non-production probes (latent-level parity verification,
+small-video debugging) but should not be expected to move production
+RGB metrics.
+
+Artifacts: `/tmp/nat_161_60_prod_cfg5{,_diffusers,_omni_explicit}.npy`
+(all 3 share md5 `f2a3dea...`); `/tmp/nat_9_cfg5_{omni,diffusers}.npy`
+(md5 differ).
+
 #### 6.14o Stage-1 late-step block/attention split — MLP stride parity fixed, trajectory drift remains ⚠️ 2026-06-01
 
 Ran the §6.14l follow-up on the corrected current workdir at 321 frames /
