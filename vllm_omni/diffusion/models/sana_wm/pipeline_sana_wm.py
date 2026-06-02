@@ -665,13 +665,14 @@ class SanaWmPipeline(
         # through ``timestep_conditioning`` like the older path did.
         denorm = self._vae_denormalize_latent(latents.to(getattr(self.vae, "dtype", dtype)))
         video = self.vae.decode(denorm, temb=None, return_dict=False)[0]
-        try:
-            from diffusers.video_processor import VideoProcessor
+        # Post-process to the requested output_type (np/pil/pt). Let failures
+        # surface: silently returning the raw decoder tensor would hand the
+        # caller a wrong-format/range video with no error (the latent-vs-RGB
+        # class of bug we already hit once).
+        from diffusers.video_processor import VideoProcessor
 
-            processor = VideoProcessor(vae_scale_factor=getattr(self.vae, "spatial_compression_ratio", 32))
-            return processor.postprocess_video(video, output_type=output_type)
-        except Exception:
-            return video
+        processor = VideoProcessor(vae_scale_factor=getattr(self.vae, "spatial_compression_ratio", 32))
+        return processor.postprocess_video(video, output_type=output_type)
 
     def _run_native_smoke_backend(
         self,
