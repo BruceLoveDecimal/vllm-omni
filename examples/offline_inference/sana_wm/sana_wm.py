@@ -170,6 +170,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-frames-npy", "--save_frames_npy", default=None,
                         help="Also dump generated frames losslessly as (T,H,W,3) uint8 .npy. Use this "
                         "as a clean --reference for the next run (avoids mp4 codec noise in metrics).")
+    parser.add_argument("--frame-align", "--frame_align", default="auto",
+                        choices=["auto", "none", "drop_pred_frame0", "drop_ref_frame0",
+                                 "drop_pred_last", "drop_ref_last"],
+                        help="Frame-0/off-by-one alignment for --reference metrics. auto picks the "
+                        "lowest-MSE shift (handles the conditioning-frame convention vs NVlabs).")
     return parser.parse_args()
 
 
@@ -317,7 +322,27 @@ def _to_luma(v: np.ndarray) -> np.ndarray:  # (T,H,W,3) -> (T,H,W) BT.601
     return 0.299 * v[..., 0] + 0.587 * v[..., 1] + 0.114 * v[..., 2]
 
 
-def _compute_video_metrics(pred_frames: list[np.ndarray], reference: str) -> dict[str, Any]:
+def _frame_align_candidates(pred: np.ndarray, ref: np.ndarray, mode: str) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Candidate (pred, ref) pairings to absorb a frame-0/off-by-one convention.
+
+    SANA-WM emits the conditioning frame 0; the NVlabs reference may drop it
+    (or trim the last frame), giving a 1-frame offset that, uncorrected, wrecks
+    a positional MAE/PSNR. We try the plausible shifts and (in auto) keep the
+    best-matching one.
+    """
+    cands: dict[str, tuple[np.ndarray, np.ndarray]] = {"none": (pred, ref)}
+    if pred.shape[0] == ref.shape[0] + 1:
+        cands["drop_pred_frame0"] = (pred[1:], ref)
+        cands["drop_pred_last"] = (pred[:-1], ref)
+    elif ref.shape[0] == pred.shape[0] + 1:
+        cands["drop_ref_frame0"] = (pred, ref[1:])
+        cands["drop_ref_last"] = (pred, ref[:-1])
+    if mode != "auto":
+        return {mode: cands[mode]} if mode in cands else {"none": (pred, ref)}
+    return cands
+
+
+def _compute_video_metrics(pred_frames: list[np.ndarray], reference: str, frame_align: str = "auto") -> dict[str, Any]:
     pred = _stack_frames_255(pred_frames)
     ref = _load_reference_255(reference)
     if pred.shape[1:3] != ref.shape[1:3]:
@@ -325,8 +350,17 @@ def _compute_video_metrics(pred_frames: list[np.ndarray], reference: str) -> dic
             "reference": reference,
             "metric_error": f"spatial size mismatch pred={pred.shape[1:3]} ref={ref.shape[1:3]}",
         }
-    n = min(pred.shape[0], ref.shape[0])
-    pred, ref = pred[:n], ref[:n]
+    orig_pred_frames, orig_ref_frames = int(pred.shape[0]), int(ref.shape[0])
+    # Pick the frame alignment that minimizes MSE (auto), or the requested one.
+    best = None  # (mse, name, pred_a, ref_a)
+    for name, (pa, ra) in _frame_align_candidates(pred, ref, frame_align).items():
+        k = min(pa.shape[0], ra.shape[0])
+        if k == 0:
+            continue
+        m = float(np.mean((pa[:k] - ra[:k]) ** 2))
+        if best is None or m < best[0]:
+            best = (m, name, pa[:k], ra[:k])
+    _, alignment, pred, ref = best
     mse = float(np.mean((pred - ref) ** 2))
     psnr = float("inf") if mse == 0.0 else float(10.0 * np.log10((255.0 ** 2) / mse))
     c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
@@ -342,9 +376,10 @@ def _compute_video_metrics(pred_frames: list[np.ndarray], reference: str) -> dic
         ssim_vals.append(float(num / den) if den else 1.0)
     return {
         "reference": reference,
-        "frames_compared": int(n),
-        "pred_frames": int(pred.shape[0]),
-        "ref_frames": int(ref.shape[0]),
+        "frame_alignment": alignment,
+        "frames_compared": int(pred.shape[0]),
+        "pred_frames": orig_pred_frames,
+        "ref_frames": orig_ref_frames,
         "mae": round(float(np.mean(np.abs(pred - ref))), 6),
         "psnr_db": round(psnr, 4) if psnr != float("inf") else "inf",
         "ssim_y": round(float(np.mean(ssim_vals)), 6),
@@ -459,14 +494,15 @@ def main() -> None:
         "output": str(output_path),
     }
     if args.reference:
-        vm = _compute_video_metrics(frames, args.reference)
+        vm = _compute_video_metrics(frames, args.reference, frame_align=args.frame_align)
         metrics.update(vm)
         if "metric_error" in vm:
             print(f"[metrics] skipped: {vm['metric_error']}")
         else:
             print(
                 f"[metrics] vs {args.reference}: MAE={vm['mae']:.4f}  "
-                f"PSNR={vm['psnr_db']} dB  SSIM-Y={vm['ssim_y']:.4f}  (frames={vm['frames_compared']})"
+                f"PSNR={vm['psnr_db']} dB  SSIM-Y={vm['ssim_y']:.4f}  "
+                f"(frames={vm['frames_compared']}, align={vm['frame_alignment']})"
             )
     else:
         print("[metrics] no --reference; MAE/PSNR/SSIM skipped (run config + timing still recorded)")
