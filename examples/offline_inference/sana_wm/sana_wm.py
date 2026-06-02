@@ -52,6 +52,7 @@ high/low-noise experts) but Sana-WM uses a single CFG branch, so it is ignored.
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -160,6 +161,15 @@ def parse_args() -> argparse.Namespace:
                         help="Disable torch.compile. Default off: the DiT blocks are regionally "
                         "compiled (dynamic=True) via the shared diffusion runner.")
     parser.add_argument("--output", default="sana_wm_out.mp4", help="Output mp4 path.")
+    # --- evaluation / metrics (optional) ---
+    parser.add_argument("--reference", default=None,
+                        help="Reference video (.mp4) or frames (.npy) to compute MAE/PSNR/SSIM-Y against. "
+                        "E.g. an eager run's output to validate the compiled path, or a frozen golden.")
+    parser.add_argument("--metrics-json", "--metrics_json", default=None,
+                        help="Write run metadata + metrics to this JSON path (persisted to disk).")
+    parser.add_argument("--save-frames-npy", "--save_frames_npy", default=None,
+                        help="Also dump generated frames losslessly as (T,H,W,3) uint8 .npy. Use this "
+                        "as a clean --reference for the next run (avoids mp4 codec noise in metrics).")
     return parser.parse_args()
 
 
@@ -272,6 +282,75 @@ def _to_frame_list(frames: Any) -> list[np.ndarray]:
     return [arr[t] for t in range(arr.shape[0])]
 
 
+# ---------------------------------------------------------------------------
+# Metrics (optional, vs a --reference video/frames). All in float [0, 255].
+# ---------------------------------------------------------------------------
+def _stack_frames_255(frames: list[np.ndarray]) -> np.ndarray:
+    """List of (H,W,C) frames -> (T,H,W,3) float32 in [0, 255]."""
+    arr = np.stack([np.asarray(f, dtype=np.float32) for f in frames], axis=0)
+    if arr.size and float(arr.max()) <= 1.0 + 1e-6:
+        arr = arr * 255.0
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    return arr
+
+
+def _load_reference_255(path: str) -> np.ndarray:
+    """Load a reference video (.mp4) or frames (.npy) as (T,H,W,3) float32 [0,255]."""
+    p = Path(path)
+    if p.suffix == ".npy":
+        a = np.asarray(np.load(p), dtype=np.float32)
+        if a.ndim == 5:
+            a = a[0]
+        if a.ndim == 4 and a.shape[0] in (3, 4):  # (C,T,H,W) -> (T,H,W,C)
+            a = np.transpose(a, (1, 2, 3, 0))
+        if a.size and float(a.max()) <= 1.0 + 1e-6:
+            a = a * 255.0
+        return a[..., :3] if a.shape[-1] == 4 else a
+    import imageio.v3 as iio
+
+    a = np.asarray(iio.imread(p), dtype=np.float32)  # (T,H,W,C)
+    return a[..., :3] if a.shape[-1] == 4 else a
+
+
+def _to_luma(v: np.ndarray) -> np.ndarray:  # (T,H,W,3) -> (T,H,W) BT.601
+    return 0.299 * v[..., 0] + 0.587 * v[..., 1] + 0.114 * v[..., 2]
+
+
+def _compute_video_metrics(pred_frames: list[np.ndarray], reference: str) -> dict[str, Any]:
+    pred = _stack_frames_255(pred_frames)
+    ref = _load_reference_255(reference)
+    if pred.shape[1:3] != ref.shape[1:3]:
+        return {
+            "reference": reference,
+            "metric_error": f"spatial size mismatch pred={pred.shape[1:3]} ref={ref.shape[1:3]}",
+        }
+    n = min(pred.shape[0], ref.shape[0])
+    pred, ref = pred[:n], ref[:n]
+    mse = float(np.mean((pred - ref) ** 2))
+    psnr = float("inf") if mse == 0.0 else float(10.0 * np.log10((255.0 ** 2) / mse))
+    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+    py, ry = _to_luma(pred), _to_luma(ref)
+    ssim_vals = []
+    for t in range(py.shape[0]):
+        p, r = py[t], ry[t]
+        mp, mr = float(p.mean()), float(r.mean())
+        vp, vr = float(np.var(p)), float(np.var(r))
+        vpr = float(np.mean((p - mp) * (r - mr)))
+        num = (2 * mp * mr + c1) * (2 * vpr + c2)
+        den = (mp ** 2 + mr ** 2 + c1) * (vp + vr + c2)
+        ssim_vals.append(float(num / den) if den else 1.0)
+    return {
+        "reference": reference,
+        "frames_compared": int(n),
+        "pred_frames": int(pred.shape[0]),
+        "ref_frames": int(ref.shape[0]),
+        "mae": round(float(np.mean(np.abs(pred - ref))), 6),
+        "psnr_db": round(psnr, 4) if psnr != float("inf") else "inf",
+        "ssim_y": round(float(np.mean(ssim_vals)), 6),
+    }
+
+
 def main() -> None:
     args = parse_args()
     _resolve_demo(args)
@@ -344,7 +423,8 @@ def main() -> None:
             extra_args=extra_args,
         ),
     )
-    print(f"[time] generation took {time.perf_counter() - start:.2f}s")
+    gen_seconds = time.perf_counter() - start
+    print(f"[time] generation took {gen_seconds:.2f}s")
 
     frames = _to_frame_list(_extract_frames(output))
     output_path = Path(args.output)
@@ -355,6 +435,47 @@ def main() -> None:
         raise ImportError("diffusers is required to export the Sana-WM video.") from exc
     export_to_video(frames, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")
+
+    if args.save_frames_npy:
+        npy_path = Path(args.save_frames_npy)
+        npy_path.parent.mkdir(parents=True, exist_ok=True)
+        frames_u8 = np.clip(_stack_frames_255(frames), 0, 255).round().astype(np.uint8)
+        np.save(npy_path, frames_u8)
+        print(f"Saved lossless frames to {npy_path}  shape={frames_u8.shape}")
+
+    # --- metrics (optional) ---
+    metrics: dict[str, Any] = {
+        "demo": args.demo,
+        "pipeline": model_class_name,
+        "height": args.height,
+        "width": args.width,
+        "num_frames": args.num_frames,
+        "num_inference_steps": args.num_inference_steps,
+        "guidance_scale": args.guidance_scale,
+        "seed": args.seed,
+        "enforce_eager": args.enforce_eager,
+        "latent_tokens": token_count,
+        "generation_seconds": round(gen_seconds, 3),
+        "output": str(output_path),
+    }
+    if args.reference:
+        vm = _compute_video_metrics(frames, args.reference)
+        metrics.update(vm)
+        if "metric_error" in vm:
+            print(f"[metrics] skipped: {vm['metric_error']}")
+        else:
+            print(
+                f"[metrics] vs {args.reference}: MAE={vm['mae']:.4f}  "
+                f"PSNR={vm['psnr_db']} dB  SSIM-Y={vm['ssim_y']:.4f}  (frames={vm['frames_compared']})"
+            )
+    else:
+        print("[metrics] no --reference; MAE/PSNR/SSIM skipped (run config + timing still recorded)")
+
+    if args.metrics_json:
+        mj = Path(args.metrics_json)
+        mj.parent.mkdir(parents=True, exist_ok=True)
+        mj.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"[metrics] wrote {mj}")
 
 
 if __name__ == "__main__":
