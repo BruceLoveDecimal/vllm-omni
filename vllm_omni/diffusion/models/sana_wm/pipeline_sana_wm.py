@@ -1133,6 +1133,16 @@ class SanaWmPipeline(
         materialized_camera_params = dict(self.camera_encoder.named_parameters()) if self.camera_encoder else {}
         cached_weights = list(weights)
         loaded = self.transformer.load_weights(cached_weights)
+        # Build the Stage-1 transformer modules now instead of lazily on the
+        # first forward. The diffusion model runner applies regional
+        # torch.compile right after model load; if the SanaWmBlock submodules
+        # do not exist yet, regionally_compile finds nothing and silently skips
+        # (so the DiT never actually compiles). Materializing here — only on a
+        # real GPU runtime — lets the shared compile path engage. CPU unit tests
+        # keep the lazy/deferred behavior.
+        if torch.cuda.is_available() and not self.transformer.is_materialized:
+            device, dtype = self._runtime_device_dtype()
+            self.transformer.materialize(device=device, dtype=dtype)
         for source_name, tensor in cached_weights:
             remapped_name = normalize_sana_wm_stage1_weight_name(source_name)
             if remapped_name is None or not remapped_name.startswith("camera_encoder."):
