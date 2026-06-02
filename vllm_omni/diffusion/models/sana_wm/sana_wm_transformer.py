@@ -1578,6 +1578,13 @@ class SanaWmSelfAttention(nn.Module):
         # (B, H_cam, D_cam, N) → (B, N, cam_dim)
         return cam_out_bhdn.permute(0, 3, 1, 2).reshape(batch_size, token_count, self.cam_dim)
 
+    # The GDN/UCPE branch dispatches into a hand-written Triton kernel whose
+    # launch grid is computed from runtime shapes; under torch.compile those
+    # become symbolic and the grid degrades to a float ("'float' object cannot
+    # be interpreted as an integer" at Triton launch). Run the whole attention
+    # eagerly (graph break) so the kernel sees concrete int shapes; the rest of
+    # the block (MLP / norms / cross-attention) still compiles.
+    @torch.compiler.disable
     def forward(
         self,
         hidden_states: torch.Tensor,
