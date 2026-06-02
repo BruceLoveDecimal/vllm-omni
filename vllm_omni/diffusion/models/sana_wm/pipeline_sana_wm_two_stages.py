@@ -691,8 +691,8 @@ def _streaming_refiner_self_attention(
         query = apply_interleaved_rotary_emb(query, query_rotary_emb)
         key = apply_interleaved_rotary_emb(key, query_rotary_emb)
     elif attn.rope_type == "split":
-        query = apply_split_rotary_emb(query, query_rotary_emb)
-        key = apply_split_rotary_emb(key, query_rotary_emb)
+        query = apply_split_rotary_emb(query, query_rotary_emb, head_dim=attn.head_dim)
+        key = apply_split_rotary_emb(key, query_rotary_emb, head_dim=attn.head_dim)
     else:
         raise ValueError(f"Unsupported LTX-2 RoPE type: {attn.rope_type}")
 
