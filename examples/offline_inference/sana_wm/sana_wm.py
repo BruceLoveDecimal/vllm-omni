@@ -157,9 +157,13 @@ def parse_args() -> argparse.Namespace:
 
     # --- runtime ---
     parser.add_argument("--tensor-parallel-size", "--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--enforce-eager", "--enforce_eager", action="store_true", default=False,
-                        help="Disable torch.compile. Default off: the DiT blocks are regionally "
-                        "compiled (dynamic=True) via the shared diffusion runner.")
+    parser.add_argument("--enforce-eager", "--enforce_eager", action="store_true", default=True,
+                        help="Run eager (default). torch.compile reuse was measured net-negative for "
+                        "Sana-WM (compute-bound; GDN/attention run eager, refiner not compiled): "
+                        "~8%% slower than eager AND it perturbs the output (PSNR ~24.5 dB vs eager). "
+                        "Pass --no-enforce-eager only to experiment with the compiled path.")
+    parser.add_argument("--no-enforce-eager", "--no_enforce_eager", dest="enforce_eager",
+                        action="store_false", help="Opt into the (slower, output-perturbing) compiled path.")
     parser.add_argument("--output", default="sana_wm_out.mp4", help="Output mp4 path.")
     # --- evaluation / metrics (optional) ---
     parser.add_argument("--reference", default=None,
