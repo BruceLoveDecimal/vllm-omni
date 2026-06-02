@@ -42,9 +42,10 @@ ours is the native vLLM-Omni port).
 
 - *cold* = first invocation, includes one-time TorchInductor codegen.
 - *warm* = second invocation reusing the inductor FX cache (steady-state).
-- vs-NVlabs uses auto frame alignment, which picked `drop_pred_frame0` (our 161
-  frames include the conditioning frame 0; NVlabs emits 160), then compares the
-  160 common frames.
+- vs-NVlabs uses the fixed I2V conditioning-frame alignment `drop_pred_frame0`
+  (`pred[1:]` vs `ref`): our output includes the given first frame at index 0,
+  the NVlabs reference does not, so the 160 generated frames are compared. This
+  is a fixed, principled alignment (not a best-of search).
 
 ### Interpretation
 
