@@ -78,12 +78,19 @@ SANA_WM_STAGE1_GDN_STATE_SIZE = 20
 SANA_WM_DISABLE_VLLM_OPS_ENV = "VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS"
 
 
+# vLLM's TP accessors assert/raise when the tensor-parallel group is not yet
+# initialized. Catch only that "not initialized" family so a genuinely
+# unexpected error surfaces instead of silently degrading to TP=1 (which would
+# build an unsharded model under a TP runtime and corrupt the output).
+_TP_NOT_READY = (AssertionError, RuntimeError, ValueError)
+
+
 def _get_tp_rank() -> int:
     if get_tensor_model_parallel_rank is None:
         return 0
     try:
         return int(get_tensor_model_parallel_rank())
-    except Exception:
+    except _TP_NOT_READY:
         return 0
 
 
@@ -92,7 +99,7 @@ def _get_tp_world_size() -> int:
         return 1
     try:
         return int(get_tensor_model_parallel_world_size())
-    except Exception:
+    except _TP_NOT_READY:
         return 1
 
 
@@ -101,7 +108,7 @@ def _vllm_tp_group_ready() -> bool:
         return False
     try:
         get_tensor_model_parallel_world_size()
-    except Exception:
+    except _TP_NOT_READY:
         return False
     return True
 

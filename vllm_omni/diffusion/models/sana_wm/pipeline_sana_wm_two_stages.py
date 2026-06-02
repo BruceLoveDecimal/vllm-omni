@@ -320,28 +320,15 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         )
 
     @staticmethod
-    def _stage2_sigmas(num_steps: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        try:
-            from diffusers.pipelines.ltx2.utils import STAGE_2_DISTILLED_SIGMA_VALUES
-
-            values = list(STAGE_2_DISTILLED_SIGMA_VALUES)
-        except Exception:
-            values = [0.7, 0.5, 0.3]
-        if not values:
-            values = [0.7]
-        if num_steps <= len(values):
-            values = values[:num_steps]
-        else:
-            values = values + [values[-1]] * (num_steps - len(values))
-        return torch.tensor(values, device=device, dtype=dtype)
-
-    @staticmethod
     def _stage2_sigma_schedule(num_steps: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         try:
             from diffusers.pipelines.ltx2.utils import STAGE_2_DISTILLED_SIGMA_VALUES
 
             values = list(STAGE_2_DISTILLED_SIGMA_VALUES)
-        except Exception:
+        except ImportError:
+            # Distilled Stage-2 sigmas (matches NVlabs' start_sigma≈0.9094). Only
+            # used if this diffusers build lacks the constant; narrow to
+            # ImportError so a real error here is not silently masked.
             values = [0.909375, 0.725, 0.421875, 0.0]
         if len(values) < 2:
             values = [values[0] if values else 0.909375, 0.0]
