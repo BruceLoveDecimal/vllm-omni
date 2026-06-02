@@ -174,11 +174,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-frames-npy", "--save_frames_npy", default=None,
                         help="Also dump generated frames losslessly as (T,H,W,3) uint8 .npy. Use this "
                         "as a clean --reference for the next run (avoids mp4 codec noise in metrics).")
-    parser.add_argument("--frame-align", "--frame_align", default="auto",
-                        choices=["auto", "none", "drop_pred_frame0", "drop_ref_frame0",
-                                 "drop_pred_last", "drop_ref_last"],
-                        help="Frame-0/off-by-one alignment for --reference metrics. auto picks the "
-                        "lowest-MSE shift (handles the conditioning-frame convention vs NVlabs).")
+    parser.add_argument("--frame-align", "--frame_align", default="drop_pred_frame0",
+                        choices=["drop_pred_frame0", "none", "drop_ref_frame0",
+                                 "drop_pred_last", "drop_ref_last", "auto"],
+                        help="Frame alignment for --reference metrics. Default 'drop_pred_frame0' is "
+                        "the fixed I2V conditioning-frame convention (pred[1:] vs ref): our output "
+                        "includes the given first frame at index 0, the reference does not. "
+                        "'auto' (lowest-MSE search) is a DIAGNOSTIC only — do not report its number.")
     return parser.parse_args()
 
 
@@ -327,26 +329,39 @@ def _to_luma(v: np.ndarray) -> np.ndarray:  # (T,H,W,3) -> (T,H,W) BT.601
 
 
 def _frame_align_candidates(pred: np.ndarray, ref: np.ndarray, mode: str) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """Candidate (pred, ref) pairings to absorb a frame-0/off-by-one convention.
+    """Resolve the (pred, ref) pairing for the requested frame alignment.
 
-    SANA-WM emits the conditioning frame 0; the NVlabs reference may drop it
-    (or trim the last frame), giving a 1-frame offset that, uncorrected, wrecks
-    a positional MAE/PSNR. We try the plausible shifts and (in auto) keep the
-    best-matching one.
+    I2V conditioning-frame convention: the first frame of an image-to-video
+    output is the *given* conditioning image, not a generated frame. SANA-WM
+    emits it at index 0; the NVlabs reference does not. So the principled,
+    fixed comparison is pred[1:] vs ref ("drop_pred_frame0") — that is the
+    default and the number to report.
+
+    The other modes (incl. ``auto``, which searches for the lowest-MSE shift)
+    exist only as opt-in diagnostics for investigating an unexpected offset.
+    auto must NOT be used for reported metrics: picking the best-scoring shift
+    is cherry-picking and can mask a real misalignment bug.
     """
-    cands: dict[str, tuple[np.ndarray, np.ndarray]] = {"none": (pred, ref)}
+    explicit = {
+        "none": (pred, ref),
+        "drop_pred_frame0": (pred[1:], ref),
+        "drop_ref_frame0": (pred, ref[1:]),
+        "drop_pred_last": (pred[:-1], ref),
+        "drop_ref_last": (pred, ref[:-1]),
+    }
+    if mode != "auto":
+        return {mode: explicit[mode]}
+    cands = {"none": (pred, ref)}
     if pred.shape[0] == ref.shape[0] + 1:
         cands["drop_pred_frame0"] = (pred[1:], ref)
         cands["drop_pred_last"] = (pred[:-1], ref)
     elif ref.shape[0] == pred.shape[0] + 1:
         cands["drop_ref_frame0"] = (pred, ref[1:])
         cands["drop_ref_last"] = (pred, ref[:-1])
-    if mode != "auto":
-        return {mode: cands[mode]} if mode in cands else {"none": (pred, ref)}
     return cands
 
 
-def _compute_video_metrics(pred_frames: list[np.ndarray], reference: str, frame_align: str = "auto") -> dict[str, Any]:
+def _compute_video_metrics(pred_frames: list[np.ndarray], reference: str, frame_align: str = "drop_pred_frame0") -> dict[str, Any]:
     pred = _stack_frames_255(pred_frames)
     ref = _load_reference_255(reference)
     if pred.shape[1:3] != ref.shape[1:3]:
