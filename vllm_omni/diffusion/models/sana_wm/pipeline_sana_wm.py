@@ -39,11 +39,6 @@ from vllm_omni.diffusion.models.sana_wm.scheduling_sana_wm import (
     SanaWmFlowDpmScheduler,  # noqa: F401 – kept for backward-compat imports
     SanaWmFlowMatchScheduler,
 )
-from vllm_omni.diffusion.models.sana_wm.cuda_graph import (
-    SanaWmCudaGraphDenoiser,
-    parse_sana_wm_cudagraph_buckets,
-    sana_wm_cudagraph_requested,
-)
 from vllm_omni.diffusion.models.sana_wm.weight_mapping import normalize_sana_wm_stage1_weight_name
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
@@ -866,9 +861,6 @@ class SanaWmPipeline(
             spatial_raymap = spatial_raymap.to(device=device, dtype=dtype)
 
         self.transformer.config = self.sana_wm_config
-        use_cudagraph = sana_wm_cudagraph_requested(extra_args)
-        cudagraph_denoiser = SanaWmCudaGraphDenoiser() if use_cudagraph else None
-        cudagraph_buckets = parse_sana_wm_cudagraph_buckets(extra_args) if use_cudagraph else ()
 
         # Build a per-frame condition mask matching NVlabs ``LTXFlowEuler``:
         # frame 0 is the conditioning frame at sigma=0 (preserved after
@@ -928,51 +920,25 @@ class SanaWmPipeline(
                 model_timestep[:, :, 0] = 0.0
             else:
                 model_timestep = timestep.expand(1)
-            if cudagraph_denoiser is not None:
-                noise_pred_cond, _ = cudagraph_denoiser.run(
-                    self.transformer,
+            noise_pred_cond = self.transformer(
+                latents,
+                model_timestep,
+                encoder_hidden_states=prompt_embeds,
+                encoder_attention_mask=prompt_attention_mask,
+                plucker=plucker,
+                raymap=raymap,
+                spatial_raymap=spatial_raymap,
+            )
+            if do_cfg:
+                noise_pred_uncond = self.transformer(
                     latents,
                     model_timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    encoder_attention_mask=prompt_attention_mask,
-                    plucker=plucker,
-                    spatial_raymap=spatial_raymap,
-                    num_frames=params.num_frames,
-                    buckets=cudagraph_buckets,
-                )
-            else:
-                noise_pred_cond = self.transformer(
-                    latents,
-                    model_timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    encoder_attention_mask=prompt_attention_mask,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    encoder_attention_mask=negative_prompt_attention_mask,
                     plucker=plucker,
                     raymap=raymap,
                     spatial_raymap=spatial_raymap,
                 )
-            if do_cfg:
-                if cudagraph_denoiser is not None:
-                    noise_pred_uncond, _ = cudagraph_denoiser.run(
-                        self.transformer,
-                        latents,
-                        model_timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        encoder_attention_mask=negative_prompt_attention_mask,
-                        plucker=plucker,
-                        spatial_raymap=spatial_raymap,
-                        num_frames=params.num_frames,
-                        buckets=cudagraph_buckets,
-                    )
-                else:
-                    noise_pred_uncond = self.transformer(
-                        latents,
-                        model_timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        encoder_attention_mask=negative_prompt_attention_mask,
-                        plucker=plucker,
-                        raymap=raymap,
-                        spatial_raymap=spatial_raymap,
-                    )
                 noise_pred = noise_pred_uncond + params.cfg_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 noise_pred = noise_pred_cond
@@ -1004,7 +970,6 @@ class SanaWmPipeline(
                         "noise_pred": _to_cpu(noise_pred),
                         "t_scalar": _to_cpu(timestep),
                         "num_frames": int(params.num_frames),
-                        "use_cudagraph": cudagraph_denoiser is not None,
                         "condition_mask": (
                             _to_cpu(condition_mask) if condition_mask is not None else None
                         ),

@@ -156,8 +156,9 @@ def parse_args() -> argparse.Namespace:
 
     # --- runtime ---
     parser.add_argument("--tensor-parallel-size", "--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--enforce-eager", "--enforce_eager", action="store_true", default=True,
-                        help="Disable torch.compile (default on for Sana-WM).")
+    parser.add_argument("--enforce-eager", "--enforce_eager", action="store_true", default=False,
+                        help="Disable torch.compile. Default off: the DiT blocks are regionally "
+                        "compiled (dynamic=True) via the shared diffusion runner.")
     parser.add_argument("--output", default="sana_wm_out.mp4", help="Output mp4 path.")
     return parser.parse_args()
 
