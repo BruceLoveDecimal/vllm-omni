@@ -293,10 +293,18 @@ def main() -> None:
     # Native Stage-1 is latent-token capped (default 4096); auto-raise with
     # headroom for the requested size unless the user pinned it explicitly.
     max_tokens = args.native_max_tokens if args.native_max_tokens is not None else max(4096, token_count * 2)
-    extra_args: dict[str, Any] = {"sana_wm_native_smoke_max_tokens": max_tokens}
-    if args.inprocess_refiner and not args.no_refiner:
+    # Always decode to RGB frames (np) so the output is a viewable mp4. Without
+    # this the native Stage-1 path returns raw 128-channel latents.
+    extra_args: dict[str, Any] = {
+        "sana_wm_native_smoke_max_tokens": max_tokens,
+        "sana_wm_output_type": "np",
+    }
+    if not args.no_refiner:
+        # Two-stage (SanaWmTwoStagesPipeline): run the in-process LTX-2 refiner
+        # to produce the production RGB video. This is the NVlabs default path.
         extra_args["sana_wm_inprocess_refiner"] = True
         extra_args["sana_wm_inprocess_refiner_steps"] = args.inprocess_refiner_steps
+        extra_args["sana_wm_refiner_output_type"] = "np"
 
     print(f"\n{'=' * 60}")
     print("Sana-WM generation")
