@@ -2316,7 +2316,7 @@ class SanaWmFinalLayer(nn.Module):
 class SanaWmTransformer3DModel(nn.Module):
     """SANA-WM Stage-1 DiT with a runnable pure-PyTorch GDN fallback path."""
 
-    _repeated_blocks: ClassVar[list[str]] = ["blocks"]
+    _repeated_blocks: ClassVar[list[str]] = ["SanaWmBlock"]
     _layerwise_offload_blocks_attr: ClassVar[str] = "blocks"
     _hsdp_shard_conditions: ClassVar[list[Any]] = [_is_sana_wm_transformer_block]
     _sp_plan: ClassVar[dict[str, Any] | None] = _build_sana_wm_sp_plan()
