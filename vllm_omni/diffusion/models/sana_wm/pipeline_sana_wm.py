@@ -14,7 +14,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-import time
 from typing import Any, ClassVar, Iterable
 
 import torch
@@ -26,20 +25,10 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.sana_wm.official_backend import (
-    SANA_WM_OFFICIAL_BACKEND_ERROR,
-    get_sana_wm_official_repo_path,
-    is_sana_wm_official_backend_requested,
-    run_sana_wm_official_backend,
-)
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.camera_control import (
     SanaWmCameraCondition,
     build_plucker_condition,
-)
-from vllm_omni.diffusion.models.sana_wm.native_backend import (
-    run_sana_wm_native_backend,
-    should_force_sana_wm_cli_backend,
 )
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
@@ -65,10 +54,8 @@ from vllm_omni.model_executor.stage_input_processors.sana_wm import normalize_sa
 
 SANA_WM_MODEL_ID = "Efficient-Large-Model/SANA-WM_bidirectional"
 SANA_WM_SCAFFOLD_ERROR = (
-    "Sana-WM native Stage-1 DiT fully internal vLLM-Omni layers, Gated DeltaNet, "
-    "and denoising layers are not implemented yet. The in-process native "
-    "reference backend requires an NVlabs/Sana checkout. "
-    f"{SANA_WM_OFFICIAL_BACKEND_ERROR}"
+    "Sana-WM native Stage-1 generation requires a resolved checkpoint "
+    "(od_config.model) so the transformer/VAE/text-encoder weights can be loaded."
 )
 
 SANA_WM_STAGE1_DIT_FILE = "dit/sana_wm_1600m_720p.safetensors"
@@ -290,19 +277,6 @@ class SanaWmPipeline(
         super().__init__()
         self.od_config = od_config
         self.prefix = prefix
-        # The official CLI bridge is only enabled when the user explicitly
-        # opts in via ``VLLM_OMNI_SANA_WM_USE_OFFICIAL_CLI=1`` AND the
-        # NVlabs/Sana repo path is provided. Setting only the repo path is
-        # required to let the reference-alignment harness invoke the CLI
-        # bridge for the *reference* run, but must not disable native
-        # Stage-1 weight loading on the prediction-path pipeline instance —
-        # otherwise ``load_weights`` early-returns ``set()`` and the
-        # native model runs with zero-initialised parameters. See audit
-        # §6.11 for the on-GPU trace evidence that produced MAE=98.31.
-        self.use_official_backend = (
-            is_sana_wm_official_backend_requested(od_config)
-            and should_force_sana_wm_cli_backend()
-        )
         self.output_height = SANA_WM_OUTPUT_HEIGHT
         self.output_width = SANA_WM_OUTPUT_WIDTH
         self.default_num_frames = SANA_WM_DEFAULT_NUM_FRAMES
@@ -322,7 +296,7 @@ class SanaWmPipeline(
         self.vae: nn.Module | None = None
         self.release_paths: SanaWmLocalPaths | None = None
         self.weights_sources = []
-        if od_config is not None and od_config.model is not None and not self.use_official_backend:
+        if od_config is not None and od_config.model is not None:
             self.weights_sources = [
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
@@ -352,14 +326,6 @@ class SanaWmPipeline(
     def _extra_args(sampling_params: Any | None) -> dict[str, Any]:
         extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
         return dict(extra_args or {})
-
-    @classmethod
-    def _native_smoke_requested(cls, sampling_params: Any | None) -> bool:
-        env_value = os.environ.get(SANA_WM_NATIVE_SMOKE_ENV, "").strip().lower()
-        if env_value in {"1", "true", "yes", "on"}:
-            return True
-        extra_args = cls._extra_args(sampling_params)
-        return str(extra_args.get("sana_wm_native_smoke", "")).strip().lower() in {"1", "true", "yes", "on"}
 
     def _native_smoke_params(self, payload: dict[str, Any], sampling_params: Any | None) -> SanaWmNativeSmokeParams:
         extra_args = self._extra_args(sampling_params)
@@ -728,9 +694,10 @@ class SanaWmPipeline(
         max_tokens = int(extra_args.get("sana_wm_native_smoke_max_tokens", SANA_WM_NATIVE_SMOKE_MAX_TOKENS))
         if token_count > max_tokens:
             raise ValueError(
-                "Sana-WM native smoke path is intentionally size-capped while the fused GDN path is being ported. "
+                "Sana-WM native latent token count exceeds the configured cap. "
                 f"Requested latent tokens={token_count}, max={max_tokens}. Set smaller "
-                "`sana_wm_native_smoke_height/width/num_frames` or use the official backend."
+                "`sana_wm_native_smoke_height/width/num_frames`, or raise the cap via "
+                "`sana_wm_native_smoke_max_tokens`."
             )
 
         device, dtype = self._runtime_device_dtype()
@@ -1172,18 +1139,6 @@ class SanaWmPipeline(
             raise ValueError("Sana-WM requires a mapping prompt with first-frame image and camera/action metadata.")
         prompt = normalize_sana_wm_payload(prompt)
         payload = prompt["additional_information"]["sana_wm"]
-        repo_path = get_sana_wm_official_repo_path(
-            explicit_repo=payload.get("official_repo_path"),
-            od_config=self.od_config,
-        )
-        if repo_path is None:
-            if self._native_smoke_requested(req.sampling_params):
-                return self._run_native_smoke_backend(
-                    prompt=prompt,
-                    payload=payload,
-                    sampling_params=req.sampling_params,
-                )
-            raise NotImplementedError(SANA_WM_SCAFFOLD_ERROR)
 
         if (
             getattr(req.sampling_params, "num_frames", None) not in (None, 1)
@@ -1196,53 +1151,20 @@ class SanaWmPipeline(
             additional["sana_wm"] = payload
             prompt["additional_information"] = additional
 
-        start = time.perf_counter()
-        paths = self.resolve_checkpoint()
-        if should_force_sana_wm_cli_backend():
-            result = run_sana_wm_official_backend(
-                prompt=prompt,
-                release_paths=paths,
-                include_refiner=self.include_refiner,
-                repo_path=repo_path,
-            )
-            return DiffusionOutput(
-                output=result.frames,
-                custom_output={
-                    "sana_wm_backend": "official_cli",
-                    "sana_wm_official_command": list(result.command),
-                    "sana_wm_official_stdout_tail": result.stdout[-2000:],
-                    "sana_wm_official_stderr_tail": result.stderr[-2000:],
-                    "sana_wm_official_video_path": result.video_path,
-                },
-                stage_durations={"sana_wm_official_backend_s": time.perf_counter() - start},
-            )
+        # Resolve the checkpoint up front so the Stage-1 config (yaml), VAE,
+        # and refiner paths are populated before the native denoise loop reads
+        # ``self.sana_wm_config``. When no checkpoint is configured (unit
+        # tests), the native path falls back to lazy resolution / defaults.
+        if self.od_config is not None and self.od_config.model is not None:
+            self.resolve_checkpoint()
 
-        result = run_sana_wm_native_backend(
+        return self._run_native_smoke_backend(
             prompt=prompt,
-            release_paths=paths,
-            include_refiner=self.include_refiner,
-            repo_path=repo_path,
+            payload=payload,
             sampling_params=req.sampling_params,
-        )
-        return DiffusionOutput(
-            output=result.frames,
-            custom_output={
-                "sana_wm_backend": result.backend,
-                "sana_wm_repo_path": result.repo_path,
-                "sana_wm_model_path": result.model_path,
-                "sana_wm_include_refiner": result.include_refiner,
-                "sana_wm_num_frames": result.num_frames,
-                "sana_wm_fps": result.fps,
-                "sana_wm_sampling_steps": result.sampling_steps,
-                "sana_wm_cfg_scale": result.cfg_scale,
-                "sana_wm_used_default_intrinsics": result.used_default_intrinsics,
-            },
-            stage_durations={"sana_wm_native_backend_s": time.perf_counter() - start},
         )
 
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
-        if self.use_official_backend:
-            return set()
         materialized_camera_params = dict(self.camera_encoder.named_parameters()) if self.camera_encoder else {}
         cached_weights = list(weights)
         loaded = self.transformer.load_weights(cached_weights)
