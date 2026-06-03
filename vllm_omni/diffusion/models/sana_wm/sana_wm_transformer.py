@@ -1623,45 +1623,7 @@ class SanaWmSelfAttention(nn.Module):
             cam_contrib = _linear_output(self.out_proj_cam(cam_raw))
             cam_contrib = self._match_local_inner_dim(cam_contrib, main_raw)
             combined = main_raw + cam_contrib.to(main_raw.dtype)
-            # Audit §6.13i probe hook: dump attn sub-stages for block-0.
-            # First call wins via file existence guard.
-            _attn_dump = os.environ.get("SANA_WM_DUMP_ATTN0", "")
-            if _attn_dump and not os.path.exists(f"{_attn_dump}_done.flag"):
-                torch.save(
-                    {
-                        "attn_in": hidden_states.detach().cpu(),
-                        "main_raw": main_raw.detach().cpu(),
-                        "cam_raw": cam_raw.detach().cpu(),
-                        "cam_contrib": cam_contrib.detach().cpu(),
-                        "combined": combined.detach().cpu(),
-                        "beta": beta.detach().cpu(),
-                        "decay": decay.detach().cpu(),
-                    },
-                    f"{_attn_dump}_internals.pt",
-                )
             attn_out = self._apply_output_gate_and_proj(combined, hidden_states)
-            if _attn_dump and not os.path.exists(f"{_attn_dump}_done.flag"):
-                gate = F.silu(
-                    _linear_output(self.output_gate(hidden_states)).float()
-                ).to(combined.dtype)
-                torch.save(
-                    {
-                        "output_gate": gate.detach().cpu(),
-                        "pre_proj": (combined * gate).detach().cpu(),
-                        "attn_out": attn_out.detach().cpu(),
-                    },
-                    f"{_attn_dump}_post.pt",
-                )
-                with open(f"{_attn_dump}_done.flag", "w") as _f:
-                    _f.write("done\n")
-                print(
-                    f"[sana-wm probe] saved native attn-0 dump prefix={_attn_dump} "
-                    f"main_raw_norm={main_raw.float().norm().item():.2f} "
-                    f"cam_contrib_norm={cam_contrib.float().norm().item():.2f} "
-                    f"combined_norm={combined.float().norm().item():.2f} "
-                    f"attn_out_norm={attn_out.float().norm().item():.2f}",
-                    flush=True,
-                )
             return attn_out
 
         if spatial_shape is not None:
@@ -1898,52 +1860,6 @@ class SanaWmMbConvFfn(nn.Module):
         value, gate = x_dep.chunk(2, dim=1)
         x_glu = value * self.glu_act(gate)
         x_pt = self.point_conv.conv(x_glu)  # (B*F, hidden, H, W)
-        # Audit §6.13i/§6.13n probe hook: dump MLP sub-stages, optionally
-        # for a specific block index (SANA_WM_DUMP_MLP_BLOCK_IDX, default 0).
-        # File name suffixed with _block{idx} so concurrent dumps don't collide.
-        _mlp_dump = os.environ.get("SANA_WM_DUMP_MLP0", "")
-        _mlp_target_idx = int(os.environ.get("SANA_WM_DUMP_MLP_BLOCK_IDX", "0"))
-        _mlp_idx = getattr(self, "block_idx", 0)
-        _mlp_per = f"{_mlp_dump}_block{_mlp_idx}" if _mlp_dump and _mlp_idx == _mlp_target_idx else ""
-        if _mlp_per and not os.path.exists(f"{_mlp_per}_done.flag"):
-            # Also include min/max/has_nan/has_inf per stage to catch overflow.
-            def _stats(t):
-                tf = t.float()
-                return {
-                    "norm": float(tf.norm().item()),
-                    "absmax": float(tf.abs().max().item()),
-                    "has_nan": bool(tf.isnan().any().item()),
-                    "has_inf": bool(tf.isinf().any().item()),
-                }
-            torch.save(
-                {
-                    "mlp_in_4d": x.detach().cpu(),
-                    "after_inverted_silu": x_inv.detach().cpu(),
-                    "after_depth": x_dep.detach().cpu(),
-                    "after_glu": x_glu.detach().cpu(),
-                    "after_point": x_pt.detach().cpu(),
-                    "stats": {
-                        "mlp_in_4d": _stats(x),
-                        "after_inverted_silu": _stats(x_inv),
-                        "after_depth": _stats(x_dep),
-                        "after_glu": _stats(x_glu),
-                        "after_point": _stats(x_pt),
-                    },
-                    "block_idx": _mlp_idx,
-                    "dtype_input": str(x.dtype),
-                },
-                f"{_mlp_per}_stages.pt",
-            )
-            with open(f"{_mlp_per}_done.flag", "w") as _f:
-                _f.write("done\n")
-            print(
-                f"[sana-wm probe] block{_mlp_idx} MLP stage dump "
-                f"inv_norm={x_inv.float().norm().item():.2f} absmax={x_inv.float().abs().max().item():.2f} "
-                f"depth_absmax={x_dep.float().abs().max().item():.2f} "
-                f"glu_absmax={x_glu.float().abs().max().item():.2f} "
-                f"point_absmax={x_pt.float().abs().max().item():.2f}",
-                flush=True,
-            )
         x = x_pt
         # Temporal aggregation: (B*F, C, H, W) → (B, F, C, H*W) → (B, C, F, H*W)
         x_temporal = (
@@ -1957,39 +1873,6 @@ class SanaWmMbConvFfn(nn.Module):
             .reshape(batch, frames * spatial_tokens, hidden_size)
             .contiguous()
         )
-        # Extra dump: t_conv output + final mlp output (§6.13j/§6.13n).
-        # Gated by SANA_WM_DUMP_MLP_FINAL prefix + SANA_WM_DUMP_MLP_BLOCK_IDX
-        # (default 0). Per-block filename suffix so concurrent dumps don't collide.
-        _mlp_final_dump = os.environ.get("SANA_WM_DUMP_MLP_FINAL", "")
-        _mlpf_target = int(os.environ.get("SANA_WM_DUMP_MLP_BLOCK_IDX", "0"))
-        _mlpf_idx = getattr(self, "block_idx", 0)
-        _mlpf_per = (
-            f"{_mlp_final_dump}_block{_mlpf_idx}"
-            if _mlp_final_dump and _mlpf_idx == _mlpf_target
-            else ""
-        )
-        if _mlpf_per and not os.path.exists(f"{_mlpf_per}_done.flag"):
-            torch.save(
-                {
-                    "t_conv_in": (x_temporal - t_conv_out).detach().cpu(),
-                    "t_conv_out": t_conv_out.detach().cpu(),
-                    "after_tconv_add": x_temporal.detach().cpu(),
-                    "final_mlp_out": final.detach().cpu(),
-                    "t_conv_weight_norm": float(self.t_conv.weight.detach().float().norm().item()),
-                    "block_idx": _mlpf_idx,
-                },
-                f"{_mlpf_per}_final.pt",
-            )
-            with open(f"{_mlpf_per}_done.flag", "w") as _f:
-                _f.write("done\n")
-            print(
-                f"[sana-wm probe] block{_mlpf_idx} MLP-final dump "
-                f"t_conv_w_norm={self.t_conv.weight.float().norm().item():.4f} "
-                f"t_conv_in_norm={(x_temporal - t_conv_out).float().norm().item():.2f} "
-                f"t_conv_out_norm={t_conv_out.float().norm().item():.2f} "
-                f"final_mlp_out_norm={final.float().norm().item():.2f}",
-                flush=True,
-            )
         return final
 
 
@@ -2140,41 +2023,6 @@ class SanaWmBlock(nn.Module):
             self.scale_shift_table[None, None, :, :] + t_per_frame
         ).chunk(6, dim=-2)  # each: (B, F, 1, D)
 
-        # Audit §6.13h/§6.13m probe hook: dump per-block intermediates for
-        # parity vs NVlabs. Gated by SANA_WM_DUMP_BLOCK0 (env path prefix)
-        # plus SANA_WM_DUMP_BLOCK_IDXS (comma-separated indices; defaults
-        # to "0" for backwards compat). Writes per-block files:
-        #   {prefix}_block{idx}_input.pt {prefix}_block{idx}_post_attn.pt
-        #   {prefix}_block{idx}_post_cross_attn.pt {prefix}_block{idx}_output.pt
-        _dump_prefix = os.environ.get("SANA_WM_DUMP_BLOCK0", "")
-        _dump_idxs_env = os.environ.get("SANA_WM_DUMP_BLOCK_IDXS", "0")
-        _dump_idx_set = {int(s) for s in _dump_idxs_env.split(",") if s.strip()}
-        _per_block_prefix = (
-            f"{_dump_prefix}_block{self.block_idx}"
-            if _dump_prefix and self.block_idx in _dump_idx_set
-            else ""
-        )
-        # First-write-wins so we only capture the first stage-1 step (the
-        # only step with clean controlled input).
-        _do_dump = bool(_per_block_prefix) and not os.path.exists(
-            f"{_per_block_prefix}_input.pt"
-        )
-        if _do_dump:
-            torch.save(hidden_states.detach().cpu(), f"{_per_block_prefix}_input.pt")
-            torch.save(
-                {
-                    "shift_msa": shift_msa.detach().cpu(),
-                    "scale_msa": scale_msa.detach().cpu(),
-                    "gate_msa": gate_msa.detach().cpu(),
-                    "shift_mlp": shift_mlp.detach().cpu(),
-                    "scale_mlp": scale_mlp.detach().cpu(),
-                    "gate_mlp": gate_mlp.detach().cpu(),
-                    "scale_shift_table": self.scale_shift_table.detach().cpu(),
-                    "encoder_hidden_states": encoder_hidden_states.detach().cpu(),
-                },
-                f"{_per_block_prefix}_modulation.pt",
-            )
-
         # Apply per-frame modulation by reshaping x to (B, F, S, D), broadcasting
         # scale/shift over the spatial axis, then flattening back.
         x_norm1 = self.norm1(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
@@ -2193,23 +2041,12 @@ class SanaWmBlock(nn.Module):
         hidden_states = hidden_states + (gate_msa * attn_output_4d).reshape(
             batch_size, token_count, hidden_size
         )
-        if _do_dump:
-            torch.save(
-                {
-                    "x_msa_in": x_msa_in.detach().cpu(),
-                    "attn_output": attn_output.detach().cpu(),
-                    "post_attn_residual": hidden_states.detach().cpu(),
-                },
-                f"{_per_block_prefix}_post_attn.pt",
-            )
 
         hidden_states = hidden_states + self.cross_attn(
             hidden_states,
             encoder_hidden_states,
             encoder_attention_mask,
         )
-        if _do_dump:
-            torch.save(hidden_states.detach().cpu(), f"{_per_block_prefix}_post_cross_attn.pt")
 
         x_norm2 = self.norm2(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_mlp_in = (x_norm2 * (1 + scale_mlp) + shift_mlp).reshape(batch_size, token_count, hidden_size)
@@ -2218,23 +2055,6 @@ class SanaWmBlock(nn.Module):
         hidden_states = hidden_states + (gate_mlp * mlp_out_4d).reshape(
             batch_size, token_count, hidden_size
         )
-        if _do_dump:
-            torch.save(
-                {
-                    "x_mlp_in": x_mlp_in.detach().cpu(),
-                    "mlp_out": mlp_out.detach().cpu(),
-                    "block_output": hidden_states.detach().cpu(),
-                },
-                f"{_per_block_prefix}_output.pt",
-            )
-            print(
-                f"[sana-wm probe] saved native block-{self.block_idx} dump "
-                f"input_norm={torch.load(f'{_per_block_prefix}_input.pt').float().norm().item():.3f} "
-                f"attn_out_norm={attn_output.float().norm().item():.3f} "
-                f"mlp_out_norm={mlp_out.float().norm().item():.3f} "
-                f"block_out_norm={hidden_states.float().norm().item():.3f}",
-                flush=True,
-            )
         return hidden_states
 
 
@@ -2817,38 +2637,7 @@ class SanaWmTransformer3DModel(nn.Module):
                 camera_conditions = camera_conditions.expand(batch_size, -1, -1)
             camera_conditions = camera_conditions.to(device=hidden_states.device, dtype=hidden_states.dtype)
 
-        # Audit §6.13n runtime weight probe: env-gated one-time dump of
-        # block.mlp.* parameter norms for load_weights verification.
-        _rtw_path = os.environ.get("SANA_WM_RUNTIME_WEIGHT_DUMP", "")
-        if _rtw_path and not os.path.exists(_rtw_path):
-            _rtw_dump: dict = {}
-            for _bi, _blk in enumerate(self.blocks):
-                for _pn, _pp in _blk.mlp.named_parameters():
-                    _rtw_dump[f"block{_bi}.mlp.{_pn}"] = float(
-                        _pp.detach().float().norm().item()
-                    )
-                    _rtw_dump[f"block{_bi}.mlp.{_pn}.shape"] = tuple(_pp.shape)
-            torch.save(_rtw_dump, _rtw_path)
-            print(
-                f"[runtime weight probe] dumped {len(_rtw_dump)//2} mlp params -> {_rtw_path}",
-                flush=True,
-            )
-
-        # Audit §6.13m compounding probe: env-gated dump of block-N outputs
-        # (default 0,5,10,15,19), final-layer in/out, and unpatchify output.
-        # Hooks are no-ops unless SANA_WM_DUMP_BLOCKS_PREFIX is set.
-        _blocks_prefix = os.environ.get("SANA_WM_DUMP_BLOCKS_PREFIX", "")
-        _blocks_target = os.environ.get("SANA_WM_DUMP_BLOCKS_INDICES", "0,5,10,15,19")
-        _blocks_idx_set = (
-            {int(s) for s in _blocks_target.split(",") if s.strip()}
-            if _blocks_prefix
-            else set()
-        )
-        _blocks_done_flag = f"{_blocks_prefix}_done.flag" if _blocks_prefix else ""
-        _blocks_active = bool(_blocks_prefix) and not os.path.exists(_blocks_done_flag)
-        _blocks_dump: dict = {}
-
-        for block_i, block in enumerate(self.blocks):
+        for block in self.blocks:
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -2859,28 +2648,11 @@ class SanaWmTransformer3DModel(nn.Module):
                 camera_conditions,
                 encoder_attention_mask,
             )
-            if _blocks_active and block_i in _blocks_idx_set:
-                _blocks_dump[f"block{block_i}_out"] = hidden_states.detach().cpu()
 
-        if _blocks_active:
-            _blocks_dump["final_layer_in"] = hidden_states.detach().cpu()
         hidden_states = self.final_layer(
             hidden_states, time_embed.to(hidden_states.dtype), spatial_shape
         )
-        if _blocks_active:
-            _blocks_dump["final_layer_out"] = hidden_states.detach().cpu()
         hidden_states = self._unpatchify(hidden_states, spatial_shape)
-        if _blocks_active:
-            _blocks_dump["unpatchify_out"] = hidden_states.detach().cpu()
-            torch.save(_blocks_dump, f"{_blocks_prefix}_blocks.pt")
-            with open(_blocks_done_flag, "w") as _bf:
-                _bf.write("done\n")
-            print(
-                f"[sana-wm probe] native blocks dump idx={sorted(_blocks_idx_set)} -> "
-                f"{_blocks_prefix}_blocks.pt (final_out_norm="
-                f"{hidden_states.float().norm().item():.2f})",
-                flush=True,
-            )
         if hidden_states.shape[2:] != latent_shape:
             hidden_states = F.interpolate(hidden_states, size=latent_shape, mode="trilinear", align_corners=False)
         if _force_fp32 and hidden_states.dtype != _input_dtype:
