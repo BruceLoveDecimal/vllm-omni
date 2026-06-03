@@ -11,10 +11,9 @@ import pytest
 
 
 pytestmark = [
-    pytest.mark.e2e,
+    pytest.mark.advanced_model,
     pytest.mark.diffusion,
     pytest.mark.gpu,
-    pytest.mark.skipif(os.environ.get("SANA_WM_E2E") != "1", reason="Set SANA_WM_E2E=1 to run Sana-WM GPU e2e."),
 ]
 
 
