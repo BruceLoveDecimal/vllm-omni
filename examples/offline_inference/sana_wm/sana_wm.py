@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -164,6 +165,12 @@ def parse_args() -> argparse.Namespace:
                         "Pass --no-enforce-eager only to experiment with the compiled path.")
     parser.add_argument("--no-enforce-eager", "--no_enforce_eager", dest="enforce_eager",
                         action="store_false", help="Opt into the (slower, output-perturbing) compiled path.")
+    parser.add_argument("--fp32-stage1", "--fp32_stage1", action="store_true",
+                        help="High-fidelity mode: run the Stage-1 DiT in fp32 (refiner stays bf16). "
+                        "The 60-step flow-matching trajectory is chaotic and bf16 per-step rounding "
+                        "is amplified; fp32 Stage-1 is the precision-stable trajectory. Measured "
+                        "+0.69 dB PSNR / -2.5 MAE vs the NVlabs fp32 reference (latent cos 0.838->0.909) "
+                        "at a Stage-1 latency cost (~1.4x). Sets SANA_WM_FORCE_FP32_TRANSFORMER=1.")
     parser.add_argument("--output", default="sana_wm_out.mp4", help="Output mp4 path.")
     # --- evaluation / metrics (optional) ---
     parser.add_argument("--reference", default=None,
@@ -409,6 +416,12 @@ def main() -> None:
     args = parse_args()
     _resolve_demo(args)
     token_count = _validate_geometry(args)
+
+    if args.fp32_stage1:
+        # High-fidelity mode: the transformer reads this at materialize/forward
+        # time, so it must be set before the pipeline is constructed below.
+        os.environ["SANA_WM_FORCE_FP32_TRANSFORMER"] = "1"
+        print("[info] --fp32-stage1: running Stage-1 DiT in fp32 (refiner stays bf16).")
 
     if args.guidance_scale_high is not None:
         print("[note] --guidance_scale_high is ignored by Sana-WM (single CFG branch).")
