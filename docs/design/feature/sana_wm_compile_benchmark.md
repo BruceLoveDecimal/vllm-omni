@@ -111,6 +111,28 @@ and `VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER=Efficient-Large-Model/gemma-2-2b-it`
 (huggingface.co and github.com are unreachable from the SeetaCloud boxes; weights
 are pre-cached on the shared `/root/autodl-tmp` disk).
 
+## High-fidelity mode: `--fp32-stage1` (`SANA_WM_FORCE_FP32_TRANSFORMER=1`)
+
+Runs the Stage-1 DiT in fp32 (the LTX-2 refiner stays bf16). The 60-step
+flow-matching trajectory is chaotic, so bf16 per-step rounding is amplified ~35×
+into the final latent; fp32 Stage-1 is the precision-stable trajectory.
+
+Measured (TP=1, 161f, 60 steps, cfg=5, vs the NVlabs reference on matched
+hardware, RGB drop_pred_frame0 align):
+
+| native vs NVlabs | Stage-1 latent cos | RGB PSNR | MAE |
+|---|---|---|---|
+| bf16 (default) | 0.838 | 14.45 dB | 37.17 |
+| **fp32 Stage-1** (both sides) | **0.909** | **15.14 dB** | **34.67** |
+
+⇒ **+0.69 dB PSNR / −2.5 MAE** at a Stage-1 latency cost (~1.4×; refiner unchanged).
+Note this gain only shows up against an *fp32* reference: NVlabs production runs
+bf16, whose own per-step noise (its bf16-vs-fp32 latent cos is 0.846, vs ours 0.995)
+dominates the bf16-vs-bf16 comparison — so `ours_fp32 vs nvlabs_bf16` stays at
+14.41 dB. The native port itself is faithful (per-step noise_pred cos 0.9998); the
+bf16 ceiling is set by NVlabs's own precision instability, not a port defect. See
+`sana_wm_parity_wip.md` for the full probe->fix->re-probe record.
+
 ## Caveats
 
 - mp4 references carry H.264 codec noise; use `--save-frames-npy` + an `.npy`
