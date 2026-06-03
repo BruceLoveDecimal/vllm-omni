@@ -764,28 +764,6 @@ class SanaWmPipeline(
             first_latent = None
             latents = noise
 
-        # Audit §6.13f probe hook: load the initial latent from a file
-        # (typically an NVlabs step-0 dump) so both pipelines start the
-        # sampling loop from byte-identical input. Lets us cleanly
-        # isolate `noise_pred` divergence due to model forward vs the
-        # RNG/init differences that previously caused cosine=+0.43 on
-        # latent_in between the two pipelines.
-        _load_latent_path = os.environ.get("SANA_WM_LOAD_LATENT_FROM", "")
-        if _load_latent_path and os.path.exists(_load_latent_path):
-            blob = torch.load(_load_latent_path, map_location=device, weights_only=True)
-            loaded = blob["latent_in"] if isinstance(blob, dict) and "latent_in" in blob else blob
-            if loaded.shape != latents.shape:
-                raise ValueError(
-                    f"SANA_WM_LOAD_LATENT_FROM shape mismatch: file={tuple(loaded.shape)}, "
-                    f"pipeline={tuple(latents.shape)}."
-                )
-            latents = loaded.to(device=device, dtype=dtype)
-            print(
-                f"[sana-wm probe] overrode initial latent from {_load_latent_path}; "
-                f"shape={tuple(latents.shape)} std={latents.float().std().item():.4f}",
-                flush=True,
-            )
-
         allow_hash_fallback = bool(extra_args.get("sana_wm_hash_prompt_smoke", False))
         prompt_embeds, prompt_source = self._native_smoke_prompt_embeds(
             prompt,
@@ -793,38 +771,6 @@ class SanaWmPipeline(
             dtype=dtype,
             allow_hash_fallback=allow_hash_fallback,
         )
-        # Audit §6.13f probe hook: override prompt_embeds from a file
-        # (typically the NVlabs step-0 dump's `prompt_embeds` field) so
-        # the model sees byte-identical text conditioning.
-        _load_prompt_path = os.environ.get("SANA_WM_LOAD_PROMPT_FROM", "")
-        if _load_prompt_path and os.path.exists(_load_prompt_path):
-            _blob = torch.load(_load_prompt_path, map_location=device, weights_only=True)
-            _loaded_prompt = _blob.get("prompt_embeds") if isinstance(_blob, dict) else _blob
-            if _loaded_prompt is None:
-                raise ValueError(f"SANA_WM_LOAD_PROMPT_FROM file missing 'prompt_embeds': {_load_prompt_path}")
-            _loaded_prompt = _loaded_prompt.to(device=device, dtype=dtype)
-            # NVlabs CFG-doubled dump (B=2): drop uncond/cond duplication and
-            # take the cond branch. If single-batch already, no-op.
-            if _loaded_prompt.shape[0] == 2 and prompt_embeds.shape[0] == 1:
-                _loaded_prompt = _loaded_prompt[1:]
-            # Match dim layout: NVlabs uses (B, 1, N, D), ours (B, N, D).
-            if _loaded_prompt.ndim == 4 and _loaded_prompt.shape[1] == 1 and prompt_embeds.ndim == 3:
-                _loaded_prompt = _loaded_prompt.squeeze(1)
-            if _loaded_prompt.shape != prompt_embeds.shape:
-                print(
-                    f"[sana-wm probe] WARNING prompt shape mismatch: "
-                    f"loaded={tuple(_loaded_prompt.shape)} vs pipeline={tuple(prompt_embeds.shape)}; "
-                    f"using loaded as-is, model must handle.",
-                    flush=True,
-                )
-            prompt_embeds = _loaded_prompt
-            prompt_source = f"loaded:{_load_prompt_path}"
-            print(
-                f"[sana-wm probe] overrode prompt_embeds from {_load_prompt_path}; "
-                f"shape={tuple(prompt_embeds.shape)} norm={prompt_embeds.float().norm().item():.3f}",
-                flush=True,
-            )
-
         prompt_attention_mask = self._last_prompt_attention_mask
 
         # Classifier-Free Guidance (NVlabs sana-wm video runs cfg=5.0 in
@@ -950,93 +896,6 @@ class SanaWmPipeline(
                 noise_pred = noise_pred_uncond + params.cfg_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 noise_pred = noise_pred_cond
-            # Audit §6.13f probe hook: opt-in dump of native step-0
-            # (input latent, per-frame timestep, noise_pred) for the
-            # noise_pred parity comparison vs the NVlabs LTXFlowEuler
-            # step-0 dump (see flow_euler_sampler.py patch).
-            _dump_path = os.environ.get("SANA_WM_DUMP_STEP0", "")
-            _dump_steps_path = os.environ.get("SANA_WM_DUMP_STEPS_PREFIX", "")
-            _dump_step_count = int(os.environ.get("SANA_WM_DUMP_STEP_COUNT", "1"))
-            # Audit §6.13t engine-vs-standalone probe: opt-in full transformer
-            # input dump so a separate harness can re-call transformer.forward
-            # with byte-identical inputs and measure dispatch-level drift.
-            _dump_engine_path = os.environ.get(
-                "SANA_WM_DUMP_ENGINE_STEP0_INPUTS", ""
-            )
-            if _dump_engine_path and _step_idx == 0:
-                def _to_cpu(t):
-                    return t.detach().cpu() if hasattr(t, "detach") else t
-
-                torch.save(
-                    {
-                        "latents": _to_cpu(latents),
-                        "model_timestep": _to_cpu(model_timestep),
-                        "prompt_embeds": _to_cpu(prompt_embeds),
-                        "plucker": _to_cpu(plucker),
-                        "raymap": _to_cpu(raymap),
-                        "spatial_raymap": _to_cpu(spatial_raymap),
-                        "noise_pred": _to_cpu(noise_pred),
-                        "t_scalar": _to_cpu(timestep),
-                        "num_frames": int(params.num_frames),
-                        "condition_mask": (
-                            _to_cpu(condition_mask) if condition_mask is not None else None
-                        ),
-                    },
-                    _dump_engine_path,
-                )
-                print(
-                    f"[sana-wm probe] saved engine step-0 transformer inputs "
-                    f"latents={tuple(latents.shape)} "
-                    f"prompt_embeds={tuple(prompt_embeds.shape)} "
-                    f"raymap={tuple(raymap.shape) if hasattr(raymap, 'shape') else None} "
-                    f"plucker={tuple(plucker.shape) if hasattr(plucker, 'shape') else None} "
-                    f"spatial_raymap={tuple(spatial_raymap.shape) if hasattr(spatial_raymap, 'shape') else None} "
-                    f"-> {_dump_engine_path}",
-                    flush=True,
-                )
-            if _dump_path and _step_idx == 0:
-                torch.save(
-                    {
-                        "latent_in": latents.detach().cpu(),
-                        "timestep_per_frame": (
-                            model_timestep.detach().cpu()
-                            if hasattr(model_timestep, "detach")
-                            else model_timestep
-                        ),
-                        "noise_pred": noise_pred.detach().cpu(),
-                        "raymap": raymap.detach().cpu() if hasattr(raymap, "detach") else raymap,
-                        "prompt_embeds_first_row": prompt_embeds[:, 0].detach().cpu(),
-                        "prompt_embeds_norm": prompt_embeds.float().norm().item(),
-                        "t_scalar": timestep.detach().cpu() if hasattr(timestep, "detach") else timestep,
-                    },
-                    _dump_path,
-                )
-                print(
-                    f"[sana-wm probe] saved native step-0 dump latent_in={tuple(latents.shape)} "
-                    f"noise_pred={tuple(noise_pred.shape)} to {_dump_path}",
-                    flush=True,
-                )
-            if _dump_steps_path and _step_idx < _dump_step_count:
-                _step_path = f"{_dump_steps_path}_step{_step_idx}.pt"
-                torch.save(
-                    {
-                        "latent_in": latents.detach().cpu(),
-                        "timestep_per_frame": (
-                            model_timestep.detach().cpu()
-                            if hasattr(model_timestep, "detach")
-                            else model_timestep
-                        ),
-                        "noise_pred": noise_pred.detach().cpu(),
-                        "t_scalar": timestep.detach().cpu() if hasattr(timestep, "detach") else timestep,
-                    },
-                    _step_path,
-                )
-                print(
-                    f"[sana-wm probe] native step-{_step_idx} dump "
-                    f"latent_norm={latents.float().norm().item():.2f} "
-                    f"noise_pred_norm={noise_pred.float().norm().item():.2f} -> {_step_path}",
-                    flush=True,
-                )
 
             if use_per_token_step:
                 # Build per-token timesteps from the (B, 1, F) model
@@ -1071,18 +930,6 @@ class SanaWmPipeline(
                     latents = torch.where(condition_mask > 0.5, latents, stepped)
             else:
                 latents = stepped
-
-        # Audit §6.13o probe hook: opt-in dump of native Stage-1 final latent
-        # (post per-token Euler loop, pre refiner+VAE). Mirrors NVlabs's
-        # SANA_WM_DUMP_STAGE1_LATENT for direct stage-1 latent parity probes.
-        _stage1_dump = os.environ.get("SANA_WM_DUMP_NATIVE_STAGE1_LATENT", "")
-        if _stage1_dump:
-            torch.save(latents.detach().cpu(), _stage1_dump)
-            print(
-                f"[sana-wm probe] saved native Stage-1 latent shape={tuple(latents.shape)} "
-                f"norm={latents.float().norm().item():.2f} -> {_stage1_dump}",
-                flush=True,
-            )
 
         output_type = str(extra_args.get("sana_wm_output_type", "latent"))
         output = self._decode_native_smoke_latents(latents, output_type=output_type, device=device, dtype=dtype)
