@@ -428,18 +428,18 @@ class SanaWmPipeline(
         # Match NVlabs' inference_video_scripts/inference_sana_wm.py VAE
         # construction. Long videos (e.g. 321 frames -> 41 latent frames)
         # otherwise decode as one large 3D volume and OOM on a 98GB RTX 6000.
-        if hasattr(self.vae, "enable_tiling"):
-            self.vae.enable_tiling()
-        if hasattr(self.vae, "use_framewise_encoding"):
-            self.vae.use_framewise_encoding = True
-            self.vae.use_framewise_decoding = True
-            vae_config = getattr(self.vae, "config", None)
-            self.vae.tile_sample_stride_num_frames = int(
-                getattr(vae_config, "tile_sample_stride_num_frames", 64)
-            )
-            self.vae.tile_sample_min_num_frames = int(
-                getattr(vae_config, "tile_sample_min_num_frames", 96)
-            )
+        self.vae.enable_tiling()
+        self.vae.use_framewise_encoding = True
+        self.vae.use_framewise_decoding = True
+        # NVlabs reads these from its YAML VAE config with 64/96 defaults; the
+        # diffusers VAE config.json only ships scaling_factor, so the defaults
+        # are load-bearing (the keys are genuinely absent here).
+        self.vae.tile_sample_stride_num_frames = int(
+            getattr(self.vae.config, "tile_sample_stride_num_frames", 64)
+        )
+        self.vae.tile_sample_min_num_frames = int(
+            getattr(self.vae.config, "tile_sample_min_num_frames", 96)
+        )
 
     def _ensure_camera_encoder(self, *, device: torch.device, dtype: torch.dtype) -> SanaWmCameraEmbedder:
         if self.camera_encoder is None or self.camera_encoder.hidden_size != self.sana_wm_config.hidden_size:
@@ -508,7 +508,7 @@ class SanaWmPipeline(
         latents_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(
             device=latent.device, dtype=latent.dtype
         )
-        scaling = float(getattr(getattr(self.vae, "config", None), "scaling_factor", 1.0))
+        scaling = float(self.vae.config.scaling_factor)
         return (latent - latents_mean) * scaling / latents_std
 
     def _vae_denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
@@ -521,7 +521,7 @@ class SanaWmPipeline(
         latents_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(
             device=latent.device, dtype=latent.dtype
         )
-        scaling = float(getattr(getattr(self.vae, "config", None), "scaling_factor", 1.0))
+        scaling = float(self.vae.config.scaling_factor)
         return latent * latents_std / scaling + latents_mean
 
     def _vae_encode_first_frame(
@@ -545,8 +545,7 @@ class SanaWmPipeline(
         frame = self._preprocess_first_frame(image, height=height, width=width, device=device, dtype=dtype)
         with torch.inference_mode():
             encoded = self.vae.encode(frame)
-            dist = getattr(encoded, "latent_dist", None)
-            first_latent = dist.mean if dist is not None else encoded.latents
+            first_latent = encoded.latent_dist.mean
             first_latent = self._vae_normalize_latent(first_latent.to(dtype=dtype))
         # VAE latent may differ from expected spatial size; resize if needed.
         if first_latent.shape[-2:] != (latent_height, latent_width):
@@ -601,7 +600,7 @@ class SanaWmPipeline(
             return self._hash_smoke_prompt_embeds(prompt_text, device=device, dtype=dtype)
 
         self._ensure_stage1_text_encoder(device=device, dtype=dtype)
-        tokenizer = getattr(self, "tokenizer", None)
+        tokenizer = self.tokenizer
         if tokenizer is None or self.text_encoder is None:
             raise RuntimeError("Sana-WM Stage-1 text encoder did not initialize.")
         chi_prompt = "\n".join(part for part in self.sana_wm_config.chi_prompt if part)
@@ -719,10 +718,19 @@ class SanaWmPipeline(
         import numpy as _np
 
         first_frame_image = (prompt.get("multi_modal_data") or {}).get("image")
-        _is_image = first_frame_image is not None and (
-            hasattr(first_frame_image, "convert")
-            or isinstance(first_frame_image, (_np.ndarray, torch.Tensor))
-        )
+        if first_frame_image is None:
+            _is_image = False
+        elif hasattr(first_frame_image, "convert") or isinstance(
+            first_frame_image, (_np.ndarray, torch.Tensor)
+        ):
+            _is_image = True
+        else:
+            raise TypeError(
+                "Sana-WM first-frame image must be a PIL Image, numpy ndarray, or "
+                f"torch.Tensor; got {type(first_frame_image).__name__}. Silently "
+                "falling back to pure-noise initialisation drops the image "
+                "conditioning and corrupts video output."
+            )
         # Per-frame timestep contract (audit §6.13a) is enabled by default
         # to match NVlabs ``LTXFlowEuler.sample``: frame 0 is the clean VAE-
         # encoded conditioning latent and its timestep is held at 0 while
@@ -818,7 +826,7 @@ class SanaWmPipeline(
                 flush=True,
             )
 
-        prompt_attention_mask = getattr(self, "_last_prompt_attention_mask", None)
+        prompt_attention_mask = self._last_prompt_attention_mask
 
         # Classifier-Free Guidance (NVlabs sana-wm video runs cfg=5.0 in
         # production). The native path previously omitted the uncond branch
@@ -1153,9 +1161,11 @@ class SanaWmPipeline(
             if param is None:
                 continue
             if tuple(param.shape) != tuple(tensor.shape):
-                # Keep the transformer-side audit record even when this smoke
-                # camera branch is not an exact official-module match yet.
-                continue
+                raise ValueError(
+                    f"Sana-WM camera_encoder weight {local_name} shape "
+                    f"mismatch: model expects {tuple(param.shape)}, "
+                    f"checkpoint has {tuple(tensor.shape)}."
+                )
             with torch.no_grad():
                 param.copy_(tensor.to(device=param.device, dtype=param.dtype))
         return loaded

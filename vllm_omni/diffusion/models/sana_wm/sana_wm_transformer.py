@@ -14,6 +14,7 @@ import hashlib
 import math
 import os
 import sys
+import warnings
 from dataclasses import dataclass, field, replace
 from functools import reduce
 from operator import mul
@@ -77,40 +78,27 @@ SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
 SANA_WM_STAGE1_GDN_STATE_SIZE = 20
 SANA_WM_DISABLE_VLLM_OPS_ENV = "VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS"
 
-
-# vLLM's TP accessors assert/raise when the tensor-parallel group is not yet
-# initialized. Catch only that "not initialized" family so a genuinely
-# unexpected error surfaces instead of silently degrading to TP=1 (which would
-# build an unsharded model under a TP runtime and corrupt the output).
-_TP_NOT_READY = (AssertionError, RuntimeError, ValueError)
-
-
-def _get_tp_rank() -> int:
-    if get_tensor_model_parallel_rank is None:
-        return 0
-    try:
-        return int(get_tensor_model_parallel_rank())
-    except _TP_NOT_READY:
-        return 0
-
-
-def _get_tp_world_size() -> int:
-    if get_tensor_model_parallel_world_size is None:
-        return 1
-    try:
-        return int(get_tensor_model_parallel_world_size())
-    except _TP_NOT_READY:
-        return 1
+_SANA_WM_TRITON_GDN_FALLBACK_WARNED = False
 
 
 def _vllm_tp_group_ready() -> bool:
+    """Return True iff the vLLM tensor-parallel group is initialized."""
     if get_tensor_model_parallel_world_size is None:
         return False
-    try:
-        get_tensor_model_parallel_world_size()
-    except _TP_NOT_READY:
-        return False
-    return True
+    import vllm.distributed.parallel_state as ps
+    return ps._TP is not None
+
+
+def _get_tp_rank() -> int:
+    if not _vllm_tp_group_ready():
+        return 0
+    return int(get_tensor_model_parallel_rank())
+
+
+def _get_tp_world_size() -> int:
+    if not _vllm_tp_group_ready():
+        return 1
+    return int(get_tensor_model_parallel_world_size())
 
 
 def _sana_wm_disable_vllm_ops() -> bool:
@@ -147,12 +135,7 @@ def _linear_output(output: torch.Tensor | tuple[torch.Tensor, Any]) -> torch.Ten
 
 
 def _linear_weight_dtype(module: nn.Module) -> torch.dtype:
-    weight = getattr(module, "weight", None)
-    if isinstance(weight, torch.Tensor):
-        return weight.dtype
-    for param in module.parameters(recurse=False):
-        return param.dtype
-    return torch.float32
+    return module.weight.dtype
 
 
 def _maybe_make_vllm_rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
@@ -181,7 +164,7 @@ def _import_nvlabs_cam_scan_bidi() -> Any:
         from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_bidi_chunkwise  # type: ignore
         _cam_triton_fn = cam_scan_bidi_chunkwise
         print(f"[sana-wm cam-triton] imported from {repo}", flush=True)
-    except Exception as exc:
+    except ImportError as exc:
         print(f"[sana-wm cam-triton] import failed ({exc}); falling back to Python path", flush=True)
         _cam_triton_fn = None
     return _cam_triton_fn
@@ -268,21 +251,16 @@ class SanaWmTensorParallelRMSNorm(nn.Module):
 
     @staticmethod
     def _all_reduce(tensor: torch.Tensor) -> None:
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return
-        try:
-            import vllm.distributed.parallel_state as vllm_parallel_state
-
-            tp_group = getattr(vllm_parallel_state, "_TP", None)
-        except Exception:
-            tp_group = None
-
-        if tp_group is not None and hasattr(tp_group, "all_reduce"):
-            tp_group.all_reduce(tensor)
-        elif tp_group is not None:
-            torch.distributed.all_reduce(tensor, group=tp_group)
-        else:
-            torch.distributed.all_reduce(tensor)
+        # Only invoked when tp_size > 1 (gated by forward), so the vLLM TP group
+        # must be initialized. Don't fall back to the default world group — that
+        # is the data-parallel group and would silently corrupt the RMS.
+        import vllm.distributed.parallel_state as ps
+        if ps._TP is None:
+            raise RuntimeError(
+                "SanaWmTensorParallelRMSNorm requires an initialized vLLM "
+                "tensor-parallel group when tp_size > 1."
+            )
+        ps._TP.all_reduce(tensor)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
@@ -1047,12 +1025,22 @@ class SanaWmSelfAttention(nn.Module):
                 )
                 output = output.permute(0, 3, 1, 2).reshape(batch_size, token_count, q_size)
                 return output, (beta, decay)
-            except Exception:
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
                 if os.environ.get(SANA_WM_REQUIRE_TRITON_GDN_ENV, "").lower() in {"1", "true", "yes", "on"}:
                     raise
                 # The fused path is an optimization. Keep the reference path as
                 # the correctness fallback for unsupported GPUs / Triton builds.
-                pass
+                # Warn once so a silent multi-second regression is observable.
+                global _SANA_WM_TRITON_GDN_FALLBACK_WARNED
+                if not _SANA_WM_TRITON_GDN_FALLBACK_WARNED:
+                    _SANA_WM_TRITON_GDN_FALLBACK_WARNED = True
+                    warnings.warn(
+                        f"Sana-WM fused Triton GDN kernel raised {type(exc).__name__}: {exc}; "
+                        "falling back to the PyTorch reference recurrence (slow). "
+                        f"Set {SANA_WM_REQUIRE_TRITON_GDN_ENV}=1 to fail fast instead.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
         query = self.q_norm(query).reshape(batch_size, token_count, self.num_heads, self.head_dim)
         key = self.k_norm(key).reshape(batch_size, token_count, self.num_heads, self.head_dim)
         value = value.reshape(batch_size, token_count, self.num_heads, self.head_dim)
@@ -2640,7 +2628,7 @@ class SanaWmTransformer3DModel(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor | None:
-        if plucker is None or not hasattr(self, "plucker_embedder"):
+        if plucker is None:
             return None
         if plucker.ndim == 4:
             plucker = plucker.unsqueeze(0)
@@ -2653,12 +2641,8 @@ class SanaWmTransformer3DModel(nn.Module):
 
         # Fuse per-pixel ray-direction map via raymap_embedder only on the
         # non-plucker path. NVlabs skips the absmap/raymap embedder whenever
-        # chunk-plucker input or post-attention injection is enabled.
-        use_chunk_plucker = bool(
-            getattr(self.config, "use_chunk_plucker_input", False)
-            or getattr(self.config, "use_chunk_plucker_post_attn", False)
-        )
-        if spatial_raymap is not None and not use_chunk_plucker and hasattr(self, "raymap_embedder"):
+        # chunk-plucker post-attention injection is enabled.
+        if spatial_raymap is not None and not self.config.use_chunk_plucker_post_attn:
             if spatial_raymap.ndim == 4:  # [C, F, H, W] → [1, C, F, H, W]
                 spatial_raymap = spatial_raymap.unsqueeze(0)
             spatial_raymap = spatial_raymap.to(device=device, dtype=dtype)

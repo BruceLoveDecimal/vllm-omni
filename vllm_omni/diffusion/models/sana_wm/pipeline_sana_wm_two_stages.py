@@ -120,19 +120,18 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             CompilationConfig,
             DeviceConfig,
             VllmConfig,
-            get_current_vllm_config,
+            get_current_vllm_config_or_none,
             set_current_vllm_config,
         )
 
-        try:
-            get_current_vllm_config()
-            vllm_config_context = nullcontext()
-        except AssertionError:
+        if get_current_vllm_config_or_none() is None:
             vllm_config = VllmConfig(
                 compilation_config=CompilationConfig(),
                 device_config=DeviceConfig(device=device),
             )
             vllm_config_context = set_current_vllm_config(vllm_config)
+        else:
+            vllm_config_context = nullcontext()
 
         # When SANA_WM_USE_DIFFUSERS_REFINER=1, swap vllm_omni's local LTX-2 port
         # for the upstream diffusers `LTX2VideoTransformer3DModel`. §6.14o probe
@@ -151,21 +150,14 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             self.refiner_transformer.eval()
             for _p in self.refiner_transformer.parameters():
                 _p.requires_grad_(False)
-            # Disable any caching from CacheMixin to keep activation memory bounded.
-            if hasattr(self.refiner_transformer, "_disable_caching"):
-                try:
-                    self.refiner_transformer._disable_caching()
-                except Exception:
-                    pass
+            # Disable diffusers CacheMixin caching to keep activation memory bounded.
+            self.refiner_transformer._disable_caching()
         else:
             from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import create_transformer_from_config
 
             with vllm_config_context, torch.device("cpu"):
                 self.refiner_transformer = create_transformer_from_config(config_dict)
-            if hasattr(self.refiner_transformer, "load_weights"):
-                self.refiner_transformer.load_weights(state_dict.items())
-            else:
-                self.refiner_transformer.load_state_dict(state_dict, strict=False)
+            self.refiner_transformer.load_weights(state_dict.items())
         self.refiner_transformer.to(device=device, dtype=dtype)
         self._force_module_tensors_to(self.refiner_transformer, device=device, dtype=dtype)
 
@@ -267,10 +259,8 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         return latents
 
     def _refiner_patch_sizes(self) -> tuple[int, int]:
-        config = getattr(self.refiner_transformer, "config", None)
-        patch_size = int(getattr(config, "patch_size", 1))
-        patch_size_t = int(getattr(config, "patch_size_t", 1))
-        return patch_size, patch_size_t
+        config = self.refiner_transformer.config
+        return int(config.patch_size), int(config.patch_size_t)
 
     def _refiner_max_sequence_length(self, extra_args: dict[str, Any]) -> int:
         if "sana_wm_refiner_max_sequence_length" in extra_args:
@@ -295,7 +285,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         if self.refiner_tokenizer is None or self.refiner_text_encoder is None or self.refiner_connectors is None:
             raise RuntimeError("SANA-WM refiner prompt encoding requires loaded refiner components.")
 
-        if getattr(self.refiner_tokenizer, "pad_token", None) is None:
+        if self.refiner_tokenizer.pad_token is None:
             self.refiner_tokenizer.pad_token = self.refiner_tokenizer.eos_token
         self.refiner_tokenizer.padding_side = "left"
 
@@ -316,7 +306,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         return self.refiner_connectors(
             hidden_states,
             encoded.attention_mask.to(device),
-            padding_side=getattr(self.refiner_tokenizer, "padding_side", "left"),
+            padding_side=self.refiner_tokenizer.padding_side,
         )
 
     @staticmethod
@@ -559,8 +549,6 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
                 payload=payload,
                 sampling_params=stage1_sampling_params,
             )
-            if not isinstance(stage1.output, torch.Tensor):
-                raise RuntimeError("SANA-WM in-process refiner requires Stage-1 latent tensor output.")
             refined = self._run_inprocess_refiner(
                 latents=stage1.output,
                 prompt_text=str(normalized_prompt.get("prompt") or ""),
@@ -669,11 +657,11 @@ def _streaming_refiner_self_attention(
 
     from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2AudioVideoAttnProcessor
 
-    try:
+    # Unit tests and standalone CPU probes run without a vLLM TP group; only
+    # apply TP-aware RoPE slicing when the group is initialized.
+    import vllm.distributed.parallel_state as _ps
+    if _ps._TP is not None:
         query_rotary_emb = LTX2AudioVideoAttnProcessor._slice_rope_for_tp(query_rotary_emb, attn)
-    except AssertionError:
-        # Unit tests and standalone CPU probes can run without a vLLM TP group.
-        pass
     if attn.rope_type == "interleaved":
         query = apply_interleaved_rotary_emb(query, query_rotary_emb)
         key = apply_interleaved_rotary_emb(key, query_rotary_emb)

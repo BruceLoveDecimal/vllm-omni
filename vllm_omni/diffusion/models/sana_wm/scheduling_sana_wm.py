@@ -185,7 +185,7 @@ class SanaWmFlowMatchScheduler:
         sigmas = self._sigmas_tensor
         idx = self._sigma_index_for(timestep)
         sigma_cur = sigmas[idx]
-        sigma_next = sigmas[idx + 1] if idx + 1 < sigmas.numel() else sigmas[-1]
+        sigma_next = sigmas[idx + 1]
         dt = (sigma_next - sigma_cur).to(latents.dtype)
         return (latents + dt * (-noise_pred.to(latents.dtype))).to(latents.dtype)
 

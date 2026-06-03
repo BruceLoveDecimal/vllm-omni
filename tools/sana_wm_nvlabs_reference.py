@@ -79,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-frames", "--num_frames", type=int, default=161)
     p.add_argument("--height", type=int, default=704, help="Used to synthesize the placeholder frame + intrinsics.")
     p.add_argument("--width", type=int, default=1280, help="Used to synthesize the placeholder frame + intrinsics.")
+    p.add_argument("--step", type=int, default=None, help="Override NVlabs DiT sampling steps (default: config/60). "
+                   "Useful for parity probes (e.g. --step 1 for a clean single-forward block dump).")
     p.add_argument("--no-refiner", "--no_refiner", action="store_true", help="Run Stage-1 only (NVlabs --no_refiner).")
     p.add_argument("--refiner-root", default=None, help="Override refiner root (default <snapshot>/refiner).")
     p.add_argument("--python", default=None, help="Python executable for the NVlabs subprocess (default: this one).")
@@ -224,6 +226,8 @@ def main() -> None:
             cmd += ["--intrinsics", str(intrinsics_path)]
         cmd += ["--translation_speed", str(args.translation_speed)]
         cmd += ["--rotation_speed_deg", str(args.rotation_speed_deg)]
+        if args.step is not None:
+            cmd += ["--step", str(args.step)]
         if args.no_refiner:
             cmd += ["--no_refiner"]
         else:

@@ -57,8 +57,6 @@ def _get_kernel_config() -> dict:
       - bf16 state_prev: ~96KB total SRAM (fits GB10's 101KB).
       - fp32 state_prev: ~128KB total SRAM (needs H100's 228KB+).
     """
-    if not torch.cuda.is_available():
-        return {"BLOCK_S": 64, "num_stages": 1, "num_warps": 4, "STATE_FP32": False}
     smem = torch.cuda.get_device_properties(0).shared_memory_per_multiprocessor
     state_fp32 = smem >= 150 * 1024  # H100 (228KB) yes, GB10 (101KB) no
     return {"BLOCK_S": 64, "num_stages": 1, "num_warps": 8, "STATE_FP32": state_fp32}
