@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
 
 import torch
 
@@ -286,32 +285,3 @@ class SanaWmFlowMatchScheduler:
         while sigma.ndim < sample.ndim:
             sigma = sigma.unsqueeze(-1)
         return (sigma * noise + (1.0 - sigma) * sample).to(sample.dtype)
-
-
-@dataclass(frozen=True)
-class SanaWmFlowDpmScheduler:
-    """Shifted-Euler smoke scheduler — kept for backward-compat with existing tests.
-
-    New code should use :class:`SanaWmFlowMatchScheduler`.
-    """
-
-    num_inference_steps: int
-    shift: float = SANA_WM_DEFAULT_INFERENCE_FLOW_SHIFT
-
-    def __post_init__(self) -> None:
-        if self.num_inference_steps <= 0:
-            raise ValueError("Sana-WM scheduler num_inference_steps must be positive.")
-
-    def timesteps(self, *, device: torch.device) -> torch.Tensor:
-        base = torch.linspace(1.0, 0.0, self.num_inference_steps + 1, device=device, dtype=torch.float32)[:-1]
-        return shift_flow_timestep(base, self.shift)
-
-    def deltas(self, *, device: torch.device) -> torch.Tensor:
-        base = torch.linspace(1.0, 0.0, self.num_inference_steps + 1, device=device, dtype=torch.float32)
-        shifted = shift_flow_timestep(base, self.shift)
-        return shifted[:-1] - shifted[1:]
-
-    def step(self, latents: torch.Tensor, noise_pred: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
-        while delta.ndim < latents.ndim:
-            delta = delta.unsqueeze(-1)
-        return latents - delta.to(device=latents.device, dtype=latents.dtype) * noise_pred

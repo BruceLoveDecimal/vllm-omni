@@ -36,7 +36,6 @@ from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SanaWmTransformer3DModel,
 )
 from vllm_omni.diffusion.models.sana_wm.scheduling_sana_wm import (
-    SanaWmFlowDpmScheduler,  # noqa: F401 – kept for backward-compat imports
     SanaWmFlowMatchScheduler,
 )
 from vllm_omni.diffusion.models.sana_wm.weight_mapping import normalize_sana_wm_stage1_weight_name
