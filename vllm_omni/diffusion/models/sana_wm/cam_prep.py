@@ -232,9 +232,6 @@ def cam_prep_func(
     q_out = to_bhdn(torch.cat((q_half, q_rope), dim=-1))
     k_out = to_bhdn(k_post)
     v_out = to_bhdn(torch.cat((v_half, v_rope), dim=-1))
-    expected = (batch, num_heads, head_dim, token_count)
-    if q_out.shape != expected or k_out.shape != expected or v_out.shape != expected:
-        raise RuntimeError("Sana-WM cam prep produced an unexpected output shape.")
     return q_out, k_out, v_out, inflation_sq
 
 

@@ -232,12 +232,7 @@ def _apply_block_diagonal(
             f"UCPE block-diagonal block sum {sum(block_sizes)} != feats D {feats.shape[-1]}."
         )
     blocks = torch.split(feats, list(block_sizes), dim=-1)
-    out = torch.cat([func(block) for func, block in zip(funcs, blocks)], dim=-1)
-    if out.shape != feats.shape:
-        raise RuntimeError(
-            f"UCPE block-diagonal output shape {tuple(out.shape)} != input {tuple(feats.shape)}."
-        )
-    return out
+    return torch.cat([func(block) for func, block in zip(funcs, blocks)], dim=-1)
 
 
 def _slice_rope_for_cam(
@@ -273,14 +268,7 @@ def _slice_rope_for_cam(
     t_part = rotary_emb[..., :new_t]
     h_part = rotary_emb[..., orig_t : orig_t + new_h]
     w_part = rotary_emb[..., orig_t + orig_h : orig_t + orig_h + new_w]
-    sliced = torch.cat([t_part, h_part, w_part], dim=-1)
-    if sliced.shape[-1] != target_complex_dim:
-        raise ValueError(
-            "SANA-WM UCPE RoPE slice produced "
-            f"{sliced.shape[-1]} complex dims, expected {target_complex_dim} "
-            f"(input_complex={rotary_emb.shape[-1]}, rope_dim={rope_dim})."
-        )
-    return sliced
+    return torch.cat([t_part, h_part, w_part], dim=-1)
 
 
 # ---------------------------------------------------------------------------

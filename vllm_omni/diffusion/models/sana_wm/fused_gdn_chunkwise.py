@@ -1108,8 +1108,6 @@ def _pick_phase_b_d_splits(BLOCK_D: int, dot_precision: int = 0):
     try:
         import torch
 
-        if not torch.cuda.is_available():
-            return (1, None, None, None)
         dev = torch.cuda.current_device()
         cache_key = (dev, dot_precision)
         if cache_key not in _PHASE_B_DTILE_ARCH_CACHE:
@@ -1157,7 +1155,7 @@ def _pick_phase_b_d_splits(BLOCK_D: int, dot_precision: int = 0):
                     cfg = (1, None, None, None)  # Ada, unknown
             _PHASE_B_DTILE_ARCH_CACHE[cache_key] = cfg
         return _PHASE_B_DTILE_ARCH_CACHE[cache_key]
-    except Exception:
+    except (RuntimeError, AttributeError):
         return (1, None, None, None)
 
 

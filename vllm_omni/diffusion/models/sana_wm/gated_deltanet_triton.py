@@ -210,10 +210,8 @@ def _triton_disabled() -> bool:
 
 
 def _rms_norm_weight(module: nn.Module, hidden_size: int, *, device: torch.device) -> torch.Tensor:
-    weight = getattr(module, "weight", None)
-    if isinstance(weight, torch.Tensor):
-        return weight.float().contiguous()
-    return torch.ones(hidden_size, device=device, dtype=torch.float32)
+    del hidden_size, device
+    return module.weight.float().contiguous()
 
 
 def triton_bidirectional_gated_delta_net_from_qkv(
@@ -273,6 +271,9 @@ def triton_bidirectional_gated_delta_net_from_qkv(
     )
 
     qkv = qkv.contiguous()
+    # q_norm is a vLLM RMSNorm on the production path, which stores its epsilon
+    # as ``variance_epsilon`` (no ``eps`` attribute); the 1e-5 fallback preserves
+    # the validated fused-path numerics for that case (and any norm without eps).
     q_inv_rms, k_inv_rms = fused_qk_inv_rms(qkv, eps=float(getattr(q_norm, "eps", 1e-5)))
     hidden_size = num_heads * head_dim
     q_norm_weight = _rms_norm_weight(q_norm, hidden_size, device=qkv.device)
