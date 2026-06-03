@@ -14,6 +14,7 @@ From ``tests/``::
 """
 
 import base64
+import json
 import os
 from io import BytesIO
 
@@ -37,6 +38,20 @@ NEGATIVE_PROMPT = "blurry, low quality, distorted, watermark"
 # Smoke knobs: a handful of frames / steps so the job finishes quickly.
 SMOKE_NUM_FRAMES = 9
 SMOKE_NUM_INFERENCE_STEPS = 2
+# First-frame I2V needs a camera trajectory; "w-<n>" is the forward-move action DSL.
+# Passed via the ``sana_wm`` form field (a JSON string parsed server-side); explicit
+# intrinsics avoid the optional Pi3X camera-calibration dependency.
+SANA_WM_PARAMS = {
+    "action": f"w-{SMOKE_NUM_FRAMES - 1}",
+    "translation_speed": 0.055,
+    "rotation_speed_deg": 1.2,
+    "intrinsics": {
+        "fx": SANA_WM_OUTPUT_WIDTH / 2,
+        "fy": SANA_WM_OUTPUT_WIDTH / 2,
+        "cx": SANA_WM_OUTPUT_WIDTH / 2,
+        "cy": SANA_WM_OUTPUT_HEIGHT / 2,
+    },
+}
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 
@@ -74,6 +89,7 @@ def test_image_to_video_001(omni_server: OmniServer, openai_client: OpenAIClient
         "form_data": {
             "prompt": PROMPT,
             "negative_prompt": NEGATIVE_PROMPT,
+            "sana_wm": json.dumps(SANA_WM_PARAMS),
             "height": SANA_WM_OUTPUT_HEIGHT,
             "width": SANA_WM_OUTPUT_WIDTH,
             "num_frames": SMOKE_NUM_FRAMES,

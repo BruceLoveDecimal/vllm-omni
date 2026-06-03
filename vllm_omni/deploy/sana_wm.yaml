@@ -31,3 +31,9 @@ stages:
       fps: 16
       num_inference_steps: 60
       guidance_scale: 5.0
+      # Run the LTX-2 refiner so /v1/videos returns decoded RGB frames rather
+      # than a raw Stage-1 latent. Redundant with the two-stage default, but
+      # makes the production serving intent explicit.
+      extra_args:
+        sana_wm_inprocess_refiner: true
+        sana_wm_inprocess_refiner_steps: 1

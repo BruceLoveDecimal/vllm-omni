@@ -526,7 +526,11 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         if bool(extra_args.get("sana_wm_load_refiner_components", False)):
             device, dtype = self._runtime_device_dtype()
             self.ensure_refiner_components(device=device, dtype=dtype)
-        if bool(extra_args.get(SANA_WM_INPROCESS_REFINER_ARG, False)):
+        # Default to running the refiner: this is the *two-stage* pipeline, so
+        # decoding Stage-1 latents to RGB via the LTX-2 refiner is its purpose.
+        # Without it, forward() returns a raw latent that /v1/videos cannot encode.
+        # Callers can still opt out with sana_wm_inprocess_refiner=False.
+        if bool(extra_args.get(SANA_WM_INPROCESS_REFINER_ARG, True)):
             if len(req.prompts) != 1:
                 raise ValueError("SANA-WM in-process refiner currently supports exactly one prompt per request.")
             prompt = req.prompts[0]
