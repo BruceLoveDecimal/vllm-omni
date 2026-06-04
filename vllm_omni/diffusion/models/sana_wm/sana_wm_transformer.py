@@ -11,6 +11,7 @@ Triton operator and exact UCPE camera branch are being ported.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import sys
@@ -77,6 +78,8 @@ SANA_WM_STAGE1_PROMPT_CHANNELS = 2304
 SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
 SANA_WM_STAGE1_GDN_STATE_SIZE = 20
 SANA_WM_DISABLE_VLLM_OPS_ENV = "VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS"
+
+logger = logging.getLogger(__name__)
 
 _SANA_WM_TRITON_GDN_FALLBACK_WARNED = False
 
@@ -163,9 +166,9 @@ def _import_nvlabs_cam_scan_bidi() -> Any:
     try:
         from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_bidi_chunkwise  # type: ignore
         _cam_triton_fn = cam_scan_bidi_chunkwise
-        print(f"[sana-wm cam-triton] imported from {repo}", flush=True)
+        logger.debug("Sana-WM cam-triton kernel imported from %s", repo)
     except ImportError as exc:
-        print(f"[sana-wm cam-triton] import failed ({exc}); falling back to Python path", flush=True)
+        logger.debug("Sana-WM cam-triton kernel import failed (%s); falling back to Python path", exc)
         _cam_triton_fn = None
     return _cam_triton_fn
 
