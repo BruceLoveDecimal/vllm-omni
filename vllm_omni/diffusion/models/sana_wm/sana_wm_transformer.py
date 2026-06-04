@@ -4,7 +4,7 @@
 
 This module is intentionally split from the official NVlabs backend.  It gives
 vLLM-Omni a materializable, shape-compatible native path for scaffolding, weight
-audits, and small smoke tests while the fused Bidirectional Gated DeltaNet
+audits, and small bounded-size runs while the fused Bidirectional Gated DeltaNet
 Triton operator and exact UCPE camera branch are being ported.
 """
 
@@ -67,7 +67,7 @@ except ImportError:  # pragma: no cover - local macOS/dev environments may not i
 
 SANA_WM_TRANSFORMER_FORWARD_ERROR = (
     "Sana-WM full Stage-1 transformer forward is not implemented yet. "
-    "The native fallback runs a pure PyTorch GDN smoke path; production quality "
+    "The native fallback runs a pure PyTorch GDN reference path; production quality "
     "still requires porting the fused Triton GDN kernel, exact camera injection, "
     "and the official denoising stack."
 )
@@ -513,7 +513,7 @@ class SanaWmWanRotaryPosEmbed(nn.Module):
 
 
 class SanaWmCameraEmbedder(nn.Module):
-    """Small camera branch used by the native smoke path."""
+    """Small camera branch used by the native path."""
 
     def __init__(
         self,
@@ -1597,10 +1597,7 @@ class SanaWmSelfAttention(nn.Module):
         4x4 transforms that are applied to the Q/K/V channels via UCPE.
         """
         if spatial_shape is not None and self.use_gdn:
-            cam_disabled = os.environ.get("VLLM_OMNI_SANA_WM_DISABLE_CAM_BRANCH", "").lower() in {
-                "1", "true", "yes", "on",
-            }
-            if camera_conditions is None or self.q_proj_cam is None or cam_disabled:
+            if camera_conditions is None or self.q_proj_cam is None:
                 # Main branch only — preserves legacy path when the request
                 # has no camera info or the cam projections were not built.
                 return self._forward_gdn(hidden_states, spatial_shape, rotary_emb)
@@ -1627,11 +1624,8 @@ class SanaWmSelfAttention(nn.Module):
             return attn_out
 
         if spatial_shape is not None:
-            cam_disabled = os.environ.get("VLLM_OMNI_SANA_WM_DISABLE_CAM_BRANCH", "").lower() in {
-                "1", "true", "yes", "on",
-            }
             main_raw = self._forward_softmax_raw(hidden_states, spatial_shape, rotary_emb)
-            if camera_conditions is not None and self.q_proj_cam is not None and not cam_disabled:
+            if camera_conditions is not None and self.q_proj_cam is not None:
                 cam_raw = self._forward_softmax_cam_branch(
                     hidden_states,
                     spatial_shape,
@@ -1821,7 +1815,7 @@ class SanaWmMbConvFfn(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, spatial_shape: tuple[int, int, int]) -> torch.Tensor:
-        """Match NVlabs ``GLUMBConvTemp.forward`` exactly (audit §6.13h):
+        """Match NVlabs ``GLUMBConvTemp.forward`` exactly:
 
         1. Reshape ``(B, N=F*H*W, C) → (B*F, H, W, C) → (B*F, C, H, W)``
            so the spatial MBConv runs PER FRAME with proper 2D (H, W)
@@ -1854,7 +1848,7 @@ class SanaWmMbConvFfn(nn.Module):
         # Conv2d to match the checkpoint key (`inverted_conv.conv.weight`),
         # so we need to apply the SiLU explicitly here — skipping it left
         # the expanded features unactivated and inflated the downstream
-        # GLU output magnitude by ~12× (audit §6.13h block-0 probe).
+        # GLU output magnitude by ~12×.
         x_inv = self.glu_act(self.inverted_conv.conv(x))
         x_dep = self.depth_conv.conv(x_inv)
         value, gate = x_dep.chunk(2, dim=1)
@@ -1946,7 +1940,7 @@ class SanaWmBlock(nn.Module):
         camera_conditions: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # NVlabs dispatch convention (audit §6.13a): when timestep
+        # NVlabs dispatch convention: when timestep
         # modulation carries a frame axis (ndim > 2), route through the
         # frame-aware path so shift/scale/gate are applied per frame.
         if timestep_modulation.ndim > 2:
@@ -1966,14 +1960,7 @@ class SanaWmBlock(nn.Module):
         ).chunk(6, dim=1)
         attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
         attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_conditions)
-        plucker_proj_disabled = os.environ.get(
-            "VLLM_OMNI_SANA_WM_DISABLE_PLUCKER_PROJ", ""
-        ).lower() in {"1", "true", "yes", "on"}
-        if (
-            camera_hidden_states is not None
-            and self.plucker_proj is not None
-            and not plucker_proj_disabled
-        ):
+        if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         hidden_states = hidden_states + gate_msa * attn_output
         hidden_states = hidden_states + self.cross_attn(
@@ -2028,14 +2015,7 @@ class SanaWmBlock(nn.Module):
         x_norm1 = self.norm1(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_msa_in = (x_norm1 * (1 + scale_msa) + shift_msa).reshape(batch_size, token_count, hidden_size)
         attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, camera_conditions)
-        plucker_proj_disabled = os.environ.get(
-            "VLLM_OMNI_SANA_WM_DISABLE_PLUCKER_PROJ", ""
-        ).lower() in {"1", "true", "yes", "on"}
-        if (
-            camera_hidden_states is not None
-            and self.plucker_proj is not None
-            and not plucker_proj_disabled
-        ):
+        if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         attn_output_4d = attn_output.reshape(batch_size, frames, spatial_tokens, hidden_size)
         hidden_states = hidden_states + (gate_msa * attn_output_4d).reshape(
@@ -2094,7 +2074,7 @@ class SanaWmFinalLayer(nn.Module):
         timestep_embed: torch.Tensor,
         spatial_shape: tuple[int, int, int] | None = None,
     ) -> torch.Tensor:
-        # Per-frame timestep contract (audit §6.13a) dispatch.
+        # Per-frame timestep contract dispatch.
         if timestep_embed.ndim > 2:
             return self._forward_frame_aware(hidden_states, timestep_embed, spatial_shape)
         shift, scale = (self.scale_shift_table[None] + timestep_embed[:, None]).chunk(2, dim=1)
@@ -2511,7 +2491,7 @@ class SanaWmTransformer3DModel(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.ndim != 5:
             raise ValueError("Sana-WM transformer expects latent input shaped [B, C, F, H, W].")
-        # Audit §6.13n: env-gated force-fp32 transformer forward for the
+        # Env-gated force-fp32 transformer forward for the
         # bf16-precision-drift upper-bound experiment. Casts inputs to fp32,
         # also upcasts model params (one-shot), and casts noise_pred back to
         # the original input dtype before returning.
@@ -2587,7 +2567,7 @@ class SanaWmTransformer3DModel(nn.Module):
             timestep = timestep.expand(batch_size)
         elif timestep.ndim == 1 and timestep.shape[0] == 1 and batch_size > 1:
             timestep = timestep.expand(batch_size)
-        # Per-frame timestep contract (audit §6.13a): when ``timestep`` is
+        # Per-frame timestep contract: when ``timestep`` is
         # rank > 1 (e.g. ``(B, 1, F)`` from the LTX flow-matching sampler),
         # the per-frame embedding is computed on the flattened token axis
         # and unflattened back to the input rank. ``time_embed`` then has

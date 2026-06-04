@@ -4,9 +4,6 @@
 
 from __future__ import annotations
 
-import math
-import os
-
 import torch
 
 SANA_WM_DEFAULT_INFERENCE_FLOW_SHIFT = 9.8
@@ -34,7 +31,7 @@ class SanaWmFlowMatchScheduler:
     explicitly. For ``shift=9.8, N=3`` this yields timesteps
     ``[1000, 909.0, 87.7]`` (matches NVlabs) rather than the near-linear
     ``[999, 951, 830]`` that the prior ``DPMSolverMultistep`` wrapper
-    produced (see audit §6.13k).
+    produced.
     """
 
     NUM_TRAIN_TIMESTEPS = 1000
@@ -79,72 +76,6 @@ class SanaWmFlowMatchScheduler:
         sig_pre = ts_pre / float(self.num_train_timesteps)
         sigmas = self.shift * sig_pre / (1.0 + (self.shift - 1.0) * sig_pre)
         timesteps = sigmas * float(self.num_train_timesteps)
-
-        # Audit §6.13s: env-gated subdivision of the biggest sigma jump.
-        # The flow-shift schedule front-loads tiny early steps then takes a
-        # huge final jump (e.g. for shift=9.8, N=20: ..., t=392 → t=87.7).
-        # Oracle-snap probe in §6.13p showed this single step is the
-        # amplifier that turns the ~0.04 same-latent noise_pred residual
-        # into the 321f trajectory collapse. Subdividing it into
-        # K halfway steps (geometric mean) reduces the per-step dt and
-        # the trajectory perturbation.
-        # Env var:
-        #   SANA_WM_SCHED_SUBDIVIDE_BIG_STEP=K  (K extra sigmas inserted at
-        #   the largest dt position; K=1 by default if set to "1"/"true").
-        # NOTE: this makes the native schedule diverge from NVlabs by K
-        # extra steps. Use only when latent parity vs NVlabs is no longer
-        # the gating concern (the 321f case in §6.13o/p).
-        subdiv_env = os.environ.get("SANA_WM_SCHED_SUBDIVIDE_BIG_STEP", "")
-        subdiv_k = 0
-        if subdiv_env:
-            if subdiv_env.lower() in {"1", "true", "yes", "on"}:
-                subdiv_k = 1
-            else:
-                try:
-                    subdiv_k = max(0, int(subdiv_env))
-                except ValueError:
-                    subdiv_k = 0
-        if subdiv_k > 0 and sigmas.numel() >= 2:
-            # find adjacent (cur, next) pair with largest |sigma_next - sigma_cur|.
-            # next-step sigmas come from cat([sigmas[1:], 0]); we want the
-            # largest jump *into* the terminal zero or *between* schedule sigmas.
-            sigmas_with_zero = torch.cat(
-                [sigmas, torch.zeros(1, dtype=torch.float32, device=device)]
-            )
-            jumps = (sigmas_with_zero[:-1] - sigmas_with_zero[1:]).abs()
-            big_idx = int(jumps.argmax().item())
-            sigma_cur = float(sigmas_with_zero[big_idx].item())
-            sigma_next = float(sigmas_with_zero[big_idx + 1].item())
-            # geometric mean(s) between sigma_cur and sigma_next.
-            # K=1: insert one sigma = sqrt(cur * next).
-            # K>1: insert K equally-log-spaced sigmas.
-            # Clamp sigma_next at 1e-6 if it's 0 so geomspace is well-defined,
-            # then drop the inserted final-zero copy.
-            log_cur = math.log(max(sigma_cur, 1e-9))
-            log_next = math.log(max(sigma_next, 1e-9))
-            new_logs = torch.linspace(
-                log_cur, log_next, subdiv_k + 2, dtype=torch.float32, device=device
-            )[1:-1]
-            inserted = new_logs.exp()
-            print(
-                f"[sana-wm scheduler] subdivide_big_step k={subdiv_k} "
-                f"big_jump=sigma[{big_idx}]={sigma_cur:.4f}→{sigma_next:.4f} "
-                f"inserted={inserted.tolist()}",
-                flush=True,
-            )
-            # If the big jump was at the LAST schedule sigma (index N-1)
-            # into the terminal 0, then big_idx == N-1; the inserted sigmas
-            # go between sigmas[N-1] and 0 — i.e., append them, then append 0.
-            # Otherwise the inserted sigmas go between sigmas[big_idx] and
-            # sigmas[big_idx+1] in the non-terminal portion of the schedule.
-            if big_idx == sigmas.numel() - 1:
-                # Big jump is the final-step jump into 0.
-                sigmas = torch.cat([sigmas, inserted])
-            else:
-                sigmas = torch.cat(
-                    [sigmas[: big_idx + 1], inserted, sigmas[big_idx + 1 :]]
-                )
-            timesteps = sigmas * float(self.num_train_timesteps)
 
         sigmas_with_terminal = torch.cat(
             [sigmas, torch.zeros(1, dtype=torch.float32, device=device)]
@@ -252,20 +183,10 @@ class SanaWmFlowMatchScheduler:
         # Sign convention follows NVlabs `LTXFlowEuler.sample`, which calls
         # diffusers with `model_output=-noise_pred`. Diffusers then applies
         # `prev = sample + dt * model_output`.
-        #
-        # 2026-05-28 GPU A/B (audit §6.13c verification): the
-        # `-noise_pred` direction gives MAE=69.06 / PSNR=9.68 on the
-        # 9-frame harness. `+noise_pred` gives MAE=112.5 / PSNR=6.0 —
-        # clearly the wrong direction. `VLLM_OMNI_SANA_WM_FLIP_FLOW_SIGN=1`
-        # swaps to the opposite convention for future verification.
-        flip = os.environ.get("VLLM_OMNI_SANA_WM_FLIP_FLOW_SIGN", "").lower() in {
-            "1", "true", "yes", "on"
-        }
-        sign = 1.0 if flip else -1.0  # default: NVlabs -noise_pred
         b, c, f, h, w = latents.shape
         latents_flat = latents.permute(0, 2, 3, 4, 1).reshape(b, -1, c).float()
         noise_flat = noise_pred.permute(0, 2, 3, 4, 1).reshape(b, -1, c).float()
-        prev_flat = latents_flat + dt.unsqueeze(-1) * (sign * noise_flat)
+        prev_flat = latents_flat + dt.unsqueeze(-1) * (-noise_flat)
         prev = prev_flat.reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3).contiguous()
         return prev.to(latents.dtype)
 

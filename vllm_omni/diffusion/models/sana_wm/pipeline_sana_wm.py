@@ -69,8 +69,7 @@ SANA_WM_REFINER_ROOT_ENV = "VLLM_OMNI_SANA_WM_REFINER_ROOT"
 SANA_WM_OUTPUT_HEIGHT = 704
 SANA_WM_OUTPUT_WIDTH = 1280
 SANA_WM_DEFAULT_NUM_FRAMES = 321
-SANA_WM_NATIVE_SMOKE_ENV = "VLLM_OMNI_SANA_WM_NATIVE_SMOKE"
-SANA_WM_NATIVE_SMOKE_MAX_TOKENS = 4096
+SANA_WM_NATIVE_MAX_TOKENS = 4096
 
 SANA_WM_STAGE1_PATTERNS = (
     SANA_WM_CONFIG_FILE,
@@ -107,7 +106,7 @@ class SanaWmLocalPaths:
 
 
 @dataclass(frozen=True)
-class SanaWmNativeSmokeParams:
+class SanaWmNativeParams:
     """Small native fallback generation settings.
 
     This is not the production SANA-WM sampler; it exists to exercise the
@@ -321,32 +320,32 @@ class SanaWmPipeline(
         extra_args = getattr(sampling_params, "extra_args", None) if sampling_params is not None else None
         return dict(extra_args or {})
 
-    def _native_smoke_params(self, payload: dict[str, Any], sampling_params: Any | None) -> SanaWmNativeSmokeParams:
+    def _native_params(self, payload: dict[str, Any], sampling_params: Any | None) -> SanaWmNativeParams:
         extra_args = self._extra_args(sampling_params)
         height = int(getattr(sampling_params, "height", None) or payload["height"])
         width = int(getattr(sampling_params, "width", None) or payload["width"])
         num_frames = int(getattr(sampling_params, "num_frames", None) or payload["num_frames"])
         steps = int(getattr(sampling_params, "num_inference_steps", None) or extra_args.get("num_inference_steps", 1))
         seed = int(getattr(sampling_params, "seed", None) or extra_args.get("seed", 0))
-        height = int(extra_args.get("sana_wm_native_smoke_height", height))
-        width = int(extra_args.get("sana_wm_native_smoke_width", width))
-        num_frames = int(extra_args.get("sana_wm_native_smoke_num_frames", num_frames))
-        steps = int(extra_args.get("sana_wm_native_smoke_steps", steps))
+        height = int(extra_args.get("sana_wm_native_height", height))
+        width = int(extra_args.get("sana_wm_native_width", width))
+        num_frames = int(extra_args.get("sana_wm_native_num_frames", num_frames))
+        steps = int(extra_args.get("sana_wm_native_steps", steps))
         if min(height, width, num_frames, steps) <= 0:
-            raise ValueError("Sana-WM native smoke height, width, num_frames, and steps must be positive.")
+            raise ValueError("Sana-WM native height, width, num_frames, and steps must be positive.")
         # CFG: only enable when the caller explicitly opts in via
         # ``guidance_scale_provided=True`` AND guidance_scale > 1. This keeps
-        # the legacy single-branch behavior for tests/probes that pass cfg=1.0
-        # (e.g. §6.14k/q probes) while restoring NVlabs production semantics
-        # (cfg=5.0 by default for sana-wm video).
+        # the legacy single-branch behavior for tests that pass cfg=1.0 while
+        # restoring NVlabs production semantics (cfg=5.0 by default for
+        # sana-wm video).
         cfg_scale = 1.0
         if sampling_params is not None and getattr(sampling_params, "guidance_scale_provided", False):
             cfg_scale = float(getattr(sampling_params, "guidance_scale", 1.0) or 1.0)
-        cfg_scale = float(extra_args.get("sana_wm_native_smoke_cfg_scale", cfg_scale))
+        cfg_scale = float(extra_args.get("sana_wm_native_cfg_scale", cfg_scale))
         # Negative prompt for CFG uncond branch; defaults to empty string
         # matching NVlabs `GenerationParams.negative_prompt = ""`.
-        negative_prompt = str(extra_args.get("sana_wm_native_smoke_negative_prompt", "") or "")
-        return SanaWmNativeSmokeParams(
+        negative_prompt = str(extra_args.get("sana_wm_native_negative_prompt", "") or "")
+        return SanaWmNativeParams(
             height=height,
             width=width,
             num_frames=num_frames,
@@ -356,7 +355,7 @@ class SanaWmPipeline(
             negative_prompt=negative_prompt,
         )
 
-    def _native_smoke_dtype(self, device: torch.device) -> torch.dtype:
+    def _native_dtype(self, device: torch.device) -> torch.dtype:
         dtype = getattr(self.od_config, "dtype", None) if self.od_config is not None else None
         if isinstance(dtype, torch.dtype):
             return dtype
@@ -364,7 +363,7 @@ class SanaWmPipeline(
 
     def _runtime_device_dtype(self) -> tuple[torch.device, torch.dtype]:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return device, self._native_smoke_dtype(device)
+        return device, self._native_dtype(device)
 
     def _checkpoint_local_files_only(self) -> bool:
         if self.release_paths is not None:
@@ -494,8 +493,8 @@ class SanaWmPipeline(
         per-channel ``latents_mean`` and ``latents_std`` tensors that must be
         applied alongside ``scaling_factor`` for the round-trip to be
         identity. The legacy `* scaling_factor` only path produced
-        decoded videos with a systematic G/B colour shift (audit §6.13e
-        diagnosis: pred RGB means ~(110, 220, 208) vs ref ~(94, 114, 138)).
+        decoded videos with a systematic G/B colour shift (pred RGB means
+        ~(110, 220, 208) vs ref ~(94, 114, 138)).
 
         Returns the normalised latent in the same dtype as the input.
         """
@@ -563,7 +562,7 @@ class SanaWmPipeline(
             return chi_prompt + user_prompt
         return user_prompt
 
-    def _hash_smoke_prompt_embeds(
+    def _hash_prompt_embeds(
         self,
         prompt_text: str,
         *,
@@ -584,9 +583,9 @@ class SanaWmPipeline(
         prompt_embeds = torch.randn(shape, generator=generator, dtype=torch.float32)
         prompt_embeds = prompt_embeds * float(self.sana_wm_config.y_norm_scale_factor)
         self._last_prompt_attention_mask = torch.ones(shape[:2], device=device, dtype=torch.float32)
-        return prompt_embeds.to(device=device, dtype=dtype), "hash_smoke"
+        return prompt_embeds.to(device=device, dtype=dtype), "hash"
 
-    def _native_smoke_prompt_embeds(
+    def _native_prompt_embeds(
         self,
         prompt: dict[str, Any],
         *,
@@ -596,7 +595,7 @@ class SanaWmPipeline(
     ) -> tuple[torch.Tensor, str]:
         prompt_text = self._stage1_prompt_text(prompt)
         if allow_hash_fallback:
-            return self._hash_smoke_prompt_embeds(prompt_text, device=device, dtype=dtype)
+            return self._hash_prompt_embeds(prompt_text, device=device, dtype=dtype)
 
         self._ensure_stage1_text_encoder(device=device, dtype=dtype)
         tokenizer = self.tokenizer
@@ -629,7 +628,7 @@ class SanaWmPipeline(
                 "Sana-WM Stage-1 Gemma hidden size mismatch: expected "
                 f"{SANA_WM_STAGE1_PROMPT_CHANNELS}, got {hidden_states.shape[-1]}."
             )
-        # Audit §6.13f: pass RAW Gemma hidden states; the model's
+        # Pass RAW Gemma hidden states; the model's
         # internal ``attention_y_norm = RMSNorm(hidden_size,
         # scale_factor=y_norm_scale_factor)`` (set in
         # SanaWmTransformer3DModel) handles normalisation. The prior
@@ -643,7 +642,7 @@ class SanaWmPipeline(
         self._last_prompt_attention_mask = attention_mask.to(device=device, dtype=torch.float32)
         return hidden_states.to(device=device, dtype=dtype), "gemma2"
 
-    def _decode_native_smoke_latents(
+    def _decode_native_latents(
         self,
         latents: torch.Tensor,
         *,
@@ -672,26 +671,26 @@ class SanaWmPipeline(
         processor = VideoProcessor(vae_scale_factor=getattr(self.vae, "spatial_compression_ratio", 32))
         return processor.postprocess_video(video, output_type=output_type)
 
-    def _run_native_smoke_backend(
+    def _run_native_backend(
         self,
         *,
         prompt: dict[str, Any],
         payload: dict[str, Any],
         sampling_params: Any | None,
     ) -> DiffusionOutput:
-        params = self._native_smoke_params(payload, sampling_params)
+        params = self._native_params(payload, sampling_params)
         latent_frames = (params.num_frames - 1) // 8 + 1
         latent_height = max(params.height // 32, 1)
         latent_width = max(params.width // 32, 1)
         token_count = latent_frames * latent_height * latent_width
         extra_args = self._extra_args(sampling_params)
-        max_tokens = int(extra_args.get("sana_wm_native_smoke_max_tokens", SANA_WM_NATIVE_SMOKE_MAX_TOKENS))
+        max_tokens = int(extra_args.get("sana_wm_native_max_tokens", SANA_WM_NATIVE_MAX_TOKENS))
         if token_count > max_tokens:
             raise ValueError(
                 "Sana-WM native latent token count exceeds the configured cap. "
                 f"Requested latent tokens={token_count}, max={max_tokens}. Set smaller "
-                "`sana_wm_native_smoke_height/width/num_frames`, or raise the cap via "
-                "`sana_wm_native_smoke_max_tokens`."
+                "`sana_wm_native_height/width/num_frames`, or raise the cap via "
+                "`sana_wm_native_max_tokens`."
             )
 
         device, dtype = self._runtime_device_dtype()
@@ -704,7 +703,7 @@ class SanaWmPipeline(
             generator=generator,
         )
 
-        # A.2: production flow-DPM-Solver++ scheduler (replaces shifted-Euler smoke)
+        # Production flow-DPM-Solver++ scheduler.
         scheduler = SanaWmFlowMatchScheduler(
             params.num_inference_steps,
             shift=self.sana_wm_config.inference_flow_shift,
@@ -730,15 +729,10 @@ class SanaWmPipeline(
                 "falling back to pure-noise initialisation drops the image "
                 "conditioning and corrupts video output."
             )
-        # Per-frame timestep contract (audit §6.13a) is enabled by default
-        # to match NVlabs ``LTXFlowEuler.sample``: frame 0 is the clean VAE-
-        # encoded conditioning latent and its timestep is held at 0 while
-        # the sampling loop drives the other frames from noise. Falls back
-        # to the legacy "noise first frame + scalar timestep" path when
-        # explicitly disabled, e.g. for back-compat smoke tests.
-        per_frame_timestep_disabled = os.environ.get(
-            "VLLM_OMNI_SANA_WM_DISABLE_PER_FRAME_TIMESTEP", ""
-        ).lower() in {"1", "true", "yes", "on"}
+        # Per-frame timestep contract matching NVlabs ``LTXFlowEuler.sample``:
+        # frame 0 is the clean VAE-encoded conditioning latent and its timestep
+        # is held at 0 while the sampling loop drives the other frames from
+        # noise.
         if _is_image:
             first_latent = self._vae_encode_first_frame(
                 first_frame_image,
@@ -749,23 +743,16 @@ class SanaWmPipeline(
                 device=device,
                 dtype=dtype,
             )
-            if per_frame_timestep_disabled:
-                # Legacy contract: noise the first-frame latent to the
-                # highest timestep before the denoising loop.
-                first_noised = scheduler.add_noise(first_latent, noise[:, :, :1], timesteps[0])
-                latents = torch.cat([first_noised, noise[:, :, 1:]], dim=2)
-            else:
-                # NVlabs contract: place the CLEAN VAE-encoded first frame
-                # at frame 0 and rely on per-frame timesteps + the
-                # `condition_mask` torch.where restore (below) to keep it
-                # invariant across denoising steps.
-                latents = torch.cat([first_latent, noise[:, :, 1:]], dim=2)
+            # Place the CLEAN VAE-encoded first frame at frame 0 and rely on
+            # per-frame timesteps + the `condition_mask` torch.where restore
+            # (below) to keep it invariant across denoising steps.
+            latents = torch.cat([first_latent, noise[:, :, 1:]], dim=2)
         else:
             first_latent = None
             latents = noise
 
-        allow_hash_fallback = bool(extra_args.get("sana_wm_hash_prompt_smoke", False))
-        prompt_embeds, prompt_source = self._native_smoke_prompt_embeds(
+        allow_hash_fallback = bool(extra_args.get("sana_wm_hash_prompt_fallback", False))
+        prompt_embeds, prompt_source = self._native_prompt_embeds(
             prompt,
             device=device,
             dtype=dtype,
@@ -781,7 +768,7 @@ class SanaWmPipeline(
         do_cfg = params.cfg_scale > 1.0
         if do_cfg:
             negative_prompt_obj = {"prompt": params.negative_prompt}
-            negative_prompt_embeds, _ = self._native_smoke_prompt_embeds(
+            negative_prompt_embeds, _ = self._native_prompt_embeds(
                 negative_prompt_obj,
                 device=device,
                 dtype=dtype,
@@ -822,7 +809,7 @@ class SanaWmPipeline(
         # sampling sigma. We omit the legacy `add_noise_to_image_conditioning_latents`
         # motion-continuity term because the public SANA-WM config sets
         # ``condition_frame_info={0: 0.0}`` (image_cond_noise_scale=0).
-        use_per_frame_timestep = first_latent is not None and not per_frame_timestep_disabled
+        use_per_frame_timestep = first_latent is not None
         if use_per_frame_timestep:
             cam_batch = latents.shape[0]
             cam_frames = latents.shape[2]
@@ -834,30 +821,9 @@ class SanaWmPipeline(
             condition_mask = None
             cam_batch = latents.shape[0]
             cam_frames = latents.shape[2]
-        # Audit §6.13c: the per-frame contract pairs with a per-token
-        # flow-matching Euler step that consumes per-token sigmas. We
-        # keep the wrapped DPMSolver fallback behind an opt-out env
-        # var purely as an ablation knob — by default we run the
-        # NVlabs-style step.
-        per_token_step_disabled = os.environ.get(
-            "VLLM_OMNI_SANA_WM_DISABLE_PER_TOKEN_STEP", ""
-        ).lower() in {"1", "true", "yes", "on"}
-        use_per_token_step = use_per_frame_timestep and not per_token_step_disabled
-        # ``condition_mask`` post-step ``torch.where`` is now a no-op
-        # safety belt under the per-token step (conditioning sigma is
-        # already 0, so the step never moves those tokens). It's
-        # enabled by default. The legacy DPMSolver-step path still
-        # hurts under mask=ON, so default-off in that mode.
-        mask_default = use_per_token_step
-        mask_override = os.environ.get("VLLM_OMNI_SANA_WM_ENABLE_COND_MASK", "")
-        if mask_override:
-            mask_enabled = mask_override.lower() in {"1", "true", "yes", "on"}
-        else:
-            mask_enabled = mask_default
-        if condition_mask is not None:
-            # Pre-flatten the per-token timestep to (B, F*H*W) once;
-            # values come from the (B, 1, F) model timestep at each step.
-            pass
+        # The per-frame contract pairs with a per-token flow-matching Euler
+        # step that consumes per-token sigmas, matching NVlabs.
+        use_per_token_step = use_per_frame_timestep
 
         for _step_idx, timestep in enumerate(timesteps):
             if use_per_frame_timestep:
@@ -914,25 +880,21 @@ class SanaWmPipeline(
             else:
                 stepped = scheduler.step(noise_pred, timestep, latents)
 
-            if condition_mask is not None and mask_enabled:
-                if use_per_token_step:
-                    # Match NVlabs LTXFlowEuler exactly. This is stricter
-                    # than a plain condition-frame restore: with bf16 latents,
-                    # the `t=1000` comparison rounds `1 - 1e-6` to `1`, so
-                    # the first full-noise step is discarded for generated
-                    # tokens as well.
-                    tokens_to_denoise_mask = (
-                        timestep / float(scheduler.num_train_timesteps) - 1e-6
-                        < (1.0 - condition_mask)
-                    )
-                    latents = torch.where(tokens_to_denoise_mask, stepped, latents)
-                else:
-                    latents = torch.where(condition_mask > 0.5, latents, stepped)
+            if condition_mask is not None:
+                # Match NVlabs LTXFlowEuler exactly. This is stricter than a
+                # plain condition-frame restore: with bf16 latents, the
+                # `t=1000` comparison rounds `1 - 1e-6` to `1`, so the first
+                # full-noise step is discarded for generated tokens as well.
+                tokens_to_denoise_mask = (
+                    timestep / float(scheduler.num_train_timesteps) - 1e-6
+                    < (1.0 - condition_mask)
+                )
+                latents = torch.where(tokens_to_denoise_mask, stepped, latents)
             else:
                 latents = stepped
 
         output_type = str(extra_args.get("sana_wm_output_type", "latent"))
-        output = self._decode_native_smoke_latents(latents, output_type=output_type, device=device, dtype=dtype)
+        output = self._decode_native_latents(latents, output_type=output_type, device=device, dtype=dtype)
         return DiffusionOutput(
             output=output,
             custom_output={
@@ -978,7 +940,7 @@ class SanaWmPipeline(
         if self.od_config is not None and self.od_config.model is not None:
             self.resolve_checkpoint()
 
-        return self._run_native_smoke_backend(
+        return self._run_native_backend(
             prompt=prompt,
             payload=payload,
             sampling_params=req.sampling_params,

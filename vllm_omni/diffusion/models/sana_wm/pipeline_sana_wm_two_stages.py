@@ -134,8 +134,8 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             vllm_config_context = nullcontext()
 
         # When SANA_WM_USE_DIFFUSERS_REFINER=1, swap vllm_omni's local LTX-2 port
-        # for the upstream diffusers `LTX2VideoTransformer3DModel`. §6.14o probe
-        # showed this makes refiner same-source bit-exact (cos 0.8912 -> 1.0000).
+        # for the upstream diffusers `LTX2VideoTransformer3DModel`. This makes the
+        # refiner same-source bit-exact (cos 0.8912 -> 1.0000).
         use_diffusers_refiner = os.environ.get("SANA_WM_USE_DIFFUSERS_REFINER", "0") == "1"
         config_dict = self._load_refiner_transformer_config()
         state_dict = load_file(str(self.release_paths.refiner_transformer_weights), device="cpu")
@@ -510,7 +510,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         output_type = str(extra_args.get("sana_wm_refiner_output_type", extra_args.get("sana_wm_output_type", "np")))
         if output_type != "latent":
             self._ensure_vae(device=device, dtype=dtype)
-        output = self._decode_native_smoke_latents(refined_latents, output_type=output_type, device=device, dtype=dtype)
+        output = self._decode_native_latents(refined_latents, output_type=output_type, device=device, dtype=dtype)
         return DiffusionOutput(
             output=output,
             custom_output={
@@ -548,7 +548,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
                 stage1_extra_args = dict(getattr(stage1_sampling_params, "extra_args", None) or {})
                 stage1_extra_args["sana_wm_output_type"] = "latent"
                 stage1_sampling_params.extra_args = stage1_extra_args
-            stage1 = self._run_native_smoke_backend(
+            stage1 = self._run_native_backend(
                 prompt=normalized_prompt,
                 payload=payload,
                 sampling_params=stage1_sampling_params,

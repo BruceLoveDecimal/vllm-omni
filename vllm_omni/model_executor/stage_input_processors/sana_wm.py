@@ -185,11 +185,7 @@ def _as_positive_float(value: Any, *, name: str) -> float:
 def _extract_image(mm_data: Any) -> Any:
     if not isinstance(mm_data, Mapping):
         return None
-    for key in ("image", "img2img", "images"):
-        image = _unwrap_single(mm_data.get(key))
-        if image is not None:
-            return image
-    return None
+    return _unwrap_single(mm_data.get("image"))
 
 
 def _first_present(*values: Any) -> Any:
@@ -202,10 +198,10 @@ def _first_present(*values: Any) -> Any:
 def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool = True) -> dict[str, Any]:
     """Return a prompt copy with canonical Sana-WM request metadata.
 
-    Accepted locations, in priority order, are top-level ``sana_wm``, then
-    ``additional_information["sana_wm"]``, ``extra_args["sana_wm"]``, and
-    ``extra_params["sana_wm"]``. Legacy top-level ``camera_trajectory`` is also
-    accepted as an explicit camera block.
+    The ``sana_wm`` block is read from the top-level ``sana_wm`` key, falling
+    back to ``additional_information["sana_wm"]`` so the function is idempotent
+    when called again on its own output. The first-frame image is read from
+    ``multi_modal_data["image"]``.
     """
 
     if not isinstance(prompt, Mapping):
@@ -213,24 +209,20 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool 
 
     result = dict(prompt)
     mm_data = _as_dict(result.get("multi_modal_data"), name="multi_modal_data")
-    image = _first_present(result.get("image"), _extract_image(mm_data))
+    image = _extract_image(mm_data)
     if require_image and image is None:
-        raise ValueError("Sana-WM requires a first-frame image in `image` or `multi_modal_data`.")
+        raise ValueError("Sana-WM requires a first-frame image in `multi_modal_data['image']`.")
 
     additional = _as_dict(result.get("additional_information"), name="additional_information")
-    extra_args = _as_dict(result.get("extra_args"), name="extra_args")
-    extra_params = _as_dict(result.get("extra_params"), name="extra_params")
     raw = _first_present(
         result.get(SANA_WM_CANONICAL_KEY),
         additional.get(SANA_WM_CANONICAL_KEY),
-        extra_args.get(SANA_WM_CANONICAL_KEY),
-        extra_params.get(SANA_WM_CANONICAL_KEY),
         {},
     )
     raw = _as_dict(raw, name=SANA_WM_CANONICAL_KEY)
 
     num_frames = _as_positive_int(
-        _first_present(raw.get("num_frames"), raw.get("frames"), result.get("num_frames"), SANA_WM_DEFAULT_NUM_FRAMES),
+        _first_present(raw.get("num_frames"), result.get("num_frames"), SANA_WM_DEFAULT_NUM_FRAMES),
         name="num_frames",
     )
     height = _as_positive_int(
@@ -239,13 +231,13 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool 
     )
     width = _as_positive_int(_first_present(raw.get("width"), result.get("width"), SANA_WM_DEFAULT_WIDTH), name="width")
 
-    camera = _first_present(raw.get("camera"), raw.get("camera_trajectory"), result.get("camera_trajectory"))
+    camera = raw.get("camera")
     camera = _as_dict(camera, name="camera") if camera is not None else None
-    action = _first_present(raw.get("action"), result.get("action"))
+    action = raw.get("action")
     if action is not None and (not isinstance(action, str) or not action.strip()):
         raise ValueError("Sana-WM action must be a non-empty string when provided.")
     if camera is not None and action is not None:
-        raise ValueError("Sana-WM accepts exactly one of `camera`/`camera_trajectory` or `action`, not both.")
+        raise ValueError("Sana-WM accepts exactly one of `camera` or `action`, not both.")
     if camera is None and action is None:
         raise ValueError("Sana-WM requires either explicit camera poses or an action DSL string.")
 
@@ -261,10 +253,10 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool 
             "poses": poses,
         }
 
-    intrinsics = _first_present(raw.get("intrinsics"), result.get("intrinsics"))
+    intrinsics = raw.get("intrinsics")
     _validate_intrinsics(intrinsics, num_frames=num_frames)
-    translation_speed = _first_present(raw.get("translation_speed"), result.get("translation_speed"))
-    rotation_speed_deg = _first_present(raw.get("rotation_speed_deg"), result.get("rotation_speed_deg"))
+    translation_speed = raw.get("translation_speed")
+    rotation_speed_deg = raw.get("rotation_speed_deg")
 
     canonical = {
         "num_frames": num_frames,
@@ -278,7 +270,7 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool 
         canonical["translation_speed"] = _as_positive_float(translation_speed, name="translation_speed")
     if rotation_speed_deg is not None:
         canonical["rotation_speed_deg"] = _as_positive_float(rotation_speed_deg, name="rotation_speed_deg")
-    official_repo_path = _first_present(raw.get("official_repo_path"), raw.get("official_repo"))
+    official_repo_path = raw.get("official_repo_path")
     if official_repo_path is not None:
         if not isinstance(official_repo_path, str) or not official_repo_path.strip():
             raise ValueError("Sana-WM official_repo_path must be a non-empty string when provided.")

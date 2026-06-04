@@ -106,9 +106,9 @@ def _run_sana_wm_e2e(
     extra_args = {"sana_wm_sampling_algo": "flow_euler_ltx", "sana_wm_offload_vae": True}
     # The native Stage-1 path is latent-token capped; raise it for full-size
     # e2e runs (704x1280 exceeds the default 4096-token cap).
-    native_smoke_max_tokens = os.environ.get("SANA_WM_E2E_NATIVE_SMOKE_MAX_TOKENS", "").strip()
-    if native_smoke_max_tokens:
-        extra_args["sana_wm_native_smoke_max_tokens"] = int(native_smoke_max_tokens)
+    native_max_tokens = os.environ.get("SANA_WM_E2E_NATIVE_MAX_TOKENS", "").strip()
+    if native_max_tokens:
+        extra_args["sana_wm_native_max_tokens"] = int(native_max_tokens)
     if inprocess_refiner:
         extra_args.update(
             {
