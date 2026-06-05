@@ -43,9 +43,7 @@ def _validate_gdn_inputs(
 
     batch_size, num_heads, head_dim, token_count = query.shape
     if token_count % spatial_tokens != 0:
-        raise ValueError(
-            f"Sana-WM GDN token count {token_count} is not divisible by spatial_tokens={spatial_tokens}."
-        )
+        raise ValueError(f"Sana-WM GDN token count {token_count} is not divisible by spatial_tokens={spatial_tokens}.")
     frames = token_count // spatial_tokens
     if beta.shape != (batch_size, num_heads, frames, spatial_tokens):
         raise ValueError(
@@ -54,8 +52,7 @@ def _validate_gdn_inputs(
         )
     if decay.shape != (batch_size, num_heads, frames):
         raise ValueError(
-            "Sana-WM GDN decay shape mismatch: expected "
-            f"{(batch_size, num_heads, frames)}, got {tuple(decay.shape)}."
+            f"Sana-WM GDN decay shape mismatch: expected {(batch_size, num_heads, frames)}, got {tuple(decay.shape)}."
         )
     return batch_size, num_heads, head_dim, token_count, frames
 
@@ -394,7 +391,7 @@ def warmup_sana_wm_gdn_kernel(
         spatial_tokens=spatial_tokens,
         k_scale=(head_dim**-0.5) * (spatial_tokens**-0.5),
     )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     return True
 
 

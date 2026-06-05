@@ -7,9 +7,10 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterable
 from copy import copy
 from pathlib import Path
-from typing import Any, ClassVar, Iterable
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -18,8 +19,8 @@ from torch import nn
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import (
     SanaWmPipeline,
-    get_sana_wm_pre_process_func,
     get_sana_wm_post_process_func,
+    get_sana_wm_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -113,9 +114,9 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         if self.release_paths is None:
             raise ValueError("Sana-WM two-stage refiner transformer requires a resolved checkpoint.")
 
-        from safetensors.torch import load_file
         from contextlib import nullcontext
 
+        from safetensors.torch import load_file
         from vllm.config import (
             CompilationConfig,
             DeviceConfig,
@@ -140,8 +141,10 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         config_dict = self._load_refiner_transformer_config()
         state_dict = load_file(str(self.release_paths.refiner_transformer_weights), device="cpu")
         if use_diffusers_refiner:
-            from diffusers.models.transformers.transformer_ltx2 import LTX2VideoTransformer3DModel as _DiffRefiner
             import inspect as _inspect
+
+            from diffusers.models.transformers.transformer_ltx2 import LTX2VideoTransformer3DModel as _DiffRefiner
+
             allowed = set(_inspect.signature(_DiffRefiner.__init__).parameters.keys())
             filtered = {k: v for k, v in config_dict.items() if k in allowed and k != "self"}
             with torch.device("cpu"):
@@ -357,7 +360,9 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             patch_size_t=patch_size_t,
         ).shape[1]
 
-        raw_timestep = torch.zeros(batch_size, latent_tokens.shape[1], 1, dtype=torch.float32, device=latent_tokens.device)
+        raw_timestep = torch.zeros(
+            batch_size, latent_tokens.shape[1], 1, dtype=torch.float32, device=latent_tokens.device
+        )
         raw_timestep[:, n_context_tokens:, 0] = sigma.float()
         timestep_scale = float(getattr(self.refiner_transformer.config, "timestep_scale_multiplier", 1000.0))
         model_timestep = raw_timestep.squeeze(-1) * timestep_scale
@@ -454,8 +459,6 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
 
         latents = latents.to(device=device, dtype=dtype)
         latent_num_frames = int(latents.shape[2])
-        latent_height = int(latents.shape[3])
-        latent_width = int(latents.shape[4])
 
         prompt_embeds, _, attention_mask = self._encode_refiner_prompt(
             prompt_text,
@@ -659,11 +662,12 @@ def _streaming_refiner_self_attention(
     query = attn.norm_q(query)
     key = attn.norm_k(key)
 
-    from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2AudioVideoAttnProcessor
-
     # Unit tests and standalone CPU probes run without a vLLM TP group; only
     # apply TP-aware RoPE slicing when the group is initialized.
     import vllm.distributed.parallel_state as _ps
+
+    from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2AudioVideoAttnProcessor
+
     if _ps._TP is not None:
         query_rotary_emb = LTX2AudioVideoAttnProcessor._slice_rope_for_tp(query_rotary_emb, attn)
     if attn.rope_type == "interleaved":

@@ -51,11 +51,9 @@ class SanaWmFlowMatchScheduler:
         # is the shifted value. set_timesteps then linspaces from
         # sigma_max=1.0 down to this shifted sigma_min.
         raw_min = 1.0 / self.num_train_timesteps
-        self._sigma_min_shifted = (
-            self.shift * raw_min / (1.0 + (self.shift - 1.0) * raw_min)
-        )
+        self._sigma_min_shifted = self.shift * raw_min / (1.0 + (self.shift - 1.0) * raw_min)
         self._timesteps_tensor: torch.Tensor | None = None  # (N,)
-        self._sigmas_tensor: torch.Tensor | None = None     # (N+1,)
+        self._sigmas_tensor: torch.Tensor | None = None  # (N+1,)
         self._timesteps_device: torch.device | None = None
 
     def _build_schedule(self, device: torch.device) -> None:
@@ -77,9 +75,7 @@ class SanaWmFlowMatchScheduler:
         sigmas = self.shift * sig_pre / (1.0 + (self.shift - 1.0) * sig_pre)
         timesteps = sigmas * float(self.num_train_timesteps)
 
-        sigmas_with_terminal = torch.cat(
-            [sigmas, torch.zeros(1, dtype=torch.float32, device=device)]
-        )
+        sigmas_with_terminal = torch.cat([sigmas, torch.zeros(1, dtype=torch.float32, device=device)])
         self._timesteps_tensor = timesteps
         self._sigmas_tensor = sigmas_with_terminal
 
@@ -131,9 +127,9 @@ class SanaWmFlowMatchScheduler:
 
     def step_flow_euler_per_token(
         self,
-        noise_pred: torch.Tensor,           # (B, C, F, H, W)
-        timestep: torch.Tensor,             # scalar current step
-        latents: torch.Tensor,              # (B, C, F, H, W)
+        noise_pred: torch.Tensor,  # (B, C, F, H, W)
+        timestep: torch.Tensor,  # scalar current step
+        latents: torch.Tensor,  # (B, C, F, H, W)
         per_token_timesteps: torch.Tensor,  # (B, F*H*W) per-token integer timestep
     ) -> torch.Tensor:
         """Per-token flow-matching Euler step matching NVlabs ``LTXFlowEuler.sample``.
@@ -164,14 +160,11 @@ class SanaWmFlowMatchScheduler:
                 f"({tuple(noise_pred.shape)} vs {tuple(latents.shape)})."
             )
         if latents.ndim != 5:
-            raise ValueError(
-                f"Sana-WM per-token step expects (B, C, F, H, W); got {tuple(latents.shape)}."
-            )
+            raise ValueError(f"Sana-WM per-token step expects (B, C, F, H, W); got {tuple(latents.shape)}.")
         self._ensure_timesteps(latents.device)
         sigmas = self._sigmas_tensor.to(device=latents.device, dtype=torch.float32)
-        per_token_sigmas = (
-            per_token_timesteps.to(device=latents.device, dtype=torch.float32)
-            / float(self.num_train_timesteps)
+        per_token_sigmas = per_token_timesteps.to(device=latents.device, dtype=torch.float32) / float(
+            self.num_train_timesteps
         )
         scheduler_sigmas = sigmas[:, None, None]
         lower_mask = scheduler_sigmas < per_token_sigmas[None] - 1e-6

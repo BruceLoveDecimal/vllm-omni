@@ -121,8 +121,4 @@ def is_diffusion_model(model_name: str) -> bool:
     # Bagel, DreamZero, and SANA-WM are not standard diffusers pipelines
     # (no model_index.json), but are still diffusion-style models in vllm-omni.
     # Detect them via config.json or model-specific files.
-    return (
-        _looks_like_bagel(model_name)
-        or _looks_like_dreamzero(model_name)
-        or _looks_like_sana_wm(model_name)
-    )
+    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name) or _looks_like_sana_wm(model_name)

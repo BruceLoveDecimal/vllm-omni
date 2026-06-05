@@ -100,13 +100,13 @@ class SanaWmConfig:
     model_max_length: int = 300
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "SanaWmConfig":
+    def from_yaml(cls, path: str | Path) -> SanaWmConfig:
         raw = load_yaml_config(path)
         data = to_dict(raw) if raw is not None else {}
         return cls.from_dict(data if isinstance(data, Mapping) else {})
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "SanaWmConfig":
+    def from_dict(cls, data: Mapping[str, Any]) -> SanaWmConfig:
         root = dict(data)
         model_value = root.get("model")
         model_cfg = _as_mapping(model_value)

@@ -25,12 +25,11 @@ returning a tensor of the same shape.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import partial
-from typing import Callable
 
 import torch
 import torch.nn.functional as F
-
 
 # ---------------------------------------------------------------------------
 # Pinhole ray-grid construction
@@ -127,7 +126,7 @@ def _world_to_ray_mats(
 
 def _process_camera_conditions(
     camera_conditions: torch.Tensor,  # (B, T, 20)
-    HW: tuple[int, int, int],
+    hw: tuple[int, int, int],
     patch_size: tuple[int, int, int] = (1, 1, 1),
 ) -> torch.Tensor:
     """Convert ``(B, T, 20)`` SANA-WM camera conditions to ``(B, T, H, W, 4, 4)``
@@ -141,16 +140,14 @@ def _process_camera_conditions(
 
     Args:
         camera_conditions: ``(B, T, 20)`` from ``_pack_camera_conditions``.
-        HW: ``(T_latent, H_latent, W_latent)`` latent-grid shape.
+        hw: ``(T_latent, H_latent, W_latent)`` latent-grid shape.
     """
     B, T_cond, last = camera_conditions.shape
     if last != 20:
         raise ValueError(f"SANA-WM camera_conditions last dim must be 20, got {last}.")
-    T_latent, H_latent, W_latent = HW
+    T_latent, H_latent, W_latent = hw
     if T_cond != T_latent:
-        raise ValueError(
-            f"SANA-WM camera_conditions frames {T_cond} != latent frames {T_latent}."
-        )
+        raise ValueError(f"SANA-WM camera_conditions frames {T_cond} != latent frames {T_latent}.")
     c2w = camera_conditions[..., :16].reshape(B, T_latent, 4, 4)
     patch_t, patch_h, patch_w = patch_size
     del patch_t
@@ -228,9 +225,7 @@ def _apply_block_diagonal(
     """
     funcs, block_sizes = zip(*func_size_pairs)
     if feats.shape[-1] != sum(block_sizes):
-        raise ValueError(
-            f"UCPE block-diagonal block sum {sum(block_sizes)} != feats D {feats.shape[-1]}."
-        )
+        raise ValueError(f"UCPE block-diagonal block sum {sum(block_sizes)} != feats D {feats.shape[-1]}.")
     blocks = torch.split(feats, list(block_sizes), dim=-1)
     return torch.cat([func(block) for func, block in zip(funcs, blocks)], dim=-1)
 
@@ -282,9 +277,9 @@ def _identity(x: torch.Tensor) -> torch.Tensor:
 
 def _prepare_ray_apply_fns(
     head_dim: int,
-    P: torch.Tensor,  # (B, N, 4, 4) ray <- world
-    P_T: torch.Tensor,  # (B, N, 4, 4) ray <- world transpose
-    P_inv: torch.Tensor,  # (B, N, 4, 4) world <- ray
+    proj: torch.Tensor,  # (B, N, 4, 4) ray <- world
+    proj_t: torch.Tensor,  # (B, N, 4, 4) ray <- world transpose
+    proj_inv: torch.Tensor,  # (B, N, 4, 4) world <- ray
     rotary_emb: torch.Tensor | None = None,
 ) -> tuple[Callable, Callable, Callable]:
     """Build ``(apply_q, apply_kv, apply_o)`` block-diagonal callables.
@@ -304,15 +299,15 @@ def _prepare_ray_apply_fns(
     half = head_dim // 2
 
     transforms_q = [
-        (partial(_apply_ray_projmat, matrix=P_T), half),
+        (partial(_apply_ray_projmat, matrix=proj_t), half),
         (rope_fwd, half),
     ]
     transforms_kv = [
-        (partial(_apply_ray_projmat, matrix=P_inv), half),
+        (partial(_apply_ray_projmat, matrix=proj_inv), half),
         (rope_fwd, half),
     ]
     transforms_o = [
-        (partial(_apply_ray_projmat, matrix=P), half),
+        (partial(_apply_ray_projmat, matrix=proj), half),
         (rope_inv, half),
     ]
 
@@ -325,7 +320,7 @@ def _prepare_ray_apply_fns(
 def prepare_prope_fns(
     head_dim: int,
     camera_conditions: torch.Tensor,
-    HW: tuple[int, int, int],
+    hw: tuple[int, int, int],
     patch_size: tuple[int, int, int] = (1, 1, 1),
     rotary_emb: torch.Tensor | None = None,
 ) -> tuple[Callable, Callable, Callable]:
@@ -336,7 +331,7 @@ def prepare_prope_fns(
     Args:
         head_dim: per-head channel count. Must be divisible by 4.
         camera_conditions: ``(B, T, 20)`` SANA-WM camera payload.
-        HW: ``(T_latent, H_latent, W_latent)`` latent-grid shape.
+        hw: ``(T_latent, H_latent, W_latent)`` latent-grid shape.
         patch_size: 3D transformer patch size. The spatial patch size maps
             the packed camera intrinsics to the token grid, matching NVlabs
             ``_process_camera_conditions_ucpe``.
@@ -347,13 +342,13 @@ def prepare_prope_fns(
     if head_dim % 4 != 0:
         raise ValueError(f"UCPE head_dim must be divisible by 4, got {head_dim}.")
     B = camera_conditions.shape[0]
-    raymats = _process_camera_conditions(camera_conditions, HW, patch_size=patch_size)
+    raymats = _process_camera_conditions(camera_conditions, hw, patch_size=patch_size)
     raymats_flat = raymats.reshape(B, -1, 4, 4)
-    P = raymats_flat
-    P_T = P.transpose(-1, -2)
-    P_inv = _invert_se3(P)
+    proj = raymats_flat
+    proj_t = proj.transpose(-1, -2)
+    proj_inv = _invert_se3(proj)
     rotary_emb_cam = _slice_rope_for_cam(rotary_emb, head_dim // 2)
-    return _prepare_ray_apply_fns(head_dim, P, P_T, P_inv, rotary_emb=rotary_emb_cam)
+    return _prepare_ray_apply_fns(head_dim, proj, proj_t, proj_inv, rotary_emb=rotary_emb_cam)
 
 
 __all__ = [

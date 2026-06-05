@@ -915,15 +915,12 @@ class OmniDiffusionConfig:
                     try:
                         from vllm.transformers_utils.repo_utils import file_or_path_exists
 
-                        has_sana_wm_layout = (
-                            self.model_class_name in {"SanaWmPipeline", "SanaWmTwoStagesPipeline"}
-                            or (
-                                file_or_path_exists(self.model, "config.yaml", revision=self.revision)
-                                and file_or_path_exists(
-                                    self.model,
-                                    "dit/sana_wm_1600m_720p.safetensors",
-                                    revision=self.revision,
-                                )
+                        has_sana_wm_layout = self.model_class_name in {"SanaWmPipeline", "SanaWmTwoStagesPipeline"} or (
+                            file_or_path_exists(self.model, "config.yaml", revision=self.revision)
+                            and file_or_path_exists(
+                                self.model,
+                                "dit/sana_wm_1600m_720p.safetensors",
+                                revision=self.revision,
                             )
                         )
                     except Exception:

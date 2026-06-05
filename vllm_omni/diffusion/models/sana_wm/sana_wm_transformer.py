@@ -16,10 +16,11 @@ import math
 import os
 import sys
 import warnings
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from functools import reduce
 from operator import mul
-from typing import Any, ClassVar, Iterable
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -89,6 +90,7 @@ def _vllm_tp_group_ready() -> bool:
     if get_tensor_model_parallel_world_size is None:
         return False
     import vllm.distributed.parallel_state as ps
+
     return ps._TP is not None
 
 
@@ -165,6 +167,7 @@ def _import_nvlabs_cam_scan_bidi() -> Any:
         sys.path.insert(0, repo)
     try:
         from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_bidi_chunkwise  # type: ignore
+
         _cam_triton_fn = cam_scan_bidi_chunkwise
         logger.debug("Sana-WM cam-triton kernel imported from %s", repo)
     except ImportError as exc:
@@ -258,10 +261,10 @@ class SanaWmTensorParallelRMSNorm(nn.Module):
         # must be initialized. Don't fall back to the default world group — that
         # is the data-parallel group and would silently corrupt the RMS.
         import vllm.distributed.parallel_state as ps
+
         if ps._TP is None:
             raise RuntimeError(
-                "SanaWmTensorParallelRMSNorm requires an initialized vLLM "
-                "tensor-parallel group when tp_size > 1."
+                "SanaWmTensorParallelRMSNorm requires an initialized vLLM tensor-parallel group when tp_size > 1."
             )
         ps._TP.all_reduce(tensor)
 
@@ -482,11 +485,7 @@ class SanaWmWanRotaryPosEmbed(nn.Module):
         if dim <= 0:
             return torch.empty(positions.shape[0], 0, dtype=torch.complex128)
         freqs = 1.0 / (
-            self.theta
-            ** (
-                torch.arange(0, dim, 2, dtype=torch.float64, device=positions.device)[: dim // 2]
-                / dim
-            )
+            self.theta ** (torch.arange(0, dim, 2, dtype=torch.float64, device=positions.device)[: dim // 2] / dim)
         )
         phase = torch.outer(positions.to(torch.float64), freqs)
         return torch.polar(torch.ones_like(phase), phase)
@@ -774,9 +773,7 @@ class SanaWmSelfAttention(nn.Module):
         cam_compress = max(config.cam_attn_compress, 1)
         self.cam_heads = max(self.num_heads // cam_compress, 1)
         if self.cam_dim % self.cam_heads != 0:
-            raise ValueError(
-                f"Sana-WM local cam_dim={self.cam_dim} must be divisible by cam_heads={self.cam_heads}."
-            )
+            raise ValueError(f"Sana-WM local cam_dim={self.cam_dim} must be divisible by cam_heads={self.cam_heads}.")
         self.cam_head_dim = self.cam_dim // self.cam_heads
         # Under TP, cam_head_dim must equal main head_dim so the WAN RoPE
         # (built for main head_dim) can be correctly sliced for the cam branch.
@@ -828,9 +825,7 @@ class SanaWmSelfAttention(nn.Module):
 
     @staticmethod
     def _apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        rotated = torch.view_as_complex(
-            hidden_states.permute(0, 1, 3, 2).to(torch.float64).unflatten(3, (-1, 2))
-        )
+        rotated = torch.view_as_complex(hidden_states.permute(0, 1, 3, 2).to(torch.float64).unflatten(3, (-1, 2)))
         output = torch.view_as_real(rotated * freqs).flatten(3, 4).permute(0, 1, 3, 2)
         return output.type_as(hidden_states)
 
@@ -897,16 +892,13 @@ class SanaWmSelfAttention(nn.Module):
         frames, height, width = spatial_shape
         spatial_tokens = height * width
         if token_count != frames * spatial_tokens:
-            raise ValueError(
-                f"Sana-WM GDN token layout mismatch: N={token_count}, expected {frames * spatial_tokens}."
-            )
+            raise ValueError(f"Sana-WM GDN token layout mismatch: N={token_count}, expected {frames * spatial_tokens}.")
         beta = torch.sigmoid(_linear_output(self.beta_proj(hidden_states)))
         beta = beta.reshape(batch_size, frames, spatial_tokens, self.num_heads).permute(0, 3, 1, 2)
         frame_states = hidden_states.reshape(batch_size, frames, spatial_tokens, hidden_size).mean(dim=2)
         gate = _linear_output(self.gate_proj(frame_states)).float()
         decay = torch.exp(
-            -self.A_log.float().exp().view(1, 1, -1)
-            * F.softplus(gate + self.dt_bias.float().view(1, 1, -1))
+            -self.A_log.float().exp().view(1, 1, -1) * F.softplus(gate + self.dt_bias.float().view(1, 1, -1))
         )
         return beta, decay.transpose(1, 2)
 
@@ -1102,8 +1094,7 @@ class SanaWmSelfAttention(nn.Module):
         local_width = reference.shape[-1]
         if local_width <= 0 or contrib.shape[-1] % local_width != 0:
             raise ValueError(
-                "Sana-WM TP contribution width mismatch: "
-                f"contrib={contrib.shape[-1]} reference={local_width}."
+                f"Sana-WM TP contribution width mismatch: contrib={contrib.shape[-1]} reference={local_width}."
             )
         tp_rank = _get_tp_rank()
         start = tp_rank * local_width
@@ -1181,9 +1172,7 @@ class SanaWmSelfAttention(nn.Module):
         batch_size, token_count, hidden_size = hidden_states.shape
         frames, height, width = spatial_shape
         if token_count != frames * height * width:
-            raise ValueError(
-                f"Sana-WM softmax attention expects N=T*H*W, got N={token_count}, THW={spatial_shape}."
-            )
+            raise ValueError(f"Sana-WM softmax attention expects N=T*H*W, got N={token_count}, THW={spatial_shape}.")
 
         qkv = _linear_output(self.qkv(hidden_states))
         q_size = self.num_heads * self.head_dim
@@ -1234,9 +1223,7 @@ class SanaWmSelfAttention(nn.Module):
         batch_size, token_count, _ = hidden_states.shape
         frames, height, width = spatial_shape
         if token_count != frames * height * width:
-            raise ValueError(
-                f"Sana-WM softmax cam branch expects N=T*H*W, got N={token_count}, THW={spatial_shape}."
-            )
+            raise ValueError(f"Sana-WM softmax cam branch expects N=T*H*W, got N={token_count}, THW={spatial_shape}.")
 
         q_cam = _linear_output(self.q_proj_cam(hidden_states))
         k_cam = _linear_output(self.k_proj_cam(hidden_states))
@@ -1260,7 +1247,7 @@ class SanaWmSelfAttention(nn.Module):
         apply_fn_q, apply_fn_kv, apply_fn_o = prepare_prope_fns(
             head_dim=self.cam_head_dim,
             camera_conditions=camera_conditions,
-            HW=spatial_shape,
+            hw=spatial_shape,
             patch_size=self.patch_size,
             rotary_emb=self._ucpe_rotary_freqs(rotary_emb),
         )
@@ -1339,9 +1326,7 @@ class SanaWmSelfAttention(nn.Module):
         batch_size, num_heads, head_dim, token_count = q_rot.shape
         frames = beta.shape[2]
         if token_count != frames * spatial_tokens:
-            raise ValueError(
-                f"single-path scan token_count={token_count} != frames*S={frames * spatial_tokens}."
-            )
+            raise ValueError(f"single-path scan token_count={token_count} != frames*S={frames * spatial_tokens}.")
 
         def to_frames(t: torch.Tensor) -> torch.Tensor:
             return t.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
@@ -1349,9 +1334,7 @@ class SanaWmSelfAttention(nn.Module):
         q_rot_f = to_frames(q_rot)
         k_rot_f = to_frames(k_rot)
         value_f = to_frames(value)
-        state_kv = torch.zeros(
-            batch_size, num_heads, head_dim, head_dim, device=q_rot.device, dtype=torch.float32
-        )
+        state_kv = torch.zeros(batch_size, num_heads, head_dim, head_dim, device=q_rot.device, dtype=torch.float32)
         outputs: list[torch.Tensor] = []
         for frame_idx in range(frames):
             qrt = q_rot_f[:, :, frame_idx]
@@ -1398,9 +1381,7 @@ class SanaWmSelfAttention(nn.Module):
                 B, H, D, N = q_rot.shape
                 F = beta.shape[2]
                 if N != F * spatial_tokens:
-                    raise ValueError(
-                        f"cam triton path: N={N} != F*S={F * spatial_tokens}"
-                    )
+                    raise ValueError(f"cam triton path: N={N} != F*S={F * spatial_tokens}")
                 # NVlabs requires fp32 contiguous q/k/v, beta (B,H,F,S), decay (B,H,F).
                 q_f = q_rot.float().contiguous()
                 k_f = k_rot.float().contiguous()
@@ -1415,9 +1396,7 @@ class SanaWmSelfAttention(nn.Module):
         batch_size, num_heads, head_dim, token_count = q_rot.shape
         frames = beta.shape[2]
 
-        out_fwd = self._cam_single_path_delta_scan(
-            q_rot, k_rot, value, beta, decay, spatial_tokens=spatial_tokens
-        )
+        out_fwd = self._cam_single_path_delta_scan(q_rot, k_rot, value, beta, decay, spatial_tokens=spatial_tokens)
 
         def to_time(t: torch.Tensor) -> torch.Tensor:
             return t.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
@@ -1490,9 +1469,7 @@ class SanaWmSelfAttention(nn.Module):
         frames, height, width = spatial_shape
         spatial_tokens = height * width
         if token_count != frames * spatial_tokens:
-            raise ValueError(
-                f"Sana-WM cam branch expects N=T*H*W, got N={token_count}, THW={spatial_shape}."
-            )
+            raise ValueError(f"Sana-WM cam branch expects N=T*H*W, got N={token_count}, THW={spatial_shape}.")
 
         # Build the cam-prep context once per call. This mirrors NVlabs'
         # fused ``cam_prep_func`` input contract instead of routing through
@@ -1525,9 +1502,7 @@ class SanaWmSelfAttention(nn.Module):
         k_raw = k_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).contiguous()
         v_raw = v_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).contiguous()
         k_scale = (self.cam_head_dim**-0.5) * (spatial_tokens**-0.5)
-        norm_eps_val = float(
-            getattr(self.q_norm_cam, "eps", getattr(self.q_norm_cam, "variance_epsilon", 1e-6))
-        )
+        norm_eps_val = float(getattr(self.q_norm_cam, "eps", getattr(self.q_norm_cam, "variance_epsilon", 1e-6)))
         q_rot_bhdn, k_rot_bhdn, v_bhdn, inflation_sq = cam_prep_func(
             q_raw,
             k_raw,
@@ -1640,7 +1615,7 @@ class SanaWmSelfAttention(nn.Module):
                 main_raw = main_raw + cam_contrib.to(main_raw.dtype)
             return self._apply_output_gate_and_proj(main_raw, hidden_states)
 
-        # Shape-only fallback for legacy callers that do not provide THW.
+        # Shape-only fallback for legacy callers that do not provide a token-grid shape.
         qkv = _linear_output(self.qkv(hidden_states))
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
@@ -1754,7 +1729,7 @@ class SanaWmCrossAttention(nn.Module):
                 f"tensor={tensor.shape[-1]} local_inner={local_inner} tp={tp_size}."
             )
         start = _get_tp_rank() * local_inner
-        return tensor[..., start:start + local_inner].contiguous()
+        return tensor[..., start : start + local_inner].contiguous()
 
     def forward(
         self,
@@ -1784,8 +1759,7 @@ class SanaWmCrossAttention(nn.Module):
         if attention_mask is not None:
             if attention_mask.ndim != 2:
                 raise ValueError(
-                    "Sana-WM cross-attention mask must be shaped [B, text_len], "
-                    f"got {tuple(attention_mask.shape)}."
+                    f"Sana-WM cross-attention mask must be shaped [B, text_len], got {tuple(attention_mask.shape)}."
                 )
             attn_mask = (1 - attention_mask.to(query.dtype)) * -10000.0
             attn_mask = attn_mask[:, None, None].repeat(1, self.num_heads, 1, 1)
@@ -1859,17 +1833,11 @@ class SanaWmMbConvFfn(nn.Module):
         x_pt = self.point_conv.conv(x_glu)  # (B*F, hidden, H, W)
         x = x_pt
         # Temporal aggregation: (B*F, C, H, W) → (B, F, C, H*W) → (B, C, F, H*W)
-        x_temporal = (
-            x.reshape(batch, frames, hidden_size, spatial_tokens).permute(0, 2, 1, 3)
-        )
+        x_temporal = x.reshape(batch, frames, hidden_size, spatial_tokens).permute(0, 2, 1, 3)
         t_conv_out = self.t_conv(x_temporal)
         x_temporal = x_temporal + t_conv_out
         # → (B, F, H*W, C) → (B, N, C)
-        final = (
-            x_temporal.permute(0, 2, 3, 1)
-            .reshape(batch, frames * spatial_tokens, hidden_size)
-            .contiguous()
-        )
+        final = x_temporal.permute(0, 2, 3, 1).reshape(batch, frames * spatial_tokens, hidden_size).contiguous()
         return final
 
 
@@ -1998,9 +1966,7 @@ class SanaWmBlock(nn.Module):
         frames, height, width = spatial_shape
         spatial_tokens = height * width
         if token_count != frames * spatial_tokens:
-            raise ValueError(
-                f"Sana-WM frame-aware block expects N=T*H*W, got N={token_count}, THW={spatial_shape}."
-            )
+            raise ValueError(f"Sana-WM frame-aware block expects N=T*H*W, got N={token_count}, THW={spatial_shape}.")
         if timestep_modulation.shape[2] != frames:
             raise ValueError(
                 "Sana-WM frame-aware block: timestep frame axis must match spatial frames, "
@@ -2021,9 +1987,7 @@ class SanaWmBlock(nn.Module):
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
         attn_output_4d = attn_output.reshape(batch_size, frames, spatial_tokens, hidden_size)
-        hidden_states = hidden_states + (gate_msa * attn_output_4d).reshape(
-            batch_size, token_count, hidden_size
-        )
+        hidden_states = hidden_states + (gate_msa * attn_output_4d).reshape(batch_size, token_count, hidden_size)
 
         hidden_states = hidden_states + self.cross_attn(
             hidden_states,
@@ -2035,9 +1999,7 @@ class SanaWmBlock(nn.Module):
         x_mlp_in = (x_norm2 * (1 + scale_mlp) + shift_mlp).reshape(batch_size, token_count, hidden_size)
         mlp_out = self.mlp(x_mlp_in, spatial_shape)
         mlp_out_4d = mlp_out.reshape(batch_size, frames, spatial_tokens, hidden_size)
-        hidden_states = hidden_states + (gate_mlp * mlp_out_4d).reshape(
-            batch_size, token_count, hidden_size
-        )
+        hidden_states = hidden_states + (gate_mlp * mlp_out_4d).reshape(batch_size, token_count, hidden_size)
         return hidden_states
 
 
@@ -2276,8 +2238,7 @@ class SanaWmTransformer3DModel(nn.Module):
         if target is None:
             if require_target:
                 raise ValueError(
-                    f"Sana-WM weight {remapped_name} was remapped but not consumed by the "
-                    "materialized Stage-1 model."
+                    f"Sana-WM weight {remapped_name} was remapped but not consumed by the materialized Stage-1 model."
                 )
             return False
         if tuple(target.shape) != tuple(tensor.shape):
@@ -2499,7 +2460,10 @@ class SanaWmTransformer3DModel(nn.Module):
         # also upcasts model params (one-shot), and casts noise_pred back to
         # the original input dtype before returning.
         _force_fp32 = os.environ.get("SANA_WM_FORCE_FP32_TRANSFORMER", "").lower() in {
-            "1", "true", "yes", "on",
+            "1",
+            "true",
+            "yes",
+            "on",
         }
         _input_dtype = hidden_states.dtype
         if _force_fp32:
@@ -2632,9 +2596,7 @@ class SanaWmTransformer3DModel(nn.Module):
                 encoder_attention_mask,
             )
 
-        hidden_states = self.final_layer(
-            hidden_states, time_embed.to(hidden_states.dtype), spatial_shape
-        )
+        hidden_states = self.final_layer(hidden_states, time_embed.to(hidden_states.dtype), spatial_shape)
         hidden_states = self._unpatchify(hidden_states, spatial_shape)
         if hidden_states.shape[2:] != latent_shape:
             hidden_states = F.interpolate(hidden_states, size=latent_shape, mode="trilinear", align_corners=False)

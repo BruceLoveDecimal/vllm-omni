@@ -11,10 +11,11 @@ into vLLM-Omni-native layers incrementally.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Iterable
+from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -25,11 +26,11 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.camera_control import (
     SanaWmCameraCondition,
     build_plucker_condition,
 )
+from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
     SanaWmCameraEmbedder,
@@ -432,12 +433,8 @@ class SanaWmPipeline(
         # NVlabs reads these from its YAML VAE config with 64/96 defaults; the
         # diffusers VAE config.json only ships scaling_factor, so the defaults
         # are load-bearing (the keys are genuinely absent here).
-        self.vae.tile_sample_stride_num_frames = int(
-            getattr(self.vae.config, "tile_sample_stride_num_frames", 64)
-        )
-        self.vae.tile_sample_min_num_frames = int(
-            getattr(self.vae.config, "tile_sample_min_num_frames", 96)
-        )
+        self.vae.tile_sample_stride_num_frames = int(getattr(self.vae.config, "tile_sample_stride_num_frames", 64))
+        self.vae.tile_sample_min_num_frames = int(getattr(self.vae.config, "tile_sample_min_num_frames", 96))
 
     def _ensure_camera_encoder(self, *, device: torch.device, dtype: torch.dtype) -> SanaWmCameraEmbedder:
         if self.camera_encoder is None or self.camera_encoder.hidden_size != self.sana_wm_config.hidden_size:
@@ -462,9 +459,9 @@ class SanaWmPipeline(
             arr = np.array(image, dtype=np.float32) / 127.5 - 1.0
         elif isinstance(image, np.ndarray):
             if image.shape[:2] != (height, width):
-                from PIL import Image as _PIL
+                from PIL import Image
 
-                image = _PIL.fromarray(image).resize((width, height))
+                image = Image.fromarray(image).resize((width, height))
                 arr = np.array(image, dtype=np.float32) / 127.5 - 1.0
             else:
                 arr = image.astype(np.float32) / 127.5 - 1.0
@@ -500,12 +497,8 @@ class SanaWmPipeline(
         """
         if self.vae is None:
             raise RuntimeError("Sana-WM VAE did not initialize.")
-        latents_mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(
-            device=latent.device, dtype=latent.dtype
-        )
-        latents_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(
-            device=latent.device, dtype=latent.dtype
-        )
+        latents_mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
+        latents_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
         scaling = float(self.vae.config.scaling_factor)
         return (latent - latents_mean) * scaling / latents_std
 
@@ -513,12 +506,8 @@ class SanaWmPipeline(
         """Inverse of :meth:`_vae_normalize_latent` — match NVlabs decode."""
         if self.vae is None:
             raise RuntimeError("Sana-WM VAE did not initialize.")
-        latents_mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(
-            device=latent.device, dtype=latent.dtype
-        )
-        latents_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(
-            device=latent.device, dtype=latent.dtype
-        )
+        latents_mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
+        latents_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
         scaling = float(self.vae.config.scaling_factor)
         return latent * latents_std / scaling + latents_mean
 
@@ -718,9 +707,7 @@ class SanaWmPipeline(
         first_frame_image = (prompt.get("multi_modal_data") or {}).get("image")
         if first_frame_image is None:
             _is_image = False
-        elif hasattr(first_frame_image, "convert") or isinstance(
-            first_frame_image, (_np.ndarray, torch.Tensor)
-        ):
+        elif hasattr(first_frame_image, "convert") or isinstance(first_frame_image, (_np.ndarray, torch.Tensor)):
             _is_image = True
         else:
             raise TypeError(
@@ -813,9 +800,7 @@ class SanaWmPipeline(
         if use_per_frame_timestep:
             cam_batch = latents.shape[0]
             cam_frames = latents.shape[2]
-            condition_mask = torch.zeros(
-                cam_batch, 1, cam_frames, 1, 1, device=latents.device, dtype=latents.dtype
-            )
+            condition_mask = torch.zeros(cam_batch, 1, cam_frames, 1, 1, device=latents.device, dtype=latents.dtype)
             condition_mask[:, :, 0] = 1.0
         else:
             condition_mask = None
@@ -834,9 +819,7 @@ class SanaWmPipeline(
                 # the latent dtype (bf16) first would quantise the
                 # timestep before the embed and inject a hidden
                 # precision variable into the contract.
-                model_timestep = timestep.float().expand(
-                    cam_batch, 1, cam_frames
-                ).clone()
+                model_timestep = timestep.float().expand(cam_batch, 1, cam_frames).clone()
                 model_timestep[:, :, 0] = 0.0
             else:
                 model_timestep = timestep.expand(1)
@@ -874,9 +857,7 @@ class SanaWmPipeline(
                     .expand(cam_batch, 1, cam_frames, latents.shape[3], latents.shape[4])
                     .reshape(cam_batch, -1)
                 )
-                stepped = scheduler.step_flow_euler_per_token(
-                    noise_pred, timestep, latents, pt_t
-                )
+                stepped = scheduler.step_flow_euler_per_token(noise_pred, timestep, latents, pt_t)
             else:
                 stepped = scheduler.step(noise_pred, timestep, latents)
 
@@ -885,10 +866,7 @@ class SanaWmPipeline(
                 # plain condition-frame restore: with bf16 latents, the
                 # `t=1000` comparison rounds `1 - 1e-6` to `1`, so the first
                 # full-noise step is discarded for generated tokens as well.
-                tokens_to_denoise_mask = (
-                    timestep / float(scheduler.num_train_timesteps) - 1e-6
-                    < (1.0 - condition_mask)
-                )
+                tokens_to_denoise_mask = timestep / float(scheduler.num_train_timesteps) - 1e-6 < (1.0 - condition_mask)
                 latents = torch.where(tokens_to_denoise_mask, stepped, latents)
             else:
                 latents = stepped
@@ -922,10 +900,9 @@ class SanaWmPipeline(
         prompt = normalize_sana_wm_payload(prompt)
         payload = prompt["additional_information"]["sana_wm"]
 
-        if (
-            getattr(req.sampling_params, "num_frames", None) not in (None, 1)
-            and int(req.sampling_params.num_frames) != int(payload["num_frames"])
-        ):
+        if getattr(req.sampling_params, "num_frames", None) not in (None, 1) and int(
+            req.sampling_params.num_frames
+        ) != int(payload["num_frames"]):
             payload = dict(payload)
             payload["num_frames"] = int(req.sampling_params.num_frames)
             prompt = dict(prompt)

@@ -71,9 +71,7 @@ def _parse_action_string(action: str) -> list[list[str]]:
             bad = sorted({key for key in keys_lower if key not in SANA_WM_ALLOWED_ACTION_KEYS})
             if bad:
                 allowed = "".join(sorted(SANA_WM_ALLOWED_ACTION_KEYS))
-                raise ValueError(
-                    f"Sana-WM action segment {segment!r} contains unknown keys {bad}; allowed: {allowed}."
-                )
+                raise ValueError(f"Sana-WM action segment {segment!r} contains unknown keys {bad}; allowed: {allowed}.")
             keys = sorted(set(keys_lower))
         per_frame.extend([keys] * int(duration))
     return per_frame
@@ -233,9 +231,7 @@ def intrinsics_to_vec4_array(intrinsics: Any, *, num_frames: int, height: int, w
         return np.stack([matrices[:, 0, 0], matrices[:, 1, 1], matrices[:, 0, 2], matrices[:, 1, 2]], axis=1)
     if array.ndim == 2 and array.shape[1] == 4 and array.shape[0] >= num_frames:
         return array[:num_frames].copy()
-    raise ValueError(
-        f"Unsupported Sana-WM intrinsics shape {array.shape}; expected (4,), (F,4), (3,3), or (F,3,3)."
-    )
+    raise ValueError(f"Unsupported Sana-WM intrinsics shape {array.shape}; expected (4,), (F,4), (3,3), or (F,3,3).")
 
 
 def _pack_camera_conditions(
