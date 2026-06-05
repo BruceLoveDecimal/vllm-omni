@@ -26,7 +26,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm_omni.diffusion.models.sana_wm.cam_prep import cam_prep_func, prepare_cam_prep_context
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.gated_deltanet_triton import (
     SANA_WM_REQUIRE_TRITON_GDN_ENV,
@@ -34,8 +33,11 @@ from vllm_omni.diffusion.models.sana_wm.gated_deltanet_triton import (
     reference_bidirectional_gated_delta_net,
     triton_bidirectional_gated_delta_net_from_qkv,
 )
-from vllm_omni.diffusion.models.sana_wm.ucpe import prepare_prope_fns
-from vllm_omni.diffusion.models.sana_wm.weight_mapping import normalize_sana_wm_stage1_weight_name
+from vllm_omni.diffusion.models.sana_wm.ucpe import (
+    cam_prep_func,
+    prepare_cam_prep_context,
+    prepare_prope_fns,
+)
 
 try:
     from vllm.distributed import (
@@ -79,10 +81,49 @@ SANA_WM_STAGE1_PROMPT_CHANNELS = 2304
 SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
 SANA_WM_STAGE1_GDN_STATE_SIZE = 20
 SANA_WM_DISABLE_VLLM_OPS_ENV = "VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS"
+SANA_WM_STAGE1_PREFIX_MAP: tuple[tuple[str, str], ...] = (
+    ("y_embedder.", "transformer.y_embedder."),
+    ("t_embedder.", "transformer.t_embedder."),
+    ("t_block.", "transformer.t_block."),
+    ("x_embedder.", "transformer.x_embedder."),
+    ("final_layer.", "transformer.final_layer."),
+    ("plucker_embedder.", "transformer.plucker_embedder."),
+    ("raymap_embedder.", "transformer.raymap_embedder."),
+    ("attention_y_norm.", "transformer.attention_y_norm."),
+)
 
 logger = logging.getLogger(__name__)
 
 _SANA_WM_TRITON_GDN_FALLBACK_WARNED = False
+
+
+def normalize_sana_wm_stage1_weight_name(name: str) -> str | None:
+    """Map released Stage-1 checkpoint keys to planned vLLM-Omni names."""
+
+    if name == "pos_embed":
+        return "transformer.pos_embed"
+    if name.startswith("blocks."):
+        parts = name.split(".", 3)
+        if len(parts) == 3 and parts[2] == "scale_shift_table":
+            return f"transformer.blocks.{parts[1]}.scale_shift_table"
+        if len(parts) < 4:
+            return None
+        _, block_idx, block_module, suffix = parts
+        block_prefix = f"transformer.blocks.{block_idx}."
+        if block_module == "attn":
+            return f"{block_prefix}attn.{suffix}"
+        if block_module == "cross_attn":
+            return f"{block_prefix}cross_attn.{suffix}"
+        if block_module == "mlp":
+            return f"{block_prefix}mlp.{suffix}"
+        if block_module == "plucker_post":
+            return f"{block_prefix}plucker_proj.{suffix}"
+        return f"{block_prefix}{block_module}.{suffix}"
+
+    for source_prefix, target_prefix in SANA_WM_STAGE1_PREFIX_MAP:
+        if name.startswith(source_prefix):
+            return f"{target_prefix}{name.removeprefix(source_prefix)}"
+    return None
 
 
 def _vllm_tp_group_ready() -> bool:

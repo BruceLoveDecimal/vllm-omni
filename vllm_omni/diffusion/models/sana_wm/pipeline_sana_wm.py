@@ -35,11 +35,11 @@ from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
     SanaWmCameraEmbedder,
     SanaWmTransformer3DModel,
+    normalize_sana_wm_stage1_weight_name,
 )
 from vllm_omni.diffusion.models.sana_wm.scheduling_sana_wm import (
     SanaWmFlowMatchScheduler,
 )
-from vllm_omni.diffusion.models.sana_wm.weight_mapping import normalize_sana_wm_stage1_weight_name
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
