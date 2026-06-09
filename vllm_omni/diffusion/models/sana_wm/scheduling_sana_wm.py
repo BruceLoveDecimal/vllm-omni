@@ -9,15 +9,6 @@ import torch
 SANA_WM_DEFAULT_INFERENCE_FLOW_SHIFT = 9.8
 
 
-def shift_flow_timestep(
-    timestep: torch.Tensor,
-    shift: float = SANA_WM_DEFAULT_INFERENCE_FLOW_SHIFT,
-) -> torch.Tensor:
-    """Apply the inference flow-shift transform used by SANA-WM."""
-
-    return shift * timestep / (1.0 + (shift - 1.0) * timestep)
-
-
 class SanaWmFlowMatchScheduler:
     """Native flow-matching Euler scheduler matching NVlabs ``LTXFlowEuler``.
 

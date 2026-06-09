@@ -17,7 +17,6 @@ import os
 import sys
 import warnings
 from collections.abc import Iterable
-from dataclasses import dataclass, field, replace
 from functools import reduce
 from operator import mul
 from typing import Any, ClassVar
@@ -27,7 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
-from vllm_omni.diffusion.models.sana_wm.gated_deltanet_triton import (
+from vllm_omni.diffusion.models.sana_wm.gdn import (
     SANA_WM_REQUIRE_TRITON_GDN_ENV,
     _flip_and_shift,
     reference_bidirectional_gated_delta_net,
@@ -69,17 +68,9 @@ except ImportError:  # pragma: no cover - local macOS/dev environments may not i
     get_tensor_model_parallel_rank = None
     get_tensor_model_parallel_world_size = None
 
-SANA_WM_TRANSFORMER_FORWARD_ERROR = (
-    "Sana-WM full Stage-1 transformer forward is not implemented yet. "
-    "The native fallback runs a pure PyTorch GDN reference path; production quality "
-    "still requires porting the fused Triton GDN kernel, exact camera injection, "
-    "and the official denoising stack."
-)
-
 SANA_WM_STAGE1_LATENT_CHANNELS = 128
 SANA_WM_STAGE1_PROMPT_CHANNELS = 2304
 SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
-SANA_WM_STAGE1_GDN_STATE_SIZE = 20
 SANA_WM_DISABLE_VLLM_OPS_ENV = "VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS"
 SANA_WM_STAGE1_PREFIX_MAP: tuple[tuple[str, str], ...] = (
     ("y_embedder.", "transformer.y_embedder."),
@@ -256,17 +247,6 @@ def _to_3tuple(value: int | tuple[int, int] | tuple[int, int, int]) -> tuple[int
     if len(value) == 2:
         return (1, int(value[0]), int(value[1]))
     return (int(value[0]), int(value[1]), int(value[2]))
-
-
-@dataclass(frozen=True)
-class SanaWmStage1LoadReport:
-    total_weights: int = 0
-    loaded_weights: int = 0
-    unmapped_weights: tuple[str, ...] = ()
-    duplicate_weights: tuple[str, ...] = ()
-    loaded_names: tuple[str, ...] = field(default_factory=tuple)
-    materialized_weights: int = 0
-    unapplied_weights: tuple[str, ...] = ()
 
 
 class SanaWmRMSNorm(nn.Module):
@@ -570,7 +550,9 @@ class SanaWmCameraEmbedder(nn.Module):
         config = config or SanaWmConfig()
         self.hidden_size = config.hidden_size
         self.plucker = nn.Module()
-        # Conv3d has no vLLM parallel equivalent — kept as nn.Conv3d.
+        # Conv3d has no vLLM parallel equivalent — kept as nn.Conv3d. Under TP>1
+        # its weight is replicated and every rank runs the same conv (redundant
+        # but cheap for a 1x1 conv); intentional, and yields a full-width output.
         self.plucker.proj = nn.Conv3d(config.chunk_plucker_channels, config.hidden_size, kernel_size=1)
         self.raymap = nn.Module()
         # raymap.proj is a plain Linear over 20 Plücker features; use
@@ -630,6 +612,10 @@ class SanaWmCameraEmbedder(nn.Module):
             ray_hidden = self.raymap.proj(raymap)
             ray_hidden = ray_hidden.repeat_interleave(height * width, dim=1)
             ray_hidden = self._match_tokens(ray_hidden, expected_tokens)
+            # Both branches are full-width and rank-consistent (plucker via the
+            # replicated Conv3d, ray via ColumnParallelLinear gather_output=True),
+            # so the sum is well-defined and matches the full hidden_size input
+            # expected by the downstream QKVParallelLinear (which splits by head).
             hidden_states = ray_hidden if hidden_states is None else hidden_states + ray_hidden
 
         return hidden_states
@@ -942,69 +928,6 @@ class SanaWmSelfAttention(nn.Module):
             -self.A_log.float().exp().view(1, 1, -1) * F.softplus(gate + self.dt_bias.float().view(1, 1, -1))
         )
         return beta, decay.transpose(1, 2)
-
-    def _gdn_update_components(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        query_rot: torch.Tensor,
-        key_rot: torch.Tensor,
-        beta: torch.Tensor,
-        decay: torch.Tensor,
-        *,
-        spatial_tokens: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_heads, head_dim, token_count = query.shape
-        frames = beta.shape[2]
-
-        def to_frames(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
-
-        query_f = to_frames(query)
-        key_f = to_frames(key)
-        value_f = to_frames(value)
-        query_rot_f = to_frames(query_rot)
-        key_rot_f = to_frames(key_rot)
-        state_kv = torch.zeros(
-            batch_size,
-            num_heads,
-            head_dim,
-            head_dim,
-            device=query.device,
-            dtype=query.dtype,
-        )
-        state_z = torch.zeros(batch_size, num_heads, head_dim, 1, device=query.device, dtype=query.dtype)
-        numerators: list[torch.Tensor] = []
-        denominators: list[torch.Tensor] = []
-
-        for frame_idx in range(frames):
-            query_t = query_f[:, :, frame_idx]
-            key_t = key_f[:, :, frame_idx]
-            value_t = value_f[:, :, frame_idx]
-            query_rot_t = query_rot_f[:, :, frame_idx]
-            key_rot_t = key_rot_f[:, :, frame_idx]
-            beta_t = beta[:, :, frame_idx].unsqueeze(2)
-            decay_t = decay[:, :, frame_idx].view(batch_size, num_heads, 1, 1)
-
-            state_kv = state_kv * decay_t
-            state_z = state_z * decay_t
-            value_pred = torch.matmul(state_kv, key_rot_t)
-            delta_value = (value_t - value_pred) * beta_t
-            state_kv = state_kv + torch.matmul(delta_value, key_rot_t.transpose(-1, -2))
-
-            z_pred = torch.matmul(state_z.transpose(-1, -2), key_t)
-            delta_z = (1.0 - z_pred) * beta_t
-            state_z = state_z + torch.matmul(key_t, delta_z.transpose(-1, -2))
-
-            numerators.append(torch.matmul(state_kv, query_rot_t))
-            denominators.append(torch.matmul(state_z.transpose(-1, -2), query_t))
-
-        def restore(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
-            stacked = torch.stack(tensors, dim=2)
-            return stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, dim, token_count)
-
-        return restore(numerators, head_dim), restore(denominators, 1)
 
     def _forward_gdn_raw(
         self,
@@ -2156,7 +2079,6 @@ class SanaWmTransformer3DModel(nn.Module):
         self._remapped_to_storage_name: dict[str, str] = {}
         self._storage_to_remapped_name: dict[str, str] = {}
         self._materialized_loaded_names: set[str] = set()
-        self.last_load_report = SanaWmStage1LoadReport()
         if materialize:
             self.materialize(
                 device=device,
@@ -2366,7 +2288,6 @@ class SanaWmTransformer3DModel(nn.Module):
         self._storage_to_remapped_name[storage_name] = remapped_name
 
     def _apply_loaded_tensors_to_materialized(self) -> None:
-        applied: list[str] = []
         unapplied: list[str] = []
         for remapped_name, storage_name in list(self._remapped_to_storage_name.items()):
             tensor = (
@@ -2374,37 +2295,13 @@ class SanaWmTransformer3DModel(nn.Module):
                 if storage_name in self._loaded_parameters
                 else getattr(self, storage_name)
             )
-            if self._copy_to_materialized_param(remapped_name, tensor):
-                applied.append(remapped_name)
-            else:
+            if not self._copy_to_materialized_param(remapped_name, tensor):
                 unapplied.append(remapped_name)
-        self.last_load_report = replace(
-            self.last_load_report,
-            materialized_weights=len(applied),
-            unapplied_weights=tuple(unapplied),
-        )
         if unapplied:
             raise ValueError(
                 "Sana-WM Stage-1 checkpoint keys were remapped but not consumed by the "
                 f"materialized model: {unapplied[:10]}"
             )
-
-    def get_loaded_tensor(self, remapped_name: str) -> torch.Tensor:
-        storage_name = self._remapped_to_storage_name.get(remapped_name)
-        if storage_name is not None:
-            if storage_name in self._loaded_parameters:
-                return self._loaded_parameters[storage_name]
-            return getattr(self, storage_name)
-        if self._is_materialized and remapped_name in self._materialized_loaded_names:
-            local_name = self._local_name(remapped_name)
-            params = dict(self.named_parameters())
-            buffers = dict(self.named_buffers())
-            target = params.get(local_name)
-            if target is None:
-                target = buffers.get(local_name)
-            if target is not None:
-                return target
-        raise KeyError(remapped_name)
 
     def _positional_embedding(self, token_count: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         pos_embed = self.pos_embed.to(device=device, dtype=dtype)
@@ -2649,10 +2546,8 @@ class SanaWmTransformer3DModel(nn.Module):
         loaded: set[str] = set()
         unmapped: list[str] = []
         duplicates: list[str] = []
-        total = 0
 
         for source_name, tensor in weights:
-            total += 1
             remapped_name = normalize_sana_wm_stage1_weight_name(source_name)
             if remapped_name is None:
                 unmapped.append(source_name)
@@ -2670,17 +2565,6 @@ class SanaWmTransformer3DModel(nn.Module):
             self._source_to_remapped_name[source_name] = remapped_name
             loaded.add(remapped_name)
 
-        self.last_load_report = SanaWmStage1LoadReport(
-            total_weights=total,
-            loaded_weights=len(loaded),
-            unmapped_weights=tuple(unmapped),
-            duplicate_weights=tuple(duplicates),
-            loaded_names=tuple(sorted(loaded)),
-            materialized_weights=sum(1 for name in loaded if name in self._materialized_loaded_names),
-            unapplied_weights=tuple(
-                name for name in sorted(loaded) if self._is_materialized and name not in self._materialized_loaded_names
-            ),
-        )
         if unmapped or duplicates:
             details = []
             if unmapped:

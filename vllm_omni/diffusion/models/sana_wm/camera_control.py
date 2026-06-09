@@ -17,11 +17,6 @@ from typing import Any
 import numpy as np
 import torch
 
-SANA_WM_CAMERA_ERROR = (
-    "Sana-WM camera raymap / Plucker projection failed. "
-    "Check camera poses, intrinsics, frame count, and target resolution."
-)
-
 SANA_WM_DEFAULT_TRANSLATION_SPEED = 0.05
 SANA_WM_DEFAULT_ROTATION_SPEED_DEG = 1.2
 SANA_WM_DEFAULT_PITCH_LIMIT_DEG = 85.0

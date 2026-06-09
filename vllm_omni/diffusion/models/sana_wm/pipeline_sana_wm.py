@@ -48,10 +48,6 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 from vllm_omni.model_executor.stage_input_processors.sana_wm import normalize_sana_wm_payload
 
 SANA_WM_MODEL_ID = "Efficient-Large-Model/SANA-WM_bidirectional"
-SANA_WM_SCAFFOLD_ERROR = (
-    "Sana-WM native Stage-1 generation requires a resolved checkpoint "
-    "(od_config.model) so the transformer/VAE/text-encoder weights can be loaded."
-)
 
 SANA_WM_STAGE1_DIT_FILE = "dit/sana_wm_1600m_720p.safetensors"
 SANA_WM_CONFIG_FILE = "config.yaml"
@@ -62,7 +58,6 @@ SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE = "refiner/transformer/diffusion_pytorch
 SANA_WM_REFINER_CONNECTORS_CONFIG_FILE = "refiner/connectors/config.json"
 SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE = "refiner/connectors/diffusion_pytorch_model.safetensors"
 SANA_WM_REFINER_TEXT_ENCODER_DIR = "refiner/text_encoder"
-SANA_WM_REFINER_TEXT_ENCODER_INDEX_FILE = "refiner/text_encoder/model.safetensors.index.json"
 SANA_WM_STAGE1_TEXT_ENCODER_ID = "google/gemma-2-2b-it"
 SANA_WM_STAGE1_TEXT_ENCODER_FALLBACK_ID = "Efficient-Large-Model/gemma-2-2b-it"
 SANA_WM_STAGE1_TEXT_ENCODER_ENV = "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER"
@@ -271,9 +266,6 @@ class SanaWmPipeline(
         super().__init__()
         self.od_config = od_config
         self.prefix = prefix
-        self.output_height = SANA_WM_OUTPUT_HEIGHT
-        self.output_width = SANA_WM_OUTPUT_WIDTH
-        self.default_num_frames = SANA_WM_DEFAULT_NUM_FRAMES
 
         self.sana_wm_config = SanaWmConfig()
         self.quant_config = getattr(od_config, "quantization_config", None) if od_config is not None else None
@@ -435,12 +427,6 @@ class SanaWmPipeline(
         # are load-bearing (the keys are genuinely absent here).
         self.vae.tile_sample_stride_num_frames = int(getattr(self.vae.config, "tile_sample_stride_num_frames", 64))
         self.vae.tile_sample_min_num_frames = int(getattr(self.vae.config, "tile_sample_min_num_frames", 96))
-
-    def _ensure_camera_encoder(self, *, device: torch.device, dtype: torch.dtype) -> SanaWmCameraEmbedder:
-        if self.camera_encoder is None or self.camera_encoder.hidden_size != self.sana_wm_config.hidden_size:
-            self.camera_encoder = SanaWmCameraEmbedder(config=self.sana_wm_config)
-        self.camera_encoder.to(device=device, dtype=dtype)
-        return self.camera_encoder
 
     @staticmethod
     def _preprocess_first_frame(

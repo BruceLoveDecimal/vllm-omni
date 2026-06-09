@@ -14,39 +14,255 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+"""Model-local Bidirectional Gated DeltaNet (GDN) kernels for SANA-WM.
+
+Merged from three previously separate modules (fused_gdn, fused_gdn_chunkwise,
+gated_deltanet_triton). Ported from the Apache-2.0 NVlabs/Sana reference and
+kept model-local because SANA-WM's bidirectional video-latent recurrence is a
+different contract than vLLM's autoregressive Qwen3-Next GDN cache path.
+
+Contents:
+  1. Config / launch helpers (``_resolve_launch_config`` & friends) plus the
+     fused Q+K inverse-RMS and RoPE-table kernels.
+  2. Chunkwise-parallel forward kernels (phase A/B/C, bidirectional and camera
+     scan variants) implementing the recurrence.
+  3. High-level GDN entry points: the Triton path
+     (``triton_bidirectional_gated_delta_net_from_qkv``) and the pure-PyTorch
+     reference fallback (``reference_bidirectional_gated_delta_net``).
+
+Precision knob: env ``FUSED_GDN_PRECISION`` / ``PRECISION_OVERRIDE``:
+  0=IEEE fp32 dots, 1=TF32, 2=bf16 TC + fp32 state [default], 3=bf16 TC + bf16 state.
 """
-Fused GDN — Chunkwise-parallel forward (v2).
 
-Ported from the Apache-2.0 NVlabs/Sana reference and kept model-local because
-these kernels implement SANA-WM's bidirectional video-latent recurrence, not
-vLLM's autoregressive Qwen3-Next GDN prefill/decode cache path.
-
-V2 changes vs v1:
-  1. Phase A is split into TWO kernels along the GDN data streams (KV and Z;
-     these are the two gating sub-paths within the GDN block, not CUDA
-     streams — both kernels are launched on the same CUDA stream):
-       _phase_a_kv_kernel: P_kv (with K_rot) + A (with K_rot, V)   — uses RoPE
-       _phase_a_z_kernel : P_z  (with K)     + B (with K)          — no RoPE
-     Z block is genuinely lighter (no V/Cos/Sin loads, no K_pair flip).
-     On H100 this enables 2 blocks/SM resident → multi-tenancy / latency hiding.
-  2. Phase A stores (I - P_kv) and (I - P_z) instead of P_kv/P_z. Phase B then
-     uses these directly: M = g · (I-P_kv)·M + A_f. The MMA `(I-P_kv) @ M` folds
-     the identity-add into the matmul (no separate M-PM elementwise pass).
-
-BiGDN inference path: QK_NORM=1, USE_PRECOMPUTED_RMS=1, SAVE_STATE=0.
-"""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any
 
 import torch
 import triton
 import triton.language as tl
+from torch import nn
 
-_CAM_IDENTITY_CACHE: dict[
-    tuple[str, int | None, int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-] = {}
+# =====================================================================
+#  GPU-adaptive kernel config
+# =====================================================================
+
+
+def _get_kernel_config() -> dict:
+    """Return optimal kernel parameters for the current GPU.
+
+    STATE_FP32: use fp32 state_prev when SRAM is large enough.
+      - bf16 state_prev: ~96KB total SRAM (fits GB10's 101KB).
+      - fp32 state_prev: ~128KB total SRAM (needs H100's 228KB+).
+    """
+    smem = torch.cuda.get_device_properties(0).shared_memory_per_multiprocessor
+    state_fp32 = smem >= 150 * 1024  # H100 (228KB) yes, GB10 (101KB) no
+    return {"BLOCK_S": 64, "num_stages": 1, "num_warps": 8, "STATE_FP32": state_fp32}
+
+
+_KCFG = None
+
+
+def _kcfg():
+    global _KCFG
+    if _KCFG is None:
+        _KCFG = _get_kernel_config()
+    return _KCFG
+
+
+# precision=0 → IEEE fp32 dots + fp32 state  (DOT_PRECISION=2, STATE_FP32=1)
+# precision=1 → TF32  dots   + fp32 state    (DOT_PRECISION=1, STATE_FP32=1)
+# precision=2 → bf16  dots   + fp32 state    (DOT_PRECISION=0, STATE_FP32=1) [default]
+# precision=3 → bf16  dots   + bf16 state    (DOT_PRECISION=0, STATE_FP32=0)
+def _precision_params(precision: int) -> tuple:
+    if precision == 0:
+        return 2, True
+    elif precision == 1:
+        return 1, True
+    elif precision == 3:
+        return 0, False
+    else:  # default
+        return 0, True
+
+
+_env_prec = os.environ.get("FUSED_GDN_PRECISION", None)
+PRECISION_OVERRIDE: int | None = int(_env_prec) if _env_prec is not None else None
+
+
+def _resolve_launch_config() -> tuple:
+    """Returns (prec, dot_prec, state_fp32, num_warps).
+
+    Uses ``PRECISION_OVERRIDE`` when set; otherwise falls back to ``_kcfg()``
+    (which picks ``STATE_FP32`` based on per-GPU SRAM). ``num_warps`` is
+    clamped to 4 when dots run on fp32 operands (more registers needed).
+    """
+    cfg = _kcfg()
+    prec = PRECISION_OVERRIDE if PRECISION_OVERRIDE is not None else 2
+    dot_prec, state_fp32 = _precision_params(prec)
+    if PRECISION_OVERRIDE is None:
+        state_fp32 = cfg["STATE_FP32"]
+    nw = cfg["num_warps"]
+    if dot_prec >= 1:
+        nw = min(nw, 4)
+    return prec, dot_prec, state_fp32, nw
+
+
+def prepare_rope_tables(rotary_emb, N: int, D: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Complex rotary_emb `(1, 1, N, D//2)` → expanded (N, D) cos/sin tables.
+
+    Encodes the interleaved-pair rotation
+        y[2i]   = x[2i]*cos[i] - x[2i+1]*sin[i]
+        y[2i+1] = x[2i]*sin[i] + x[2i+1]*cos[i]
+    as  y[d] = x[d]*cos_exp[d] + x[d^1]*sin_exp[d]
+    where sin_exp[2i] = -sin[i], sin_exp[2i+1] = +sin[i].
+
+    Returns (cos_exp, sin_exp) both (N, D) float32, contiguous.
+    """
+    if rotary_emb is None:
+        return (
+            torch.ones(N, D, device=device, dtype=torch.float32),
+            torch.zeros(N, D, device=device, dtype=torch.float32),
+        )
+    freqs = rotary_emb.squeeze(0).squeeze(0)  # (N, D//2) complex
+    cos_half = freqs.real.float()
+    sin_half = freqs.imag.float()
+    rope_cos = cos_half.repeat_interleave(2, dim=-1)
+    rope_sin = torch.stack([-sin_half, sin_half], dim=-1).reshape(N, D)
+    return rope_cos.contiguous(), rope_sin.contiguous()
+
+
+# =====================================================================
+#  Fused single-pass Q+K inverse-RMS Triton kernel
+# =====================================================================
+# Single Triton launch that reads each `(b, n)` row of `qkv` once and emits
+# both `q_inv_rms[b, n]` and `k_inv_rms[b, n]`. Replaces two separate PyTorch
+# scans (cast→square→sum→rsqrt) over `qkv[:, :, 0]` and `qkv[:, :, 1]`.
+#
+# Layout assumed: `qkv` is (B, N, 3, H, D) contiguous, so the C = H*D channels
+# for a given (b, n, qkv_idx) live in a contiguous memory span.
+
+
+@triton.jit
+def _fused_qk_inv_rms_kernel(
+    qkv_ptr,  # *T_in     (B, N, 3, H, D), contiguous
+    q_inv_rms_ptr,  # *float32  (B, N)
+    k_inv_rms_ptr,  # *float32  (B, N)
+    N: tl.constexpr,
+    C: tl.constexpr,  # H * D
+    eps,
+    BLOCK_C: tl.constexpr,
+):
+    bn_id = tl.program_id(0)
+    qkv_row_stride = 3 * C
+    row_base = bn_id * qkv_row_stride
+    q_base = row_base
+    k_base = row_base + C
+
+    offs = tl.arange(0, BLOCK_C)
+    mask = offs < C
+
+    q_vals = tl.load(qkv_ptr + q_base + offs, mask=mask, other=0.0).to(tl.float32)
+    k_vals = tl.load(qkv_ptr + k_base + offs, mask=mask, other=0.0).to(tl.float32)
+
+    q_sq = tl.sum(q_vals * q_vals, axis=0)
+    k_sq = tl.sum(k_vals * k_vals, axis=0)
+
+    inv_c = 1.0 / C
+    q_inv = tl.rsqrt(q_sq * inv_c + eps)
+    k_inv = tl.rsqrt(k_sq * inv_c + eps)
+
+    tl.store(q_inv_rms_ptr + bn_id, q_inv)
+    tl.store(k_inv_rms_ptr + bn_id, k_inv)
+
+
+def fused_qk_inv_rms(
+    qkv: torch.Tensor,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-pass Triton fused Q+K inverse-RMS.
+
+    Replaces ``(_precompute_inv_rms(qkv, 0, C, eps), _precompute_inv_rms(qkv, 1, C, eps))``
+    with one launch that reads each ``(b, n)`` row of ``qkv`` exactly once.
+
+    Args:
+      qkv: (B, N, 3, H, D) contiguous tensor, any fp dtype.
+      eps: RMSNorm epsilon.
+
+    Returns:
+      (q_inv_rms, k_inv_rms), each (B, N) float32 contiguous.
+    """
+    assert qkv.is_contiguous(), "qkv must be contiguous (B, N, 3, H, D)"
+    assert qkv.dim() == 5 and qkv.shape[2] == 3, f"expected (B, N, 3, H, D), got {tuple(qkv.shape)}"
+    B, N, _, H, D = qkv.shape
+    C = H * D
+    q_inv_rms = torch.empty((B, N), dtype=torch.float32, device=qkv.device)
+    k_inv_rms = torch.empty((B, N), dtype=torch.float32, device=qkv.device)
+    BLOCK_C = triton.next_power_of_2(C)
+    _fused_qk_inv_rms_kernel[(B * N,)](
+        qkv,
+        q_inv_rms,
+        k_inv_rms,
+        N=N,
+        C=C,
+        eps=eps,
+        BLOCK_C=BLOCK_C,
+    )
+    return q_inv_rms, k_inv_rms
+
+
+# =====================================================================
+#  Bidirectional GDN entry point (delegates to chunkwise)
+# =====================================================================
+
+
+def fused_bigdn_func(
+    qkv: torch.Tensor,  # (B, N, 3, H, D)
+    q_inv_rms: torch.Tensor,  # (B, N) float32
+    k_inv_rms: torch.Tensor,  # (B, N) float32
+    q_norm_weight: torch.Tensor,  # (C,) float32
+    k_norm_weight: torch.Tensor,  # (C,) float32
+    rope_cos: torch.Tensor,  # (N, D) float32
+    rope_sin: torch.Tensor,  # (N, D) float32
+    beta: torch.Tensor,  # (B, H, F, S)
+    decay: torch.Tensor,  # (B, H, F)
+    F: int,
+    S: int,
+    k_scale: float,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Bidirectional fused GDN. Returns ``(B, N, H, D)``.
+
+    Thin entry point kept for call-site stability; delegates to
+    :func:`fused_bigdn_bidi_chunkwise` from ``fused_gdn_chunkwise``.
+    """
+
+    return fused_bigdn_bidi_chunkwise(
+        qkv,
+        q_inv_rms,
+        k_inv_rms,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        beta,
+        decay,
+        F=F,
+        S=S,
+        k_scale=k_scale,
+        eps=eps,
+    )
+
+
+# Identity RMS/RoPE tables are pure shape-keyed constants (all ones/zeros), so
+# they are cached to avoid re-allocating them on every forward. The key varies
+# with batch size B and token count N, which are request-dependent in serving,
+# so the cache is bounded (LRU) to prevent unbounded GPU-memory growth.
+_CAM_IDENTITY_CACHE_MAXSIZE = 32
 
 # ════════════════════════════════════════════════════════════════
 #  Per-architecture launch config (auto-selected via compute capability)
@@ -1493,358 +1709,9 @@ def fused_bigdn_bidi_chunkwise(
 
 def _default_dot_prec():
     """Pull dot_precision from `_resolve_launch_config` (honors PRECISION_OVERRIDE)."""
-    from vllm_omni.diffusion.models.sana_wm.fused_gdn import _resolve_launch_config
 
     _, dot_prec, _, _ = _resolve_launch_config()
     return dot_prec
-
-
-def fused_gdn_func_chunkwise(
-    qkv,
-    q_inv_rms,
-    k_inv_rms,
-    q_norm_weight,
-    k_norm_weight,
-    rope_cos,
-    rope_sin,
-    beta,
-    decay,
-    F,
-    S,
-    k_scale,
-    eps=1e-6,
-    reverse=False,
-    dot_precision=None,
-):
-    """Single-direction chunkwise GDN — drop-in for `fused_gdn.fused_gdn_func`.
-
-    Computes only one scan direction (Phase B + Phase C × 1) and returns
-    `(num, den)` shape-compatible with the upstream function. dot_precision
-    defaults to whatever `_resolve_launch_config` returns (honors module-level
-    `PRECISION_OVERRIDE`).
-    """
-    if dot_precision is None:
-        dot_precision = _default_dot_prec()
-    direction = 2 if reverse else 1
-    I_P_kv, A, I_P_z, B_z = phase_a(
-        qkv,
-        beta,
-        q_inv_rms,
-        k_inv_rms,
-        q_norm_weight,
-        k_norm_weight,
-        rope_cos,
-        rope_sin,
-        F=F,
-        S=S,
-        k_scale=k_scale,
-        dot_precision=dot_precision,
-    )
-    M_fwd, z_fwd, M_rev, z_rev = phase_b_triton(
-        I_P_kv,
-        A,
-        I_P_z,
-        B_z,
-        decay,
-        F=F,
-        dot_precision=dot_precision,
-        direction=direction,
-    )
-    M_use = M_rev if reverse else M_fwd
-    z_use = z_rev if reverse else z_fwd
-    num, den = phase_c(
-        qkv, q_inv_rms, q_norm_weight, rope_cos, rope_sin, M_use, z_use, F=F, S=S, dot_precision=dot_precision
-    )
-    return num, den
-
-
-def fused_gdn_stateful_chunkwise(
-    qkv,
-    q_inv_rms,
-    k_inv_rms,
-    q_norm_weight,
-    k_norm_weight,
-    rope_cos,
-    rope_sin,
-    beta,
-    decay,
-    F,
-    S,
-    k_scale,
-    eps=1e-6,
-    reverse=False,
-    init_state_kv=None,
-    init_state_z=None,
-    return_final_state=False,
-    dot_precision=None,
-):
-    """Single-direction chunkwise GDN with optional state cache — drop-in for
-    `fused_gdn.fused_gdn_stateful`. Forward direction supports state load/save
-    (used for autoregressive sampling); reverse direction always runs fresh
-    (per upstream's bidi state-cache convention).
-    """
-    if dot_precision is None:
-        dot_precision = _default_dot_prec()
-    direction = 2 if reverse else 1
-    if reverse and (init_state_kv is not None or return_final_state):
-        raise ValueError(
-            "fused_gdn_stateful_chunkwise: state cache is forward-only (matching "
-            "upstream's bidi convention); pass reverse=False or omit state args."
-        )
-    I_P_kv, A, I_P_z, B_z = phase_a(
-        qkv,
-        beta,
-        q_inv_rms,
-        k_inv_rms,
-        q_norm_weight,
-        k_norm_weight,
-        rope_cos,
-        rope_sin,
-        F=F,
-        S=S,
-        k_scale=k_scale,
-        dot_precision=dot_precision,
-    )
-    # Pad caller-supplied state from (B,H,D,D)/(B,H,D,1) to (BH, BLOCK_D, BLOCK_D)/(BH, BLOCK_D).
-    # Needed because the state returned by this function is unpadded (B,H,D,D),
-    # but phase_b_triton's kernel expects the padded layout.
-    init_kv_padded, init_z_padded = init_state_kv, init_state_z
-    if init_state_kv is not None:
-        B_, H_, D_in, D_out = init_state_kv.shape
-        BLOCK_D_ = I_P_kv.shape[-1]
-        if D_in != BLOCK_D_ or D_out != BLOCK_D_:
-            pad_in = BLOCK_D_ - D_in
-            pad_out = BLOCK_D_ - D_out
-            init_kv_padded = torch.nn.functional.pad(
-                init_state_kv.transpose(-1, -2).reshape(B_ * H_, D_out, D_in), (0, pad_in, 0, pad_out)
-            ).contiguous()
-        else:
-            init_kv_padded = init_state_kv.transpose(-1, -2).reshape(B_ * H_, BLOCK_D_, BLOCK_D_).contiguous()
-        # z: (B, H, D) or (B, H, D, 1) → (BH, BLOCK_D)
-        z_ = init_state_z.squeeze(-1) if init_state_z.dim() == 4 else init_state_z
-        Bz_, Hz_, Dz_ = z_.shape
-        if Dz_ != BLOCK_D_:
-            init_z_padded = torch.nn.functional.pad(z_.reshape(Bz_ * Hz_, Dz_), (0, BLOCK_D_ - Dz_)).contiguous()
-        else:
-            init_z_padded = z_.reshape(Bz_ * Hz_, Dz_).contiguous()
-    if return_final_state:
-        M_fwd, z_fwd, M_rev, z_rev, final_kv, final_z = phase_b_triton(
-            I_P_kv,
-            A,
-            I_P_z,
-            B_z,
-            decay,
-            F=F,
-            dot_precision=dot_precision,
-            direction=direction,
-            init_state_kv=init_kv_padded,
-            init_state_z=init_z_padded,
-            return_final_state=True,
-        )
-    else:
-        M_fwd, z_fwd, M_rev, z_rev = phase_b_triton(
-            I_P_kv,
-            A,
-            I_P_z,
-            B_z,
-            decay,
-            F=F,
-            dot_precision=dot_precision,
-            direction=direction,
-            init_state_kv=init_kv_padded,
-            init_state_z=init_z_padded,
-        )
-    M_use = M_rev if reverse else M_fwd
-    z_use = z_rev if reverse else z_fwd
-    num, den = phase_c(
-        qkv, q_inv_rms, q_norm_weight, rope_cos, rope_sin, M_use, z_use, F=F, S=S, dot_precision=dot_precision
-    )
-    if return_final_state:
-        B = qkv.shape[0]
-        H = qkv.shape[3]
-        D = qkv.shape[4]
-        BLOCK_D = final_kv.shape[1]
-        state_kv = final_kv.view(B, H, BLOCK_D, BLOCK_D)[:, :, :D, :D].transpose(-1, -2).contiguous()
-        state_z = final_z.view(B, H, BLOCK_D)[:, :, :D].unsqueeze(-1).contiguous()
-        return num, den, state_kv, state_z
-    return num, den
-
-
-def fused_bidi_stateful_chunkwise_shared_phase_a(
-    qkv,
-    q_inv_rms,
-    k_inv_rms,
-    q_norm_weight,
-    k_norm_weight,
-    rope_cos,
-    rope_sin,
-    beta,
-    decay,
-    F,
-    S,
-    k_scale,
-    eps=1e-6,
-    init_state_kv=None,
-    init_state_z=None,
-    dot_precision=None,
-):
-    """Bidi state-cached chunkwise GDN with shared Phase A and combined-history
-    Phase B. Default chunkwise path for ``_fused_statecached_forward``.
-
-    Pipeline (per layer per step):
-      1. Phase A once over qkv  — K/V/RoPE pre-norm; was previously duplicated
-         across two streams.
-      2. Phase B with direction=0 + combined_history=True — single program does
-         fwd then rev; fwd writes M_hist; rev read-add-stores into the same
-         buffer so on exit M_hist[f] = M_fwd[f] + M_rev[f] (same for z).
-         Forward branch loads init_state and saves final state.
-      3. Phase C ONCE on M_hist/z_hist  — Phase C is linear in M/z so
-         `Q @ (M_fwd + M_rev) = Q @ M_fwd + Q @ M_rev`.
-
-    Returns ``(num_combined, den_combined, state_kv, state_z)`` — caller hands
-    the num/den pair to ``fused_bidi_merge(num, None, den, None, eps, gate)``
-    in PRE_SUMMED mode.
-
-    HBM-traffic delta vs the prior 2× Phase C version (per call, B=1 prod):
-      saved : 1× Phase C Q+RoPE pass (~90 MB)
-      saved : one (B,N,H,D) num and (B,H,N) den allocation
-      cost  : Phase B rev does read-add of M_hist (~14 MB extra per layer)
-      net   : ~76 MB saved + 1 fewer kernel launch
-
-    Measured speed on GB10 (sm_121) at H=20, S=920, D=112, vs the prior
-    shared-Phase-A-with-2×-Phase-C path, across production F values:
-      P0 IEEE fp32     : 1.26-1.42× (F=3,6,11; B=1,2)
-      P2 bf16+fp32-st  : 1.57-1.80×
-      P3 bf16+bf16-st  : 1.63-1.96×
-    Correctness cos ≥ 0.999997 across all cells, state_kv exact.
-    """
-    if dot_precision is None:
-        dot_precision = _default_dot_prec()
-
-    I_P_kv, A, I_P_z, B_z = phase_a(
-        qkv,
-        beta,
-        q_inv_rms,
-        k_inv_rms,
-        q_norm_weight,
-        k_norm_weight,
-        rope_cos,
-        rope_sin,
-        F=F,
-        S=S,
-        k_scale=k_scale,
-        dot_precision=dot_precision,
-    )
-
-    init_kv_padded, init_z_padded = init_state_kv, init_state_z
-    if init_state_kv is not None:
-        B_, H_, D_in, D_out = init_state_kv.shape
-        BLOCK_D_ = I_P_kv.shape[-1]
-        if D_in != BLOCK_D_ or D_out != BLOCK_D_:
-            pad_in = BLOCK_D_ - D_in
-            pad_out = BLOCK_D_ - D_out
-            init_kv_padded = torch.nn.functional.pad(
-                init_state_kv.transpose(-1, -2).reshape(B_ * H_, D_out, D_in), (0, pad_in, 0, pad_out)
-            ).contiguous()
-        else:
-            init_kv_padded = init_state_kv.transpose(-1, -2).reshape(B_ * H_, BLOCK_D_, BLOCK_D_).contiguous()
-        z_ = init_state_z.squeeze(-1) if init_state_z.dim() == 4 else init_state_z
-        Bz_, Hz_, Dz_ = z_.shape
-        if Dz_ != BLOCK_D_:
-            init_z_padded = torch.nn.functional.pad(z_.reshape(Bz_ * Hz_, Dz_), (0, BLOCK_D_ - Dz_)).contiguous()
-        else:
-            init_z_padded = z_.reshape(Bz_ * Hz_, Dz_).contiguous()
-
-    # combined_history=True routes the rev contribution into the fwd buffer →
-    # M_hist[f] = M_fwd[f] + M_rev[f]. M_rev/z_rev outputs are placeholders.
-    M_hist, z_hist, _, _, final_kv, final_z = phase_b_triton(
-        I_P_kv,
-        A,
-        I_P_z,
-        B_z,
-        decay,
-        F=F,
-        dot_precision=dot_precision,
-        direction=0,
-        init_state_kv=init_kv_padded,
-        init_state_z=init_z_padded,
-        return_final_state=True,
-        combined_history=True,
-    )
-
-    num, den = phase_c(
-        qkv, q_inv_rms, q_norm_weight, rope_cos, rope_sin, M_hist, z_hist, F=F, S=S, dot_precision=dot_precision
-    )
-
-    B = qkv.shape[0]
-    H = qkv.shape[3]
-    D = qkv.shape[4]
-    BLOCK_D = final_kv.shape[1]
-    state_kv = final_kv.view(B, H, BLOCK_D, BLOCK_D)[:, :, :D, :D].transpose(-1, -2).contiguous()
-    state_z = final_z.view(B, H, BLOCK_D)[:, :, :D].unsqueeze(-1).contiguous()
-    return num, den, state_kv, state_z
-
-
-def fused_bigdn_stateful_chunkwise(
-    qkv,
-    q_inv_rms,
-    k_inv_rms,
-    q_norm_weight,
-    k_norm_weight,
-    rope_cos,
-    rope_sin,
-    beta,
-    decay,
-    F,
-    S,
-    k_scale,
-    eps=1e-6,
-    return_final_state=False,
-    dot_precision=None,
-):
-    """Drop-in replacement for `fused_gdn.fused_bigdn_stateful` using the
-    chunkwise pipeline. Same signature, same return shape:
-      output (B, N, H, D), and if return_final_state: + (state_kv, state_z).
-    dot_precision defaults to whatever `_resolve_launch_config` returns.
-    """
-    if dot_precision is None:
-        dot_precision = _default_dot_prec()
-    if return_final_state:
-        out, state_kv, state_z = fused_bigdn_bidi_chunkwise(
-            qkv,
-            q_inv_rms,
-            k_inv_rms,
-            q_norm_weight,
-            k_norm_weight,
-            rope_cos,
-            rope_sin,
-            beta,
-            decay,
-            F=F,
-            S=S,
-            k_scale=k_scale,
-            eps=eps,
-            dot_precision=dot_precision,
-            return_final_state=True,
-        )
-        return out, state_kv, state_z
-    out = fused_bigdn_bidi_chunkwise(
-        qkv,
-        q_inv_rms,
-        k_inv_rms,
-        q_norm_weight,
-        k_norm_weight,
-        rope_cos,
-        rope_sin,
-        beta,
-        decay,
-        F=F,
-        S=S,
-        k_scale=k_scale,
-        eps=eps,
-        dot_precision=dot_precision,
-    )
-    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1867,6 +1734,23 @@ def fused_bigdn_stateful_chunkwise(
 #    2. No Z denominator scan; output is num-only (out = Q @ M, no /Z).
 #       skip_z=True elides Phase A Z; num_only=True elides Phase C den compute.
 # ─────────────────────────────────────────────────────────────────────────────
+@lru_cache(maxsize=_CAM_IDENTITY_CACHE_MAXSIZE)
+def _cam_identity_tables_cached(
+    device_type: str,
+    device_index: int | None,
+    B: int,
+    N: int,
+    H: int,
+    D: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = torch.device(device_type, device_index) if device_index is not None else torch.device(device_type)
+    ones_inv_rms = torch.ones(B, N, device=device, dtype=torch.float32)
+    ones_nw = torch.ones(H * D, device=device, dtype=torch.float32)
+    ones_cos = torch.ones(N, D, device=device, dtype=torch.float32)
+    zeros_sin = torch.zeros(N, D, device=device, dtype=torch.float32)
+    return ones_inv_rms, ones_nw, ones_cos, zeros_sin
+
+
 def _cam_identity_tables(
     *,
     B: int,
@@ -1875,20 +1759,13 @@ def _cam_identity_tables(
     D: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Cached identity RMS/RoPE tables used by ``cam_scan_chunkwise``."""
-    device_index = device.index if device.type == "cuda" else None
-    key = (device.type, device_index, B, N, H * D, D)
-    cached = _CAM_IDENTITY_CACHE.get(key)
-    if cached is not None:
-        return cached
+    """Bounded-LRU-cached identity RMS/RoPE tables used by ``cam_scan_chunkwise``.
 
-    ones_inv_rms = torch.ones(B, N, device=device, dtype=torch.float32)
-    ones_nw = torch.ones(H * D, device=device, dtype=torch.float32)
-    ones_cos = torch.ones(N, D, device=device, dtype=torch.float32)
-    zeros_sin = torch.zeros(N, D, device=device, dtype=torch.float32)
-    cached = (ones_inv_rms, ones_nw, ones_cos, zeros_sin)
-    _CAM_IDENTITY_CACHE[key] = cached
-    return cached
+    Normalizes ``device`` to a hashable ``(type, index)`` pair so equivalent
+    devices (e.g. ``cuda`` vs ``cuda:0``) share a cache entry.
+    """
+    device_index = device.index if device.type == "cuda" else None
+    return _cam_identity_tables_cached(device.type, device_index, B, N, H, D)
 
 
 def cam_scan_chunkwise(
@@ -2139,133 +2016,391 @@ def cam_scan_bidi_chunkwise(
     return num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
 
 
-def cam_scan_pair_chunkwise(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    beta_fwd: torch.Tensor,
-    decay_fwd: torch.Tensor,
-    beta_rev: torch.Tensor,
-    decay_rev: torch.Tensor,
+SANA_WM_GDN_ERROR = (
+    "Sana-WM fused Bidirectional Gated DeltaNet Triton kernel is unavailable. "
+    "This module falls back to the pure PyTorch reference recurrence when the "
+    "fused NVlabs recurrence cannot be launched."
+)
+SANA_WM_DISABLE_TRITON_GDN_ENV = "VLLM_OMNI_SANA_WM_DISABLE_TRITON_GDN"
+SANA_WM_REQUIRE_TRITON_GDN_ENV = "VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN"
+
+
+def _validate_gdn_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    spatial_tokens: int,
+) -> tuple[int, int, int, int, int]:
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("Sana-WM GDN query/key/value must be shaped [B, H, D, N].")
+    if query.shape != key.shape or query.shape != value.shape:
+        raise ValueError(
+            "Sana-WM GDN query/key/value shapes must match, got "
+            f"{tuple(query.shape)}, {tuple(key.shape)}, {tuple(value.shape)}."
+        )
+    if beta.ndim != 4:
+        raise ValueError("Sana-WM GDN beta must be shaped [B, H, T, S].")
+    if decay.ndim != 3:
+        raise ValueError("Sana-WM GDN decay must be shaped [B, H, T].")
+    if spatial_tokens <= 0:
+        raise ValueError("Sana-WM GDN spatial_tokens must be positive.")
+
+    batch_size, num_heads, head_dim, token_count = query.shape
+    if token_count % spatial_tokens != 0:
+        raise ValueError(f"Sana-WM GDN token count {token_count} is not divisible by spatial_tokens={spatial_tokens}.")
+    frames = token_count // spatial_tokens
+    if beta.shape != (batch_size, num_heads, frames, spatial_tokens):
+        raise ValueError(
+            "Sana-WM GDN beta shape mismatch: expected "
+            f"{(batch_size, num_heads, frames, spatial_tokens)}, got {tuple(beta.shape)}."
+        )
+    if decay.shape != (batch_size, num_heads, frames):
+        raise ValueError(
+            f"Sana-WM GDN decay shape mismatch: expected {(batch_size, num_heads, frames)}, got {tuple(decay.shape)}."
+        )
+    return batch_size, num_heads, head_dim, token_count, frames
+
+
+def _delta_scan(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_rot: torch.Tensor,
+    key_rot: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
     *,
-    dot_precision: int | None = None,
+    spatial_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, num_heads, head_dim, token_count = query.shape
+    frames = beta.shape[2]
+
+    def to_frames(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
+
+    query_f = to_frames(query)
+    key_f = to_frames(key)
+    value_f = to_frames(value)
+    query_rot_f = to_frames(query_rot)
+    key_rot_f = to_frames(key_rot)
+    state_kv = torch.zeros(batch_size, num_heads, head_dim, head_dim, device=query.device, dtype=query.dtype)
+    state_z = torch.zeros(batch_size, num_heads, head_dim, 1, device=query.device, dtype=query.dtype)
+    numerators: list[torch.Tensor] = []
+    denominators: list[torch.Tensor] = []
+
+    for frame_idx in range(frames):
+        query_t = query_f[:, :, frame_idx]
+        key_t = key_f[:, :, frame_idx]
+        value_t = value_f[:, :, frame_idx]
+        query_rot_t = query_rot_f[:, :, frame_idx]
+        key_rot_t = key_rot_f[:, :, frame_idx]
+        beta_t = beta[:, :, frame_idx].unsqueeze(2)
+        decay_t = decay[:, :, frame_idx].view(batch_size, num_heads, 1, 1)
+
+        state_kv = state_kv * decay_t
+        state_z = state_z * decay_t
+        value_pred = torch.matmul(state_kv, key_rot_t)
+        delta_value = (value_t - value_pred) * beta_t
+        state_kv = state_kv + torch.matmul(delta_value, key_rot_t.transpose(-1, -2))
+
+        z_pred = torch.matmul(state_z.transpose(-1, -2), key_t)
+        delta_z = (1.0 - z_pred) * beta_t
+        state_z = state_z + torch.matmul(key_t, delta_z.transpose(-1, -2))
+
+        numerators.append(torch.matmul(state_kv, query_rot_t))
+        denominators.append(torch.matmul(state_z.transpose(-1, -2), query_t))
+
+    def restore(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
+        stacked = torch.stack(tensors, dim=2)
+        return stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, dim, token_count)
+
+    return restore(numerators, head_dim), restore(denominators, 1)
+
+
+def _flip_and_shift(tensor: torch.Tensor, *, dim: int, shift_value: float) -> torch.Tensor:
+    flipped = torch.flip(tensor, dims=[dim])
+    shifted = flipped.narrow(dim, 0, tensor.shape[dim] - 1)
+    pad_shape = list(tensor.shape)
+    pad_shape[dim] = 1
+    padding = torch.full(pad_shape, shift_value, device=tensor.device, dtype=tensor.dtype)
+    return torch.cat([padding, shifted], dim=dim)
+
+
+def reference_bidirectional_gated_delta_net(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    spatial_tokens: int,
+    query_rot: torch.Tensor | None = None,
+    key_rot: torch.Tensor | None = None,
+    eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Sum a forward camera scan and a separately-gated reverse scan.
+    """Run the SANA-WM bidirectional gated delta recurrence in PyTorch.
 
-    Chunk-causal camera attention needs the reverse branch to use boundary-masked
-    gates while the forward branch uses the original gates. This wrapper keeps
-    that exact behavior but shares QKV packing, identity tables, and the final
-    output layout conversion across the two scans.
+    Inputs follow the layout used by the official Stage-1 operator:
+    ``query/key/value/query_rot/key_rot`` are ``[B, H, D, T*S]``, ``beta`` is
+    ``[B, H, T, S]``, and ``decay`` is ``[B, H, T]``.
     """
-    assert q.shape == k.shape == v.shape, f"q/k/v shape mismatch: {q.shape} {k.shape} {v.shape}"
-    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-    assert beta_fwd.is_contiguous() and decay_fwd.is_contiguous()
-    assert beta_rev.is_contiguous() and decay_rev.is_contiguous()
-    assert q.dtype == torch.float32, f"cam_scan_pair_chunkwise requires fp32 q/k/v (got {q.dtype})"
 
-    B, H, D, N = q.shape
-    F = beta_fwd.shape[2]
-    assert N % F == 0
-    S = N // F
-    assert beta_fwd.shape == beta_rev.shape == (B, H, F, S)
-    assert decay_fwd.shape == decay_rev.shape == (B, H, F)
+    batch_size, num_heads, head_dim, token_count, frames = _validate_gdn_inputs(
+        query, key, value, beta, decay, spatial_tokens
+    )
+    if query_rot is None:
+        query_rot = query
+    if key_rot is None:
+        key_rot = key
+    if query_rot.shape != query.shape or key_rot.shape != key.shape:
+        raise ValueError("Sana-WM GDN rotary query/key shapes must match query/key.")
 
-    if dot_precision is None:
-        dot_precision = _default_dot_prec()
+    dtype_orig = query.dtype
+    query = query.float()
+    key = key.float()
+    value = value.float()
+    query_rot = query_rot.float()
+    key_rot = key_rot.float()
+    beta = beta.float()
+    decay = decay.float()
 
-    qkv = torch.empty(B, N, 3, H, D, device=q.device, dtype=q.dtype)
-    qkv[:, :, 0].copy_(q.permute(0, 3, 1, 2))
-    qkv[:, :, 1].copy_(k.permute(0, 3, 1, 2))
-    qkv[:, :, 2].copy_(v.permute(0, 3, 1, 2))
+    num_fwd, den_fwd = _delta_scan(
+        query,
+        key,
+        value,
+        query_rot,
+        key_rot,
+        beta,
+        decay,
+        spatial_tokens=spatial_tokens,
+    )
 
-    ones_inv_rms, ones_nw, ones_cos, zeros_sin = _cam_identity_tables(B=B, N=N, H=H, D=D, device=q.device)
+    def to_time(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
 
-    I_P_kv, A_, I_P_z, B_z = phase_a(
+    def from_time(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, head_dim, token_count)
+
+    query_t = to_time(query)
+    key_t = to_time(key)
+    value_t = to_time(value)
+    query_rot_t = to_time(query_rot)
+    key_rot_t = to_time(key_rot)
+    num_bwd_flipped, den_bwd_flipped = _delta_scan(
+        from_time(torch.flip(query_t, dims=[2])),
+        from_time(_flip_and_shift(key_t, dim=2, shift_value=0.0)),
+        from_time(_flip_and_shift(value_t, dim=2, shift_value=0.0)),
+        from_time(torch.flip(query_rot_t, dims=[2])),
+        from_time(_flip_and_shift(key_rot_t, dim=2, shift_value=0.0)),
+        _flip_and_shift(beta, dim=2, shift_value=0.0),
+        _flip_and_shift(decay, dim=2, shift_value=1.0),
+        spatial_tokens=spatial_tokens,
+    )
+
+    def flip_back(tensor: torch.Tensor) -> torch.Tensor:
+        dim = tensor.shape[2]
+        tensor = tensor.view(batch_size, num_heads, dim, frames, spatial_tokens)
+        return torch.flip(tensor, dims=[3]).reshape(batch_size, num_heads, dim, token_count)
+
+    output = (num_fwd + flip_back(num_bwd_flipped)) / (den_fwd + flip_back(den_bwd_flipped) + eps)
+    return output.to(dtype_orig)
+
+
+def _triton_disabled() -> bool:
+    return os.environ.get(SANA_WM_DISABLE_TRITON_GDN_ENV, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _rms_norm_weight(module: nn.Module, hidden_size: int, *, device: torch.device) -> torch.Tensor:
+    del hidden_size, device
+    return module.weight.float().contiguous()
+
+
+def triton_bidirectional_gated_delta_net_from_qkv(
+    qkv: torch.Tensor,
+    *,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    q_norm: nn.Module,
+    k_norm: nn.Module,
+    spatial_tokens: int,
+    rotary_emb: torch.Tensor | None = None,
+    k_scale: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Run the fused NVlabs bidirectional GDN kernel from raw QKV.
+
+    Args:
+      qkv: ``[B, N, 3, H, D]`` raw projected Q/K/V after temporal K-conv.
+      beta: ``[B, H, T, S]`` token gates.
+      decay: ``[B, H, T]`` per-frame decay.
+
+    Returns:
+      Tensor shaped ``[B, H, D, N]`` to match
+      :func:`reference_bidirectional_gated_delta_net`.
+    """
+
+    if _triton_disabled():
+        raise RuntimeError(f"{SANA_WM_DISABLE_TRITON_GDN_ENV} disables the fused Sana-WM GDN kernel.")
+    if not qkv.is_cuda:
+        raise RuntimeError("Sana-WM fused GDN requires CUDA tensors.")
+    if qkv.ndim != 5 or qkv.shape[2] != 3:
+        raise ValueError(f"Sana-WM fused GDN expects qkv [B, N, 3, H, D], got {tuple(qkv.shape)}.")
+    if spatial_tokens <= 0:
+        raise ValueError("Sana-WM fused GDN spatial_tokens must be positive.")
+
+    batch_size, token_count, _, num_heads, head_dim = qkv.shape
+    if token_count % spatial_tokens != 0:
+        raise ValueError(
+            f"Sana-WM fused GDN token count {token_count} is not divisible by spatial_tokens={spatial_tokens}."
+        )
+    frames = token_count // spatial_tokens
+    if beta.shape != (batch_size, num_heads, frames, spatial_tokens):
+        raise ValueError(
+            "Sana-WM fused GDN beta shape mismatch: expected "
+            f"{(batch_size, num_heads, frames, spatial_tokens)}, got {tuple(beta.shape)}."
+        )
+    if decay.shape != (batch_size, num_heads, frames):
+        raise ValueError(
+            "Sana-WM fused GDN decay shape mismatch: expected "
+            f"{(batch_size, num_heads, frames)}, got {tuple(decay.shape)}."
+        )
+
+
+    qkv = qkv.contiguous()
+    # q_norm is a vLLM RMSNorm on the production path, which stores its epsilon
+    # as ``variance_epsilon`` (no ``eps`` attribute); the 1e-5 fallback preserves
+    # the validated fused-path numerics for that case (and any norm without eps).
+    q_inv_rms, k_inv_rms = fused_qk_inv_rms(qkv, eps=float(getattr(q_norm, "eps", 1e-5)))
+    hidden_size = num_heads * head_dim
+    q_norm_weight = _rms_norm_weight(q_norm, hidden_size, device=qkv.device)
+    k_norm_weight = _rms_norm_weight(k_norm, hidden_size, device=qkv.device)
+    rope_cos, rope_sin = prepare_rope_tables(rotary_emb, token_count, head_dim, qkv.device)
+    output = fused_bigdn_func(
         qkv,
-        beta_fwd,
-        ones_inv_rms,
-        ones_inv_rms,
-        ones_nw,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
-        F=F,
-        S=S,
-        k_scale=1.0,
-        norm_eps=1e-5,
-        dot_precision=dot_precision,
-        skip_relu=True,
-        skip_z=True,
+        q_inv_rms,
+        k_inv_rms,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+        rope_cos=rope_cos,
+        rope_sin=rope_sin,
+        beta=beta.contiguous(),
+        decay=decay.contiguous(),
+        F=frames,
+        S=spatial_tokens,
+        k_scale=k_scale,
+        eps=eps,
     )
-    M_fwd, z_fwd, _, _ = phase_b_triton(
-        I_P_kv,
-        A_,
-        I_P_z,
-        B_z,
-        decay_fwd,
-        F=F,
-        dot_precision=dot_precision,
-        direction=1,
-        skip_z=True,
-    )
-    num_out, _ = phase_c(
-        qkv,
-        ones_inv_rms,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
-        M_fwd,
-        z_fwd,
-        F=F,
-        S=S,
-        dot_precision=dot_precision,
-        skip_relu=True,
-        num_only=True,
-    )
-    del I_P_kv, A_, I_P_z, B_z, M_fwd, z_fwd
+    return output.permute(0, 2, 3, 1).contiguous()
 
-    I_P_kv, A_, I_P_z, B_z = phase_a(
+
+class BidirectionalGatedDeltaNetTriton(nn.Module):
+    """Reference-compatible wrapper for SANA-WM's model-local GDN operator.
+
+    The fused path is intentionally model-local: SANA-WM uses a bidirectional
+    video-latent recurrence instead of the autoregressive GDN cache contract
+    implemented by vLLM's Qwen3-Next layers.
+    """
+
+    def __init__(self, *, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        try:
+            beta = kwargs.pop("beta")
+            decay = kwargs.pop("decay")
+            spatial_tokens = int(kwargs.pop("spatial_tokens"))
+        except KeyError as exc:
+            raise TypeError(f"Sana-WM GDN missing required argument: {exc.args[0]}") from exc
+        if kwargs.keys() - {"query_rot", "key_rot", "eps"}:
+            raise TypeError(f"Unexpected Sana-WM GDN arguments: {sorted(kwargs)}")
+        return reference_bidirectional_gated_delta_net(
+            query,
+            key,
+            value,
+            beta=beta,
+            decay=decay,
+            spatial_tokens=spatial_tokens,
+            query_rot=kwargs.pop("query_rot", None),
+            key_rot=kwargs.pop("key_rot", None),
+            eps=float(kwargs.pop("eps", self.eps)),
+        )
+
+
+def warmup_sana_wm_gdn_kernel(
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    batch_size: int = 1,
+    frames: int = 2,
+    spatial_tokens: int = 4,
+    num_heads: int = 2,
+    head_dim: int = 16,
+) -> bool:
+    """Compile/autotune the fused SANA-WM GDN kernel with a small workload.
+
+    vLLM's Qwen3-Next GDN path warms its chunked prefill kernels before real
+    inference to avoid first-request autotune after cache allocation. SANA-WM
+    does not use the autoregressive GDN cache path, but the same operational
+    concern applies to the model-local Triton recurrence.
+
+    Returns ``True`` when the warmup ran. Returns ``False`` when CUDA is not
+    available or the fused path is explicitly disabled.
+    """
+
+    if _triton_disabled() or not torch.cuda.is_available():
+        return False
+    device = torch.device(device or "cuda")
+    token_count = frames * spatial_tokens
+    qkv = torch.zeros(
+        batch_size,
+        token_count,
+        3,
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    beta = torch.full(
+        (batch_size, num_heads, frames, spatial_tokens),
+        0.5,
+        device=device,
+        dtype=torch.float32,
+    )
+    decay = torch.full(
+        (batch_size, num_heads, frames),
+        0.9,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    class _WarmupNorm(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.eps = 1e-6
+            self.weight = nn.Parameter(torch.ones(num_heads * head_dim, device=device))
+
+    triton_bidirectional_gated_delta_net_from_qkv(
         qkv,
-        beta_rev,
-        ones_inv_rms,
-        ones_inv_rms,
-        ones_nw,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
-        F=F,
-        S=S,
-        k_scale=1.0,
-        norm_eps=1e-5,
-        dot_precision=dot_precision,
-        skip_relu=True,
-        skip_z=True,
+        beta=beta,
+        decay=decay,
+        q_norm=_WarmupNorm(),
+        k_norm=_WarmupNorm(),
+        spatial_tokens=spatial_tokens,
+        k_scale=(head_dim**-0.5) * (spatial_tokens**-0.5),
     )
-    _, _, M_rev, z_rev = phase_b_triton(
-        I_P_kv,
-        A_,
-        I_P_z,
-        B_z,
-        decay_rev,
-        F=F,
-        dot_precision=dot_precision,
-        direction=2,
-        skip_z=True,
-    )
-    phase_c(
-        qkv,
-        ones_inv_rms,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
-        M_rev,
-        z_rev,
-        F=F,
-        S=S,
-        dot_precision=dot_precision,
-        num_out=num_out,
-        accumulate=True,
-        skip_relu=True,
-        num_only=True,
-    )
-    return num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
+    torch.accelerator.synchronize(device)
+    return True
+
+
+__all__ = [
+    "SANA_WM_GDN_ERROR",
+    "SANA_WM_DISABLE_TRITON_GDN_ENV",
+    "SANA_WM_REQUIRE_TRITON_GDN_ENV",
+    "BidirectionalGatedDeltaNetTriton",
+    "reference_bidirectional_gated_delta_net",
+    "triton_bidirectional_gated_delta_net_from_qkv",
+    "warmup_sana_wm_gdn_kernel",
+]
