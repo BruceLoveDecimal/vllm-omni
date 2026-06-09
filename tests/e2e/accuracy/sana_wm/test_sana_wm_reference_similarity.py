@@ -64,12 +64,11 @@ def _require_env() -> str:
 
 def _native_video(model: str, num_frames: int, steps: int) -> np.ndarray:
     """vLLM-Omni native Stage-1 + SANA VAE decode. Returns (T, H, W, 3)."""
+    from tests.e2e.accuracy.sana_wm.run_sana_wm_reference import _first_frame_image
     from vllm_omni.diffusion.models.sana_wm import SANA_WM_OUTPUT_HEIGHT, SANA_WM_OUTPUT_WIDTH
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.outputs import OmniRequestOutput
-
-    from tests.e2e.accuracy.sana_wm.run_sana_wm_reference import _first_frame_image
 
     omni = Omni(model=model, model_class_name="SanaWmPipeline", enforce_eager=True)
     try:
@@ -81,14 +80,21 @@ def _native_video(model: str, num_frames: int, steps: int) -> np.ndarray:
                     "camera": {"poses": make_camera(num_frames)},
                     "num_frames": num_frames,
                     "intrinsics": {
-                        "fx": SANA_WM_OUTPUT_WIDTH / 2, "fy": SANA_WM_OUTPUT_WIDTH / 2,
-                        "cx": SANA_WM_OUTPUT_WIDTH / 2, "cy": SANA_WM_OUTPUT_HEIGHT / 2,
+                        "fx": SANA_WM_OUTPUT_WIDTH / 2,
+                        "fy": SANA_WM_OUTPUT_WIDTH / 2,
+                        "cx": SANA_WM_OUTPUT_WIDTH / 2,
+                        "cy": SANA_WM_OUTPUT_HEIGHT / 2,
                     },
                 },
             },
             OmniDiffusionSamplingParams(
-                height=SANA_WM_OUTPUT_HEIGHT, width=SANA_WM_OUTPUT_WIDTH, num_frames=num_frames,
-                seed=SEED, fps=FPS, num_inference_steps=steps, guidance_scale=CFG_SCALE,
+                height=SANA_WM_OUTPUT_HEIGHT,
+                width=SANA_WM_OUTPUT_WIDTH,
+                num_frames=num_frames,
+                seed=SEED,
+                fps=FPS,
+                num_inference_steps=steps,
+                guidance_scale=CFG_SCALE,
                 guidance_scale_provided=True,
                 extra_args={
                     "sana_wm_sampling_algo": "flow_euler_ltx",

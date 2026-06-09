@@ -2267,7 +2267,6 @@ def triton_bidirectional_gated_delta_net_from_qkv(
             f"{(batch_size, num_heads, frames)}, got {tuple(decay.shape)}."
         )
 
-
     qkv = qkv.contiguous()
     # q_norm is a vLLM RMSNorm on the production path, which stores its epsilon
     # as ``variance_epsilon`` (no ``eps`` attribute); the 1e-5 fallback preserves

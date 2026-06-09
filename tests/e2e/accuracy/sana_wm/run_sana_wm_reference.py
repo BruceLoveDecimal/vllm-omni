@@ -134,8 +134,14 @@ def generate_reference(
     intrinsics = module.transform_intrinsics_for_crop(make_intrinsics(num_frames), src_size, resized_size, crop_offset)
     c2w = make_camera(num_frames)
     params = module.GenerationParams(
-        num_frames=num_frames, fps=fps, step=steps, cfg_scale=cfg,
-        flow_shift=None, seed=seed, negative_prompt="", sampling_algo="flow_euler_ltx",
+        num_frames=num_frames,
+        fps=fps,
+        step=steps,
+        cfg_scale=cfg,
+        flow_shift=None,
+        seed=seed,
+        negative_prompt="",
+        sampling_algo="flow_euler_ltx",
     )
     with torch.inference_mode():
         result = pipe.generate(cropped, prompt, c2w, intrinsics, params)
@@ -145,7 +151,7 @@ def generate_reference(
 
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
     return video
 
 
@@ -161,8 +167,12 @@ def main() -> None:
     args = parser.parse_args()
 
     video = generate_reference(
-        num_frames=args.num_frames, steps=args.steps, cfg=args.cfg, seed=args.seed,
-        fps=args.fps, image_path=args.image,
+        num_frames=args.num_frames,
+        steps=args.steps,
+        cfg=args.cfg,
+        seed=args.seed,
+        fps=args.fps,
+        image_path=args.image,
     )
     np.save(args.output, video)
     print(f"reference video {video.shape} {video.dtype} -> {args.output}", flush=True)
