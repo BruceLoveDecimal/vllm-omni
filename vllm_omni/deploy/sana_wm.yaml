@@ -36,4 +36,8 @@ stages:
       # makes the production serving intent explicit.
       extra_args:
         sana_wm_inprocess_refiner: true
-        sana_wm_inprocess_refiner_steps: 1
+        # 3 = the full LTX-2 distilled Stage-2 sigma schedule
+        # (0.909 -> 0.725 -> 0.422 -> 0.0), matching NVlabs
+        # diffusion/refiner/diffusers_ltx2_refiner.py (num_inference_steps=3).
+        # Fewer steps stop before sigma=0 and decode to noise.
+        sana_wm_inprocess_refiner_steps: 3

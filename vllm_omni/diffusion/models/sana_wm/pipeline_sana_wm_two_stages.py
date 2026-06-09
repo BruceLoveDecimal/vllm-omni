@@ -9,7 +9,6 @@ import os
 import time
 from collections.abc import Iterable
 from copy import copy
-from pathlib import Path
 from typing import Any, ClassVar
 
 import torch
@@ -48,13 +47,6 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         self.refiner_text_encoder: nn.Module | None = None
         self.refiner_connectors: nn.Module | None = None
         self.refiner_tokenizer: Any | None = None
-
-    def _local_files_only(self) -> bool:
-        if self.release_paths is not None:
-            return True
-        if self.od_config is None or self.od_config.model is None:
-            return False
-        return Path(str(self.od_config.model)).expanduser().exists()
 
     def _ensure_refiner_text_encoder(self, *, device: torch.device, dtype: torch.dtype) -> None:
         if self.refiner_text_encoder is not None and self.refiner_tokenizer is not None:
@@ -468,7 +460,10 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         )
 
         frame_rate = float(payload.get("fps", getattr(sampling_params, "resolved_frame_rate", None) or 24.0))
-        num_steps = max(1, int(extra_args.get(SANA_WM_INPROCESS_REFINER_STEPS_ARG, 1)))
+        # Default to the full LTX-2 distilled Stage-2 schedule (3 steps, ending
+        # at sigma=0), matching NVlabs diffusers_ltx2_refiner. Fewer steps stop
+        # before sigma=0 (e.g. 1 step ends at 0.725) and decode to noise.
+        num_steps = max(1, int(extra_args.get(SANA_WM_INPROCESS_REFINER_STEPS_ARG, 3)))
         sigmas = self._stage2_sigma_schedule(num_steps, device=device, dtype=torch.float32)
         sink_size = int(extra_args.get("sana_wm_refiner_sink_size", 1))
         if latent_num_frames <= sink_size:
