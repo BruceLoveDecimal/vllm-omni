@@ -1449,7 +1449,12 @@ def _phase_c_kernel(
     q_nw_pair = tl.load(q_norm_w_ptr + nw_offset + offs_d_pair, mask=mask_d_pair, other=0.0).to(tl.float32)
 
     M_f = tl.load(M_bhf + offs_dd, mask=mask_dd, other=0.0)
-    z_f = tl.load(z_bhf + offs_d, mask=mask_d, other=0.0)
+    if NUM_ONLY:
+        # NUM_ONLY callers (cam scan) pass a 1-element placeholder for z;
+        # never dereference it — the addresses above would be out of bounds.
+        z_f = tl.zeros([BLOCK_D], dtype=tl.float32)
+    else:
+        z_f = tl.load(z_bhf + offs_d, mask=mask_d, other=0.0)
 
     n_base = pid_f * S
     for s0 in range(0, S, BLOCK_S):
