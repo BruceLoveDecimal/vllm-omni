@@ -47,6 +47,17 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         self.refiner_text_encoder: nn.Module | None = None
         self.refiner_connectors: nn.Module | None = None
         self.refiner_tokenizer: Any | None = None
+        # Build the refiner stack at construction (startup), the same as
+        # LTX2TwoStagesPipeline. This runs inside the loader's
+        # DeviceMemoryProfiler-wrapped load_model, so the refiner shows up in
+        # the "Model loading took X GiB" accounting; it also makes the modules
+        # non-None when the offloader's ModuleDiscovery runs (it skips None
+        # attributes), and surfaces any load-time OOM at deploy rather than on
+        # the first user request. When no checkpoint is configured (unit
+        # tests), the first-request `ensure_refiner_components` still serves as
+        # a lazy fallback.
+        if self.od_config is not None and self.od_config.model is not None:
+            self.ensure_refiner_components()
 
     def _ensure_refiner_text_encoder(self, *, device: torch.device, dtype: torch.dtype) -> None:
         if self.refiner_text_encoder is not None and self.refiner_tokenizer is not None:
@@ -116,6 +127,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             get_current_vllm_config_or_none,
             set_current_vllm_config,
         )
+        from vllm.utils.torch_utils import set_default_torch_dtype
 
         if get_current_vllm_config_or_none() is None:
             vllm_config = VllmConfig(
@@ -132,6 +144,10 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         use_diffusers_refiner = os.environ.get("SANA_WM_USE_DIFFUSERS_REFINER", "0") == "1"
         config_dict = self._load_refiner_transformer_config()
         state_dict = load_file(str(self.release_paths.refiner_transformer_weights), device="cpu")
+        # Construct in the target dtype (default-dtype context) so the module is
+        # never materialized in fp32 — otherwise a full fp32 copy of the refiner
+        # lives on CPU at the same time as the bf16 state_dict. `del state_dict`
+        # right after the load frees that staging copy before the GPU upload.
         if use_diffusers_refiner:
             import inspect as _inspect
 
@@ -139,9 +155,10 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
 
             allowed = set(_inspect.signature(_DiffRefiner.__init__).parameters.keys())
             filtered = {k: v for k, v in config_dict.items() if k in allowed and k != "self"}
-            with torch.device("cpu"):
+            with set_default_torch_dtype(dtype), torch.device("cpu"):
                 self.refiner_transformer = _DiffRefiner(**filtered)
             self.refiner_transformer.load_state_dict(state_dict, strict=False)
+            del state_dict
             self.refiner_transformer.eval()
             for _p in self.refiner_transformer.parameters():
                 _p.requires_grad_(False)
@@ -150,9 +167,10 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         else:
             from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import create_transformer_from_config
 
-            with vllm_config_context, torch.device("cpu"):
+            with vllm_config_context, set_default_torch_dtype(dtype), torch.device("cpu"):
                 self.refiner_transformer = create_transformer_from_config(config_dict)
             self.refiner_transformer.load_weights(state_dict.items())
+            del state_dict
         self.refiner_transformer.to(device=device, dtype=dtype)
         self._force_module_tensors_to(self.refiner_transformer, device=device, dtype=dtype)
 
