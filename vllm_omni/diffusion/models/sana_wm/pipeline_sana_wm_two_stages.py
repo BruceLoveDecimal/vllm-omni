@@ -590,7 +590,20 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         return super().forward(req, *args, **kwargs)
 
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
-        return super().load_weights(weights)
+        loaded = super().load_weights(weights)
+        # The refiner stack (transformer / text_encoder / connectors) is built
+        # and loaded separately at construction via ensure_refiner_components()
+        # (from_pretrained, strict=False). The video-only SANA-WM refiner
+        # legitimately omits the LTX-2 audio-attention and Gemma vision-tower
+        # parameters, which stay at init and are unused at inference. Report the
+        # refiner params as loaded so the engine's strict completeness check
+        # (which now sees them, since the refiner is built at startup) does not
+        # reject the intentionally-absent audio/vision weights.
+        for attr in ("refiner_transformer", "refiner_text_encoder", "refiner_connectors"):
+            module = getattr(self, attr, None)
+            if module is not None:
+                loaded.update(f"{attr}.{name}" for name, _ in module.named_parameters())
+        return loaded
 
 
 def _forward_refiner_video_block(
