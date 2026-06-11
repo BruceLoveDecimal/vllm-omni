@@ -81,7 +81,7 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
 ```
 
 For a production-length request using the deploy defaults, use an action length
-that matches `num_frames - 1` and raise the native token cap:
+that matches `num_frames - 1`:
 
 ```bash
 curl -sS -X POST http://localhost:8091/v1/videos/sync \
@@ -97,7 +97,6 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
   -F "guidance_scale=5.0" \
   -F "seed=42" \
   --form-string 'sana_wm={"action":"w-160","translation_speed":0.055,"rotation_speed_deg":1.2,"intrinsics":{"fx":640,"fy":640,"cx":640,"cy":352}}' \
-  --form-string 'extra_params={"sana_wm_native_max_tokens":20000}' \
   -o sana_wm_output.mp4
 ```
 

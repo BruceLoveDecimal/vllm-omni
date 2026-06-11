@@ -108,6 +108,9 @@ def _run_sana_wm_e2e(
     native_max_tokens = os.environ.get("SANA_WM_E2E_NATIVE_MAX_TOKENS", "").strip()
     if native_max_tokens:
         extra_args["sana_wm_native_max_tokens"] = int(native_max_tokens)
+    # Return the requested output type so the shape assertion matches the
+    # pipeline output instead of the raw Stage-1 latent default.
+    extra_args["sana_wm_output_type"] = output_type
     if inprocess_refiner:
         extra_args.update(
             {

@@ -1,20 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SANA-WM Stage-1 transformer fallback.
+"""SANA-WM Stage-1 transformer.
 
-This module is intentionally split from the official NVlabs backend.  It gives
-vLLM-Omni a materializable, shape-compatible native path for scaffolding, weight
-audits, and small bounded-size runs while the fused Bidirectional Gated DeltaNet
-Triton operator and exact UCPE camera branch are being ported.
+Native vLLM-Omni port of the NVlabs SANA-WM DiT. Modules are built eagerly at
+construction (under the loader's target-device context) and checkpoint tensors
+are streamed in via ``load_weights``; the fused Bidirectional Gated DeltaNet
+Triton kernels live in-tree in ``gdn.py``.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import os
-import sys
 import warnings
 from collections.abc import Iterable
 from functools import reduce
@@ -29,6 +27,7 @@ from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.gdn import (
     SANA_WM_REQUIRE_TRITON_GDN_ENV,
     _flip_and_shift,
+    cam_scan_bidi_chunkwise,
     reference_bidirectional_gated_delta_net,
     triton_bidirectional_gated_delta_net_from_qkv,
 )
@@ -179,33 +178,6 @@ def _maybe_make_vllm_rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
     if VllmRMSNorm is None or _sana_wm_disable_vllm_ops():
         return SanaWmRMSNorm(hidden_size, eps=eps)
     return VllmRMSNorm(hidden_size, eps=eps)
-
-
-_CAM_TRITON_SENTINEL: object = object()
-_cam_triton_fn: Any = _CAM_TRITON_SENTINEL
-
-
-def _import_nvlabs_cam_scan_bidi() -> Any:
-    """Lazy import of NVlabs ``cam_scan_bidi_chunkwise``. Cached after first call.
-
-    Requires ``VLLM_OMNI_SANA_WM_OFFICIAL_REPO`` to point at the NVlabs source
-    tree. Returns ``None`` on import failure (caller falls back to Python path).
-    """
-    global _cam_triton_fn
-    if _cam_triton_fn is not _CAM_TRITON_SENTINEL:
-        return _cam_triton_fn
-    repo = os.environ.get("VLLM_OMNI_SANA_WM_OFFICIAL_REPO", "")
-    if repo and repo not in sys.path:
-        sys.path.insert(0, repo)
-    try:
-        from diffusion.model.ops.fused_gdn_chunkwise import cam_scan_bidi_chunkwise  # type: ignore
-
-        _cam_triton_fn = cam_scan_bidi_chunkwise
-        logger.debug("Sana-WM cam-triton kernel imported from %s", repo)
-    except ImportError as exc:
-        logger.debug("Sana-WM cam-triton kernel import failed (%s); falling back to Python path", exc)
-        _cam_triton_fn = None
-    return _cam_triton_fn
 
 
 def _is_sana_wm_transformer_block(name: str, module: Any) -> bool:
@@ -787,8 +759,14 @@ class SanaWmSelfAttention(nn.Module):
         self.dt_bias = nn.Parameter(torch.zeros(self.num_heads))
         self.register_buffer("recall_gate", torch.zeros(1))
         self.conv_k = (
-            nn.Conv1d(local_inner_dim, local_inner_dim, kernel_size=config.conv_kernel_size, groups=local_inner_dim)
-            if config.conv_kernel_size > 0
+            nn.Conv1d(
+                local_inner_dim,
+                local_inner_dim,
+                kernel_size=config.conv_kernel_size,
+                groups=local_inner_dim,
+                bias=False,
+            )
+            if self.use_gdn and config.conv_kernel_size > 0
             else None
         )
         self.conv_q = None
@@ -819,8 +797,14 @@ class SanaWmSelfAttention(nn.Module):
         self.q_norm_cam = norm_cls(self.cam_dim)
         self.k_norm_cam = norm_cls(self.cam_dim)
         self.conv_k_cam = (
-            nn.Conv1d(self.cam_dim, self.cam_dim, kernel_size=config.conv_kernel_size, groups=self.cam_dim)
-            if config.conv_kernel_size > 0
+            nn.Conv1d(
+                self.cam_dim,
+                self.cam_dim,
+                kernel_size=config.conv_kernel_size,
+                groups=self.cam_dim,
+                bias=False,
+            )
+            if self.use_gdn and config.conv_kernel_size > 0
             else None
         )
         self.conv_q_cam = None
@@ -1333,30 +1317,27 @@ class SanaWmSelfAttention(nn.Module):
         the decay by one frame (with neutral 1.0 pad), matching NVlabs
         ``flip_and_shift`` conventions.
 
-        Set ``SANA_WM_CAM_TRITON=1`` to dispatch to NVlabs
-        ``cam_scan_bidi_chunkwise`` from
-        ``diffusion.model.ops.fused_gdn_chunkwise``; falls back to the
-        Python reference path on import failure.
+        Set ``SANA_WM_CAM_TRITON=1`` to dispatch to the in-tree Triton port
+        ``gdn.cam_scan_bidi_chunkwise``; the default is the Python reference
+        path below.
         """
-        if os.environ.get("SANA_WM_CAM_TRITON", "").lower() in {"1", "true", "yes", "on"}:
-            triton_fn = _import_nvlabs_cam_scan_bidi()
-            if triton_fn is not None:
-                dtype_orig = q_rot.dtype
-                B, H, D, N = q_rot.shape
-                F = beta.shape[2]
-                if N != F * spatial_tokens:
-                    raise ValueError(f"cam triton path: N={N} != F*S={F * spatial_tokens}")
-                # NVlabs requires fp32 contiguous q/k/v, beta (B,H,F,S), decay (B,H,F).
-                q_f = q_rot.float().contiguous()
-                k_f = k_rot.float().contiguous()
-                v_f = value.float().contiguous()
-                if beta.ndim == 3:
-                    beta_f = beta.unsqueeze(-1).expand(B, H, F, spatial_tokens).contiguous()
-                else:
-                    beta_f = beta.float().contiguous()
-                decay_f = decay.float().contiguous()
-                out = triton_fn(q_f, k_f, v_f, beta_f, decay_f)
-                return out.to(dtype_orig)
+        if q_rot.is_cuda and os.environ.get("SANA_WM_CAM_TRITON", "").lower() in {"1", "true", "yes", "on"}:
+            dtype_orig = q_rot.dtype
+            B, H, D, N = q_rot.shape
+            F = beta.shape[2]
+            if N != F * spatial_tokens:
+                raise ValueError(f"cam triton path: N={N} != F*S={F * spatial_tokens}")
+            # The kernel requires fp32 contiguous q/k/v, beta (B,H,F,S), decay (B,H,F).
+            q_f = q_rot.float().contiguous()
+            k_f = k_rot.float().contiguous()
+            v_f = value.float().contiguous()
+            if beta.ndim == 3:
+                beta_f = beta.float().unsqueeze(-1).expand(B, H, F, spatial_tokens).contiguous()
+            else:
+                beta_f = beta.float().contiguous()
+            decay_f = decay.float().contiguous()
+            out = cam_scan_bidi_chunkwise(q_f, k_f, v_f, beta_f, decay_f)
+            return out.to(dtype_orig)
         batch_size, num_heads, head_dim, token_count = q_rot.shape
         frames = beta.shape[2]
 
@@ -2056,7 +2037,6 @@ class SanaWmTransformer3DModel(nn.Module):
         self,
         config: SanaWmConfig | None = None,
         *,
-        materialize: bool = False,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
         latent_channels: int = SANA_WM_STAGE1_LATENT_CHANNELS,
@@ -2072,37 +2052,6 @@ class SanaWmTransformer3DModel(nn.Module):
         self.use_vllm_parallel_layers = use_vllm_parallel_layers and _vllm_parallel_layers_available()
         self._latent_channels = latent_channels
         self._prompt_channels = prompt_channels
-        self._is_materialized = False
-        self.register_buffer("_device_anchor", torch.empty(0), persistent=False)
-        self._loaded_parameters = nn.ParameterDict()
-        self._source_to_remapped_name: dict[str, str] = {}
-        self._remapped_to_storage_name: dict[str, str] = {}
-        self._storage_to_remapped_name: dict[str, str] = {}
-        self._materialized_loaded_names: set[str] = set()
-        if materialize:
-            self.materialize(
-                device=device,
-                dtype=dtype,
-                latent_channels=latent_channels,
-                prompt_channels=prompt_channels,
-            )
-
-    @property
-    def is_materialized(self) -> bool:
-        return self._is_materialized
-
-    def materialize(
-        self,
-        *,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-        latent_channels: int | None = None,
-        prompt_channels: int | None = None,
-    ) -> None:
-        if self._is_materialized:
-            return
-        self._latent_channels = latent_channels or self._latent_channels
-        self._prompt_channels = prompt_channels or self._prompt_channels
         self.patch_size = _to_3tuple(self.config.patch_size)
         self.x_embedder = SanaWmPatchEmbedMS3D(self.patch_size, self._latent_channels, self.config.hidden_size)
         self.y_embedder = SanaWmTextEmbedder(
@@ -2165,62 +2114,12 @@ class SanaWmTransformer3DModel(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, 484, self.config.hidden_size))
         self.rope = SanaWmWanRotaryPosEmbed(self.config.linear_head_dim)
         self.attention_y_norm = _maybe_make_vllm_rms_norm(self.config.hidden_size)
-        self.to(device=device, dtype=dtype)
-        self._is_materialized = True
-        self._apply_loaded_tensors_to_materialized()
-
-    @staticmethod
-    def _storage_name(remapped_name: str, index: int) -> str:
-        digest = hashlib.sha1(remapped_name.encode("utf-8")).hexdigest()[:16]
-        return f"w_{index}_{digest}"
+        if device is not None or dtype is not None:
+            self.to(device=device, dtype=dtype)
 
     @staticmethod
     def _local_name(remapped_name: str) -> str:
         return remapped_name.removeprefix("transformer.")
-
-    def _copy_to_materialized_param(
-        self,
-        remapped_name: str,
-        tensor: torch.Tensor,
-        *,
-        require_target: bool = False,
-    ) -> bool:
-        if not self._is_materialized or not remapped_name.startswith("transformer."):
-            if require_target:
-                raise ValueError(
-                    f"Sana-WM weight {remapped_name} was remapped but is not a transformer weight "
-                    "that can be consumed by the materialized Stage-1 model."
-                )
-            return False
-        local_name = self._local_name(remapped_name)
-        params = dict(self.named_parameters())
-        buffers = dict(self.named_buffers())
-        target = params.get(local_name)
-        if target is None:
-            target = buffers.get(local_name)
-        if target is None:
-            if require_target:
-                raise ValueError(
-                    f"Sana-WM weight {remapped_name} was remapped but not consumed by the materialized Stage-1 model."
-                )
-            return False
-        if tuple(target.shape) != tuple(tensor.shape):
-            weight_loader = getattr(target, "weight_loader", None)
-            if callable(weight_loader):
-                weight_loader(target, tensor.to(device=target.device, dtype=target.dtype))
-                self._materialized_loaded_names.add(remapped_name)
-                return True
-            if tuple(target.shape) != tuple(tensor.shape):
-                tensor = self._maybe_shard_loaded_tensor(remapped_name, tensor, target)
-            if tuple(target.shape) != tuple(tensor.shape):
-                raise ValueError(
-                    f"Sana-WM weight shape mismatch for {remapped_name}: "
-                    f"expected {tuple(target.shape)}, got {tuple(tensor.shape)}."
-                )
-        with torch.no_grad():
-            target.copy_(tensor.to(device=target.device, dtype=target.dtype))
-        self._materialized_loaded_names.add(remapped_name)
-        return True
 
     @staticmethod
     def _maybe_shard_loaded_tensor(
@@ -2271,37 +2170,6 @@ class SanaWmTransformer3DModel(nn.Module):
             return tensor
         start = tp_rank * target_size
         return tensor.narrow(dim, start, target_size)
-
-    def _store_tensor(self, remapped_name: str, tensor: torch.Tensor) -> None:
-        if self._is_materialized:
-            self._copy_to_materialized_param(remapped_name, tensor, require_target=True)
-            return
-        storage_name = self._storage_name(remapped_name, len(self._remapped_to_storage_name))
-        target_device = self._device_anchor.device
-        if target_device.type != "meta" and tensor.device != target_device:
-            tensor = tensor.to(target_device)
-        if torch.is_floating_point(tensor) or torch.is_complex(tensor):
-            self._loaded_parameters[storage_name] = nn.Parameter(tensor.detach(), requires_grad=False)
-        else:
-            self.register_buffer(storage_name, tensor.detach(), persistent=True)
-        self._remapped_to_storage_name[remapped_name] = storage_name
-        self._storage_to_remapped_name[storage_name] = remapped_name
-
-    def _apply_loaded_tensors_to_materialized(self) -> None:
-        unapplied: list[str] = []
-        for remapped_name, storage_name in list(self._remapped_to_storage_name.items()):
-            tensor = (
-                self._loaded_parameters[storage_name]
-                if storage_name in self._loaded_parameters
-                else getattr(self, storage_name)
-            )
-            if not self._copy_to_materialized_param(remapped_name, tensor):
-                unapplied.append(remapped_name)
-        if unapplied:
-            raise ValueError(
-                "Sana-WM Stage-1 checkpoint keys were remapped but not consumed by the "
-                f"materialized model: {unapplied[:10]}"
-            )
 
     def _positional_embedding(self, token_count: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         pos_embed = self.pos_embed.to(device=device, dtype=dtype)
@@ -2421,18 +2289,6 @@ class SanaWmTransformer3DModel(nn.Module):
                 raymap = raymap.float()
             if spatial_raymap is not None:
                 spatial_raymap = spatial_raymap.float()
-        if not self._is_materialized:
-            prompt_channels = (
-                int(encoder_hidden_states.shape[-1])
-                if encoder_hidden_states is not None
-                else SANA_WM_STAGE1_PROMPT_CHANNELS
-            )
-            self.materialize(
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-                latent_channels=int(hidden_states.shape[1]),
-                prompt_channels=prompt_channels,
-            )
 
         batch_size = hidden_states.shape[0]
         latent_shape = hidden_states.shape[2:]
@@ -2543,6 +2399,16 @@ class SanaWmTransformer3DModel(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
+        """Stream checkpoint tensors into the eagerly-built modules.
+
+        Follows the wan2_2 idiom: one ``named_parameters`` lookup table, the
+        per-tensor ``weight_loader`` for vLLM parallel layers (which narrows
+        full checkpoint tensors to the TP-local shard at copy time), and a
+        manual narrow for the model-local GDN/conv vectors. The source tensor
+        is dropped each iteration — no copy of the checkpoint is retained.
+        """
+        params_dict = dict(self.named_parameters())
+        buffers_dict = dict(self.named_buffers())
         loaded: set[str] = set()
         unmapped: list[str] = []
         duplicates: list[str] = []
@@ -2552,17 +2418,30 @@ class SanaWmTransformer3DModel(nn.Module):
             if remapped_name is None:
                 unmapped.append(source_name)
                 continue
-            if (
-                remapped_name in self._remapped_to_storage_name
-                or remapped_name in self._materialized_loaded_names
-                or remapped_name in loaded
-            ):
+            if remapped_name in loaded:
                 duplicates.append(remapped_name)
                 continue
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"Sana-WM weight {source_name!r} must be a torch.Tensor, got {type(tensor).__name__}.")
-            self._store_tensor(remapped_name, tensor)
-            self._source_to_remapped_name[source_name] = remapped_name
+            local_name = self._local_name(remapped_name)
+            target = params_dict.get(local_name)
+            if target is None:
+                target = buffers_dict.get(local_name)
+            if target is None:
+                raise ValueError(f"Sana-WM weight {remapped_name} was remapped but not consumed by the Stage-1 model.")
+            weight_loader = getattr(target, "weight_loader", None)
+            if callable(weight_loader):
+                weight_loader(target, tensor)
+            else:
+                if tuple(target.shape) != tuple(tensor.shape):
+                    tensor = self._maybe_shard_loaded_tensor(remapped_name, tensor, target)
+                if tuple(target.shape) != tuple(tensor.shape):
+                    raise ValueError(
+                        f"Sana-WM weight shape mismatch for {remapped_name}: "
+                        f"expected {tuple(target.shape)}, got {tuple(tensor.shape)}."
+                    )
+                with torch.no_grad():
+                    target.copy_(tensor.to(device=target.device, dtype=target.dtype))
             loaded.add(remapped_name)
 
         if unmapped or duplicates:

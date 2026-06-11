@@ -39,8 +39,9 @@ With the standard vLLM-Omni CLI, prefer the `--deploy-config` form above.
 
 `POST /v1/videos/sync` blocks until generation finishes and returns the MP4
 bytes directly. The example below uses a short 9-frame clip for a quick smoke
-test. Use the deploy defaults or raise `sana_wm_native_max_tokens` through
-`extra_params` for longer production clips.
+test. Production-length clips work with the deploy defaults: the native token
+cap now covers the model's full envelope (up to 321 frames at 704x1280). Raise
+`sana_wm_native_max_tokens` through `extra_params` only for requests beyond it.
 
 ```bash
 curl -sS -X POST http://localhost:8091/v1/videos/sync \

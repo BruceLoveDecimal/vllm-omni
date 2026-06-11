@@ -35,7 +35,6 @@ from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
     SanaWmCameraEmbedder,
     SanaWmTransformer3DModel,
-    normalize_sana_wm_stage1_weight_name,
 )
 from vllm_omni.diffusion.models.sana_wm.scheduling_sana_wm import (
     SanaWmFlowMatchScheduler,
@@ -65,7 +64,16 @@ SANA_WM_REFINER_ROOT_ENV = "VLLM_OMNI_SANA_WM_REFINER_ROOT"
 SANA_WM_OUTPUT_HEIGHT = 704
 SANA_WM_OUTPUT_WIDTH = 1280
 SANA_WM_DEFAULT_NUM_FRAMES = 321
-SANA_WM_NATIVE_MAX_TOKENS = 4096
+# Fail-fast envelope for the native Stage-1 path: the model's native 704x1280
+# output at its maximum supported 321-frame (20s @16fps) clip — 41 latent
+# frames x 22 x 40 = 36080 latent tokens. Derived from the constants above so
+# it always covers the advertised defaults (e.g. the deploy YAML's 161-frame
+# config = 18480 tokens) while still rejecting genuinely oversized requests
+# before they OOM a worker. Callers can override per-request via the
+# ``sana_wm_native_max_tokens`` extra arg.
+SANA_WM_NATIVE_MAX_TOKENS = ((SANA_WM_DEFAULT_NUM_FRAMES - 1) // 8 + 1) * (SANA_WM_OUTPUT_HEIGHT // 32) * (
+    SANA_WM_OUTPUT_WIDTH // 32
+)
 
 SANA_WM_STAGE1_PATTERNS = (
     SANA_WM_CONFIG_FILE,
@@ -269,11 +277,6 @@ class SanaWmPipeline(
 
         self.sana_wm_config = SanaWmConfig()
         self.quant_config = getattr(od_config, "quantization_config", None) if od_config is not None else None
-        self.transformer = SanaWmTransformer3DModel(
-            config=self.sana_wm_config,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.transformer" if prefix else "transformer",
-        )
         self.camera_encoder: SanaWmCameraEmbedder | None = None
 
         # Filled by the real implementation.
@@ -283,6 +286,11 @@ class SanaWmPipeline(
         self.release_paths: SanaWmLocalPaths | None = None
         self.weights_sources = []
         if od_config is not None and od_config.model is not None:
+            # Resolve the checkpoint once at construction (the standard
+            # startup-time flow, like every other diffusion pipeline) so the
+            # transformer below is built with the released config.yaml shape
+            # rather than defaults.
+            self.resolve_checkpoint()
             self.weights_sources = [
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
@@ -293,8 +301,18 @@ class SanaWmPipeline(
                     allow_patterns_overrides=[SANA_WM_STAGE1_DIT_BASENAME],
                 )
             ]
+        # Built eagerly: the loader constructs the pipeline under the target
+        # device / default-dtype context, and the weight loader then streams
+        # checkpoint tensors directly into these modules.
+        self.transformer = SanaWmTransformer3DModel(
+            config=self.sana_wm_config,
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.transformer" if prefix else "transformer",
+        )
 
     def resolve_checkpoint(self, *, include_refiner: bool | None = None) -> SanaWmLocalPaths:
+        if self.release_paths is not None:
+            return self.release_paths
         if self.od_config is None or self.od_config.model is None:
             raise ValueError("Sana-WM checkpoint resolution requires od_config.model.")
         include = self.include_refiner if include_refiner is None else include_refiner
@@ -304,7 +322,6 @@ class SanaWmPipeline(
             revision=self.od_config.revision,
         )
         self.sana_wm_config = SanaWmConfig.from_yaml(self.release_paths.config)
-        self.transformer.config = self.sana_wm_config
         self.camera_encoder = None
         return self.release_paths
 
@@ -896,10 +913,8 @@ class SanaWmPipeline(
             additional["sana_wm"] = payload
             prompt["additional_information"] = additional
 
-        # Resolve the checkpoint up front so the Stage-1 config (yaml), VAE,
-        # and refiner paths are populated before the native denoise loop reads
-        # ``self.sana_wm_config``. When no checkpoint is configured (unit
-        # tests), the native path falls back to lazy resolution / defaults.
+        # The checkpoint is resolved once in __init__; this is a cached no-op
+        # kept as a guard for pipelines constructed without od_config.model.
         if self.od_config is not None and self.od_config.model is not None:
             self.resolve_checkpoint()
 
@@ -910,33 +925,8 @@ class SanaWmPipeline(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
-        materialized_camera_params = dict(self.camera_encoder.named_parameters()) if self.camera_encoder else {}
-        cached_weights = list(weights)
-        loaded = self.transformer.load_weights(cached_weights)
-        # Build the Stage-1 transformer modules now instead of lazily on the
-        # first forward. The diffusion model runner applies regional
-        # torch.compile right after model load; if the SanaWmBlock submodules
-        # do not exist yet, regionally_compile finds nothing and silently skips
-        # (so the DiT never actually compiles). Materializing here — only on a
-        # real GPU runtime — lets the shared compile path engage. CPU unit tests
-        # keep the lazy/deferred behavior.
-        if torch.cuda.is_available() and not self.transformer.is_materialized:
-            device, dtype = self._runtime_device_dtype()
-            self.transformer.materialize(device=device, dtype=dtype)
-        for source_name, tensor in cached_weights:
-            remapped_name = normalize_sana_wm_stage1_weight_name(source_name)
-            if remapped_name is None or not remapped_name.startswith("camera_encoder."):
-                continue
-            local_name = remapped_name.removeprefix("camera_encoder.")
-            param = materialized_camera_params.get(local_name)
-            if param is None:
-                continue
-            if tuple(param.shape) != tuple(tensor.shape):
-                raise ValueError(
-                    f"Sana-WM camera_encoder weight {local_name} shape "
-                    f"mismatch: model expects {tuple(param.shape)}, "
-                    f"checkpoint has {tuple(tensor.shape)}."
-                )
-            with torch.no_grad():
-                param.copy_(tensor.to(device=param.device, dtype=param.dtype))
-        return loaded
+        # The transformer streams the iterator tensor-by-tensor; no full
+        # checkpoint copy is materialized. (The previous camera_encoder copy
+        # loop was dead code: normalize_sana_wm_stage1_weight_name only emits
+        # ``transformer.*`` names.)
+        return self.transformer.load_weights(weights)
