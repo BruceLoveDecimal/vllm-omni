@@ -41,7 +41,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
 
 import torch
 import triton
@@ -297,8 +296,7 @@ _CAM_IDENTITY_CACHE_MAXSIZE = 32
 # controls register spread; Phase C's loaded M[128,128] is 64 KB → BS controls
 # transient SMEM footprint).
 #
-# Adding a new arch: pick the closest existing bucket, then override individual
-# fields in _CHUNKWISE_SHAPE_OVERRIDES once a targeted sweep lands.
+# Adding a new arch: pick the closest existing bucket in _CHUNKWISE_TUNING.
 
 
 @dataclass(frozen=True)
@@ -420,26 +418,6 @@ _CHUNKWISE_TUNING: dict[tuple[str, str], _ChunkwiseCfg] = {
 }
 
 
-# ──────────────────────────────────────────────────────────────────
-# Shape-aware override table: empty by default. Keyed by
-#     (arch_key, prec_key, shape_hint)
-# where shape_hint is a free-form string (e.g. "small_BH", "large_F",
-# "B>=8") chosen when populating. Lookup is exact-match; values are
-# full `_ChunkwiseCfg` instances (no partial overrides — copy-paste
-# from `_CHUNKWISE_TUNING` and edit the one phase you want to change).
-#
-# Leave empty unless a targeted sweep shows a particular shape regresses
-# with the broad arch config. Adding here is strictly additive — base
-# table remains the fallback.
-# ──────────────────────────────────────────────────────────────────
-_CHUNKWISE_SHAPE_OVERRIDES: dict[tuple[str, str, str], _ChunkwiseCfg] = {}
-
-
-# Per-(cap, dot_prec) exact overrides (pins a specific GPU model if the arch
-# bucket is wrong for it). Also empty by default.
-_ARCH_OVERRIDES: dict = {}
-
-
 def _arch_key(cap: tuple) -> str:
     """Map compute capability → named arch bucket in `_CHUNKWISE_TUNING`.
 
@@ -465,40 +443,29 @@ def _prec_key(dot_prec: int) -> str:
     return "fp32" if dot_prec >= 1 else "bf16"
 
 
-def _auto_config(dot_prec: int, cap: tuple, shape_hint: str | None = None) -> tuple:
+def _auto_config(dot_prec: int, cap: tuple) -> tuple:
     """Look up chunkwise kernel launch params from the tuning table.
 
     Resolution order:
-      1. `_ARCH_OVERRIDES[(cap, dot_prec)]` — exact-capability pin, highest priority.
-      2. `_CHUNKWISE_SHAPE_OVERRIDES[(arch, prec, shape_hint)]` — sweep-driven overrides.
-      3. `_CHUNKWISE_TUNING[(arch, prec)]` — primary per-(arch, prec) table.
-      4. Fallback to ("ampere", prec) if the arch is unrecognised.
+      1. `_CHUNKWISE_TUNING[(arch, prec)]` — primary per-(arch, prec) table.
+      2. Fallback to ("ampere", prec) if the arch is unrecognised.
 
     Returns the legacy 8-tuple `(a_nw, a_BS, b_nw, b_ns, b_use_acc, c_nw, c_BS, c_ns)`
     for backward compatibility with `_get_arch_config` callers.
     """
-    arch = _arch_key(cap)
     prec = _prec_key(dot_prec)
-
-    if shape_hint is not None:
-        cfg = _CHUNKWISE_SHAPE_OVERRIDES.get((arch, prec, shape_hint))
-        if cfg is not None:
-            return cfg.as_tuple()
-
-    cfg = _CHUNKWISE_TUNING.get((arch, prec)) or _CHUNKWISE_TUNING[("ampere", prec)]
+    cfg = _CHUNKWISE_TUNING.get((_arch_key(cap), prec)) or _CHUNKWISE_TUNING[("ampere", prec)]
     return cfg.as_tuple()
 
 
 def _get_arch_config(
     dot_precision: int = 0,
-    shape_hint: str | None = None,
     device: torch.device | int | None = None,
 ):
     """Returns (a_warps, a_BLOCK_S, b_warps, b_stages, b_use_acc_fusion,
                 c_warps, c_BLOCK_S, c_stages).
 
     dot_precision: 0=bf16 TC, 1=TF32 TC, 2=IEEE fp32.
-    shape_hint:    optional string key for `_CHUNKWISE_SHAPE_OVERRIDES`.
     device:        device whose capability drives the lookup. Defaults to the
                    current CUDA device — pass ``qkv.device`` (or any input
                    tensor's device) when launching kernels in heterogeneous
@@ -515,10 +482,7 @@ def _get_arch_config(
         else:
             dev_idx = device.index if device.index is not None else torch.cuda.current_device()
         cap = torch.cuda.get_device_capability(dev_idx)
-    key = (cap, dot_precision)
-    if key in _ARCH_OVERRIDES:
-        return _ARCH_OVERRIDES[key]
-    return _auto_config(dot_precision, cap, shape_hint)
+    return _auto_config(dot_precision, cap)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1764,178 +1728,13 @@ def _cam_identity_tables(
     D: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Bounded-LRU-cached identity RMS/RoPE tables used by ``cam_scan_chunkwise``.
+    """Bounded-LRU-cached identity RMS/RoPE tables used by ``cam_scan_bidi_chunkwise``.
 
     Normalizes ``device`` to a hashable ``(type, index)`` pair so equivalent
     devices (e.g. ``cuda`` vs ``cuda:0``) share a cache entry.
     """
     device_index = device.index if device.type == "cuda" else None
     return _cam_identity_tables_cached(device.type, device_index, B, N, H, D)
-
-
-def cam_scan_chunkwise(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    decay: torch.Tensor,
-    *,
-    reverse: bool = False,
-    init_state: torch.Tensor | None = None,
-    save_final_state: bool = False,
-    dot_precision: int | None = None,
-):
-    """Drop-in chunkwise replacement for `cam_scan_func`.
-
-    Args mirror `cam_scan_func` exactly:
-      q, k, v: ``(B, H, D, N)`` fp32 contiguous (cam-prep'd: RMSNorm+ReLU+UCPE+RoPE)
-      beta:    ``(B, H, F, S)`` fp32 contiguous
-      decay:   ``(B, H, F)`` fp32 contiguous
-      reverse: bwd flip-and-shift semantics (autograd path); not yet supported.
-      init_state:       optional ``(B*H, BLOCK_D, BLOCK_D)`` fp32 — cross-chunk AR state.
-      save_final_state: when True, also returns ``(out, final_state)``.
-
-    Returns ``out`` of shape ``(B, H, D, N)`` fp32, or
-    ``(out, final_state: (B*H, BLOCK_D, BLOCK_D))`` if save_final_state=True.
-    """
-    assert q.shape == k.shape == v.shape, f"q/k/v shape mismatch: {q.shape} {k.shape} {v.shape}"
-    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-    assert beta.is_contiguous() and decay.is_contiguous()
-    assert q.dtype == torch.float32, f"cam_scan_chunkwise requires fp32 q/k/v (got {q.dtype})"
-
-    if reverse and (init_state is not None or save_final_state):
-        raise NotImplementedError(
-            "cam_scan_chunkwise: state passing (init_state / save_final_state) is "
-            "only supported for the forward direction (reverse=False). The cam "
-            "branch's anti-causal pass resets per chunk; there is no global "
-            "cross-prefix state to cache for the reverse direction."
-        )
-
-    B, H, D, N = q.shape
-    F = beta.shape[2]
-    assert N % F == 0
-    S = N // F
-    assert beta.shape == (B, H, F, S)
-    assert decay.shape == (B, H, F)
-
-    BLOCK_D = triton.next_power_of_2(D)
-
-    if dot_precision is None:
-        dot_precision = _default_dot_prec()
-
-    # Repack (B, H, D, N) → (B, N, 3, H, D) for chunkwise's qkv layout.
-    # Avoid ``stack(...).permute(...).contiguous()`` because that materializes
-    # two large tensors. Direct packing allocates the destination once.
-    qkv = torch.empty(B, N, 3, H, D, device=q.device, dtype=q.dtype)
-    qkv[:, :, 0].copy_(q.permute(0, 3, 1, 2))
-    qkv[:, :, 1].copy_(k.permute(0, 3, 1, 2))
-    qkv[:, :, 2].copy_(v.permute(0, 3, 1, 2))
-
-    # Identity prep tables — make chunkwise's RMSNorm + RoPE no-ops.
-    ones_inv_rms, ones_nw, ones_cos, zeros_sin = _cam_identity_tables(B=B, N=N, H=H, D=D, device=q.device)
-
-    # Phase A (skip_relu=True for cam-prep'd K; skip_z=True since cam has no Z scan).
-    # k_scale=1.0 because cam_prep already applied K-scale.
-    I_P_kv, A_, I_P_z, B_z = phase_a(
-        qkv,
-        beta,
-        ones_inv_rms,
-        ones_inv_rms,
-        ones_nw,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
-        F=F,
-        S=S,
-        k_scale=1.0,
-        norm_eps=1e-5,
-        dot_precision=dot_precision,
-        skip_relu=True,
-        skip_z=True,
-    )
-
-    # Phase B (forward direction only; cam supports init_state on fwd, save_final
-    # on fwd; no rev). Pads (B*H, D, D) ↔ (B*H, BLOCK_D, BLOCK_D) inline.
-    init_kv_padded = None
-    init_z_padded = None
-    if init_state is not None:
-        if init_state.shape != (B * H, BLOCK_D, BLOCK_D):
-            raise ValueError(
-                f"cam_scan_chunkwise: init_state shape {tuple(init_state.shape)} "
-                f"!= expected (B*H, BLOCK_D, BLOCK_D) = {(B * H, BLOCK_D, BLOCK_D)}"
-            )
-        if init_state.dtype != torch.float32:
-            raise ValueError(f"cam_scan_chunkwise: init_state must be fp32 (got {init_state.dtype}).")
-        if not init_state.is_contiguous():
-            raise ValueError("cam_scan_chunkwise: init_state must be contiguous.")
-        # Cam stores state as M[K_feat, V_feat]. Chunkwise's Phase B kernel reads
-        # state with offs_dd = i*BLOCK_D + j where i is the fwd loop's M row.
-        # Storage layout matches cam's (row-major (D_K, D_V)), so a direct cast
-        # to fp32 contiguous is enough — no transpose needed.
-        init_kv_padded = init_state.to(torch.float32).contiguous()
-        # No Z state in cam — pass zeros to satisfy phase_b_triton.
-        init_z_padded = torch.zeros(B * H, BLOCK_D, device=q.device, dtype=torch.float32)
-
-    direction = 2 if reverse else 1
-    if save_final_state:
-        M_fwd, z_fwd_out, M_rev, z_rev_out, final_kv, _final_z = phase_b_triton(
-            I_P_kv,
-            A_,
-            I_P_z,
-            B_z,
-            decay,
-            F=F,
-            dot_precision=dot_precision,
-            direction=direction,
-            init_state_kv=init_kv_padded,
-            init_state_z=init_z_padded,
-            return_final_state=True,
-            skip_z=True,
-        )
-    else:
-        M_fwd, z_fwd_out, M_rev, z_rev_out = phase_b_triton(
-            I_P_kv,
-            A_,
-            I_P_z,
-            B_z,
-            decay,
-            F=F,
-            dot_precision=dot_precision,
-            direction=direction,
-            init_state_kv=init_kv_padded,
-            init_state_z=init_z_padded,
-            skip_z=True,
-        )
-
-    # For reverse (flip-and-shift bwd), Phase B's reverse mode produces M_rev
-    # such that M_rev[F-1] = 0 and M_rev[t] = state computed from K/V at frames
-    # {F-1, F-2, ..., t+1} — exactly cam's REVERSE=1 semantics.
-    M_use = M_rev if reverse else M_fwd
-    z_use = z_rev_out if reverse else z_fwd_out
-
-    # Phase C — num-only (NUM_ONLY=True skips den compute + store).
-    # z is unused with NUM_ONLY but still required by the kernel signature.
-    num_out, _ = phase_c(
-        qkv,
-        ones_inv_rms,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
-        M_use,
-        z_use,
-        F=F,
-        S=S,
-        dot_precision=dot_precision,
-        skip_relu=True,
-        num_only=True,
-    )
-
-    # Convert chunkwise output (B, N, H, D) → cam's (B, H, D, N) layout, fp32.
-    out = num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
-
-    if save_final_state:
-        return out, final_kv  # final_kv already (B*H, BLOCK_D, BLOCK_D) fp32
-    return out
 
 
 def cam_scan_bidi_chunkwise(
@@ -1949,8 +1748,8 @@ def cam_scan_bidi_chunkwise(
 ) -> torch.Tensor:
     """Bidirectional camera scan using shared chunkwise phases.
 
-    This is equivalent to ``cam_scan_chunkwise(..., reverse=False) +
-    cam_scan_chunkwise(..., reverse=True)`` for full bidirectional attention,
+    This is equivalent to a forward + reverse single-direction camera scan
+    summed together for full bidirectional attention,
     but it packs QKV once, runs Phase A once, combines forward/reverse histories
     inside Phase B, and runs Phase C once on the summed state.
     """
@@ -2021,11 +1820,6 @@ def cam_scan_bidi_chunkwise(
     return num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
 
 
-SANA_WM_GDN_ERROR = (
-    "Sana-WM fused Bidirectional Gated DeltaNet Triton kernel is unavailable. "
-    "This module falls back to the pure PyTorch reference recurrence when the "
-    "fused NVlabs recurrence cannot be launched."
-)
 SANA_WM_DISABLE_TRITON_GDN_ENV = "VLLM_OMNI_SANA_WM_DISABLE_TRITON_GDN"
 SANA_WM_REQUIRE_TRITON_GDN_ENV = "VLLM_OMNI_SANA_WM_REQUIRE_TRITON_GDN"
 
@@ -2299,112 +2093,9 @@ def triton_bidirectional_gated_delta_net_from_qkv(
     return output.permute(0, 2, 3, 1).contiguous()
 
 
-class BidirectionalGatedDeltaNetTriton(nn.Module):
-    """Reference-compatible wrapper for SANA-WM's model-local GDN operator.
-
-    The fused path is intentionally model-local: SANA-WM uses a bidirectional
-    video-latent recurrence instead of the autoregressive GDN cache contract
-    implemented by vLLM's Qwen3-Next layers.
-    """
-
-    def __init__(self, *, eps: float = 1e-8) -> None:
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        try:
-            beta = kwargs.pop("beta")
-            decay = kwargs.pop("decay")
-            spatial_tokens = int(kwargs.pop("spatial_tokens"))
-        except KeyError as exc:
-            raise TypeError(f"Sana-WM GDN missing required argument: {exc.args[0]}") from exc
-        if kwargs.keys() - {"query_rot", "key_rot", "eps"}:
-            raise TypeError(f"Unexpected Sana-WM GDN arguments: {sorted(kwargs)}")
-        return reference_bidirectional_gated_delta_net(
-            query,
-            key,
-            value,
-            beta=beta,
-            decay=decay,
-            spatial_tokens=spatial_tokens,
-            query_rot=kwargs.pop("query_rot", None),
-            key_rot=kwargs.pop("key_rot", None),
-            eps=float(kwargs.pop("eps", self.eps)),
-        )
-
-
-def warmup_sana_wm_gdn_kernel(
-    *,
-    device: torch.device | str | None = None,
-    dtype: torch.dtype = torch.bfloat16,
-    batch_size: int = 1,
-    frames: int = 2,
-    spatial_tokens: int = 4,
-    num_heads: int = 2,
-    head_dim: int = 16,
-) -> bool:
-    """Compile/autotune the fused SANA-WM GDN kernel with a small workload.
-
-    vLLM's Qwen3-Next GDN path warms its chunked prefill kernels before real
-    inference to avoid first-request autotune after cache allocation. SANA-WM
-    does not use the autoregressive GDN cache path, but the same operational
-    concern applies to the model-local Triton recurrence.
-
-    Returns ``True`` when the warmup ran. Returns ``False`` when CUDA is not
-    available or the fused path is explicitly disabled.
-    """
-
-    if _triton_disabled() or not torch.cuda.is_available():
-        return False
-    device = torch.device(device or "cuda")
-    token_count = frames * spatial_tokens
-    qkv = torch.zeros(
-        batch_size,
-        token_count,
-        3,
-        num_heads,
-        head_dim,
-        device=device,
-        dtype=dtype,
-    )
-    beta = torch.full(
-        (batch_size, num_heads, frames, spatial_tokens),
-        0.5,
-        device=device,
-        dtype=torch.float32,
-    )
-    decay = torch.full(
-        (batch_size, num_heads, frames),
-        0.9,
-        device=device,
-        dtype=torch.float32,
-    )
-
-    class _WarmupNorm(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.eps = 1e-6
-            self.weight = nn.Parameter(torch.ones(num_heads * head_dim, device=device))
-
-    triton_bidirectional_gated_delta_net_from_qkv(
-        qkv,
-        beta=beta,
-        decay=decay,
-        q_norm=_WarmupNorm(),
-        k_norm=_WarmupNorm(),
-        spatial_tokens=spatial_tokens,
-        k_scale=(head_dim**-0.5) * (spatial_tokens**-0.5),
-    )
-    torch.accelerator.synchronize(device)
-    return True
-
-
 __all__ = [
-    "SANA_WM_GDN_ERROR",
     "SANA_WM_DISABLE_TRITON_GDN_ENV",
     "SANA_WM_REQUIRE_TRITON_GDN_ENV",
-    "BidirectionalGatedDeltaNetTriton",
     "reference_bidirectional_gated_delta_net",
     "triton_bidirectional_gated_delta_net_from_qkv",
-    "warmup_sana_wm_gdn_kernel",
 ]
