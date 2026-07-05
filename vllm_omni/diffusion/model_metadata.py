@@ -11,6 +11,7 @@ class DiffusionModelMetadata:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     attention_mask_free: bool = False
+    skip_dummy_run: bool = False
 
 
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
@@ -40,6 +41,16 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "WanImageToVideoPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanVACEPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanS2VPipeline": DiffusionModelMetadata(attention_mask_free=True),
+    "SanaWmPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        skip_dummy_run=True,
+    ),
+    "SanaWmTwoStagesPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        skip_dummy_run=True,
+    ),
 }
 
 

@@ -2949,6 +2949,7 @@ async def _parse_video_form(
     frame_interpolation_scale: float | None = Form(default=None, gt=0.0),
     frame_interpolation_model_path: str | None = Form(default=None),
     lora: str | None = Form(default=None),
+    sana_wm: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
 ) -> tuple[
     VideoGenerationRequest,
@@ -3005,6 +3006,7 @@ async def _parse_video_form(
         "frame_interpolation_scale": frame_interpolation_scale,
         "frame_interpolation_model_path": frame_interpolation_model_path,
         "lora": _parse_form_json(lora, expected_type=dict),
+        "sana_wm": _parse_form_json(sana_wm, expected_type=dict),
         "extra_params": _parse_form_json(extra_params, expected_type=dict),
     }
     request_data = {k: v for k, v in request_data.items() if v is not None}
