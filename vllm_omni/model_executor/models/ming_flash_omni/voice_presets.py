@@ -63,6 +63,7 @@ class VoicePresetRegistry:
     def get(self, voice_name: str) -> dict[str, Any] | None:
         return self.registered.get(voice_name)
 
+    @torch.no_grad()
     def register(
         self,
         voice_name: str,
@@ -72,6 +73,11 @@ class VoicePresetRegistry:
         dtype: torch.dtype,
     ) -> None:
         """Register a voice preset from one or more reference wav files.
+
+        Runs under ``torch.no_grad()``: the spk-head / AudioVAE / aggregator
+        forwards here touch model weights that vLLM loads as inference-mode
+        tensors, and tracking them through autograd raises "Inference tensors
+        cannot be saved for backward" on newer torch/vLLM.
 
         Args:
             voice_name: Key under which to store the preset.
@@ -161,6 +167,30 @@ class VoicePresetRegistry:
                 self.registered[name]["prompt_text"] = prompt_text
             except Exception as e:  # pragma: no cover — manifest is best-effort
                 logger.warning("Failed to register voice preset '%s': %s", name, e)
+
+        self._write_prompt_meta_sidecar()
+
+    def _write_prompt_meta_sidecar(self) -> None:
+        """Publish per-voice prompt lengths so the stage input processor can
+        size native prompt-KV slots to match the model's prefill embeddings.
+
+        ``prompt_wav_len`` is only known after the AudioVAE encodes each preset
+        wav, so it cannot be derived ahead of time by the input processor.
+        """
+        from .talker_module import write_ming_voice_meta
+
+        meta: dict[str, dict[str, Any]] = {}
+        for name, info in self.registered.items():
+            emb = info.get("prompt_wav_emb")
+            prompt_wav_len = int(emb.size(1)) if emb is not None and hasattr(emb, "size") else 0
+            spk = info.get("spk_emb")
+            spk_emb_count = len(spk) if isinstance(spk, list) else (0 if spk is None else 1)
+            meta[name] = {
+                "prompt_text": info.get("prompt_text", "") or "",
+                "prompt_wav_len": prompt_wav_len,
+                "spk_emb_count": spk_emb_count,
+            }
+        write_ming_voice_meta(self._model_path, meta)
 
     @cached_property
     def _spkemb_extractor(self) -> SpkembExtractor:
