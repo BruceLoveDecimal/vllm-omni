@@ -10,6 +10,7 @@ class DiffusionModelMetadata:
     # config/model plumbing can read it without importing concrete pipelines.
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
+    skip_dummy_run: bool = False
 
 
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
@@ -25,6 +26,16 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HunyuanImage3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
+    ),
+    "SanaWmPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        skip_dummy_run=True,
+    ),
+    "SanaWmTwoStagesPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        skip_dummy_run=True,
     ),
 }
 

@@ -230,6 +230,21 @@ def _try_resolve_omni_model_type(model: str) -> str | None:
     return best_match
 
 
+def _looks_like_sana_wm_layout(model: str) -> bool:
+    path = Path(model)
+    if path.is_dir():
+        return (path / "config.yaml").is_file() and (path / "dit" / "sana_wm_1600m_720p.safetensors").is_file()
+
+    try:
+        return file_or_path_exists(model, "config.yaml", revision=None) and file_or_path_exists(
+            model,
+            "dit/sana_wm_1600m_720p.safetensors",
+            revision=None,
+        )
+    except Exception:
+        return "sana-wm" in model.lower() or "sana_wm" in model.lower()
+
+
 def resolve_model_config_path(model: str) -> str:
     """Resolve the stage config file path from the model name.
 
@@ -279,6 +294,8 @@ def resolve_model_config_path(model: str) -> str:
             # No config.json at repo root (e.g. GLM-TTS stores configs in
             # subdirectories only).  Try matching against registered deploy
             # YAML filenames before giving up.
+            if _looks_like_sana_wm_layout(model):
+                return None
             model_type = _try_resolve_omni_model_type(model)
             if model_type is None:
                 raise ValueError(
