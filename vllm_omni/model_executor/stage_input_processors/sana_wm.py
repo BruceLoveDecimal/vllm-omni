@@ -20,7 +20,6 @@ SANA_WM_DEFAULT_HEIGHT = 704
 SANA_WM_DEFAULT_WIDTH = 1280
 SANA_WM_DEFAULT_CAMERA_FORMAT = "c2w_4x4"
 SANA_WM_DEFAULT_COORDINATE_SYSTEM = "official"
-SANA_WM_SUPPORTED_INTRINSICS_SHAPES = ((3, 3), (4,))
 
 
 def _unwrap_single(value: Any) -> Any:
@@ -37,27 +36,11 @@ def _as_dict(value: Any, *, name: str) -> dict[str, Any]:
     return dict(value)
 
 
-def _shape_of(value: Any) -> tuple[int, ...] | None:
-    shape = getattr(value, "shape", None)
-    if shape is not None:
-        try:
-            return tuple(int(dim) for dim in shape)
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
 def _is_sequence(value: Any) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
 
 
 def _validate_numeric_matrix4x4(matrix: Any, *, name: str) -> None:
-    shape = _shape_of(matrix)
-    if shape is not None:
-        if shape != (4, 4):
-            raise ValueError(f"Sana-WM {name} must have shape (4, 4), got {shape}.")
-        return
-
     if not _is_sequence(matrix) or len(matrix) != 4:
         raise ValueError(f"Sana-WM {name} must be a 4x4 matrix.")
     for row_idx, row in enumerate(matrix):
@@ -71,12 +54,6 @@ def _validate_numeric_matrix4x4(matrix: Any, *, name: str) -> None:
 
 
 def _validate_numeric_matrix3x3(matrix: Any, *, name: str) -> None:
-    shape = _shape_of(matrix)
-    if shape is not None:
-        if shape != (3, 3):
-            raise ValueError(f"Sana-WM {name} must have shape (3, 3), got {shape}.")
-        return
-
     if not _is_sequence(matrix) or len(matrix) != 3:
         raise ValueError(f"Sana-WM {name} must be a 3x3 matrix.")
     for row_idx, row in enumerate(matrix):
@@ -90,14 +67,6 @@ def _validate_numeric_matrix3x3(matrix: Any, *, name: str) -> None:
 
 
 def _validate_camera_poses(poses: Any, *, num_frames: int | None = None) -> None:
-    shape = _shape_of(poses)
-    if shape is not None:
-        if len(shape) != 3 or shape[1:] != (4, 4):
-            raise ValueError(f"Sana-WM camera poses must have shape (F, 4, 4), got {shape}.")
-        if num_frames is not None and shape[0] != num_frames:
-            raise ValueError(f"Sana-WM camera poses length {shape[0]} must equal num_frames {num_frames}.")
-        return
-
     if not _is_sequence(poses) or len(poses) == 0:
         raise ValueError("Sana-WM camera poses must be a non-empty sequence of 4x4 matrices.")
     if num_frames is not None and len(poses) != num_frames:
@@ -120,18 +89,6 @@ def _validate_intrinsics(intrinsics: Any, *, num_frames: int | None = None) -> N
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"Sana-WM intrinsics[{key!r}] must be numeric.") from exc
         return
-
-    shape = _shape_of(intrinsics)
-    if shape is not None:
-        if shape in SANA_WM_SUPPORTED_INTRINSICS_SHAPES:
-            return
-        if len(shape) == 3 and shape[1:] == (3, 3):
-            if num_frames is not None and shape[0] not in (1, num_frames):
-                raise ValueError(
-                    f"Sana-WM per-frame intrinsics length {shape[0]} must be 1 or num_frames {num_frames}."
-                )
-            return
-        raise ValueError("Sana-WM intrinsics must have shape (3, 3), (F, 3, 3), or (4,).")
 
     if _is_sequence(intrinsics):
         if len(intrinsics) == 0:
@@ -270,11 +227,6 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool 
         canonical["translation_speed"] = _as_positive_float(translation_speed, name="translation_speed")
     if rotation_speed_deg is not None:
         canonical["rotation_speed_deg"] = _as_positive_float(rotation_speed_deg, name="rotation_speed_deg")
-    official_repo_path = raw.get("official_repo_path")
-    if official_repo_path is not None:
-        if not isinstance(official_repo_path, str) or not official_repo_path.strip():
-            raise ValueError("Sana-WM official_repo_path must be a non-empty string when provided.")
-        canonical["official_repo_path"] = official_repo_path
 
     if image is not None:
         mm_data["image"] = image
@@ -283,19 +235,3 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool 
     result["additional_information"] = additional
     result.pop(SANA_WM_CANONICAL_KEY, None)
     return result
-
-
-def ar2diffusion(
-    source_outputs: list[Any],
-    prompt: Mapping[str, Any] | list[Mapping[str, Any]] | None = None,
-    requires_multimodal_data: bool = False,
-    streaming_context: Any | None = None,
-) -> list[dict[str, Any]]:
-    """Normalize Sana-WM request payloads for a downstream diffusion stage."""
-
-    del source_outputs, requires_multimodal_data, streaming_context
-
-    if prompt is None:
-        return []
-    prompts = prompt if isinstance(prompt, list) else [prompt]
-    return [normalize_sana_wm_payload(p) for p in prompts]
