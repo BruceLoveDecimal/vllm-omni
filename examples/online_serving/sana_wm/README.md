@@ -7,7 +7,7 @@ camera trajectory.
 
 For the video endpoint contract, see
 [Videos API](../../../docs/serving/videos_api.md). For deployment guidance, see
-the [SANA-WM recipe](../../../recipes/Efficient-Large-Model/SANA-WM.md).
+the [SANA-WM recipe](../../../recipes/sana/SANA-WM.md).
 
 ## Start Server
 

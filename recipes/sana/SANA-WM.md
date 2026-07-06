@@ -8,6 +8,10 @@
 - Model: `Efficient-Large-Model/SANA-WM_bidirectional`
 - Task: First-frame image-to-video generation with camera control
 - Mode: Online serving with the OpenAI-compatible video API
+- Model weights: approximately 102 GB for the full SANA-WM pipeline with refiner
+- Local disk: reserve approximately 180 GB for the Hugging Face cache, refiner
+  weights, and runtime artifacts
+- Recommended GPU: 1x NVIDIA RTX PRO 6000 Blackwell 96 GB, or a larger CUDA GPU
 - Maintainer: Community
 
 ## When to use this recipe
@@ -28,7 +32,19 @@ two-stage pipeline: SANA-WM Stage-1 DiT plus the bundled LTX-2 refiner.
 
 ## GPU
 
-### 1x H100 80GB
+### 1x NVIDIA RTX PRO 6000 Blackwell 96GB
+
+#### Capacity
+
+- Model storage: the SANA-WM model weights plus the bundled refiner are about
+  102 GB.
+- Disk sizing: provision about 180 GB of local disk or Hugging Face cache volume
+  so the model, refiner, temporary downloads, and generated artifacts fit
+  without cache eviction.
+- GPU sizing: use one RTX PRO 6000 Blackwell 96 GB class GPU or larger for the
+  default 1280x704, 161-frame, 60-step serving profile below. On smaller GPUs,
+  lower `width`, `height`, `num_frames`, or refiner settings before serving
+  production requests.
 
 #### Environment
 
