@@ -11,12 +11,13 @@ the [SANA-WM recipe](../../../recipes/sana/SANA-WM.md).
 
 ## Start Server
 
-SANA-WM uses a deploy config because the Hugging Face repository does not ship a
-standard Diffusers `model_index.json`. Use the model ID as the positional
-argument and pass the deploy YAML explicitly:
+The repository ships the standard Diffusers layout (`model_index.json` +
+`transformer/`, `vae/`, `refiner/`). SANA-WM still needs a deploy config to wire
+its omni serving stages, so use the model ID as the positional argument and pass
+the deploy YAML explicitly:
 
 ```bash
-vllm serve Efficient-Large-Model/SANA-WM_bidirectional \
+vllm serve BBBBruce/SANA-WM_bidirectional-diffusers \
   --omni \
   --deploy-config vllm_omni/deploy/sana_wm.yaml \
   --host 0.0.0.0 \

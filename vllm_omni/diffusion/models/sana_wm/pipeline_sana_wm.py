@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 import torch
 import torch.nn.functional as F
 from torch import nn
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -42,14 +43,19 @@ from vllm_omni.diffusion.models.sana_wm.scheduling_sana_wm import (
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.stage_input_processors.sana_wm import normalize_sana_wm_payload
 
-SANA_WM_MODEL_ID = "Efficient-Large-Model/SANA-WM_bidirectional"
+# The loader expects the standard diffusers layout (transformer/config.json +
+# transformer/diffusion_pytorch_model.safetensors + model_index.json). This
+# repo is that layout, converted offline from the NVlabs bespoke weights; the
+# original bespoke repo (Efficient-Large-Model/SANA-WM_bidirectional) no longer
+# loads as-is.
+SANA_WM_MODEL_ID = "BBBBruce/SANA-WM_bidirectional-diffusers"
 
-SANA_WM_STAGE1_DIT_FILE = "dit/sana_wm_1600m_720p.safetensors"
-SANA_WM_CONFIG_FILE = "config.yaml"
+SANA_WM_STAGE1_DIT_FILE = "transformer/diffusion_pytorch_model.safetensors"
+SANA_WM_CONFIG_FILE = "transformer/config.json"
 SANA_WM_VAE_CONFIG_FILE = "vae/config.json"
 SANA_WM_VAE_WEIGHT_FILE = "vae/diffusion_pytorch_model.safetensors"
 SANA_WM_REFINER_TRANSFORMER_CONFIG_FILE = "refiner/transformer/config.json"
@@ -81,7 +87,7 @@ SANA_WM_STAGE1_PATTERNS = (
     SANA_WM_VAE_CONFIG_FILE,
     SANA_WM_VAE_WEIGHT_FILE,
 )
-SANA_WM_STAGE1_DIT_SUBFOLDER = "dit"
+SANA_WM_STAGE1_DIT_SUBFOLDER = "transformer"
 SANA_WM_STAGE1_DIT_BASENAME = Path(SANA_WM_STAGE1_DIT_FILE).name
 SANA_WM_REFINER_PATTERNS = (
     SANA_WM_REFINER_TRANSFORMER_CONFIG_FILE,
@@ -230,20 +236,20 @@ def get_sana_wm_pre_process_func(od_config: OmniDiffusionConfig):
         from vllm_omni.inputs.data import OmniTextPrompt
 
         sampling_params = getattr(request, "sampling_params", None)
-        for idx, prompt in enumerate(request.prompts):
-            prompt_mapping = OmniTextPrompt(prompt=prompt) if isinstance(prompt, str) else prompt
-            if sampling_params is not None:
-                prompt_mapping = dict(prompt_mapping)
-                if getattr(sampling_params, "num_frames", None) not in (None, 1):
-                    prompt_mapping.setdefault("num_frames", sampling_params.num_frames)
-                if getattr(sampling_params, "height", None) is not None:
-                    prompt_mapping.setdefault("height", sampling_params.height)
-                if getattr(sampling_params, "width", None) is not None:
-                    prompt_mapping.setdefault("width", sampling_params.width)
-            request.prompts[idx] = normalize_sana_wm_payload(prompt_mapping)
+        prompt = request.prompt
+        prompt_mapping = OmniTextPrompt(prompt=prompt) if isinstance(prompt, str) else prompt
+        if sampling_params is not None:
+            prompt_mapping = dict(prompt_mapping)
+            if getattr(sampling_params, "num_frames", None) not in (None, 1):
+                prompt_mapping.setdefault("num_frames", sampling_params.num_frames)
+            if getattr(sampling_params, "height", None) is not None:
+                prompt_mapping.setdefault("height", sampling_params.height)
+            if getattr(sampling_params, "width", None) is not None:
+                prompt_mapping.setdefault("width", sampling_params.width)
+        request.prompt = normalize_sana_wm_payload(prompt_mapping)
 
-        if sampling_params is not None and request.prompts:
-            payload = request.prompts[0]["additional_information"]["sana_wm"]
+        if sampling_params is not None:
+            payload = request.prompt["additional_information"]["sana_wm"]
             sampling_params.num_frames = payload["num_frames"]
             sampling_params.height = payload["height"]
             sampling_params.width = payload["width"]
@@ -288,7 +294,7 @@ class SanaWmPipeline(
         if od_config is not None and od_config.model is not None:
             # Resolve the checkpoint once at construction (the standard
             # startup-time flow, like every other diffusion pipeline) so the
-            # transformer below is built with the released config.yaml shape
+            # transformer below is built with the transformer/config.json shape
             # rather than defaults.
             self.resolve_checkpoint()
             self.weights_sources = [
@@ -296,7 +302,10 @@ class SanaWmPipeline(
                     model_or_path=od_config.model,
                     subfolder=SANA_WM_STAGE1_DIT_SUBFOLDER,
                     revision=od_config.revision,
-                    prefix="",
+                    # The subfolder file carries module-local keys (standard
+                    # diffusers layout); prefix them into the pipeline
+                    # namespace for the loader's strict-coverage check.
+                    prefix="transformer.",
                     fall_back_to_pt=False,
                     allow_patterns_overrides=[SANA_WM_STAGE1_DIT_BASENAME],
                 )
@@ -321,7 +330,7 @@ class SanaWmPipeline(
             include_refiner=include,
             revision=self.od_config.revision,
         )
-        self.sana_wm_config = SanaWmConfig.from_yaml(self.release_paths.config)
+        self.sana_wm_config = SanaWmConfig.from_json(self.release_paths.config)
         self.camera_encoder = None
         return self.release_paths
 
@@ -892,7 +901,7 @@ class SanaWmPipeline(
             },
         )
 
-    def forward(self, req: OmniDiffusionRequest, *args: Any, **kwargs: Any) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, *args: Any, **kwargs: Any) -> DiffusionOutput:
         del args, kwargs
         if len(req.prompts) != 1:
             raise ValueError("Sana-WM native backend currently supports exactly one prompt per request.")
@@ -925,8 +934,8 @@ class SanaWmPipeline(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
-        # The transformer streams the iterator tensor-by-tensor; no full
-        # checkpoint copy is materialized. (The previous camera_encoder copy
-        # loop was dead code: normalize_sana_wm_stage1_weight_name only emits
-        # ``transformer.*`` names.)
-        return self.transformer.load_weights(weights)
+        # Keys arrive pipeline-prefixed (``transformer.*``, per the component
+        # source). AutoWeightsLoader streams them to the submodule and returns
+        # the prefixed names the loader's strict-coverage check compares.
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
