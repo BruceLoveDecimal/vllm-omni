@@ -5,7 +5,7 @@
 ## Summary
 
 - Vendor: Efficient-Large-Model / NVlabs SANA
-- Model: `Efficient-Large-Model/SANA-WM_bidirectional`
+- Model: `BBBBruce/SANA-WM_bidirectional-diffusers` (standard diffusers layout, converted offline from the NVlabs release)
 - Task: First-frame image-to-video generation with camera control
 - Mode: Online serving with the OpenAI-compatible video API
 - Model weights: approximately 102 GB for the full SANA-WM pipeline with refiner
@@ -64,7 +64,7 @@ standard Diffusers `model_index.json`.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-vllm serve Efficient-Large-Model/SANA-WM_bidirectional \
+vllm serve BBBBruce/SANA-WM_bidirectional-diffusers \
   --omni \
   --deploy-config vllm_omni/deploy/sana_wm.yaml \
   --host 0.0.0.0 \

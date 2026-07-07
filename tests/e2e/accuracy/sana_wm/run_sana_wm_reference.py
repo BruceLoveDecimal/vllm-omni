@@ -5,17 +5,23 @@
 
 This is the *reference* (official NVlabs) generation used as the baseline for
 the native vLLM-Omni implementation. It does NOT vendor the NVlabs code — it
-imports the official ``inference_video_scripts/inference_sana_wm.py`` from the
-checkout pointed at by ``VLLM_OMNI_SANA_WM_OFFICIAL_REPO`` (the same mechanism
-``sana_wm_transformer._import_nvlabs_cam_scan_bidi`` uses), so this file stays
-small and the heavyweight reference implementation lives upstream.
+imports the official ``inference_sana_wm.py`` from the checkout pointed at by
+``VLLM_OMNI_SANA_WM_OFFICIAL_REPO``, so this file stays small and the
+heavyweight reference implementation lives upstream.
 
 Run standalone to produce a reference clip:
 
     VLLM_OMNI_SANA_WM_OFFICIAL_REPO=/path/to/NVlabs-Sana \
-    SANA_WM_E2E_MODEL=/path/to/SANA-WM_bidirectional/snapshots/<rev> \
+    SANA_WM_REF_MODEL=/path/to/SANA-WM_bidirectional/snapshots/<rev> \
     python -m tests.e2e.accuracy.sana_wm.run_sana_wm_reference \
         --num-frames 161 --steps 60 --cfg 5.0 --seed 42 --output ref.npy
+
+The reference consumes the *original* NVlabs checkpoint layout (``config.yaml``
++ ``dit/*.safetensors`` with NVlabs key names); the converted diffusers layout
+carries neither, so the reference root is resolved separately from the native
+``SANA_WM_E2E_MODEL``:
+``SANA_WM_REF_MODEL`` first, falling back to ``SANA_WM_E2E_MODEL`` for
+pre-conversion snapshots.
 
 ``refiner=None`` keeps the comparison on the Stage-1 DiT + SANA VAE decode,
 matching the native ``SanaWmPipeline`` (``sana_wm_output_type="np"``) path.
@@ -42,12 +48,41 @@ CFG_SCALE = 5.0
 TRANSLATION_SPEED = 0.055
 
 
+REF_CONFIG_FILE = "config.yaml"
+REF_STAGE1_DIT_FILE = "dit/sana_wm_1600m_720p.safetensors"
+
+
+def reference_model_root() -> Path | None:
+    """Root of an original-layout SANA-WM snapshot, or None if unavailable."""
+    root = os.environ.get("SANA_WM_REF_MODEL") or os.environ.get("SANA_WM_E2E_MODEL")
+    if not root:
+        return None
+    path = Path(root).expanduser()
+    return path if (path / REF_CONFIG_FILE).is_file() else None
+
+
+# Upstream moved the WM inference script into a wm/ subdir (NVlabs/Sana#417);
+# accept both layouts so old and new checkouts work.
+_OFFICIAL_SCRIPT_CANDIDATES = (
+    Path("inference_video_scripts") / "wm" / "inference_sana_wm.py",
+    Path("inference_video_scripts") / "inference_sana_wm.py",
+)
+
+
+def _official_script(repo: Path) -> Path | None:
+    for rel in _OFFICIAL_SCRIPT_CANDIDATES:
+        script = repo / rel
+        if script.is_file():
+            return script
+    return None
+
+
 def official_repo() -> Path | None:
     repo = os.environ.get("VLLM_OMNI_SANA_WM_OFFICIAL_REPO", "")
     if not repo:
         return None
     path = Path(repo)
-    return path if (path / "inference_video_scripts" / "inference_sana_wm.py").is_file() else None
+    return path if _official_script(path) is not None else None
 
 
 def load_official_module() -> ModuleType:
@@ -56,11 +91,12 @@ def load_official_module() -> ModuleType:
     if repo is None:
         raise RuntimeError(
             "VLLM_OMNI_SANA_WM_OFFICIAL_REPO must point at an NVlabs-Sana checkout "
-            "containing inference_video_scripts/inference_sana_wm.py."
+            "containing inference_video_scripts/[wm/]inference_sana_wm.py."
         )
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
-    script = repo / "inference_video_scripts" / "inference_sana_wm.py"
+    script = _official_script(repo)
+    assert script is not None
     spec = importlib.util.spec_from_file_location("_sana_wm_official_ref", script)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load NVlabs reference from {script}.")
@@ -113,17 +149,25 @@ def generate_reference(
     """Run the NVlabs reference Stage-1 + SANA VAE decode. Returns (T,H,W,3) uint8."""
     import torch
 
-    from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import resolve_sana_wm_local_paths
-
     module = load_official_module()
-    model_root = os.environ["SANA_WM_E2E_MODEL"]
-    paths = resolve_sana_wm_local_paths(model_root)
-    config = module.pyrallis.parse(config_class=module.InferenceConfig, config_path=str(paths.config), args=[])
-    config.vae.vae_pretrained = str(paths.root)
+    model_root = reference_model_root()
+    if model_root is None:
+        raise RuntimeError(
+            "The NVlabs reference needs the original checkpoint layout "
+            f"({REF_CONFIG_FILE} + {REF_STAGE1_DIT_FILE}); the converted diffusers "
+            "layout carries neither. Point SANA_WM_REF_MODEL at an "
+            "Efficient-Large-Model/SANA-WM_bidirectional snapshot."
+        )
+    config = module.pyrallis.parse(
+        config_class=module.InferenceConfig,
+        config_path=str(model_root / REF_CONFIG_FILE),
+        args=[],
+    )
+    config.vae.vae_pretrained = str(model_root)
 
     pipe = module.SanaWMPipeline(
         config=config,
-        model_path=str(paths.stage1_dit),
+        model_path=str(model_root / REF_STAGE1_DIT_FILE),
         device=torch.device("cuda"),
         refiner=None,
         offload_vae=True,

@@ -1,9 +1,9 @@
 # SANA-WM I2V deploy: single-stage (Stage-1 DiT + LTX-2 refiner, native smoke path).
 #
-# model_class_name must be set here because the SANA-WM HF repo has no
-# model_index.json; data.py detects the layout heuristically but allows the
-# yaml to override.  skip_mm_profiling is required because diffusion_engine.py
-# skips dummy_run for SanaWmTwoStagesPipeline.
+# The converted checkpoint ships a standard diffusers model_index.json whose
+# _class_name already resolves to SanaWmTwoStagesPipeline; model_class_name is
+# kept here as an explicit override.  skip_mm_profiling is required because
+# diffusion_engine.py skips dummy_run for SanaWmTwoStagesPipeline.
 #
 # default_sampling_params mirror the NVlabs-recommended production inference
 # config. See recipes/sana/SANA-WM.md and examples/online_serving/sana_wm/README.md

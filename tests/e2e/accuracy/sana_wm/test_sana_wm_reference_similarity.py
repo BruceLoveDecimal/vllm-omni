@@ -10,8 +10,10 @@ Runs the same first-frame / camera / prompt / resolution / steps through both:
 
 then compares the decoded RGB frames with SSIM/PSNR.
 
-Gated: requires CUDA, the SANA-WM weights (``SANA_WM_E2E_MODEL``), and the
-official checkout (``VLLM_OMNI_SANA_WM_OFFICIAL_REPO``); skipped otherwise.
+Gated: requires CUDA, the SANA-WM weights (``SANA_WM_E2E_MODEL``, plus
+``SANA_WM_REF_MODEL`` pointing at an original-layout snapshot for the
+reference side once ``SANA_WM_E2E_MODEL`` is a converted diffusers tree), and
+the official checkout (``VLLM_OMNI_SANA_WM_OFFICIAL_REPO``); skipped otherwise.
 
 Note on thresholds: native runs in the Omni worker subprocess while the
 reference runs in-process, so the two seed *different* RNG streams and the
@@ -37,6 +39,7 @@ from tests.e2e.accuracy.sana_wm.run_sana_wm_reference import (
     SEED,
     generate_reference,
     make_camera,
+    reference_model_root,
 )
 
 pytestmark = [
@@ -59,6 +62,11 @@ def _require_env() -> str:
         pytest.skip("Set SANA_WM_E2E_MODEL to the SANA-WM checkpoint path.")
     if not os.environ.get("VLLM_OMNI_SANA_WM_OFFICIAL_REPO"):
         pytest.skip("Set VLLM_OMNI_SANA_WM_OFFICIAL_REPO to the NVlabs-Sana checkout.")
+    if reference_model_root() is None:
+        pytest.skip(
+            "Set SANA_WM_REF_MODEL to an original-layout (config.yaml + dit/) "
+            "SANA-WM snapshot for the NVlabs reference side."
+        )
     return model
 
 
@@ -77,7 +85,11 @@ def _native_video(model: str, num_frames: int, steps: int) -> np.ndarray:
                 "prompt": PROMPT,
                 "multi_modal_data": {"image": _first_frame_image(None)},
                 "sana_wm": {
-                    "camera": {"poses": make_camera(num_frames)},
+                    # The vLLM payload follows the JSON contract (nested lists);
+                    # make_camera returns an ndarray, which the payload validator
+                    # rejects as "not a sequence". Serialize to lists here. The
+                    # reference side keeps the ndarray for the NVlabs pipeline.
+                    "camera": {"poses": make_camera(num_frames).tolist()},
                     "num_frames": num_frames,
                     "intrinsics": {
                         "fx": SANA_WM_OUTPUT_WIDTH / 2,

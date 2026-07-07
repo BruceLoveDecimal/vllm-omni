@@ -71,49 +71,10 @@ SANA_WM_STAGE1_LATENT_CHANNELS = 128
 SANA_WM_STAGE1_PROMPT_CHANNELS = 2304
 SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
 SANA_WM_DISABLE_VLLM_OPS_ENV = "VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS"
-SANA_WM_STAGE1_PREFIX_MAP: tuple[tuple[str, str], ...] = (
-    ("y_embedder.", "transformer.y_embedder."),
-    ("t_embedder.", "transformer.t_embedder."),
-    ("t_block.", "transformer.t_block."),
-    ("x_embedder.", "transformer.x_embedder."),
-    ("final_layer.", "transformer.final_layer."),
-    ("plucker_embedder.", "transformer.plucker_embedder."),
-    ("raymap_embedder.", "transformer.raymap_embedder."),
-    ("attention_y_norm.", "transformer.attention_y_norm."),
-)
 
 logger = logging.getLogger(__name__)
 
 _SANA_WM_TRITON_GDN_FALLBACK_WARNED = False
-
-
-def normalize_sana_wm_stage1_weight_name(name: str) -> str | None:
-    """Map released Stage-1 checkpoint keys to planned vLLM-Omni names."""
-
-    if name == "pos_embed":
-        return "transformer.pos_embed"
-    if name.startswith("blocks."):
-        parts = name.split(".", 3)
-        if len(parts) == 3 and parts[2] == "scale_shift_table":
-            return f"transformer.blocks.{parts[1]}.scale_shift_table"
-        if len(parts) < 4:
-            return None
-        _, block_idx, block_module, suffix = parts
-        block_prefix = f"transformer.blocks.{block_idx}."
-        if block_module == "attn":
-            return f"{block_prefix}attn.{suffix}"
-        if block_module == "cross_attn":
-            return f"{block_prefix}cross_attn.{suffix}"
-        if block_module == "mlp":
-            return f"{block_prefix}mlp.{suffix}"
-        if block_module == "plucker_post":
-            return f"{block_prefix}plucker_proj.{suffix}"
-        return f"{block_prefix}{block_module}.{suffix}"
-
-    for source_prefix, target_prefix in SANA_WM_STAGE1_PREFIX_MAP:
-        if name.startswith(source_prefix):
-            return f"{target_prefix}{name.removeprefix(source_prefix)}"
-    return None
 
 
 def _vllm_tp_group_ready() -> bool:
@@ -2118,12 +2079,8 @@ class SanaWmTransformer3DModel(nn.Module):
             self.to(device=device, dtype=dtype)
 
     @staticmethod
-    def _local_name(remapped_name: str) -> str:
-        return remapped_name.removeprefix("transformer.")
-
-    @staticmethod
     def _maybe_shard_loaded_tensor(
-        remapped_name: str,
+        name: str,
         tensor: torch.Tensor,
         target: torch.Tensor,
     ) -> torch.Tensor:
@@ -2153,7 +2110,7 @@ class SanaWmTransformer3DModel(nn.Module):
         if tp_size <= 1 or target_size * tp_size != loaded_size:
             return tensor
         if not any(
-            token in remapped_name
+            token in name
             for token in (
                 ".A_log",
                 ".dt_bias",
@@ -2414,35 +2371,33 @@ class SanaWmTransformer3DModel(nn.Module):
         duplicates: list[str] = []
 
         for source_name, tensor in weights:
-            remapped_name = normalize_sana_wm_stage1_weight_name(source_name)
-            if remapped_name is None:
-                unmapped.append(source_name)
-                continue
-            if remapped_name in loaded:
-                duplicates.append(remapped_name)
+            # Weights ship in the standard diffusers ``transformer/`` layout, so
+            # the checkpoint key is already the module-local parameter name.
+            if source_name in loaded:
+                duplicates.append(source_name)
                 continue
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"Sana-WM weight {source_name!r} must be a torch.Tensor, got {type(tensor).__name__}.")
-            local_name = self._local_name(remapped_name)
-            target = params_dict.get(local_name)
+            target = params_dict.get(source_name)
             if target is None:
-                target = buffers_dict.get(local_name)
+                target = buffers_dict.get(source_name)
             if target is None:
-                raise ValueError(f"Sana-WM weight {remapped_name} was remapped but not consumed by the Stage-1 model.")
+                unmapped.append(source_name)
+                continue
             weight_loader = getattr(target, "weight_loader", None)
             if callable(weight_loader):
                 weight_loader(target, tensor)
             else:
                 if tuple(target.shape) != tuple(tensor.shape):
-                    tensor = self._maybe_shard_loaded_tensor(remapped_name, tensor, target)
+                    tensor = self._maybe_shard_loaded_tensor(source_name, tensor, target)
                 if tuple(target.shape) != tuple(tensor.shape):
                     raise ValueError(
-                        f"Sana-WM weight shape mismatch for {remapped_name}: "
+                        f"Sana-WM weight shape mismatch for {source_name}: "
                         f"expected {tuple(target.shape)}, got {tuple(tensor.shape)}."
                     )
                 with torch.no_grad():
                     target.copy_(tensor.to(device=target.device, dtype=target.dtype))
-            loaded.add(remapped_name)
+            loaded.add(source_name)
 
         if unmapped or duplicates:
             details = []

@@ -21,7 +21,7 @@ from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import (
     get_sana_wm_post_process_func,
     get_sana_wm_pre_process_func,
 )
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 SANA_WM_INPROCESS_REFINER_ARG = "sana_wm_inprocess_refiner"
 SANA_WM_INPROCESS_REFINER_STEPS_ARG = "sana_wm_inprocess_refiner_steps"
@@ -537,7 +537,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             },
         )
 
-    def forward(self, req: OmniDiffusionRequest, *args: Any, **kwargs: Any) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, *args: Any, **kwargs: Any) -> DiffusionOutput:
         extra_args = self._extra_args(getattr(req, "sampling_params", None))
         if bool(extra_args.get("sana_wm_load_refiner_components", False)):
             device, dtype = self._runtime_device_dtype()
