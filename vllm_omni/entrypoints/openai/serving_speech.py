@@ -1938,6 +1938,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         _voice = getattr(request, "voice", None)
         _voice = _voice.strip() if isinstance(_voice, str) else ""
         _voice_created = self._voice_created_at(_voice.lower()) if _voice else 0
+        # Only a *registered* named voice (created_at > 0) may key the speaker
+        # cache by name. The OpenAI speech API requires ``voice`` and clients
+        # commonly send "default" (or any placeholder); for voice cloning the
+        # timbre comes from ref_audio, so an unregistered name must fall through
+        # to content-addressed caching. Otherwise every "default" request
+        # collides on a single cache slot and gets the first caller's speaker
+        # codes back -- silently cloning the wrong voice.
+        _named_voice = _voice if _voice_created > 0 else None
 
         async def _encode_ref(ref_str: str) -> torch.Tensor:
             return await encode_reference_codes(
@@ -1948,7 +1956,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 variant=v,
                 n_vq=n_vq,
                 sr_target=sr_target,
-                voice_name=_voice or None,
+                voice_name=_named_voice,
                 voice_created_at=_voice_created,
             )
 
