@@ -1856,6 +1856,32 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._moss_processor_cache = proc
         return proc
 
+    def _get_moss_ref_encoder(self):
+        """Lazily build the per-server MOSS reference-audio encoder once."""
+        cached = getattr(self, "_moss_ref_encoder", None)
+        if cached is not None:
+            return cached
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import MossReferenceEncoder
+
+        proc = self._get_moss_processor()
+        v = self._moss_variant
+        n_vq = int(getattr(proc.model_config, "n_vq", 32))
+        # Local-v1.5 encodes reference audio at a fixed 24 kHz working rate
+        # regardless of its 48 kHz stereo *output* codec -- mirrors the offline
+        # example's hardcoded encode_audios_from_wav(sampling_rate=24000) for
+        # this variant; proc.model_config.sampling_rate there is the output rate
+        # (48000), the wrong value to resample the reference into.
+        sr_target = 24000 if v == "local" else int(getattr(proc.model_config, "sampling_rate", 24000))
+        encoder = MossReferenceEncoder(
+            proc,
+            variant=v,
+            n_vq=n_vq,
+            sr_target=sr_target,
+            speaker_cache=self._speaker_cache,
+        )
+        self._moss_ref_encoder = encoder
+        return encoder
+
     async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build the talker prompt + ``additional_information`` payload for any
         MOSS-TTS-family request (nano + 5 full variants).
@@ -1920,35 +1946,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # consumes, so skipping this path silently drops all voice-clone
         # conditioning and produces unconditioned/garbage audio online). ----
         proc = self._get_moss_processor()
-        n_vq = int(getattr(proc.model_config, "n_vq", 32))
-        # Local-v1.5 encodes reference audio at a fixed 24 kHz working rate
-        # regardless of its 48 kHz stereo *output* codec -- mirrors the
-        # offline example's hardcoded encode_audios_from_wav(sampling_rate=24000)
-        # for this variant; proc.model_config.sampling_rate there is the
-        # output rate (48000), the wrong value to resample the reference into.
-        sr_target = 24000 if v == "local" else int(getattr(proc.model_config, "sampling_rate", 24000))
 
         # Reference-audio encoding + speaker caching lives in the model package
         # (moss_tts.reference_encoder), mirroring Fish Speech / CosyVoice3 /
         # Qwen3-TTS which keep reference handling with the model rather than in
-        # this shared serving file. Imported lazily so the API-server process
-        # only pulls it on the delay-family path (alongside the upstream proc).
-        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
+        # this shared serving file. The per-server encoder adds content-addressed
+        # caching, single-flight, and micro-batched encoding on top of the
+        # speaker cache (see RFC #4676).
+        encoder = self._get_moss_ref_encoder()
 
         _voice = getattr(request, "voice", None)
         _voice = _voice.strip() if isinstance(_voice, str) else ""
         _voice_created = self._voice_created_at(_voice.lower()) if _voice else 0
+        # Only a registered uploaded voice may key the reference cache by name.
+        # Placeholder API values such as "default" must fall back to ref_audio
+        # content keys, or unrelated voice-clone requests will share one slot.
+        _named_voice = _voice if _voice_created > 0 else None
 
         async def _encode_ref(ref_str: str) -> torch.Tensor:
-            return await encode_reference_codes(
+            return await encoder.encode(
                 ref_str,
-                processor=proc,
                 resolve_ref_audio=self._resolve_ref_audio,
-                speaker_cache=self._speaker_cache,
-                variant=v,
-                n_vq=n_vq,
-                sr_target=sr_target,
-                voice_name=_voice or None,
+                get_artifact_key=self._get_resolved_ref_audio_artifact_key,
+                voice_name=_named_voice,
                 voice_created_at=_voice_created,
             )
 
@@ -1956,10 +1976,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if v in ("tts", "local"):
             user_kwargs["reference"] = [await _encode_ref(request.ref_audio)]
         elif v == "ttsd":
-            refs = [await _encode_ref(request.ref_audio)]
+            # Encode both speakers concurrently so they land in the same batch
+            # window / share single-flight instead of serializing.
             if request.ref_audio_2:
-                refs.append(await _encode_ref(request.ref_audio_2))
-            user_kwargs["reference"] = refs
+                user_kwargs["reference"] = list(
+                    await asyncio.gather(
+                        _encode_ref(request.ref_audio),
+                        _encode_ref(request.ref_audio_2),
+                    )
+                )
+            else:
+                user_kwargs["reference"] = [await _encode_ref(request.ref_audio)]
         elif v == "sound_effect":
             user_kwargs["text"] = request.input or ""  # may be empty
             user_kwargs["ambient_sound"] = request.ambient_sound or ""
