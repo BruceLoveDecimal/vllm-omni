@@ -1334,3 +1334,59 @@ def test_purge_is_noop_on_empty_deques(build_adapter):
     adapter.restore_queues(waiting_queue, running_queue, scheduler_requests={})
     assert running_queue == []
     assert waiting_queue == []
+
+
+# ---------------------------------------------------------------------------
+# Sender-side cleanup on abort (RFC #4676, W5b)
+# ---------------------------------------------------------------------------
+
+
+def _seed_sender_state(adapter, ext: str):
+    adapter.code_prompt_token_ids[ext].append(torch.zeros(3, dtype=torch.long))
+    adapter.put_req_chunk[ext] = 2
+    adapter.requests_num_chunks_sent[ext] = 5
+    adapter.request_payload[ext] = {"x": 1}
+    adapter._pending_streaming_prefills[ext] = {"y": 2}
+
+
+def test_cleanup_sender_clears_all_sender_state(build_adapter):
+    adapter, _ = build_adapter(stage_id=0, model_mode="ar")
+    _seed_sender_state(adapter, "ext-1")
+    adapter.cleanup_sender("ext-1")
+    assert "ext-1" not in adapter.code_prompt_token_ids
+    assert "ext-1" not in adapter.put_req_chunk
+    assert "ext-1" not in adapter.requests_num_chunks_sent
+    assert "ext-1" not in adapter.request_payload
+    assert "ext-1" not in adapter._pending_streaming_prefills
+    # Idempotent: a second call on an unknown id is a no-op.
+    adapter.cleanup_sender("ext-1")
+
+
+def test_cleanup_task_routes_to_cleanup_sender_without_touching_connector(build_adapter):
+    adapter, connector = build_adapter(stage_id=0, model_mode="ar")
+    _seed_sender_state(adapter, "ext-2")
+    adapter._send_single_request({"__cleanup_sender__": "ext-2"})
+    assert "ext-2" not in adapter.code_prompt_token_ids
+    connector.put.assert_not_called()  # cleanup task never sends
+
+
+def test_finish_requests_enqueues_sender_cleanup(build_adapter):
+    adapter, _ = build_adapter(stage_id=0, model_mode="ar")
+    _seed_sender_state(adapter, "ext-3")
+    req = _req("req-3", RequestStatus.FINISHED_ABORTED, external_req_id="ext-3")
+
+    adapter.finish_requests({"req-3"}, RequestStatus.FINISHED_ABORTED, {"req-3": req})
+
+    # Cleanup is deferred to the save thread as a task (not run inline).
+    tasks = [t for t in adapter._pending_save_reqs if t.get("__cleanup_sender__") == "ext-3"]
+    assert len(tasks) == 1
+    # Draining the task reclaims the leaked sender state.
+    adapter._send_single_request(tasks[0])
+    assert "ext-3" not in adapter.code_prompt_token_ids
+    assert "ext-3" not in adapter.put_req_chunk
+
+
+def test_enqueue_sender_cleanup_none_is_noop(build_adapter):
+    adapter, _ = build_adapter(stage_id=0, model_mode="ar")
+    adapter.enqueue_sender_cleanup(None)
+    assert not any(t.get("__cleanup_sender__") for t in adapter._pending_save_reqs)

@@ -291,7 +291,27 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         return False
 
+    def enqueue_sender_cleanup(self, external_req_id: str | None) -> None:
+        """Schedule sender-side state reclamation on the save thread.
+
+        Aborted requests are dropped before ``save_async`` runs, so they never
+        reach the ``is_payload_finished`` cleanup in ``_send_single_request``
+        and their per-request sender state (buffered codes, chunk counters)
+        would leak. Enqueuing the cleanup as a save task keeps it ordered behind
+        any in-flight chunk and off the scheduler thread, avoiding a race with
+        ``save_loop``.
+        """
+        if external_req_id is None:
+            return
+        self._pending_save_reqs.append({"__cleanup_sender__": external_req_id})
+        with self._save_cond:
+            self._save_cond.notify()
+
     def _send_single_request(self, task: dict):
+        cleanup_ext = task.get("__cleanup_sender__")
+        if cleanup_ext is not None:
+            self.cleanup_sender(cleanup_ext)
+            return
         raw_mm = task["multimodal_output"]
         multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
@@ -777,5 +797,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.finished_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)
             self._cancelled_load_reqs.add(req_id)
+
+        # Sender-side reclamation: an aborted request never sends its terminal
+        # chunk (it is dropped before ``save_async``), so reclaim its buffered
+        # codes / chunk counters on the save thread. cleanup_sender is
+        # idempotent, so this is a harmless no-op for pure receiver stages.
+        if requests is not None:
+            for req_id in request_ids:
+                request = requests.get(req_id)
+                self.enqueue_sender_cleanup(getattr(request, "external_req_id", None) if request is not None else None)
 
         return []
