@@ -75,6 +75,74 @@ def _iter_state_row_spans(
 
 
 # ---------------------------------------------------------------------------
+# Audio-code history ring buffer (repetition-penalty window)
+# ---------------------------------------------------------------------------
+#
+# The local depth transformer's per-codebook repetition penalty only ever looks
+# at the last ``AUDIO_HISTORY_WINDOW`` frames. Growing a full ``(T, n_vq)``
+# tensor with ``torch.cat`` every step made both the append and the runner's
+# GPU-resident clone O(T) per step -> O(T^2) per utterance. A fixed-length ring
+# buffer keeps the exact same window at O(1) per step; the CPU materialisation
+# happens only when the penalty is actually active.
+
+AUDIO_HISTORY_WINDOW = 50
+
+
+def _push_code_history(
+    history: torch.Tensor | None,
+    hist_len: int,
+    hist_pos: int,
+    new_codes: torch.Tensor,
+    *,
+    n_vq: int,
+    device: torch.device,
+    window: int = AUDIO_HISTORY_WINDOW,
+) -> tuple[torch.Tensor, int, int]:
+    """Append one ``(n_vq,)`` frame to a fixed-length ring buffer (O(1)).
+
+    ``history`` is a ``(window, n_vq)`` GPU-resident long tensor written in
+    place. Returns the (possibly newly allocated) buffer plus the updated
+    ``hist_len`` (frames written, capped at ``window``) and ``hist_pos`` (next
+    write slot).
+    """
+    if not isinstance(history, torch.Tensor) or history.numel() == 0:
+        history = torch.zeros((window, n_vq), dtype=torch.long, device=device)
+        hist_len = 0
+        hist_pos = 0
+    elif history.device != device:
+        history = history.to(device)
+    history[hist_pos] = new_codes.to(device=device, dtype=torch.long).reshape(-1)
+    hist_pos = (hist_pos + 1) % window
+    hist_len = min(hist_len + 1, window)
+    return history, hist_len, hist_pos
+
+
+def _materialize_code_history(
+    history: torch.Tensor | None,
+    hist_len: int,
+    hist_pos: int,
+    *,
+    n_vq: int,
+) -> list[list[int]]:
+    """Rebuild chronological per-codebook history == the old ``acc[-window:]``.
+
+    Returns ``n_vq`` lists, each the oldest->newest codes for that codebook.
+    Only called when the repetition penalty is active, so the single D2H copy
+    here is not on the penalty-free hot path.
+    """
+    if not isinstance(history, torch.Tensor) or hist_len <= 0:
+        return [[] for _ in range(n_vq)]
+    window = int(history.shape[0])
+    if hist_len < window:
+        ordered = history[:hist_len]
+    else:
+        # Full buffer: oldest frame sits at hist_pos, roll it back to row 0.
+        ordered = torch.roll(history, shifts=-hist_pos, dims=0)
+    tail = ordered.long().cpu().tolist()
+    return [[row[cb] for row in tail] for cb in range(n_vq)]
+
+
+# ---------------------------------------------------------------------------
 # MossTTSDelayTalkerForGeneration
 # ---------------------------------------------------------------------------
 
@@ -863,7 +931,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
-            ("audio_codes", "accumulated"),
+            # Fixed-length repetition-penalty ring buffer (replaces the old
+            # O(T^2) growing ``accumulated`` tensor).
+            ("audio_codes", "history"),
             ("hidden_states", "last"),
         }
 
@@ -1083,15 +1153,14 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 last_h = hidden[row_end - 1].unsqueeze(0)  # (1, H)
                 # Sampling parameters mirror upstream ``MossTTSRealtimeInference.generate``:
                 # 0.8 / 0.6 / 30 + 1.1 repetition penalty over a 50-frame window.
-                rep_window = 50
-                hist_per_cb: list[list[int]] = []
-                acc_for_hist = (info.get("audio_codes", {}) or {}).get("accumulated")
-                if isinstance(acc_for_hist, torch.Tensor) and acc_for_hist.numel() > 0:
-                    tail = acc_for_hist[-rep_window:].long().cpu().tolist()
-                    for cb in range(self.n_vq):
-                        hist_per_cb.append([row[cb] for row in tail])
-                else:
-                    hist_per_cb = [[] for _ in range(self.n_vq)]
+                # The window comes from a fixed-length ring buffer instead of a
+                # growing ``accumulated`` tensor (avoids O(T^2) cat/clone); the
+                # penalty is active (1.1) so the CPU materialisation runs each step.
+                audio_codes = info.get("audio_codes", {}) or {}
+                history = audio_codes.get("history")
+                hist_len = int(audio_codes.get("hist_len", 0))
+                hist_pos = int(audio_codes.get("hist_pos", 0))
+                hist_per_cb = _materialize_code_history(history, hist_len, hist_pos, n_vq=self.n_vq)
                 new_codes = self.local_transformer.generate_frame(
                     last_h,
                     self.local_lm_heads,
@@ -1116,28 +1185,37 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 if ch0 == self.AUDIO_EOS:
                     state["is_stopping"] = True
                     state["step"] = int(state.get("step", 0)) + 1
+                    # Preserve the ring buffer unchanged: the eos frame is not
+                    # appended to history.
                     info["audio_codes"] = {
                         "current": new_codes,
-                        "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
-                    }
-                    continue  # don't append the eos frame to accumulated
-
-                if ch0 in (self.AUDIO_BOS, self.audio_pad_token):
-                    # Skip the bos / pad frames — they don't decode to real audio.
-                    state["step"] = int(state.get("step", 0)) + 1
-                    info["audio_codes"] = {
-                        "current": new_codes,
-                        "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
+                        "history": history,
+                        "hist_len": hist_len,
+                        "hist_pos": hist_pos,
                     }
                     continue
 
-                acc = (info.get("audio_codes", {}) or {}).get("accumulated")
-                if isinstance(acc, torch.Tensor) and acc.numel() > 0:
-                    updated_acc = torch.cat([acc.to(new_codes.device), new_codes.unsqueeze(0)], dim=0)
-                else:
-                    updated_acc = new_codes.unsqueeze(0)
+                if ch0 in (self.AUDIO_BOS, self.audio_pad_token):
+                    # Skip the bos / pad frames — they don't decode to real audio
+                    # and are not appended to the history window.
+                    state["step"] = int(state.get("step", 0)) + 1
+                    info["audio_codes"] = {
+                        "current": new_codes,
+                        "history": history,
+                        "hist_len": hist_len,
+                        "hist_pos": hist_pos,
+                    }
+                    continue
 
-                info["audio_codes"] = {"current": new_codes, "accumulated": updated_acc}
+                history, hist_len, hist_pos = _push_code_history(
+                    history, hist_len, hist_pos, new_codes, n_vq=self.n_vq, device=new_codes.device
+                )
+                info["audio_codes"] = {
+                    "current": new_codes,
+                    "history": history,
+                    "hist_len": hist_len,
+                    "hist_pos": hist_pos,
+                }
                 state["step"] = int(state.get("step", 0)) + 1
                 per_req_codes[i] = new_codes.unsqueeze(0)
                 have_codes = True
@@ -1325,7 +1403,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
-            ("audio_codes", "accumulated"),
+            # Fixed-length repetition-penalty ring buffer (replaces the old
+            # O(T^2) growing ``accumulated`` tensor); stays on GPU so the
+            # per-step in-place write needs no host sync.
+            ("audio_codes", "history"),
             ("hidden_states", "last"),
         }
 
@@ -1524,6 +1605,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         audio_temperature = 1.7
         audio_top_k = 25
         audio_top_p = 0.8
+        audio_repetition_penalty = 1.0
         do_sample_val = True if do_sample is None else bool(do_sample)
 
         for i in range(bsz):
@@ -1531,7 +1613,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             state = dict(info.get("audio_state", {}) or {})
             step = int(state.get("step", 0))
             max_new_frames = int(state.get("max_new_frames", -1))
-            acc = (info.get("audio_codes", {}) or {}).get("accumulated")
+            audio_codes = info.get("audio_codes", {}) or {}
+            history = audio_codes.get("history")
+            hist_len = int(audio_codes.get("hist_len", 0))
+            hist_pos = int(audio_codes.get("hist_pos", 0))
 
             if state.get("is_stopping"):
                 write_update(
@@ -1546,10 +1631,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 )
                 continue
 
-            rep_window = 50
-            if isinstance(acc, torch.Tensor) and acc.numel() > 0:
-                tail = acc[-rep_window:].long().cpu().tolist()
-                hist_per_cb = [[row[cb] for row in tail] for cb in range(self.n_vq)]
+            # Repetition penalty is inert (1.0) for Local v1.5, so the history
+            # window is never consumed on the hot path; only materialise the
+            # ring buffer to a host list when the penalty is actually enabled.
+            if audio_repetition_penalty != 1.0:
+                hist_per_cb = _materialize_code_history(history, hist_len, hist_pos, n_vq=self.n_vq)
             else:
                 hist_per_cb = [[] for _ in range(self.n_vq)]
 
@@ -1563,7 +1649,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 temperature=audio_temperature,
                 top_k=audio_top_k,
                 top_p=audio_top_p,
-                repetition_penalty=1.0,
+                repetition_penalty=audio_repetition_penalty,
                 history_per_codebook=hist_per_cb,
                 generator=generator,
             )
@@ -1579,17 +1665,18 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                         "audio_state": state,
                         "audio_codes": {
                             "current": input_embeds.new_empty((0, self.n_vq), dtype=torch.long),
-                            "accumulated": acc,
+                            "history": history,
+                            "hist_len": hist_len,
+                            "hist_pos": hist_pos,
                             "emit": False,
                         },
                     },
                 )
                 continue
 
-            if isinstance(acc, torch.Tensor) and acc.numel() > 0:
-                updated_acc = torch.cat([acc.to(dev), new_codes.unsqueeze(0)], dim=0)
-            else:
-                updated_acc = new_codes.unsqueeze(0)
+            history, hist_len, hist_pos = _push_code_history(
+                history, hist_len, hist_pos, new_codes, n_vq=self.n_vq, device=dev
+            )
 
             state["step"] = step + 1
             current = new_codes.unsqueeze(0)
@@ -1602,7 +1689,9 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                     "audio_state": state,
                     "audio_codes": {
                         "current": current,
-                        "accumulated": updated_acc,
+                        "history": history,
+                        "hist_len": hist_len,
+                        "hist_pos": hist_pos,
                         "emit": True,
                     },
                 },
@@ -1653,24 +1742,16 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         if not have_codes:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
-        # Local-v1.5 emits the current raw code frame (no delay pattern); the
-        # pipeline routes those rows through ``talker2codec_raw_async_chunk``.
-        per_req_ref_codes: list[torch.Tensor] = []
-        for info in info_dicts:
-            ref_codes = (info.get("codes", {}) or {}).get("ref") if isinstance(info, dict) else None
-            if isinstance(ref_codes, torch.Tensor) and ref_codes.numel() > 0:
-                ref_codes = ref_codes.detach()
-                if ref_codes.dim() == 1 and ref_codes.numel() % self.n_vq == 0:
-                    ref_codes = ref_codes.view(-1, self.n_vq)
-                if ref_codes.dim() == 2 and ref_codes.shape[1] == self.n_vq:
-                    per_req_ref_codes.append(ref_codes.to(device=hidden.device, dtype=torch.long))
-                    continue
-            per_req_ref_codes.append(hidden.new_empty((0, self.n_vq), dtype=torch.long))
-
+        # Local-v1.5 emits only the current raw code frame (no delay pattern);
+        # the pipeline routes those rows through ``talker2codec_raw_async_chunk``.
+        # The reference-audio codes condition the talker at prefill and are not
+        # re-emitted here: no Stage-1 processor or codec reads ``codes["ref"]``
+        # from the output payload, so echoing the full (T_ref, n_vq) grid every
+        # decode step was pure connector/GC overhead.
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={
-                "codes": {"audio": per_req_codes, "ref": per_req_ref_codes},
+                "codes": {"audio": per_req_codes},
             },
         )
 
