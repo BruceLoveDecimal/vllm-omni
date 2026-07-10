@@ -320,21 +320,31 @@ def talker2codec_raw_async_chunk(
     ).contiguous()
     finished = bool(is_finished and len(pending_frames) == 0)
 
-    codec_flat = chunk_codes.transpose(0, 1).contiguous().reshape(-1).to(torch.long)
+    # Ship the ``(T, n_vq)`` frame grid as a 2-D tensor by default: the Stage-1
+    # codec reshapes it directly and the receive side keeps it a tensor across
+    # the connector (the ``ndim >= 2`` fast path). Flattening to a 1-D
+    # ``[n_vq * T]`` code stream (which the receiver then materialises into a
+    # ``list[int]`` ``prompt_token_ids``) is the compatibility fallback.
+    tensor_payload = bool(cfg.get("moss_codec_tensor_payload", True))
+    total_codes = int(chunk_codes.numel())
+    if tensor_payload:
+        audio_codes = chunk_codes.to(torch.long)  # (T, n_vq)
+    else:
+        audio_codes = chunk_codes.transpose(0, 1).contiguous().reshape(-1).to(torch.long)  # (n_vq * T,)
 
     if finished:
         transfer_manager.code_prompt_token_ids.pop(req_id, None)
         transfer_manager.request_payload.pop(req_id, None)
 
     return OmniPayloadStruct(
-        codes=CodesStruct(audio=codec_flat),
+        codes=CodesStruct(audio=audio_codes),
         meta=MetaStruct(
             req_id=[req_id],
             left_context_size=0,
             codec_streaming=True,
             codec_chunk_frames=int(chunk_codes.shape[0]),
             codec_left_context_frames=0,
-            code_flat_numel=int(codec_flat.numel()),
+            code_flat_numel=total_codes,
             stream_finished=torch.tensor(finished, dtype=torch.bool),
             finished=torch.tensor(finished, dtype=torch.bool),
         ),

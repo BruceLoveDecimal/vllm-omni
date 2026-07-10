@@ -299,21 +299,30 @@ class MossTTSCodecDecoder(nn.Module):
                 for _, wav in self._finish_empty_streaming_requests([info]).items():
                     audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
                 continue
-            if seg.numel() % self._n_vq != 0:
-                logger.warning(
-                    "MossTTS codec input length %d not divisible by n_vq %d; skipping.",
-                    int(seg.numel()),
-                    self._n_vq,
-                )
+
+            # Prefer the 2-D ``(T, n_vq)`` tensor payload delivered via
+            # additional_information (kept a tensor across the connector). The
+            # flat ``input_ids`` code stream -- which the receive side
+            # materialises into a ``list[int]`` prompt -- is the fallback.
+            codes_nq_t = self._extract_frame_tensor_codes(info, device)
+            if codes_nq_t is None:
+                if seg.numel() % self._n_vq != 0:
+                    logger.warning(
+                        "MossTTS codec input length %d not divisible by n_vq %d; skipping.",
+                        int(seg.numel()),
+                        self._n_vq,
+                    )
+                    continue
+                t_chunk = int(seg.numel() // self._n_vq)
+                codes_nq_t = seg.reshape(self._n_vq, t_chunk).to(device=device)
+                # Clamp out-of-range codes on the flat/delay path: the talker
+                # uses ``audio_pad_code`` (= ``codebook_size``) for delay-pattern
+                # padding. The stage input processor de-delays and drops pad rows
+                # before forwarding here, but clamp guards edge-case leakage.
+                codebook_size = self._codec.config.codebook_size
+                codes_nq_t = codes_nq_t.clamp_(0, int(codebook_size) - 1)
+            if codes_nq_t.numel() == 0:
                 continue
-            t_chunk = int(seg.numel() // self._n_vq)
-            codes_nq_t = seg.reshape(self._n_vq, t_chunk).to(device=device)
-            # Clamp out-of-range codes: the talker uses ``audio_pad_code``
-            # (= ``codebook_size``) for delay-pattern padding.  The stage input
-            # processor de-delays and drops pad rows before forwarding here, but
-            # clamp as a defensive guard against any edge-case leakage.
-            codebook_size = self._codec.config.codebook_size
-            codes_nq_t = codes_nq_t.clamp_(0, int(codebook_size) - 1)
 
             left_ctx = meta.get("left_context_size", 0)
             if isinstance(left_ctx, (list, tuple)):
@@ -399,6 +408,46 @@ class MossTTSCodecDecoder(nn.Module):
                     )
                 self._finish_stream_request(req_key, session, slot)
         return outputs
+
+    def _extract_frame_tensor_codes(self, info: Any, device: torch.device) -> torch.Tensor | None:
+        """Return ``(n_vq, T)`` codes from a 2-D tensor payload, else ``None``.
+
+        The raw async-chunk processor ships codes as a ``(T, n_vq)`` tensor in
+        ``additional_information["codes"]["audio"]`` (W3). Range-validate here --
+        dropping any frame carrying an out-of-range code -- instead of silently
+        clamping, so a leaked stop/EOS/pad frame surfaces as a logged drop rather
+        than decoding to wrong audio. Returns ``None`` (fall back to the flat
+        ``input_ids`` path) when no usable 2-D tensor is present.
+        """
+        if not isinstance(info, dict):
+            return None
+        codes = info.get("codes")
+        audio = codes.get("audio") if isinstance(codes, dict) else None
+        if not isinstance(audio, torch.Tensor) or audio.ndim != 2 or audio.numel() == 0:
+            return None
+        if int(audio.shape[1]) == self._n_vq:
+            frames_nq_t = audio.transpose(0, 1).contiguous().to(device=device, dtype=torch.long)  # (n_vq, T)
+        elif int(audio.shape[0]) == self._n_vq:
+            frames_nq_t = audio.to(device=device, dtype=torch.long)  # already (n_vq, T)
+        else:
+            logger.warning(
+                "MossTTS codec tensor payload shape %s incompatible with n_vq %d; falling back to flat.",
+                tuple(audio.shape),
+                self._n_vq,
+            )
+            return None
+        codebook_size = int(self._codec.config.codebook_size)
+        invalid = (frames_nq_t < 0) | (frames_nq_t >= codebook_size)
+        if bool(invalid.any()):
+            bad_frames = invalid.any(dim=0)  # (T,)
+            logger.warning(
+                "MossTTS codec tensor payload: dropping %d out-of-range frame(s) "
+                "(codebook_size=%d); stop/pad codes must not reach the codec.",
+                int(bad_frames.sum()),
+                codebook_size,
+            )
+            frames_nq_t = frames_nq_t[:, ~bad_frames]
+        return frames_nq_t
 
     @staticmethod
     def _normalize_seq_token_counts(value: Any) -> list[int] | None:

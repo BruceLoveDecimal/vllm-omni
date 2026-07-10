@@ -18,6 +18,7 @@ connectors:
       codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s steady chunks
       codec_left_context_frames: 0
       codec_stream_slots: 8
+      moss_codec_tensor_payload: true  # ship codes as (T, n_vq) tensors; false = 1-D flat fallback
 
 stages:
   - stage_id: 0
