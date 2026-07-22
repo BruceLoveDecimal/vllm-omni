@@ -173,20 +173,3 @@ class SanaWmFlowMatchScheduler:
         prev_flat = latents_flat + dt.unsqueeze(-1) * (-noise_flat)
         prev = prev_flat.reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3).contiguous()
         return prev.to(latents.dtype)
-
-    def add_noise(
-        self,
-        sample: torch.Tensor,
-        noise: torch.Tensor,
-        timestep: torch.Tensor,
-    ) -> torch.Tensor:
-        """Linear flow interpolation: sigma*noise + (1-sigma)*sample.
-
-        ``sigma = timestep / num_train_timesteps`` maps the scheduler's integer
-        timestep (0–1000 range) back to the [0, 1] noise level.
-        """
-        num_train = float(self.num_train_timesteps)
-        sigma = (timestep.float() / num_train).clamp(0.0, 1.0)
-        while sigma.ndim < sample.ndim:
-            sigma = sigma.unsqueeze(-1)
-        return (sigma * noise + (1.0 - sigma) * sample).to(sample.dtype)

@@ -10,7 +10,6 @@ Triton kernels live in-tree in ``gdn.py``.
 
 from __future__ import annotations
 
-import logging
 import math
 import os
 import warnings
@@ -71,8 +70,6 @@ SANA_WM_STAGE1_LATENT_CHANNELS = 128
 SANA_WM_STAGE1_PROMPT_CHANNELS = 2304
 SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
 SANA_WM_DISABLE_VLLM_OPS_ENV = "VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS"
-
-logger = logging.getLogger(__name__)
 
 _SANA_WM_TRITON_GDN_FALLBACK_WARNED = False
 
@@ -393,7 +390,6 @@ class SanaWmPatchEmbedMS3D(nn.Module):
         super().__init__()
         self.patch_size = _to_3tuple(patch_size)
         self.kernel_size = _to_3tuple(kernel_size or patch_size)
-        self.flatten = True
         self.proj = nn.Conv3d(
             in_channels,
             hidden_size,
@@ -570,15 +566,10 @@ class SanaWmSelfAttention(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.num_heads = self.total_num_heads
         self.num_kv_heads = self.total_num_heads
-        self.heads = self.total_num_heads
-        self.dim = self.head_dim
-        self.in_dim = hidden_size
-        self.out_dim = hidden_size
         self.eps = 1e-8
         self.attn_type = config.attn_type
         self.use_gdn = use_gdn and "GDN" in config.attn_type
         self.use_vllm_attention = (not self.use_gdn) and _vllm_attention_available()
-        self.k_conv_only = config.k_conv_only
         self.conv_kernel_size = config.conv_kernel_size
         self.patch_size = _to_3tuple(config.patch_size)
         self.uses_vllm_parallel_layers = use_vllm_parallel_layers and _vllm_parallel_layers_available()
