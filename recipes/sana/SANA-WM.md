@@ -59,8 +59,9 @@ two-stage pipeline: SANA-WM Stage-1 DiT plus the bundled LTX-2 refiner.
 
 #### Command
 
-SANA-WM needs the deploy YAML because the Hugging Face repo does not include a
-standard Diffusers `model_index.json`.
+The repo ships the standard Diffusers layout (`model_index.json` + `transformer/`,
+`vae/`, `refiner/`). SANA-WM still needs the deploy YAML to wire its omni serving
+stages, so pass it through `--deploy-config`.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -124,7 +125,16 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
 - Action strings use comma-separated `<keys>-<duration>` segments. Supported
   keys are `w`, `a`, `s`, `d` for translation and `i`, `j`, `k`, `l` for
   pitch/yaw rotation.
-- Explicit `intrinsics` are recommended. The mapping form is
-  `{"fx":640,"fy":640,"cx":640,"cy":352}` for 1280x704 examples.
+- Explicit camera control (alternative to `action`): pass
+  `"camera": {"poses": [...]}` where `poses` is a list of `num_frames`
+  camera-to-world 4x4 matrices (row-major, OpenCV `+X right, +Y down, +Z forward`
+  convention), e.g.
+  `sana_wm={"camera":{"poses":[[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]], ...]},"intrinsics":{...}}`.
+  Most callers should prefer `action`; explicit poses exist for callers that
+  already have a per-frame trajectory.
+- Explicit `intrinsics` are recommended and take the mapping form
+  `{"fx":640,"fy":640,"cx":640,"cy":352}` (for 1280x704). This `{fx,fy,cx,cy}`
+  mapping is the only accepted intrinsics form; omit `intrinsics` to derive them
+  from the output resolution.
 - The deploy config enables the in-process LTX-2 refiner so the video API
   returns decoded MP4 bytes rather than Stage-1 latents.

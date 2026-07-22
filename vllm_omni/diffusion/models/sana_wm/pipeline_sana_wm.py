@@ -69,16 +69,19 @@ SANA_WM_STAGE1_TEXT_ENCODER_ENV = "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER"
 SANA_WM_REFINER_ROOT_ENV = "VLLM_OMNI_SANA_WM_REFINER_ROOT"
 SANA_WM_OUTPUT_HEIGHT = 704
 SANA_WM_OUTPUT_WIDTH = 1280
-SANA_WM_DEFAULT_NUM_FRAMES = 321
+# The model's maximum supported clip length (20s @16fps). This is the native
+# *envelope*, not a request default — request-side defaults live in
+# ``stage_input_processors/sana_wm.py`` and match the deploy YAML (161 frames).
+SANA_WM_NATIVE_NUM_FRAMES = 321
 # Fail-fast envelope for the native Stage-1 path: the model's native 704x1280
-# output at its maximum supported 321-frame (20s @16fps) clip — 41 latent
-# frames x 22 x 40 = 36080 latent tokens. Derived from the constants above so
-# it always covers the advertised defaults (e.g. the deploy YAML's 161-frame
-# config = 18480 tokens) while still rejecting genuinely oversized requests
-# before they OOM a worker. Callers can override per-request via the
-# ``sana_wm_native_max_tokens`` extra arg.
+# output at its maximum supported 321-frame clip — 41 latent frames x 22 x 40 =
+# 36080 latent tokens. Derived from the constants above so it always covers the
+# advertised defaults (e.g. the deploy YAML's 161-frame config = 18480 tokens)
+# while still rejecting genuinely oversized requests before they OOM a worker.
+# Callers can override per-request via the ``sana_wm_native_max_tokens`` extra
+# arg.
 SANA_WM_NATIVE_MAX_TOKENS = (
-    ((SANA_WM_DEFAULT_NUM_FRAMES - 1) // 8 + 1) * (SANA_WM_OUTPUT_HEIGHT // 32) * (SANA_WM_OUTPUT_WIDTH // 32)
+    ((SANA_WM_NATIVE_NUM_FRAMES - 1) // 8 + 1) * (SANA_WM_OUTPUT_HEIGHT // 32) * (SANA_WM_OUTPUT_WIDTH // 32)
 )
 
 SANA_WM_STAGE1_PATTERNS = (

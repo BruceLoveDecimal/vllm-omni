@@ -201,7 +201,11 @@ def compute_raymap(
 
 
 def intrinsics_to_vec4_array(intrinsics: Any, *, num_frames: int, height: int, width: int) -> np.ndarray:
-    """Normalize supported intrinsics payloads to ``(F, 4)`` arrays."""
+    """Normalize the intrinsics payload to an ``(F, 4)`` ``[fx, fy, cx, cy]`` array.
+
+    Accepts either ``None`` (derive from the output resolution) or the
+    ``{fx, fy, cx, cy}`` mapping — the only form the request contract exposes.
+    """
 
     if intrinsics is None:
         focal = float(max(height, width))
@@ -215,18 +219,7 @@ def intrinsics_to_vec4_array(intrinsics: Any, *, num_frames: int, height: int, w
         )
         return np.broadcast_to(vec, (num_frames, 4)).copy()
 
-    array = np.asarray(intrinsics, dtype=np.float32)
-    if array.shape == (4,):
-        return np.broadcast_to(array, (num_frames, 4)).copy()
-    if array.shape == (3, 3):
-        vec = np.array([array[0, 0], array[1, 1], array[0, 2], array[1, 2]], dtype=np.float32)
-        return np.broadcast_to(vec, (num_frames, 4)).copy()
-    if array.ndim == 3 and array.shape[1:] == (3, 3) and array.shape[0] >= num_frames:
-        matrices = array[:num_frames]
-        return np.stack([matrices[:, 0, 0], matrices[:, 1, 1], matrices[:, 0, 2], matrices[:, 1, 2]], axis=1)
-    if array.ndim == 2 and array.shape[1] == 4 and array.shape[0] >= num_frames:
-        return array[:num_frames].copy()
-    raise ValueError(f"Unsupported Sana-WM intrinsics shape {array.shape}; expected (4,), (F,4), (3,3), or (F,3,3).")
+    raise ValueError("Sana-WM intrinsics must be a {fx, fy, cx, cy} mapping.")
 
 
 def _pack_camera_conditions(

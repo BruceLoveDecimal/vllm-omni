@@ -15,7 +15,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 SANA_WM_CANONICAL_KEY = "sana_wm"
-SANA_WM_DEFAULT_NUM_FRAMES = 321
+# Last-resort request fallback, mirroring the deploy YAML default (161 frames).
+# The served path (serving_video) and the offline path (pipeline pre_process)
+# both inject num_frames into the payload, so this is only reached by a bare
+# direct call that omits it. Height/width are the model's fixed native output.
+SANA_WM_DEFAULT_NUM_FRAMES = 161
 SANA_WM_DEFAULT_HEIGHT = 704
 SANA_WM_DEFAULT_WIDTH = 1280
 SANA_WM_DEFAULT_CAMERA_FORMAT = "c2w_4x4"
@@ -53,19 +57,6 @@ def _validate_numeric_matrix4x4(matrix: Any, *, name: str) -> None:
                 raise ValueError(f"Sana-WM {name}[{row_idx}][{col_idx}] must be numeric.") from exc
 
 
-def _validate_numeric_matrix3x3(matrix: Any, *, name: str) -> None:
-    if not _is_sequence(matrix) or len(matrix) != 3:
-        raise ValueError(f"Sana-WM {name} must be a 3x3 matrix.")
-    for row_idx, row in enumerate(matrix):
-        if not _is_sequence(row) or len(row) != 3:
-            raise ValueError(f"Sana-WM {name}[{row_idx}] must contain 3 values.")
-        for col_idx, value in enumerate(row):
-            try:
-                float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Sana-WM {name}[{row_idx}][{col_idx}] must be numeric.") from exc
-
-
 def _validate_camera_poses(poses: Any, *, num_frames: int | None = None) -> None:
     if not _is_sequence(poses) or len(poses) == 0:
         raise ValueError("Sana-WM camera poses must be a non-empty sequence of 4x4 matrices.")
@@ -75,48 +66,23 @@ def _validate_camera_poses(poses: Any, *, num_frames: int | None = None) -> None
         _validate_numeric_matrix4x4(pose, name=f"camera.poses[{idx}]")
 
 
-def _validate_intrinsics(intrinsics: Any, *, num_frames: int | None = None) -> None:
+def _validate_intrinsics(intrinsics: Any) -> None:
+    # Only the ``{fx, fy, cx, cy}`` mapping is accepted (the one form the recipe
+    # and examples use). Camera intrinsics are optional; when omitted the model
+    # derives them from the output resolution.
     if intrinsics is None:
         return
-    if isinstance(intrinsics, Mapping):
-        required = {"fx", "fy", "cx", "cy"}
-        missing = sorted(required - set(intrinsics))
-        if missing:
-            raise ValueError(f"Sana-WM intrinsics mapping is missing keys: {missing}.")
-        for key in required:
-            try:
-                float(intrinsics[key])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Sana-WM intrinsics[{key!r}] must be numeric.") from exc
-        return
-
-    if _is_sequence(intrinsics):
-        if len(intrinsics) == 0:
-            raise ValueError("Sana-WM intrinsics must not be empty.")
-
-        first = intrinsics[0]
-        if _is_sequence(first) and len(first) > 0 and _is_sequence(first[0]):
-            if num_frames is not None and len(intrinsics) not in (1, num_frames):
-                raise ValueError(
-                    f"Sana-WM per-frame intrinsics length {len(intrinsics)} must be 1 or num_frames {num_frames}."
-                )
-            for idx, matrix in enumerate(intrinsics):
-                _validate_numeric_matrix3x3(matrix, name=f"intrinsics[{idx}]")
-            return
-
-        if len(intrinsics) == 4:
-            for idx, value in enumerate(intrinsics):
-                try:
-                    float(value)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(f"Sana-WM intrinsics[{idx}] must be numeric.") from exc
-            return
-
-        if len(intrinsics) == 3:
-            _validate_numeric_matrix3x3(intrinsics, name="intrinsics")
-            return
-
-    raise ValueError("Sana-WM intrinsics must be a mapping, (3, 3), (F, 3, 3), or (4,) value.")
+    if not isinstance(intrinsics, Mapping):
+        raise ValueError("Sana-WM intrinsics must be a {fx, fy, cx, cy} mapping.")
+    required = {"fx", "fy", "cx", "cy"}
+    missing = sorted(required - set(intrinsics))
+    if missing:
+        raise ValueError(f"Sana-WM intrinsics mapping is missing keys: {missing}.")
+    for key in required:
+        try:
+            float(intrinsics[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Sana-WM intrinsics[{key!r}] must be numeric.") from exc
 
 
 def _as_positive_int(value: Any, *, name: str) -> int:
@@ -211,7 +177,7 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool 
         }
 
     intrinsics = raw.get("intrinsics")
-    _validate_intrinsics(intrinsics, num_frames=num_frames)
+    _validate_intrinsics(intrinsics)
     translation_speed = raw.get("translation_speed")
     rotation_speed_deg = raw.get("rotation_speed_deg")
 

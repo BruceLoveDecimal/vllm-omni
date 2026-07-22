@@ -4,7 +4,6 @@
 
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import (
-    SANA_WM_DEFAULT_NUM_FRAMES,
     SANA_WM_MODEL_ID,
     SANA_WM_OUTPUT_HEIGHT,
     SANA_WM_OUTPUT_WIDTH,
@@ -16,7 +15,6 @@ from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm_two_stages import SanaW
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import SanaWmTransformer3DModel
 
 __all__ = [
-    "SANA_WM_DEFAULT_NUM_FRAMES",
     "SANA_WM_MODEL_ID",
     "SANA_WM_OUTPUT_HEIGHT",
     "SANA_WM_OUTPUT_WIDTH",
