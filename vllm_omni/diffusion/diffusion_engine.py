@@ -10,7 +10,7 @@ import queue
 import threading
 import time
 from collections.abc import AsyncGenerator, Iterable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -40,12 +40,11 @@ from vllm_omni.diffusion.output_formatter import (
 )
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
-    get_diffusion_action_post_process_func,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
+from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
@@ -134,10 +133,18 @@ class _RpcTask:
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
+    #: Import path of the model runner this engine's workers should build, or
+    #: ``None`` for the platform default. Subclasses declare their runner here
+    #: (e.g. the AR-Diffusion engine), the worker resolves it through
+    #: :meth:`resolve_engine_class` — so engine->runner routing lives on the
+    #: engine class itself, and ``od_config.diffusion_model_runner_cls``
+    #: remains a pure explicit user override (never mutated by engines).
+    default_diffusion_model_runner_cls: str | None = None
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
+        scheduler: BaseScheduler | None = None,
     ):
         """Initialize the diffusion engine.
 
@@ -147,17 +154,10 @@ class DiffusionEngine:
         self.od_config = od_config
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
-        self.action_post_process_func = get_diffusion_action_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
-        self._action_post_process_accepts_sampling_params = _func_accepts_parameter(
-            self.action_post_process_func, "sampling_params"
-        )
-        self._action_post_process_accepts_custom_output = _func_accepts_parameter(
-            self.action_post_process_func, "custom_output"
-        )
 
         self.step_execution = bool(getattr(od_config, "step_execution", False))
         if self.od_config.streaming_output and not self.step_execution:
@@ -167,9 +167,7 @@ class DiffusionEngine:
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.scheduler: SchedulerInterface = scheduler or (
-            StepScheduler() if self.step_execution else RequestScheduler()
-        )
+        self.scheduler: BaseScheduler = scheduler or (StepScheduler() if self.step_execution else RequestScheduler())
         self.scheduler.initialize(od_config)
         self.supports_request_batch = False if self.step_execution else supports_request_batch(od_config)
         self.main_loop: asyncio.AbstractEventLoop | None = None
@@ -299,46 +297,18 @@ class DiffusionEngine:
         if self.od_config.enable_cpu_offload:
             output_data = _move_tensor_tree_to_cpu(output_data)
 
-        custom_output = output.custom_output or {}
-        action_payload = None
-        action_only_output = bool(custom_output.get("action_only_output"))
-
         postprocess_start_time = time.perf_counter()
-        if action_only_output:
-            outputs = []
-        elif self.post_process_func is not None:
+        if self.post_process_func is not None:
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
+            postprocess_kwargs: dict[str, object] = {}
             if self._post_process_accepts_sampling_params:
-                outputs = self.post_process_func(output_data, sampling_params=request.sampling_params)
-            else:
-                outputs = self.post_process_func(output_data)
+                postprocess_kwargs["sampling_params"] = request.sampling_params
+            outputs = self.post_process_func(output_data, **postprocess_kwargs)
         else:
             outputs = output_data
 
-        postprocess_output = normalize_diffusion_postprocess_output(outputs, custom_output)
-        custom_output = postprocess_output.custom_output
-        action_payload = postprocess_output.action_payload
-        if action_payload is None:
-            action_payload = custom_output.get("actions")
-            if action_payload is not None:
-                postprocess_output = replace(postprocess_output, action_payload=action_payload)
-        action_post_process_func = getattr(self, "action_post_process_func", None)
-        if action_payload is None and action_post_process_func is not None:
-            raw_action_payload = custom_output.get("action")
-            if raw_action_payload is not None:
-                action_kwargs: dict[str, Any] = {}
-                if getattr(self, "_action_post_process_accepts_custom_output", False):
-                    action_kwargs["custom_output"] = custom_output
-                if getattr(self, "_action_post_process_accepts_sampling_params", False):
-                    action_kwargs["sampling_params"] = request.sampling_params
-                action_payload = action_post_process_func(raw_action_payload, **action_kwargs)
-                custom_output = {**custom_output, "actions": action_payload}
-                postprocess_output = replace(
-                    postprocess_output,
-                    custom_output=custom_output,
-                    action_payload=action_payload,
-                )
+        postprocess_output = normalize_diffusion_postprocess_output(outputs)
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 
@@ -609,19 +579,55 @@ class DiffusionEngine:
             self._put_streaming_output_with_cv(request_id, out)
 
     @staticmethod
-    def make_engine(
-        config: OmniDiffusionConfig,
-        scheduler: SchedulerInterface | None = None,
-    ) -> DiffusionEngine:
-        """Factory method to create a DiffusionEngine instance.
+    def resolve_engine_class(config: OmniDiffusionConfig) -> type[DiffusionEngine]:
+        """Resolve the engine class selected by ``config.engine_backend``.
+
+        Mirrors ``DiffusionExecutor.get_class``: accepts ``"default"``, a
+        ``DiffusionEngine`` subclass, or an import-path string (e.g. a deploy
+        config's ``engine_backend``). Kept separate from :meth:`make_engine` so the
+        selection is testable without constructing an engine (which runs a dummy forward).
 
         Args:
             config: The configuration for the diffusion engine.
 
         Returns:
-            An instance of DiffusionEngine.
+            The ``DiffusionEngine`` (sub)class to instantiate.
         """
-        return DiffusionEngine(config, scheduler=scheduler)
+        backend = getattr(config, "engine_backend", "default") or "default"
+
+        if isinstance(backend, type):
+            if not issubclass(backend, DiffusionEngine):
+                raise TypeError(f"engine_backend must be a DiffusionEngine subclass. Got {backend}.")
+            return backend
+        if backend == "default":
+            return DiffusionEngine
+        if isinstance(backend, str):
+            try:
+                engine_class = resolve_obj_by_qualname(backend)
+            except (ImportError, ValueError) as e:
+                raise ValueError(
+                    f"Failed to load engine_backend '{backend}'. Ensure it is a valid python path. Error: {e}"
+                ) from e
+            if not issubclass(engine_class, DiffusionEngine):
+                raise TypeError(f"engine_backend must resolve to a DiffusionEngine subclass. Got {engine_class}.")
+            return engine_class
+        raise ValueError(f"Unknown engine_backend: {backend!r}")
+
+    @staticmethod
+    def make_engine(
+        config: OmniDiffusionConfig,
+        scheduler: BaseScheduler | None = None,
+    ) -> DiffusionEngine:
+        """Factory method to create the engine selected by ``config.engine_backend``.
+
+        Args:
+            config: The configuration for the diffusion engine.
+
+        Returns:
+            An instance of the resolved ``DiffusionEngine`` (sub)class.
+        """
+        engine_class = DiffusionEngine.resolve_engine_class(config)
+        return engine_class(config, scheduler=scheduler)
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         with self._cv:

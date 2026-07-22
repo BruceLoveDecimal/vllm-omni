@@ -18,6 +18,7 @@ from transformers import PretrainedConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
+from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -228,6 +229,7 @@ class StagePipelineConfig:
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
+    scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
     # stage's config/tokenizer lives in a subdirectory (e.g. GLM-Image's AR
     # config is in ``vision_language_encoder/``).  Consumed at stage-init time
@@ -267,6 +269,10 @@ class PipelineConfig:
     # this value to auto-detect the pipeline.  Only needed for diffusers-style
     # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
     diffusers_class_name: str | None = None
+    endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
+    # Bundled deploy defaults for this concrete pipeline topology. The file is
+    # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
+    default_deploy_config_name: str | None = None
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""
@@ -468,6 +474,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
     # Get the non-reserved keys for this stage
     flat_args = {k: v for k, v in stage_data.items() if k not in _STAGE_RESERVED_KEYS}
+    explicit_engine_extras = dict(stage_data.get("engine_extras") or {})
     runtime_cfg = dict(stage_data.get("runtime", {}))
     devices = runtime_cfg.get("devices", stage_data.get("devices"))
     num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
@@ -495,7 +502,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
-    kwargs["engine_extras"] = flat_args
+    kwargs["engine_extras"] = _get_recursively_merged_dict(explicit_engine_extras, flat_args)
     return StageDeployConfig(**kwargs)
 
 
@@ -895,7 +902,7 @@ def merge_pipeline_deploy(
                 final_output=ps.final_output,
                 final_output_type=ps.final_output_type,
                 worker_type=worker_type,
-                scheduler_cls=_scheduler_path(sched_cls),
+                scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
                 is_comprehension=ps.owns_tokenizer,
                 yaml_engine_args=engine_args,
