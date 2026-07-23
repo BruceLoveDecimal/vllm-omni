@@ -98,10 +98,15 @@ def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) ->
     )
 
 
-def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
+def _request_batch_model_cls(od_config: OmniDiffusionConfig):
     model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
     if model_cls is None:
         model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
+    return model_cls
+
+
+def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
+    model_cls = _request_batch_model_cls(od_config)
     if model_cls is None:
         return False
     return bool(getattr(model_cls, "supports_request_batch", False))
@@ -112,6 +117,21 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
         return max(1, int(getattr(od_config, "max_num_seqs", 1)))
     except (TypeError, ValueError):
         return 1
+
+
+def request_batch_ignored_sampling_param_fields(
+    od_config: OmniDiffusionConfig,
+) -> frozenset[str]:
+    model_cls = _request_batch_model_cls(od_config)
+    if model_cls is None:
+        return frozenset()
+    return frozenset(
+        getattr(
+            model_cls,
+            "request_batch_ignored_sampling_param_fields",
+            (),
+        )
+    )
 
 
 def _move_tensor_tree_to_cpu(value: object) -> object:
@@ -220,6 +240,10 @@ class DiffusionEngine:
         else:
             self.scheduler = RequestScheduler()
         self.scheduler.initialize(od_config)
+        if self.supports_request_batch and isinstance(self.scheduler, RequestScheduler):
+            self.scheduler.set_ignored_sampling_param_fields(
+                request_batch_ignored_sampling_param_fields(od_config)
+            )
 
     def _init_runtime_state(self) -> None:
         self.main_loop: asyncio.AbstractEventLoop | None = None

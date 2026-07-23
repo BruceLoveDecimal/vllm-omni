@@ -15,9 +15,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionModel,
     Unpack,
     apply_rotary_pos_emb,
-    check_model_inputs,
     create_causal_mask,
-    deprecate_kwarg,
     eager_attention_forward,
 )
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -38,6 +36,8 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLTextRMSNorm as HFQwen3VLTextRMSNorm,
 )
+from transformers.utils.deprecation import deprecate_kwarg
+from transformers.utils.generic import check_model_inputs
 
 
 class Qwen3VLTextRMSNorm(HFQwen3VLTextRMSNorm):
@@ -176,9 +176,8 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
 
         attention_mask = create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
@@ -217,6 +216,7 @@ class Qwen3VLModel(HFQwen3VLModel):
     base_model_prefix = ""
     _checkpoint_conversion_mapping = {}
     accepts_loss_kwargs = False
+    config_class = Qwen3VLConfig
     config: Qwen3VLConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
 
@@ -230,8 +230,11 @@ class Qwen3VLModel(HFQwen3VLModel):
 
 class Qwen3VLForConditionalGeneration(HFQwen3VLForConditionalGeneration):
     _checkpoint_conversion_mapping = {}
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {
+        "lm_head.weight": "model.language_model.embed_tokens.weight",
+    }
     accepts_loss_kwargs = False
+    config_class = Qwen3VLConfig
     config: Qwen3VLConfig
 
     def __init__(self, config):

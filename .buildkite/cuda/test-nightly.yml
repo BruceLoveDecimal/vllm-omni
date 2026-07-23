@@ -217,6 +217,8 @@ steps:
             tests/e2e/online_serving/test_boogu_image_expansion.py
             tests/e2e/online_serving/test_boogu_image_edit_expansion.py
             tests/e2e/online_serving/test_bagel_expansion.py
+            tests/e2e/online_serving/test_mage_flow_expansion.py
+            tests/e2e/online_serving/test_mage_flow_edit_expansion.py
             tests/e2e/online_serving/test_krea2_expansion.py
             tests/e2e/offline_inference/test_krea2_expansion.py
             -m "full_model and diffusion and H100 and not distributed_cuda"
