@@ -184,12 +184,15 @@ checkpoint、相同步数与开关下重测，不能直接把公开数字当作�
 - `transformers >= 5.3, < 5.6`；
 - 单独安装 `flash-attn == 2.8.3`。
 
-当前 vLLM-Omni 锁定环境包含：
+当前 vLLM-Omni 仓库声明的约束为：
 
-- PyTorch 2.11；
-- Transformers 5.8；
-- `requirements/common.txt` 要求 `transformers >= 5.5.3`；
-- Diffusers 0.38.0。
+- `requirements/common.txt` 要求 `transformers >= 5.5.3`，不设置上限；
+- `requirements/common.txt` 固定 `diffusers == 0.38.0`；
+- 仓库不直接固定 PyTorch 版本，实际版本由上游 vLLM 依赖和 CI 镜像共同决定。
+
+本地生成的 `uv.lock` 被 `.gitignore` 排除，其解析结果不属于仓库承诺，也不能作为实现中的
+版本判断条件。正式兼容基线以提交时的受支持依赖范围和 CI 镜像为准，具体小版本由 Phase 0
+的复现记录给出。
 
 此外，上游限制 Transformers `< 5.6` 的直接原因是依赖后来被移除的
 `input_embeds` 调用形式。
@@ -197,17 +200,18 @@ checkpoint、相同步数与开关下重测，不能直接把公开数字当作�
 ### 5.2 决策
 
 - 不把 `mage-flow` 加入运行时依赖；
-- 不降低 vLLM-Omni 的 Transformers 版本；
-- 不提高整个仓库的 PyTorch 最低版本；
+- 不收窄或降级 vLLM-Omni 当前支持的 Transformers 范围；
+- 不为 Mage-Flow 增加模型专属 PyTorch 下限，也不强制整个项目升级框架；
 - 不直接依赖 `flash-attn` Python 包；
 - 在 MIT 许可证允许的范围内移植必要实现，并保留原始版权和来源说明；
 - Qwen3-VL 兼容代码优先复用
-  `vllm_omni/diffusion/models/internvla_a1/adapter_qwen3_vl.py` 的 Transformers 5.8
-  适配方式；
-- attention 统一经过 `vllm_omni.diffusion.attention.Attention`。
+  `vllm_omni/diffusion/models/internvla_a1/adapter_qwen3_vl.py` 面向当前 Transformers API
+  的局部适配方式；
+- attention 从 `vllm_omni.diffusion.attention.layer` 导入并统一经过 `Attention`。
 
-若 PyTorch 2.11 缺少某个上游算子，只允许在 Mage-Flow 模块内增加等价兼容实现；不得以本模型
-接入为由全局升级框架版本。
+若当前 CI 使用的 PyTorch 缺少某个上游算子，只允许在 Mage-Flow 模块内增加等价兼容实现；
+不得以本模型接入为由全局升级框架版本。Phase 0 必须记录实际验证的 PyTorch、Transformers、
+CUDA 和 attention backend 版本。
 
 ## 6. 代码结构
 
@@ -229,10 +233,30 @@ vllm_omni/diffusion/models/mage_flow/
 ```text
 vllm_omni/diffusion/registry.py
 vllm_omni/diffusion/model_metadata.py
-examples/offline_inference/text_to_image/mage_flow.py
-examples/offline_inference/image_to_image/mage_flow_edit.py
+examples/offline_inference/text_to_image/text_to_image.py
+examples/offline_inference/image_to_image/image_edit.py
+examples/online_serving/text_to_image/README.md
+examples/online_serving/image_to_image/README.md
+docs/user_guide/examples/online_serving/text_to_image.md
+docs/user_guide/examples/online_serving/image_to_image.md
+docs/models/supported_models.md
 tests/diffusion/models/mage_flow/...
+tests/e2e/offline_inference/test_mage_flow.py
+tests/e2e/online_serving/test_mage_flow.py
+tests/e2e/online_serving/test_mage_flow_edit.py
+tests/e2e/online_serving/test_mage_flow_expansion.py
+tests/e2e/online_serving/test_mage_flow_edit_expansion.py
+tests/dfx/perf/tests/test_mage_flow_vllm_omni.json
+tests/dfx/perf/tests/test_mage_flow_edit_vllm_omni.json
+.buildkite/test-ready.yml
+.buildkite/test-merge.yml
+.buildkite/test-nightly.yml
 ```
+
+Mage-Flow 属于已有 Text-to-Image / Image-to-Image 分类，优先扩展上述共享示例。只有在共享脚本
+无法表达模型必要参数时，才新增 `examples/offline_inference/mage_flow/`；不得在现有分类目录下
+新增孤立的 `mage_flow.py`。在线示例复用任务级客户端和启动脚本，在 README 与用户指南中补充
+Mage-Flow 命令、模型特有 `extra_args` 和 1～3 图 Edit 用法。
 
 各文件职责如下。
 
@@ -240,13 +264,20 @@ tests/diffusion/models/mage_flow/...
 
 提供 `MageFlowTransformer2DModel(nn.Module)`：
 
-- 构造 input / context projection、time embedding、12 个 double-stream block 和 output head；
+- 构造 input / context projection、time embedding、12 个 double-stream block 和 output head，
+  其中全部 block 保存在单一 `nn.ModuleList`；
+- 声明 `_repeated_blocks = ["MageFlowDoubleStreamBlock"]`，供 regional compilation 识别；
 - 接收 `OmniDiffusionConfig`，为将来的分布式与量化扩展保留入口；
 - 不继承上游或 Diffusers 的 `ModelMixin`、`ConfigMixin`；
-- 暴露 `load_weights()`，使用 `AutoWeightsLoader`，只为经过确认的命名差异设置
-  `WeightsMapper`；
+- 暴露 `load_weights()`，使用来自 vLLM 上游
+  `vllm.model_executor.models.utils` 的 `AutoWeightsLoader` 和 `WeightsMapper`，且 mapper
+  只处理经过确认的命名差异；
 - forward 返回图像 token 的 velocity / flow prediction，不返回文本 token；
 - 不在 forward 中创建 attention layer、scheduler 或临时 module。
+
+`_repeated_blocks` 只表示可重复编译单元，不等于支持 Cache-DiT。PR 4 若启用缓存，需单独评估
+`CachedTransformer`、`_cache_dit_adapter_config` 以及 block 前后 hooks；在此之前将
+`MageFlowPipeline` 放入 registry 的 `_NO_CACHE_ACCELERATION` 集合。
 
 建议的首期接口：
 
@@ -274,7 +305,7 @@ def forward(
 - text / image RMSNorm 或 QK norm；
 - 三轴 RoPE，其中一轴用于文本 / 模态位置，两轴用于图像 H/W；
 - `MageJointAttention`；
-- double-stream block；
+- `MageFlowDoubleStreamBlock`；
 - final modulation 和 output projection。
 
 `MageJointAttention` 的固定处理顺序：
@@ -282,13 +313,15 @@ def forward(
 1. 文本和图像分别做 Q、K、V 投影；
 2. Q/K norm；
 3. 对文本和图像应用与官方一致的三轴 RoPE；
-4. 沿 sequence 维拼接 text / image QKV；
-5. 调用 vLLM-Omni `Attention`；
-6. 按原始长度拆分；
+4. 单卡路径沿 sequence 维显式拼接 text / image QKV；
+5. 调用 `vllm_omni.diffusion.attention.layer.Attention`；
+6. 按原始长度将结果拆回 text / image；
 7. 分别通过 text / image output projection。
 
 首期只有一个真实样本，不需要 padding，也不需要 `cu_seqlens`。CFG 正负分支顺序执行，从而
-避免在第一版修改通用 attention metadata。PR 3 再增加真正的 packed varlen backend。
+避免在第一版修改通用 attention metadata。当前 `AttentionMetadata.joint_*` 只会被 Ring /
+Ulysses 等 SP strategy 消费，单卡 `NoParallelAttention` 不会自动拼接；因此 PR 1 参考 LongCat
+的 non-SP 显式 concat 路径。PR 3 再处理变长批次，PR 4 实现 SP 时复用 `joint_*`。
 
 ### 6.3 `autoencoder_mage.py`
 
@@ -316,7 +349,7 @@ Mage-VAE 是一阶段 diffusion codec，不得用 `AutoencoderKL` 或现有 VAE 
 - 视觉输入长边 384 的保持比例缩放；
 - 1～3 张参考图的 placeholder 与顺序；
 - 有效 token 提取和 2560 维 context 输出；
-- Transformers 5.8 下替代上游全局 monkeypatch 的局部适配。
+- 当前受支持 Transformers API 下替代上游全局 monkeypatch 的局部适配。
 
 禁止在 import 时 monkeypatch 全局 Hugging Face attention。适配必须局限在 Mage-Flow 使用的
 module / wrapper 内，避免改变其他模型行为。
@@ -348,9 +381,10 @@ _encoder_modules = ["text_encoder"]
 _vae_modules = ["vae"]
 ```
 
-Pipeline 继承 `nn.Module`、`DiffusionPipelineProfilerMixin` 和
-`SupportsComponentDiscovery`。是否在 PR 1 直接接入 `CFGParallelMixin` 由实现复杂度决定，
-但对外仍只允许单卡；普通 CFG 必须可用。
+Pipeline 在 PR 1 即继承 `nn.Module`、`CFGParallelMixin`、`ProgressBarMixin`、
+`DiffusionPipelineProfilerMixin` 和 `SupportsComponentDiscovery`。PR 1 实现稳定的
+`predict_noise()` 契约，并通过 `predict_noise_maybe_with_cfg()` 统一处理无 CFG 和单卡顺序
+CFG。首期对 `cfg_world_size > 1` fail fast；PR 4 完成分布式正确性与性能验证后再解除该门禁。
 
 构造阶段：
 
@@ -555,8 +589,9 @@ vae/diffusion_pytorch_model.safetensors
 ### 10.1 PR 1 / PR 2：单请求 dense
 
 - `supports_request_batch = False`；
-- 每次只有一个样本，文本和图像 token 拼接后无需 padding；
-- 使用 vLLM-Omni `Attention`；
+- 每次只有一个样本，无需 padding；
+- 使用 `vllm_omni.diffusion.attention.layer.Attention`；
+- text / image QKV 在模型层显式拼接，首期不新增 attention metadata 字段；
 - CFG 正负分支顺序执行；
 - 不依赖上游 raw FlashAttention；
 - 输出先追求与官方一致，再优化吞吐。
@@ -565,17 +600,30 @@ vae/diffusion_pytorch_model.safetensors
 
 ### 10.2 PR 3：真正的 packed varlen
 
-扩展 Mage 专用 metadata，或在通用 `AttentionMetadata` 已有能力的基础上复用：
+PR 3 分为两个决策点，不预设必须修改通用 attention API。
+
+第一步实现 padded request batch：
+
+- 每个样本保留独立 text / image 长度；
+- 对每个样本拼接 text / image 后构造二维 `attn_mask`；
+- 复用现有 FlashAttention backend 的 masked varlen 路径，由 backend 从 mask 内部推导
+  `cu_seqlens`；
+- 其他 backend 不支持 mask 时使用经过数值验证的 padded fallback 或明确拒绝。
+
+只有 padded 方案不能满足显存或吞吐目标时，才进入第二步：为真正无 padding 的 flat-packed
+表示设计显式边界 metadata。以下字段均属于候选的新 API，不是当前 `AttentionMetadata`
+已有能力：
 
 ```text
 cu_seqlens_q
 cu_seqlens_kv
 max_seqlen_q
 max_seqlen_kv
-per_sample_image_grid_hw
-text_lengths
-image_lengths
 ```
+
+`per_sample_image_grid_hw`、`text_lengths` 和 `image_lengths` 保留在 Mage 层，由模型生成 RoPE、
+拆分 text / image 输出；通用 attention backend 只接收执行 attention 所需的序列边界。新增
+metadata 前必须先提交独立设计与至少两个 backend 的兼容性评估。
 
 目标：
 
@@ -593,11 +641,12 @@ Mage 层自己负责位置编码。
 
 按以下顺序推进：
 
-1. CFG parallel；
+1. 验证 CFG collective、解除 `cfg_world_size > 1` 门禁；
 2. tensor parallel 的 QKV / MLP；
-3. sequence parallel；
+3. sequence parallel，并按 LongCat 先例用 `AttentionMetadata.joint_*` 表达复制的文本流；
 4. VAE parallel；
-5. step execution 与 cache。
+5. step execution；
+6. Cache-DiT / 其他 cache backend。
 
 每项能力独立开关、独立测试；不得在一个 PR 中同时修改 attention、TP、SP 和 scheduler。
 
@@ -628,13 +677,13 @@ ID，不记录用户原始 prompt 或图像内容。
 
 ## 12. 测试计划
 
-### 12.1 CPU 单元测试
+### 12.1 L1 CPU 单元测试
 
 不下载完整 checkpoint，使用 tiny config 或构造权重：
 
 - 配置解析与校验；
 - 三轴 RoPE shape 和坐标；
-- joint attention 的 concat / split；
+- Mage 单卡 concat / split 与纯 PyTorch joint attention 参考实现数值一致；
 - attention mask 不发生跨样本泄漏；
 - tiny Transformer forward shape；
 - Transformer 权重名映射；
@@ -644,9 +693,14 @@ ID，不记录用户原始 prompt 或图像内容。
 - 尺寸、宽高比、参考图数量校验；
 - scheduler 参数与 step index 重置；
 - registry lazy import；
-- Transformers 5.8 import 和调用签名；
+- 当前 Transformers API 的 import 和调用签名；
 - safety / watermark 开关解析；
-- 相同 seed 得到相同初始 noise。
+- 相同 seed 得到相同初始 noise；
+- Turbo 在 CFG 1.0 时不构造、也不执行 negative prompt 分支；
+- `cfg_world_size > 1` 在首期得到明确的 unsupported error。
+
+这些测试位于 `tests/diffusion/models/mage_flow/`，CPU 可运行用例标记
+`core_model and cpu`。仅验证 CUDA kernel 的测试不得混入 CPU marker。
 
 ### 12.2 GPU 数值对齐
 
@@ -688,6 +742,8 @@ ID，不记录用户原始 prompt 或图像内容。
 - OpenAI 兼容在线 T2I；
 - 在线 multipart / multimodal Edit；
 - 重复 seed；
+- 同一服务进程连续发送多个请求，验证 scheduler step index、generator 和输出不受前一请求污染；
+- 相同 seed 的连续请求结果一致，不同 seed 的请求结果发生变化；
 - 非法尺寸；
 - 第 4 张参考图被拒绝；
 - 无图的 Edit checkpoint 仍按 T2I 路径运行，或给出产品确认后的明确限制；
@@ -696,10 +752,26 @@ ID，不记录用户原始 prompt 或图像内容。
 
 ### 12.4 CI 分层
 
-- 普通 CI：lint、类型检查、CPU tiny tests、registry import；
-- GPU CI：最小 checkpoint / mocked component smoke test；
-- nightly 或手动 workflow：完整官方 checkpoint parity 和性能；
-- 模型下载测试必须使用缓存，并支持离线重跑。
+测试必须接入仓库 `docs/contributing/ci/CI_5levels.md` 定义的现有体系：
+
+| 级别 | 文件与内容 | Marker | Buildkite |
+| --- | --- | --- | --- |
+| L1 | `tests/diffusion/models/mage_flow/`：tiny config、纯函数、registry、权重映射 | `core_model and cpu` | `.buildkite/test-ready.yml` 的 CPU 单测步骤 |
+| L2 | online `test_mage_flow.py` / `test_mage_flow_edit.py`：dummy / 最小权重服务启动、请求成功与非空图像 | `core_model and diffusion`，用 `hardware_marks` 声明 H100 | `.buildkite/test-ready.yml` |
+| L3 | 上述 online 测试与 offline `test_mage_flow.py`：真实权重、尺寸和确定性检查 | `advanced_model and diffusion`，用 `hardware_marks` 声明 H100 | `.buildkite/test-merge.yml` |
+| L4 | `test_mage_flow_expansion.py` 与 `test_mage_flow_edit_expansion.py`：变体、边界尺寸、多图、异常路径 | `full_model and diffusion`，用 `hardware_marks` 声明 H100 | `.buildkite/test-nightly.yml` |
+| L5 | 长时间并发、故障注入和恢复；首两个模型 PR 不新增 | `slow and diffusion`，附硬件 marker | 需要时接入 `.buildkite/test-weekly.yml` |
+
+具体要求：
+
+- PR 1 合并前至少提供一个接入指南要求的 L4 functionality test；PR 2 增加 Edit L4；
+- L2 / L3 的 Buildkite step 配置 `source_file_dependencies`，至少覆盖
+  `vllm_omni/diffusion/models/mage_flow/`、registry、metadata 和对应测试文件；
+- 同一个在线测试可以同时带 `core_model` 与 `advanced_model`，由 `--run-level` 控制断言深度；
+- 完整 checkpoint、模型 revision 和基准 tensor 使用缓存或受控 artifact，并支持离线重跑；
+- 完整官方环境的逐层 parity 可作为手动 / nightly 辅助作业，但不能替代 L4 functionality test；
+- 固定硬件性能回归放在 `tests/dfx/perf/` 对应配置和 nightly 性能步骤中，不在 L2 / L3
+  functionality smoke test 中设置峰值显存硬断言。
 
 ## 13. 性能与可观测性
 
@@ -729,11 +801,14 @@ postprocess
 
 PR 1 的性能门槛：
 
-- 在同一 A100 环境、关闭安全检查和水印后，单请求 T2I 峰值显存不超过官方实现的
-  `max(10%, 2 GiB)`；
+- 在同一 A100 环境、相同 checkpoint revision、关闭安全检查和水印并完成 warmup 后，单请求
+  T2I 峰值显存相对官方实现的增量不超过 `max(官方峰值的 10%, 2 GiB)`；
 - denoise 主循环不比官方 dense 等价基准慢 20% 以上；若因顺序 CFG 超出，应在 PR 中量化，
   并将 packed CFG 列为 PR 3 的阻塞指标；
 - 不出现每步 CPU↔GPU 权重迁移或重复 tokenizer / processor 加载。
+
+上述性能门槛在固定硬件的独立 benchmark / nightly 作业中执行，记录 warmup 次数、采样次数和
+波动范围；功能 smoke test 只采集指标，不因一次峰值抖动失败。
 
 PR 3 的目标：
 
@@ -751,9 +826,11 @@ PR 3 的目标：
 
 - tiny Transformer 可加载官方一层权重；
 - Mage-VAE decode 一张官方 latent；
-- Qwen3-VL 在 Transformers 5.8 下输出 context；
+- Qwen3-VL 在仓库当前 CI 依赖环境下输出 context；
 - 单次 denoise step 与官方对齐；
 - 记录实际显存；
+- 记录 PyTorch、Transformers、CUDA、attention backend 和六个 checkpoint revision；
+- 复核 VAE channel、context dim、scheduler shift / mode 及上游依赖声明；
 - 确认移植文件的许可证头。
 
 退出条件：四个组件均有可运行证据。任何一项失败都先更新本规格，不直接扩写完整 pipeline。
@@ -765,10 +842,11 @@ PR 3 的目标：
 - Transformer、layers、VAE、prompt utils、水印；
 - scheduler 与 T2I pipeline；
 - registry / post-process；
+- `CFGParallelMixin` 单卡顺序 CFG、`ProgressBarMixin` 和 `_repeated_blocks`；
 - Base / RL / Turbo；
 - 单请求 CUDA BF16；
-- offline / online 示例；
-- CPU 单测和 T2I GPU parity。
+- 共享 offline / online 示例及 `docs/models/supported_models.md`；
+- L1～L4 CI 接线、CPU 单测和 T2I GPU parity。
 
 退出条件：
 
@@ -776,7 +854,8 @@ PR 3 的目标：
 - 固定 seed parity 达标；
 - 1024² 和 512×2048 通过；
 - 默认安全检查 / 水印行为已验证；
-- 不存在未解释的 missing / unexpected weights。
+- 不存在未解释的 missing / unexpected weights；
+- L2 / L3 通过，且至少一个 T2I L4 functionality test 可由 nightly 执行。
 
 ### PR 2：Edit，5～8 人日
 
@@ -787,22 +866,23 @@ PR 3 的目标：
 - Mage-VAE reference encode；
 - 1～3 张参考图；
 - Edit 三个变体；
-- Edit 示例、服务测试和 GPU parity。
+- 共享 Edit 示例、L2～L4 服务测试和 GPU parity。
 
 退出条件：
 
 - 单图与三图 edit 均达标；
 - 视觉与 latent 双路径中间张量对齐；
 - 第 4 张图在进入模型前被拒绝；
-- T2I 无回归。
+- T2I 无回归；
+- Edit L4 expansion test 可由 nightly 执行。
 
 ### PR 3：Packed batching，8～12 人日
 
 内容：
 
 - request batching；
-- mixed-resolution packed sequence；
-- varlen attention metadata；
+- padded mixed-resolution batch + `attn_mask` 原型；
+- 在性能数据证明必要时增加 flat-packed sequence 与显式 varlen metadata；
 - packed CFG；
 - dense fallback；
 - 吞吐基准。
@@ -818,11 +898,11 @@ PR 3 的目标：
 
 内容按收益拆成小 PR：
 
-- CFG parallel；
+- CFG collective 验证并解除多卡门禁；
 - TP；
 - SP；
 - step execution；
-- cache；
+- `CachedTransformer` / `_cache_dit_adapter_config` 与 cache；
 - VAE parallel / offload；
 - 可选裁剪 safety generation head。
 
@@ -830,9 +910,9 @@ PR 3 的目标：
 
 | 风险 | 影响 | 预防 / 处理 |
 | --- | --- | --- |
-| Transformers 5.8 改变 Qwen3-VL 接口 | prompt / vision embedding 不一致 | 复用局部 adapter，增加 embedding golden test |
+| 仓库支持的 Transformers API 与上游 Mage 预期不同 | prompt / vision embedding 不一致 | 复用局部 adapter，在实际 CI 版本增加 embedding golden test |
 | 直接移植上游全局 monkeypatch | 污染其他模型 | 禁止 import-time patch，封装在 Mage module |
-| Mage-VAE 运算不被 PyTorch 2.11 支持 | 无法解码或性能差 | Phase 0 单独验证，局部兼容实现 |
+| 当前 CI PyTorch 缺少 Mage-VAE 所需算子 | 无法解码或性能差 | Phase 0 单独验证，局部兼容实现，不新增模型专属框架下限 |
 | dense attention 数值顺序不同 | fixed-seed 图像漂移 | 从 block / noise prediction 逐层定位 |
 | sequential CFG 性能较差 | 首期延迟高 | 明确基线，PR 3 packed CFG |
 | 权重命名或分片特殊 | 漏加载且不易发现 | 严格 missing/unexpected 审计 |
@@ -854,9 +934,12 @@ PR 3 的目标：
 - [ ] fixed-seed 数值和感知 parity 达标；
 - [ ] 默认步数、CFG、安全检查和水印与官方一致；
 - [ ] 当前不支持能力均 fail fast；
-- [ ] CPU CI 不下载大模型；
-- [ ] 完整 GPU 回归可在隔离环境复现；
-- [ ] 示例、支持模型列表和用户文档已更新；
+- [ ] L1 CPU CI 不下载大模型；
+- [ ] L2 / L3 Buildkite step 与 `source_file_dependencies` 已接线；
+- [ ] 至少一个 L4 functionality test 可在 nightly 运行；
+- [ ] 完整 GPU parity 可在隔离环境复现；
+- [ ] 共享 offline / online 示例和用户指南已更新；
+- [ ] `docs/models/supported_models.md` 已加入 Mage-Flow 能力与限制；
 - [ ] 性能报告包含环境、revision、开关和逐阶段数据；
 - [ ] 移植代码包含正确的 MIT 来源和版权说明。
 
@@ -869,17 +952,18 @@ PR 2 改为关闭 issue 的阻塞项，但不要把 packed batching 和并行能
 1. 锁定官方 Mage repo 和 6 个 checkpoint revision；
 2. 建立独立官方基准环境，导出一组中间 tensor；
 3. 移植 Mage layers 和 tiny Transformer；
-4. 替换为 vLLM-Omni Attention，完成单步对齐；
+4. 接入单卡显式 QKV concat 和 vLLM-Omni `Attention`，完成单步对齐；
 5. 移植 Mage-VAE，完成 decode / encode 对齐；
-6. 适配 Qwen3-VL + processor 到 Transformers 5.8；
+6. 适配 Qwen3-VL + processor 到仓库当前支持的 Transformers API；
 7. 实现 scheduler、noise / watermark 和 T2I denoise loop；
-8. 接入权重 loader、registry、post-process；
-9. 完成 T2I 单测、GPU parity、示例和性能报告；
-10. 合并 PR 1；
-11. 增加 Edit 双路图像条件和 multimodal metadata；
-12. 完成 1～3 图 Edit parity 后合并 PR 2；
-13. 设计并实现 packed varlen metadata；
-14. 按 CFG → TP → SP → step/cache 的顺序优化。
+8. 接入 CFG mixin、进度条、权重 loader、registry、post-process；
+9. 扩展共享示例、支持模型文档和 L1～L4 Buildkite 测试；
+10. 完成 T2I GPU parity 和固定硬件性能报告；
+11. 合并 PR 1；
+12. 增加 Edit 双路图像条件和 multimodal metadata；
+13. 完成 1～3 图 Edit parity 与 L4 expansion 后合并 PR 2；
+14. 先验证 padded mask batching，再按性能数据决定是否新增 flat-packed metadata；
+15. 按 CFG → TP → SP → step/cache 的顺序优化。
 
 ## 18. 参考资料
 
@@ -888,6 +972,8 @@ PR 2 改为关闭 issue 的阻塞项，但不要把 packed batching 和并行能
 - T2I 模型：<https://huggingface.co/microsoft/Mage-Flow>
 - Edit 模型：<https://huggingface.co/microsoft/Mage-Flow-Edit>
 - 本仓库模型接入指南：`docs/contributing/model/adding_diffusion_model.md`
+- 本仓库 CI 分层：`docs/contributing/ci/CI_5levels.md`
+- 支持模型表：`docs/models/supported_models.md`
 - 可参考的 T2I pipeline：`vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py`
 - 可参考的多图处理：`vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image_edit_plus.py`
 - 可参考的 Qwen3-VL 兼容层：

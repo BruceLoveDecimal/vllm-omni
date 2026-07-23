@@ -110,6 +110,27 @@ def test_formatter_preserves_single_video_audio_actions_and_custom_output(
     }
 
 
+def test_formatter_uses_explicit_image_size_when_resolution_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    request = _request("edit")
+    request.sampling_params.resolution = None
+    request.sampling_params.height = 512
+    request.sampling_params.width = 768
+
+    [result] = format_diffusion_outputs(
+        request=request,
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=torch.zeros(1)),
+        output_data=torch.zeros(1),
+        postprocess_output=normalize_diffusion_postprocess_output(["image"], {}),
+        timings=_timings(),
+    )
+
+    assert result.metrics["resolution"] == 768
+
+
 def test_formatter_preserves_text_custom_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
     postprocess_output = normalize_diffusion_postprocess_output(

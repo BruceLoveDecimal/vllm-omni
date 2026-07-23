@@ -358,6 +358,12 @@ class YourModelPipeline(nn.Module):
 
 [`DiffusionRequestBatch`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/worker/request_batch/#vllm_omni.diffusion.worker.request_batch.DiffusionRequestBatch) exposes compatibility properties such as `prompts`, `sampling_params`, and `request_id`. Pipelines that can execute the whole request batch in one forward pass should set `supports_request_batch = True`; other pipelines still receive a single-request batch and return a one-element output list.
 
+If the pipeline pads heterogeneous shapes itself, it may also declare
+`request_batch_ignored_sampling_param_fields`, for example
+`frozenset({"height", "width", "resolution"})`. Only declare fields whose
+request-local semantics are preserved by the model; unknown field names are
+rejected before scheduling.
+
 See some parameters in `OmniDiffusionSamplingParams` as follows:
 
 | parameters | type |value | function |

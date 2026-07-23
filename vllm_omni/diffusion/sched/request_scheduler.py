@@ -6,7 +6,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler, get_request_batch_sampling_params_key
+from vllm_omni.diffusion.sched.base_scheduler import (
+    _BaseScheduler,
+    get_request_batch_sampling_params_key,
+    validate_request_batch_ignored_sampling_param_fields,
+)
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
@@ -19,8 +23,26 @@ if TYPE_CHECKING:
 class RequestScheduler(_BaseScheduler):
     """Diffusion scheduler with vLLM-style waiting/running queues."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._ignored_sampling_param_fields: frozenset[str] = frozenset()
+
+    def set_ignored_sampling_param_fields(
+        self,
+        fields: frozenset[str],
+    ) -> None:
+        if self._request_states:
+            raise RuntimeError(
+                "request-batch compatibility fields must be configured before requests are added"
+            )
+        validate_request_batch_ignored_sampling_param_fields(fields)
+        self._ignored_sampling_param_fields = fields
+
     def _build_sampling_params_key(self, request: OmniDiffusionRequest):
-        return get_request_batch_sampling_params_key(request)
+        return get_request_batch_sampling_params_key(
+            request,
+            self._ignored_sampling_param_fields,
+        )
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         return super().add_request(request)

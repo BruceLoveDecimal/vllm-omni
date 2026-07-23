@@ -34,6 +34,10 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.mage_flow import (
+    MAGE_FLOW_EXTRA_BODY_PARAMS,
+    MAGE_FLOW_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
@@ -133,6 +137,10 @@ def default_image_to_video_prompt(
 
 
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
+    "MageFlowPipeline": {
+        "extra_body_params": MAGE_FLOW_EXTRA_BODY_PARAMS,
+        "extra_output_params": MAGE_FLOW_EXTRA_OUTPUT_PARAMS,
+    },
     "AudioXPipeline": {
         "extra_body_params": AUDIOX_EXTRA_BODY_PARAMS,
         "extra_output_params": AUDIOX_EXTRA_OUTPUT_PARAMS,

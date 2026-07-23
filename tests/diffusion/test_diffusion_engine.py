@@ -127,6 +127,33 @@ class TestRequestBatchCapability:
 
         assert diffusion_engine_module.supports_request_batch(od_config) is True
 
+    def test_resolves_model_declared_request_local_sampling_fields(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class _MixedResolutionPipeline(_BatchCapablePipeline):
+            request_batch_ignored_sampling_param_fields = {
+                "height",
+                "width",
+            }
+
+        od_config = SimpleNamespace(
+            model_class_name="MixedResolutionPipeline",
+            custom_pipeline_args=None,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _MixedResolutionPipeline,
+        )
+
+        assert (
+            diffusion_engine_module.request_batch_ignored_sampling_param_fields(
+                od_config
+            )
+            == {"height", "width"}
+        )
+
     def test_supports_request_batch_uses_custom_pipeline_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
         od_config = SimpleNamespace(
             model_class_name="SinglePipeline",

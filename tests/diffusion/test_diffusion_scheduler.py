@@ -236,6 +236,41 @@ class TestGetRequestBatchSamplingParamsKey:
             self._make(seed=1, generator=gen_a)
         ) == get_request_batch_sampling_params_key(self._make(seed=2, generator=gen_b))
 
+    def test_model_can_make_spatial_shape_request_local(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import (
+            get_request_batch_sampling_params_key,
+        )
+
+        first = self._make()
+        first.sampling_params.height = 512
+        first.sampling_params.width = 1024
+        second = self._make()
+        second.sampling_params.height = 1024
+        second.sampling_params.width = 512
+        ignored = frozenset({"height", "width"})
+
+        assert get_request_batch_sampling_params_key(
+            first,
+            ignored,
+        ) == get_request_batch_sampling_params_key(second, ignored)
+        assert get_request_batch_sampling_params_key(
+            first
+        ) != get_request_batch_sampling_params_key(second)
+
+    def test_unknown_ignored_field_is_rejected(self) -> None:
+        from vllm_omni.diffusion.sched.base_scheduler import (
+            get_request_batch_sampling_params_key,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Unknown request-batch compatibility fields",
+        ):
+            get_request_batch_sampling_params_key(
+                self._make(),
+                frozenset({"not_a_sampling_field"}),
+            )
+
 
 class TestRequestScheduler:
     def setup_method(self) -> None:
@@ -356,6 +391,36 @@ class TestRequestScheduler:
         assert _new_ids(sched_output) == [req_id_a, req_id_b]
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
+
+    def test_model_declared_spatial_fields_allow_mixed_resolution_batch(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        scheduler.set_ignored_sampling_param_fields(
+            frozenset({"height", "width", "resolution"})
+        )
+        first = _make_step_request(
+            "wide",
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=1,
+                height=512,
+                width=1024,
+            ),
+        )
+        second = _make_step_request(
+            "tall",
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=1,
+                height=1024,
+                width=512,
+            ),
+        )
+        scheduler.add_request(first)
+        scheduler.add_request(second)
+
+        scheduled = scheduler.schedule()
+
+        assert _new_ids(scheduled) == ["wide", "tall"]
+        assert scheduled.num_running_reqs == 2
 
     def test_batches_incompatible_request_sampling_params_separately(self) -> None:
         scheduler = RequestScheduler()

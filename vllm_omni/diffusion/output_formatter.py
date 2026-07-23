@@ -100,12 +100,23 @@ def format_diffusion_outputs(
     """Convert a finished diffusion model output into API-facing outputs."""
 
     outputs = _ensure_list(postprocess_output.outputs)
+    height = request.sampling_params.height
+    width = request.sampling_params.width
+    if height is not None and width is not None:
+        metric_resolution = max(int(height), int(width))
+    elif request.sampling_params.resolution is not None:
+        metric_resolution = int(request.sampling_params.resolution)
+    else:
+        metric_resolution = max(
+            int(height) if height is not None else 0,
+            int(width) if width is not None else 0,
+        )
     metrics = {
         "preprocess_time_ms": timings.preprocess_time_s * 1000,
         "diffusion_engine_exec_time_ms": timings.exec_time_s * 1000,
         "diffusion_engine_total_time_ms": timings.total_time_ms,
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
-        "resolution": int(request.sampling_params.resolution),
+        "resolution": metric_resolution,
         "postprocess_time_ms": timings.postprocess_time_s * 1000,
     }
 
