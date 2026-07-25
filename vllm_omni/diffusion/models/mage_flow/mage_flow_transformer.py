@@ -259,7 +259,9 @@ class MageFlowTransformer2DModel(nn.Module):
     ) -> torch.Tensor:
         frequencies = []
         for grids in grids_per_sample:
-            sample_frequencies = self.pos_embed(grids)
+            # RoPE owns a bounded device-aware LRU. Pass the execution device
+            # explicitly so cached GPU tensors cannot cross device boundaries.
+            sample_frequencies = self.pos_embed(grids, device=device)
             padding = max_image_tokens - sample_frequencies.shape[0]
             if padding < 0:
                 raise ValueError("Mage-Flow image grid exceeds the padded token length")

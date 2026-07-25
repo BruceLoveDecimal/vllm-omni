@@ -13,6 +13,7 @@ backend-selectable ``Attention`` layer.
 """
 
 import math
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -173,18 +174,44 @@ class MageFlowEmbedRope(nn.Module):
         self.axes_dim = axes_dim
         self.scale_rope = scale_rope
 
-        # Keep only integer indices as buffers. Complex buffers are unsafe here:
-        # ``module.to(dtype=torch.bfloat16)`` casts them to a real dtype and
-        # silently discards the imaginary component that encodes RoPE phase.
-        self.register_buffer(
-            "positive_indices",
-            torch.arange(max_positions),
-            persistent=False,
+        # DiffusersPipelineLoader may instantiate modules under a CUDA or meta
+        # default-device context. Pin construction to CPU explicitly; relying
+        # on torch.arange()'s ambient device would silently reintroduce the
+        # CUDA pow/polar rounding that this cache is intended to avoid.
+        positive_indices = torch.arange(max_positions, device="cpu")
+        negative_indices = (
+            torch.arange(max_positions, device="cpu").flip(0) * -1 - 1
         )
-        self.register_buffer(
-            "negative_indices",
-            torch.arange(max_positions).flip(0) * -1 - 1,
-            persistent=False,
+
+        # Match Qwen-Image and upstream Mage: build the canonical complex64
+        # tables on CPU, then lazily move the complete tables to the device
+        # requested by forward(). CPU and CUDA pow/polar differ in their last
+        # few bits, which is enough to change BF16 rounding after RoPE.
+        #
+        # These must remain plain attributes rather than registered buffers.
+        # The pipeline applies ``module.to(dtype=torch.bfloat16)``; applying
+        # that conversion to a complex buffer discards its imaginary phase.
+        self.pos_freqs = torch.cat(
+            [
+                self._rope_params(
+                    positive_indices,
+                    axis_dim,
+                    self.theta,
+                )
+                for axis_dim in self.axes_dim
+            ],
+            dim=1,
+        )
+        self.neg_freqs = torch.cat(
+            [
+                self._rope_params(
+                    negative_indices,
+                    axis_dim,
+                    self.theta,
+                )
+                for axis_dim in self.axes_dim
+            ],
+            dim=1,
         )
 
     @staticmethod
@@ -197,20 +224,32 @@ class MageFlowEmbedRope(nn.Module):
             index,
             1.0
             / torch.pow(
-                torch.tensor(theta, device=index.device),
+                theta,
                 torch.arange(
                     0,
                     dim,
                     2,
                     dtype=torch.float32,
-                    device=index.device,
+                    device="cpu",
                 ).div(dim),
             ),
         )
         return torch.polar(torch.ones_like(frequencies), frequencies)
 
+    @staticmethod
+    def _canonical_device(device: torch.device) -> torch.device:
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            return torch.device(
+                "cuda",
+                torch.accelerator.current_device_index(),
+            )
+        return device
+
+    @lru_cache(maxsize=16)
     def _compute_grid(
         self,
+        device: torch.device,
         frame: int,
         height: int,
         width: int,
@@ -218,9 +257,26 @@ class MageFlowEmbedRope(nn.Module):
     ) -> torch.Tensor:
         if frame < 1 or height < 1 or width < 1:
             raise ValueError(f"image grid dimensions must be positive, got {(frame, height, width)}")
-        positive = tuple(self._rope_params(self.positive_indices, axis_dim, self.theta) for axis_dim in self.axes_dim)
-        negative = tuple(self._rope_params(self.negative_indices, axis_dim, self.theta) for axis_dim in self.axes_dim)
-        if frame_offset + frame > positive[0].shape[0] or height > positive[1].shape[0] or width > positive[2].shape[0]:
+        if self.pos_freqs.device != device:
+            # As in Qwen-Image, mutate the single canonical table pair to the
+            # active device. The final grid cache is keyed by device, so a
+            # cached cuda:0 tensor can never satisfy a cuda:1 request.
+            self.pos_freqs = self.pos_freqs.to(device)
+            self.neg_freqs = self.neg_freqs.to(device)
+
+        positive = self.pos_freqs.split(
+            [axis_dim // 2 for axis_dim in self.axes_dim],
+            dim=1,
+        )
+        negative = self.neg_freqs.split(
+            [axis_dim // 2 for axis_dim in self.axes_dim],
+            dim=1,
+        )
+        if (
+            frame_offset + frame > positive[0].shape[0]
+            or height > positive[1].shape[0]
+            or width > positive[2].shape[0]
+        ):
             raise ValueError(f"image grid {(frame, height, width)} exceeds the RoPE cache")
 
         frame_freqs = (
@@ -245,18 +301,38 @@ class MageFlowEmbedRope(nn.Module):
 
         height_freqs = height_freqs.view(1, height, 1, -1).expand(frame, height, width, -1)
         width_freqs = width_freqs.view(1, 1, width, -1).expand(frame, height, width, -1)
-        return torch.cat([frame_freqs, height_freqs, width_freqs], dim=-1).reshape(frame * height * width, -1)
+        # Cache the final contiguous device tensor, not an expanded view. This
+        # bounds both recomputation and repeated CPU-to-device transfers.
+        return (
+            torch.cat(
+                [frame_freqs, height_freqs, width_freqs],
+                dim=-1,
+            )
+            .reshape(frame * height * width, -1)
+            .clone()
+            .contiguous()
+        )
 
     def forward(
         self,
         image_grid_fhw: tuple[int, int, int] | list[tuple[int, int, int]],
+        device: torch.device | None = None,
     ) -> torch.Tensor:
         grids = [image_grid_fhw] if isinstance(image_grid_fhw, tuple) else image_grid_fhw
         if not grids:
             raise ValueError("image_grid_fhw must contain one grid")
+        target_device = self._canonical_device(
+            self.pos_freqs.device if device is None else device
+        )
         return torch.cat(
             [
-                self._compute_grid(frame, height, width, frame_offset=index)
+                self._compute_grid(
+                    target_device,
+                    frame,
+                    height,
+                    width,
+                    frame_offset=index,
+                )
                 for index, (frame, height, width) in enumerate(grids)
             ],
             dim=0,
