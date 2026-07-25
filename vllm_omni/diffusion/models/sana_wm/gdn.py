@@ -737,7 +737,7 @@ def phase_a(
     BLOCK_D = triton.next_power_of_2(D)
     BH = B * H
 
-    # FAIR-COMPARE PATCH: keep fp32 inter-phase bridge at P0/P1 to match pytorch/fused
+    # Keep the fp32 inter-phase bridge at P0/P1 to match the pytorch/fused paths.
     bridge_dtype = torch.float32 if dot_precision >= 1 else torch.bfloat16
     I_P_kv = torch.empty(BH, F, BLOCK_D, BLOCK_D, device=qkv.device, dtype=bridge_dtype)
     A = torch.empty(BH, F, BLOCK_D, BLOCK_D, device=qkv.device, dtype=bridge_dtype)

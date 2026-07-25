@@ -47,15 +47,11 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         self.refiner_text_encoder: nn.Module | None = None
         self.refiner_connectors: nn.Module | None = None
         self.refiner_tokenizer: Any | None = None
-        # Build the refiner stack at construction (startup), the same as
-        # LTX2TwoStagesPipeline. This runs inside the loader's
-        # DeviceMemoryProfiler-wrapped load_model, so the refiner shows up in
-        # the "Model loading took X GiB" accounting; it also makes the modules
-        # non-None when the offloader's ModuleDiscovery runs (it skips None
-        # attributes), and surfaces any load-time OOM at deploy rather than on
-        # the first user request. When no checkpoint is configured (unit
-        # tests), the first-request `ensure_refiner_components` still serves as
-        # a lazy fallback.
+        # Build the refiner stack at startup like LTX2TwoStagesPipeline: it then
+        # lands inside the loader's memory accounting, is non-None for the
+        # offloader's ModuleDiscovery, and OOMs at deploy instead of on the first
+        # request. Without a checkpoint (unit tests),
+        # `ensure_refiner_components` still runs lazily on first use.
         if self.od_config is not None and self.od_config.model is not None:
             self.ensure_refiner_components()
 
@@ -138,9 +134,8 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         else:
             vllm_config_context = nullcontext()
 
-        # When SANA_WM_USE_DIFFUSERS_REFINER=1, swap vllm_omni's local LTX-2 port
-        # for the upstream diffusers `LTX2VideoTransformer3DModel`. This makes the
-        # refiner same-source bit-exact (cos 0.8912 -> 1.0000).
+        # SANA_WM_USE_DIFFUSERS_REFINER=1 swaps vllm_omni's local LTX-2 port for
+        # the upstream diffusers `LTX2VideoTransformer3DModel`.
         use_diffusers_refiner = os.environ.get("SANA_WM_USE_DIFFUSERS_REFINER", "0") == "1"
         config_dict = self._load_refiner_transformer_config()
         state_dict = load_file(str(self.release_paths.refiner_transformer_weights), device="cpu")
@@ -591,14 +586,11 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
 
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
         loaded = super().load_weights(weights)
-        # The refiner stack (transformer / text_encoder / connectors) is built
-        # and loaded separately at construction via ensure_refiner_components()
-        # (from_pretrained, strict=False). The video-only SANA-WM refiner
-        # legitimately omits the LTX-2 audio-attention and Gemma vision-tower
-        # parameters, which stay at init and are unused at inference. Report the
-        # refiner params as loaded so the engine's strict completeness check
-        # (which now sees them, since the refiner is built at startup) does not
-        # reject the intentionally-absent audio/vision weights.
+        # The refiner stack is loaded separately in ensure_refiner_components()
+        # (from_pretrained, strict=False), and the video-only SANA-WM refiner
+        # legitimately ships no LTX-2 audio-attention / Gemma vision-tower
+        # weights. Report its params as loaded so the engine's strict
+        # completeness check does not reject those intentional absences.
         for attr in ("refiner_transformer", "refiner_text_encoder", "refiner_connectors"):
             module = getattr(self, attr, None)
             if module is not None:

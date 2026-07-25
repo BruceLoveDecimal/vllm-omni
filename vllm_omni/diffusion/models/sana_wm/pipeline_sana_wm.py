@@ -69,17 +69,13 @@ SANA_WM_STAGE1_TEXT_ENCODER_ENV = "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER"
 SANA_WM_REFINER_ROOT_ENV = "VLLM_OMNI_SANA_WM_REFINER_ROOT"
 SANA_WM_OUTPUT_HEIGHT = 704
 SANA_WM_OUTPUT_WIDTH = 1280
-# The model's maximum supported clip length (20s @16fps). This is the native
-# *envelope*, not a request default — request-side defaults live in
-# ``stage_input_processors/sana_wm.py`` and match the deploy YAML (161 frames).
+# Maximum supported clip length (20s @16fps) — the native envelope, not a
+# request default. Request-side defaults live in
+# ``stage_input_processors/sana_wm.py``.
 SANA_WM_NATIVE_NUM_FRAMES = 321
-# Fail-fast envelope for the native Stage-1 path: the model's native 704x1280
-# output at its maximum supported 321-frame clip — 41 latent frames x 22 x 40 =
-# 36080 latent tokens. Derived from the constants above so it always covers the
-# advertised defaults (e.g. the deploy YAML's 161-frame config = 18480 tokens)
-# while still rejecting genuinely oversized requests before they OOM a worker.
-# Callers can override per-request via the ``sana_wm_native_max_tokens`` extra
-# arg.
+# Fail-fast latent-token cap for the native Stage-1 path, sized to the native
+# 704x1280 output at the maximum clip length so it only rejects genuinely
+# oversized requests. Overridable per-request via ``sana_wm_native_max_tokens``.
 SANA_WM_NATIVE_MAX_TOKENS = (
     ((SANA_WM_NATIVE_NUM_FRAMES - 1) // 8 + 1) * (SANA_WM_OUTPUT_HEIGHT // 32) * (SANA_WM_OUTPUT_WIDTH // 32)
 )
@@ -132,10 +128,9 @@ class SanaWmNativeParams:
     num_frames: int
     num_inference_steps: int
     seed: int
-    # Classifier-free guidance: NVlabs Sana-WM video runs cfg_scale=5.0 by
-    # default. The native path defaults to 1.0 (no CFG) for back-compat with
-    # earlier probes; pipelines that pass ``guidance_scale > 1.0`` with
-    # ``guidance_scale_provided=True`` get a true two-branch CFG forward.
+    # Defaults to 1.0 (single-branch, no CFG). A two-branch CFG forward runs
+    # only when the caller passes ``guidance_scale > 1.0`` together with
+    # ``guidance_scale_provided=True`` (NVlabs production uses cfg_scale=5.0).
     cfg_scale: float = 1.0
     negative_prompt: str = ""
 
@@ -288,7 +283,6 @@ class SanaWmPipeline(
         self.quant_config = getattr(od_config, "quantization_config", None) if od_config is not None else None
         self.camera_encoder: SanaWmCameraEmbedder | None = None
 
-        # Filled by the real implementation.
         self.tokenizer: Any | None = None
         self.text_encoder: nn.Module | None = None
         self.vae: nn.Module | None = None
@@ -355,11 +349,6 @@ class SanaWmPipeline(
         steps = int(extra_args.get("sana_wm_native_steps", steps))
         if min(height, width, num_frames, steps) <= 0:
             raise ValueError("Sana-WM native height, width, num_frames, and steps must be positive.")
-        # CFG: only enable when the caller explicitly opts in via
-        # ``guidance_scale_provided=True`` AND guidance_scale > 1. This keeps
-        # the legacy single-branch behavior for tests that pass cfg=1.0 while
-        # restoring NVlabs production semantics (cfg=5.0 by default for
-        # sana-wm video).
         cfg_scale = 1.0
         if sampling_params is not None and getattr(sampling_params, "guidance_scale_provided", False):
             cfg_scale = float(getattr(sampling_params, "guidance_scale", 1.0) or 1.0)
@@ -632,17 +621,8 @@ class SanaWmPipeline(
                 "Sana-WM Stage-1 Gemma hidden size mismatch: expected "
                 f"{SANA_WM_STAGE1_PROMPT_CHANNELS}, got {hidden_states.shape[-1]}."
             )
-        # Pass RAW Gemma hidden states; the model's
-        # internal ``attention_y_norm = RMSNorm(hidden_size,
-        # scale_factor=y_norm_scale_factor)`` (set in
-        # SanaWmTransformer3DModel) handles normalisation. The prior
-        # ``F.normalize(...) * y_norm_scale_factor`` step double-
-        # normalised and used the scale_factor as a multiplicative
-        # post-normalise gain rather than as the RMSNorm scale, which
-        # collapsed the prompt embed L2 norm to ~0.17 (vs the expected
-        # ~450 at this shape) and left the model effectively
-        # unconditioned on the prompt. Probed via
-        # tools/scripts/probe_step0.py.
+        # Return RAW Gemma hidden states: the transformer's ``attention_y_norm``
+        # RMSNorm does the normalisation, so normalising here double-normalises.
         self._last_prompt_attention_mask = attention_mask.to(device=device, dtype=torch.float32)
         return hidden_states.to(device=device, dtype=dtype), "gemma2"
 
@@ -659,17 +639,13 @@ class SanaWmPipeline(
         self._ensure_vae(device=device, dtype=dtype)
         if self.vae is None:
             raise RuntimeError("Sana-WM VAE did not initialize.")
-        # LTX-2 VAE denormalisation: see :meth:`_vae_denormalize_latent`.
         # NVlabs always passes ``temb=None`` to ``vae.decode`` for this VAE
-        # (see ``builder.py::vae_decode -> LTX2VAE_diffusers``); we match
-        # that unconditionally rather than threading a zero timestep
-        # through ``timestep_conditioning`` like the older path did.
+        # (``builder.py::vae_decode -> LTX2VAE_diffusers``); match that.
         denorm = self._vae_denormalize_latent(latents.to(getattr(self.vae, "dtype", dtype)))
         video = self.vae.decode(denorm, temb=None, return_dict=False)[0]
         # Post-process to the requested output_type (np/pil/pt). Let failures
         # surface: silently returning the raw decoder tensor would hand the
-        # caller a wrong-format/range video with no error (the latent-vs-RGB
-        # class of bug we already hit once).
+        # caller a wrong-format/range video with no error.
         from diffusers.video_processor import VideoProcessor
 
         processor = VideoProcessor(vae_scale_factor=getattr(self.vae, "spatial_compression_ratio", 32))
@@ -762,11 +738,8 @@ class SanaWmPipeline(
         )
         prompt_attention_mask = self._last_prompt_attention_mask
 
-        # Classifier-Free Guidance (NVlabs sana-wm video runs cfg=5.0 in
-        # production). The native path previously omitted the uncond branch
-        # entirely, so ``guidance_scale`` was silently dropped. When the
-        # caller opts in to cfg > 1, encode the negative prompt now and run
-        # a two-branch transformer forward per denoise step (see below).
+        # Under CFG, encode the negative prompt up front; each denoise step
+        # then runs a two-branch transformer forward.
         do_cfg = params.cfg_scale > 1.0
         if do_cfg:
             negative_prompt_obj = {"prompt": params.negative_prompt}
@@ -777,9 +750,8 @@ class SanaWmPipeline(
                 allow_hash_fallback=allow_hash_fallback,
             )
             negative_prompt_attention_mask = self._last_prompt_attention_mask
-            # Restore the cond mask on the instance attribute so callers
-            # inspecting `_last_prompt_attention_mask` after this method
-            # (e.g. dump probes) still see the positive-branch mask.
+            # Restore the cond mask so later readers of
+            # `_last_prompt_attention_mask` see the positive branch.
             self._last_prompt_attention_mask = prompt_attention_mask
         else:
             negative_prompt_embeds = None
@@ -827,13 +799,9 @@ class SanaWmPipeline(
 
         for _step_idx, timestep in enumerate(timesteps):
             if use_per_frame_timestep:
-                # (B, 1, F) per-frame timestep, frame 0 forced to 0.
-                # Keep fp32 to match NVlabs ``LTXFlowEuler.sample`` — the
-                # sinusoidal-embedding inside ``SanaWmTimestepEmbedder``
-                # uses ``timestep.float()`` internally; casting through
-                # the latent dtype (bf16) first would quantise the
-                # timestep before the embed and inject a hidden
-                # precision variable into the contract.
+                # (B, 1, F) per-frame timestep, frame 0 forced to 0. Stays fp32:
+                # casting through the bf16 latent dtype would quantise it before
+                # ``SanaWmTimestepEmbedder``'s sinusoidal embed.
                 model_timestep = timestep.float().expand(cam_batch, 1, cam_frames).clone()
                 model_timestep[:, :, 0] = 0.0
             else:
@@ -862,10 +830,8 @@ class SanaWmPipeline(
                 noise_pred = noise_pred_cond
 
             if use_per_token_step:
-                # Build per-token timesteps from the (B, 1, F) model
-                # timestep by broadcasting to (B, 1, F, H, W) and
-                # flattening F*H*W. Conditioning tokens (frame 0) are
-                # already at 0 in model_timestep.
+                # Broadcast the (B, 1, F) timestep to (B, 1, F, H, W) and flatten
+                # F*H*W; frame-0 conditioning tokens are already 0.
                 pt_t = (
                     model_timestep.unsqueeze(-1)
                     .unsqueeze(-1)

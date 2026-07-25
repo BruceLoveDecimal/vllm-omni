@@ -704,9 +704,7 @@ class SanaWmSelfAttention(nn.Module):
             else None
         )
 
-        # These names mirror the official GDN checkpoint. The current forward
-        # executes a pure PyTorch recurrence; the fused Triton scan is ported
-        # separately.
+        # These names mirror the official GDN checkpoint.
         self.A_log = nn.Parameter(torch.zeros(self.num_heads))
         self.dt_bias = nn.Parameter(torch.zeros(self.num_heads))
         self.register_buffer("recall_gate", torch.zeros(1))
@@ -1092,14 +1090,10 @@ class SanaWmSelfAttention(nn.Module):
         value = value.transpose(1, 2)
 
         dtype_orig = hidden_states.dtype
-        # NVlabs runs SDPA in bf16 even when ``fp32_attention=True`` because
-        # FlashAttention only supports bf16/fp16; fp32 falls back to the
-        # math backend. Match that semantics: if the upstream code path
-        # promoted Q/K/V to fp32 (e.g. q/k_norm in fp32), demote back to
-        # bf16 before SDPA. See
-        # ``NVlabs-Sana/diffusion/model/nets/sana_gdn_camctrl_blocks.py``
-        # ``_forward_softmax_attn_sdpa`` (the comment "SDPA / FlashAttention
-        # only supports bf16/fp16; fp32 falls back to math backend.").
+        # NVlabs runs SDPA in bf16 even under ``fp32_attention=True``, since
+        # FlashAttention only supports bf16/fp16 and fp32 falls back to the math
+        # backend. Demote Q/K/V that an upstream step promoted to fp32. See
+        # ``sana_gdn_camctrl_blocks.py::_forward_softmax_attn_sdpa``.
         if query.dtype == torch.float32:
             query = query.bfloat16()
             key = key.bfloat16()
@@ -1163,14 +1157,8 @@ class SanaWmSelfAttention(nn.Module):
         query = q_cam_trans
         key = k_cam_trans
         value = v_cam_trans
-        # Match NVlabs ``_forward_softmax_attn_sdpa``: promote to fp32 to honor
-        # ``fp32_attention=True``, then demote back to bf16 for SDPA so we
-        # get FlashAttention instead of the fp32 math-backend fallback. The
-        # net SDPA math is therefore bf16 (matching NVlabs), but Q/K/V are
-        # composed in fp32 prior to the demote. See the comment in
-        # ``sana_gdn_camctrl_blocks.py::_forward_softmax_attn_sdpa``:
-        # "SDPA / FlashAttention only supports bf16/fp16; fp32 falls back to
-        # math backend."
+        # Compose Q/K/V in fp32 to honor ``fp32_attention``, then demote for the
+        # bf16 SDPA (see the softmax-attention path above).
         if getattr(self, "fp32_attention", True):
             query = query.float()
             key = key.float()
@@ -1691,13 +1679,9 @@ class SanaWmMbConvFfn(nn.Module):
     def forward(self, hidden_states: torch.Tensor, spatial_shape: tuple[int, int, int]) -> torch.Tensor:
         """Match NVlabs ``GLUMBConvTemp.forward`` exactly:
 
-        1. Reshape ``(B, N=F*H*W, C) → (B*F, H, W, C) → (B*F, C, H, W)``
-           so the spatial MBConv runs PER FRAME with proper 2D (H, W)
-           geometry. Our previous reshape ``(B, C, F, H*W)`` made the
-           3×3 ``depth_conv`` span the (F, H*W) plane treating F as
-           height and the flattened H*W as a 1D width — wrong axis,
-           producing garbage (cosine ≈ 0.04 vs NVlabs in the
-           block-0 parity probe).
+        1. Reshape ``(B, N=F*H*W, C) → (B*F, H, W, C) → (B*F, C, H, W)`` so the
+           spatial MBConv runs PER FRAME with proper 2D (H, W) geometry — the
+           3×3 ``depth_conv`` must not span an (F, H*W) plane.
         2. Apply expand → depthwise 3×3 → GLU → contract on per-frame
            (B*F, C, H, W).
         3. Temporal aggregation: reshape back to ``(B, C, F, H*W)``
@@ -1713,16 +1697,13 @@ class SanaWmMbConvFfn(nn.Module):
             .reshape(batch * frames, height, width, hidden_size)
             .permute(0, 3, 1, 2)
         )
-        # NVlabs leaves this NHWC-derived NCHW view non-contiguous. On bf16
-        # CUDA convs that selects a different kernel/layout than a contiguous
-        # copy; preserving the stride is required for late-step parity.
-        # NVlabs ``ConvLayer`` wraps Conv2d in `Conv → norm → act`. For SANA-WM
-        # `act=("silu", "silu", None)`: inverted_conv applies SiLU, depth_conv
-        # and point_conv don't. Our ``_ConvWrapper`` only stores the raw
-        # Conv2d to match the checkpoint key (`inverted_conv.conv.weight`),
-        # so we need to apply the SiLU explicitly here — skipping it left
-        # the expanded features unactivated and inflated the downstream
-        # GLU output magnitude by ~12×.
+        # Keep this NHWC-derived NCHW view non-contiguous like NVlabs: on bf16
+        # CUDA convs the stride selects a different kernel, and a contiguous
+        # copy breaks late-step parity.
+        # NVlabs ``ConvLayer`` is `Conv → norm → act` with
+        # `act=("silu", "silu", None)`, so inverted_conv activates and the other
+        # two do not. ``_ConvWrapper`` stores only the raw Conv2d (to match the
+        # `inverted_conv.conv.weight` checkpoint key), hence the explicit SiLU.
         x_inv = self.glu_act(self.inverted_conv.conv(x))
         x_dep = self.depth_conv.conv(x_inv)
         value, gate = x_dep.chunk(2, dim=1)
@@ -1750,8 +1731,6 @@ class SanaWmBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.block_idx = block_idx
-        # Attach block_idx to attn/mlp so per-block probes can read it.
-        # (Set after they're created below — see end of __init__.)
         hidden_size = config.hidden_size
         use_gdn = config.softmax_every_n <= 0 or (block_idx + 1) % config.softmax_every_n != 0
         use_plucker_proj = config.use_chunk_plucker_post_attn and (
@@ -1808,9 +1787,7 @@ class SanaWmBlock(nn.Module):
         camera_conditions: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # NVlabs dispatch convention: when timestep
-        # modulation carries a frame axis (ndim > 2), route through the
-        # frame-aware path so shift/scale/gate are applied per frame.
+        # Per-frame timestep contract (see SanaWmTransformer3DModel.forward).
         if timestep_modulation.ndim > 2:
             return self._forward_frame_aware(
                 hidden_states,
@@ -2209,35 +2186,6 @@ class SanaWmTransformer3DModel(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.ndim != 5:
             raise ValueError("Sana-WM transformer expects latent input shaped [B, C, F, H, W].")
-        # Env-gated force-fp32 transformer forward for the
-        # bf16-precision-drift upper-bound experiment. Casts inputs to fp32,
-        # also upcasts model params (one-shot), and casts noise_pred back to
-        # the original input dtype before returning.
-        _force_fp32 = os.environ.get("SANA_WM_FORCE_FP32_TRANSFORMER", "").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        _input_dtype = hidden_states.dtype
-        if _force_fp32:
-            if not getattr(self, "_fp32_upcasted", False):
-                self.to(torch.float32)
-                self._fp32_upcasted = True
-            hidden_states = hidden_states.float()
-            if encoder_hidden_states is not None:
-                encoder_hidden_states = encoder_hidden_states.float()
-            if encoder_attention_mask is not None:
-                encoder_attention_mask = encoder_attention_mask.to(device=hidden_states.device)
-            if camera_hidden_states is not None:
-                camera_hidden_states = camera_hidden_states.float()
-            if plucker is not None:
-                plucker = plucker.float()
-            if raymap is not None:
-                raymap = raymap.float()
-            if spatial_raymap is not None:
-                spatial_raymap = spatial_raymap.float()
-
         batch_size = hidden_states.shape[0]
         latent_shape = hidden_states.shape[2:]
         hidden_states, spatial_shape = self.x_embedder.project_with_shape(hidden_states)
@@ -2276,15 +2224,11 @@ class SanaWmTransformer3DModel(nn.Module):
             timestep = timestep.expand(batch_size)
         elif timestep.ndim == 1 and timestep.shape[0] == 1 and batch_size > 1:
             timestep = timestep.expand(batch_size)
-        # Per-frame timestep contract: when ``timestep`` is
-        # rank > 1 (e.g. ``(B, 1, F)`` from the LTX flow-matching sampler),
-        # the per-frame embedding is computed on the flattened token axis
-        # and unflattened back to the input rank. ``time_embed`` then has
-        # an extra ``hidden_size`` axis appended (``(B, 1, F, D)``) and
-        # ``timestep_modulation`` has ``6*hidden_size`` (``(B, 1, F, 6*D)``).
-        # SanaWmBlock / SanaWmFinalLayer dispatch on ``ndim > 2`` to the
-        # frame-aware paths that broadcast per-frame modulation over the
-        # spatial tokens within each frame.
+        # Per-frame timestep contract: a rank > 1 ``timestep`` (``(B, 1, F)``
+        # from the LTX flow-matching sampler) embeds on the flattened token axis
+        # and unflattens back, giving ``(B, 1, F, D)`` / ``(B, 1, F, 6*D)``.
+        # SanaWmBlock and SanaWmFinalLayer dispatch on ``ndim > 2`` to the
+        # frame-aware paths that broadcast modulation over spatial tokens.
         timestep_shape = tuple(timestep.shape)
         time_embed = self.t_embedder(timestep)  # (numel, D)
         # t_block is Sequential(SiLU, Linear|ColumnParallelLinear); index explicitly
@@ -2342,8 +2286,6 @@ class SanaWmTransformer3DModel(nn.Module):
         hidden_states = self._unpatchify(hidden_states, spatial_shape)
         if hidden_states.shape[2:] != latent_shape:
             hidden_states = F.interpolate(hidden_states, size=latent_shape, mode="trilinear", align_corners=False)
-        if _force_fp32 and hidden_states.dtype != _input_dtype:
-            hidden_states = hidden_states.to(_input_dtype)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
