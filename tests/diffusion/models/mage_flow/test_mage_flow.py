@@ -221,6 +221,36 @@ def test_rope_preserves_complex_phase_after_bfloat16_conversion() -> None:
     torch.testing.assert_close(frequencies, expected)
 
 
+def test_rope_tables_ignore_ambient_construction_device() -> None:
+    with torch.device("meta"):
+        rope = MageFlowEmbedRope(theta=10000, axes_dim=[2, 2, 4])
+
+    assert rope.pos_freqs.device.type == "cpu"
+    assert rope.neg_freqs.device.type == "cpu"
+    assert rope.pos_freqs.dtype == torch.complex64
+
+
+def test_rope_uses_bounded_device_aware_grid_cache() -> None:
+    rope = MageFlowEmbedRope(
+        theta=10000,
+        axes_dim=[2, 2, 4],
+        max_positions=32,
+    )
+    rope._compute_grid.cache_clear()
+    device = torch.device("cpu")
+
+    first = rope._compute_grid(device, 1, 2, 3)
+    second = rope._compute_grid(device, 1, 2, 3)
+    assert second is first
+    assert rope._compute_grid.cache_info().hits == 1
+
+    for width in range(1, 18):
+        rope._compute_grid(device, 1, 1, width)
+    cache_info = rope._compute_grid.cache_info()
+    assert cache_info.maxsize == 16
+    assert cache_info.currsize == 16
+
+
 def test_joint_attention_matches_pytorch_reference() -> None:
     torch.manual_seed(7)
     attention = MageJointAttention(
