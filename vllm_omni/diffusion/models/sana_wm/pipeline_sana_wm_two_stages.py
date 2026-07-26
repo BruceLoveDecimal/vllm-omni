@@ -18,8 +18,11 @@ from torch import nn
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import (
     SanaWmPipeline,
+    build_sana_wm_output_envelope,
     get_sana_wm_post_process_func,
     get_sana_wm_pre_process_func,
+    read_sana_wm_envelope_metadata,
+    read_sana_wm_envelope_payload,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -160,7 +163,7 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             # Disable diffusers CacheMixin caching to keep activation memory bounded.
             self.refiner_transformer._disable_caching()
         else:
-            from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import create_transformer_from_config
+            from vllm_omni.diffusion.models.ltx2.ltx2_components import create_transformer_from_config
 
             with vllm_config_context, set_default_torch_dtype(dtype), torch.device("cpu"):
                 self.refiner_transformer = create_transformer_from_config(config_dict)
@@ -523,13 +526,16 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
             self._ensure_vae(device=device, dtype=dtype)
         output = self._decode_native_latents(refined_latents, output_type=output_type, device=device, dtype=dtype)
         return DiffusionOutput(
-            output=output,
-            custom_output={
-                "sana_wm_backend": "native_inprocess_refiner",
-                "sana_wm_output_space": output_type,
-                "sana_wm_refiner_steps": actual_steps,
-                "sana_wm_refiner_latent_shape": tuple(refined_latents.shape),
-            },
+            output=build_sana_wm_output_envelope(
+                output=output,
+                output_type=output_type,
+                metadata={
+                    "backend": "native_inprocess_refiner",
+                    "output_space": output_type,
+                    "refiner_steps": actual_steps,
+                    "refiner_latent_shape": tuple(refined_latents.shape),
+                },
+            ),
         )
 
     def forward(self, req: DiffusionRequestBatch, *args: Any, **kwargs: Any) -> DiffusionOutput:
@@ -565,17 +571,21 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
                 sampling_params=stage1_sampling_params,
             )
             refined = self._run_inprocess_refiner(
-                latents=stage1.output,
+                latents=read_sana_wm_envelope_payload(stage1.output),
                 prompt_text=str(normalized_prompt.get("prompt") or ""),
                 payload=payload,
                 sampling_params=req.sampling_params,
             )
-            refined.custom_output = {
-                **(stage1.custom_output or {}),
-                **(refined.custom_output or {}),
-                "sana_wm_stage1_backend": stage1.custom_output.get("sana_wm_backend")
-                if stage1.custom_output
-                else "unknown",
+            stage1_metadata = read_sana_wm_envelope_metadata(stage1.output)
+            refined.output = {
+                "payload": refined.output["payload"],
+                "metadata": {
+                    "sana_wm": {
+                        **stage1_metadata,
+                        **read_sana_wm_envelope_metadata(refined.output),
+                        "stage1_backend": stage1_metadata.get("backend", "unknown"),
+                    }
+                },
             }
             refined.stage_durations = {
                 **(stage1.stage_durations or {}),

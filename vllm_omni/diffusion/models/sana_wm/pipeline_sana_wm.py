@@ -218,10 +218,45 @@ def resolve_or_download_sana_wm_checkpoint(
     return paths
 
 
+def build_sana_wm_output_envelope(
+    *,
+    output: Any,
+    output_type: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Wrap a Stage-1/refiner result in the canonical output envelope.
+
+    ``normalize_diffusion_postprocess_output`` splits ``{"payload": ...,
+    "metadata": ...}`` into the API-facing payload and the metadata groups, so
+    the model-specific diagnostics ride along under a ``sana_wm`` group instead
+    of the removed ``DiffusionOutput.custom_output`` field.
+    """
+    payload_key = "latents" if output_type == "latent" else "video"
+    return {"payload": {payload_key: output}, "metadata": {"sana_wm": metadata}}
+
+
+def read_sana_wm_envelope_payload(output: Any) -> Any:
+    """Return the single payload value carried by a SANA-WM output envelope."""
+    payload = output.get("payload") if isinstance(output, dict) else None
+    if not isinstance(payload, dict) or len(payload) != 1:
+        raise ValueError("Expected a single-entry SANA-WM output envelope from the Stage-1 backend.")
+    return next(iter(payload.values()))
+
+
+def read_sana_wm_envelope_metadata(output: Any) -> dict[str, Any]:
+    """Return the ``sana_wm`` metadata group of a SANA-WM output envelope."""
+    metadata = output.get("metadata") if isinstance(output, dict) else None
+    group = metadata.get("sana_wm") if isinstance(metadata, dict) else None
+    return dict(group) if isinstance(group, dict) else {}
+
+
 def get_sana_wm_post_process_func(od_config: OmniDiffusionConfig):
     del od_config
 
     def post_process_func(output: Any) -> Any:
+        # The pipeline already decodes to the requested output type and emits the
+        # payload/metadata envelope the formatter normalizes, so postprocess is a
+        # pass-through.
         return output
 
     return post_process_func
@@ -855,19 +890,22 @@ class SanaWmPipeline(
         output_type = str(extra_args.get("sana_wm_output_type", "latent"))
         output = self._decode_native_latents(latents, output_type=output_type, device=device, dtype=dtype)
         return DiffusionOutput(
-            output=output,
-            custom_output={
-                "sana_wm_backend": "native_gdn",
-                "sana_wm_output_space": output_type,
-                "sana_wm_prompt_source": prompt_source,
-                "sana_wm_chi_prompt_applied": bool(self.sana_wm_config.chi_prompt),
-                "sana_wm_first_frame_encoded": _is_image,
-                "sana_wm_num_frames": params.num_frames,
-                "sana_wm_height": params.height,
-                "sana_wm_width": params.width,
-                "sana_wm_latent_tokens": token_count,
-                "sana_wm_sampling_steps": params.num_inference_steps,
-            },
+            output=build_sana_wm_output_envelope(
+                output=output,
+                output_type=output_type,
+                metadata={
+                    "backend": "native_gdn",
+                    "output_space": output_type,
+                    "prompt_source": prompt_source,
+                    "chi_prompt_applied": bool(self.sana_wm_config.chi_prompt),
+                    "first_frame_encoded": _is_image,
+                    "num_frames": params.num_frames,
+                    "height": params.height,
+                    "width": params.width,
+                    "latent_tokens": token_count,
+                    "sampling_steps": params.num_inference_steps,
+                },
+            ),
         )
 
     def forward(self, req: DiffusionRequestBatch, *args: Any, **kwargs: Any) -> DiffusionOutput:
