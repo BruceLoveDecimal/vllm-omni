@@ -18,12 +18,27 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention import FeedForward
+import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding
 from diffusers.models.normalization import RMSNorm
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
+
+
+def _sequence_parallel_active() -> bool:
+    """True while execution is inside an ``_sp_plan``-sharded region."""
+    return is_forward_context_available() and get_forward_context().sp_active
 
 
 def _request_isolated_forward(
@@ -339,6 +354,142 @@ class MageFlowEmbedRope(nn.Module):
         )
 
 
+class MageFlowImageRopePrepare(nn.Module):
+    """Project image tokens and build their RoPE table behind one boundary.
+
+    Sequence parallelism shards the image stream, and the RoPE frequencies must
+    be sharded in lockstep with it — a token and its rotation have to land on
+    the same rank. Emitting both from a single module gives ``_sp_plan`` one
+    place to split them together; ``_sp_plan`` hooks only fire at ``nn.Module``
+    boundaries, so the inline computation could not be intercepted.
+
+    ``img_in`` and ``pos_embed`` stay owned by the transformer and are merely
+    referenced here, so ``named_parameters()`` keeps reporting the checkpoint's
+    own names.
+    """
+
+    def __init__(self, img_in: nn.Module, pos_embed: nn.Module) -> None:
+        super().__init__()
+        self.img_in = img_in
+        self.pos_embed = pos_embed
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        image_attention_mask: torch.Tensor | None,
+        grids_per_sample: list[list[tuple[int, int, int]]],
+        max_image_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = hidden_states.device
+        frequencies = []
+        for grids in grids_per_sample:
+            # RoPE owns a bounded device-aware LRU. Pass the execution device
+            # explicitly so cached GPU tensors cannot cross device boundaries.
+            sample_frequencies = self.pos_embed(grids, device=device)
+            padding = max_image_tokens - sample_frequencies.shape[0]
+            if padding < 0:
+                raise ValueError("Mage-Flow image grid exceeds the padded token length")
+            if padding:
+                sample_frequencies = torch.cat(
+                    [
+                        sample_frequencies,
+                        torch.ones(
+                            padding,
+                            sample_frequencies.shape[1],
+                            dtype=sample_frequencies.dtype,
+                            device=device,
+                        ),
+                    ],
+                    dim=0,
+                )
+            frequencies.append(sample_frequencies)
+        image_rotary_emb = torch.stack(frequencies)
+        hidden_states = _request_isolated_forward(
+            self.img_in,
+            hidden_states,
+            image_attention_mask,
+        )
+        return hidden_states, image_rotary_emb
+
+
+class ColumnParallelApproxGELU(nn.Module):
+    """Column-sharded ``Linear`` + tanh-approximate GELU (diffusers ``GELU``)."""
+
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        *,
+        approximate: str = "tanh",
+        bias: bool = True,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.proj = ColumnParallelLinear(
+            dim_in,
+            dim_out,
+            bias=bias,
+            gather_output=False,
+            return_bias=False,
+            prefix=f"{prefix}.proj" if prefix else "proj",
+        )
+        self.approximate = approximate
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return F.gelu(self.proj(hidden_states), approximate=self.approximate)
+
+
+class FeedForward(nn.Module):
+    """Tensor-parallel drop-in for the diffusers ``FeedForward`` used by Mage.
+
+    The submodule names (``net.0.proj`` / ``net.2``) intentionally match the
+    diffusers layout so the official checkpoint loads without remapping. Index
+    ``net.1`` is the parameter-free dropout slot and stays an ``Identity``.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        dim_out: int | None = None,
+        mult: int = 4,
+        activation_fn: str = "gelu-approximate",
+        inner_dim: int | None = None,
+        bias: bool = True,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if activation_fn != "gelu-approximate":
+            raise ValueError(f"Mage-Flow FFN only supports 'gelu-approximate', got {activation_fn!r}")
+        inner_dim = inner_dim if inner_dim is not None else int(dim * mult)
+        dim_out = dim_out if dim_out is not None else dim
+
+        self.net = nn.ModuleList(
+            [
+                ColumnParallelApproxGELU(
+                    dim,
+                    inner_dim,
+                    approximate="tanh",
+                    bias=bias,
+                    prefix=f"{prefix}.net.0" if prefix else "net.0",
+                ),
+                nn.Identity(),  # placeholder keeping the diffusers weight names
+                RowParallelLinear(
+                    inner_dim,
+                    dim_out,
+                    bias=bias,
+                    input_is_parallel=True,
+                    return_bias=False,
+                    prefix=f"{prefix}.net.2" if prefix else "net.2",
+                ),
+            ]
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for module in self.net:
+            hidden_states = module(hidden_states)
+        return hidden_states
+
+
 class MageJointAttention(nn.Module):
     """Joint attention over padded per-request ``[text, image]`` tokens."""
 
@@ -356,24 +507,70 @@ class MageJointAttention(nn.Module):
         self.heads = heads
         self.dim_head = dim_head
         self.inner_dim = heads * dim_head
+        self.query_dim = query_dim
+        self.added_kv_proj_dim = added_kv_proj_dim
 
-        # Names match the official Mage checkpoint.
-        self.to_q = nn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = nn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_v = nn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.add_q_proj = nn.Linear(added_kv_proj_dim, self.inner_dim, bias=bias)
-        self.add_k_proj = nn.Linear(added_kv_proj_dim, self.inner_dim, bias=bias)
-        self.add_v_proj = nn.Linear(added_kv_proj_dim, self.inner_dim, bias=bias)
+        # Fused Q/K/V projections. The official checkpoint ships separate
+        # ``to_q``/``to_k``/``to_v`` (and ``add_*_proj``) tensors; they are
+        # merged at load time via the transformer's stacked_params_mapping.
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=query_dim,
+            head_size=dim_head,
+            total_num_heads=heads,
+            bias=bias,
+            return_bias=False,
+            prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
+        )
+        self.add_qkv_proj = QKVParallelLinear(
+            hidden_size=added_kv_proj_dim,
+            head_size=dim_head,
+            total_num_heads=heads,
+            bias=bias,
+            return_bias=False,
+            prefix=f"{prefix}.add_qkv_proj" if prefix else "add_qkv_proj",
+        )
 
+        # Per-GPU head counts. Everything downstream of the QKV projection
+        # operates on the local shard, so the attention layer and every
+        # ``unflatten`` below must use these, not the global ``heads``.
+        self.local_heads = self.to_qkv.num_heads
+        self.local_kv_heads = self.to_qkv.num_kv_heads
+        self.q_size = self.local_heads * dim_head
+        self.kv_size = self.local_kv_heads * dim_head
+        self.local_inner_dim = self.q_size
+
+        # RMSNorm normalizes over ``dim_head`` only, so it never reduces across
+        # the head dimension and stays correct under TP without extra comms.
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
         self.norm_added_q = RMSNorm(dim_head, eps=eps)
         self.norm_added_k = RMSNorm(dim_head, eps=eps)
-        self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, query_dim, bias=True), nn.Dropout(0.0)])
-        self.to_add_out = nn.Linear(self.inner_dim, added_kv_proj_dim, bias=True)
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(
+                    self.inner_dim,
+                    query_dim,
+                    bias=True,
+                    input_is_parallel=True,
+                    return_bias=False,
+                    prefix=f"{prefix}.to_out.0" if prefix else "to_out.0",
+                ),
+                nn.Dropout(0.0),
+            ]
+        )
+        self.to_add_out = RowParallelLinear(
+            self.inner_dim,
+            added_kv_proj_dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            prefix=f"{prefix}.to_add_out" if prefix else "to_add_out",
+        )
 
+        # ``num_kv_heads`` is left unset: Mage-Flow is pure MHA, so local_kv_heads
+        # always equals local_heads and the default already matches.
         self.attention = Attention(
-            num_heads=heads,
+            num_heads=self.local_heads,
             head_size=dim_head,
             softmax_scale=dim_head**-0.5,
             causal=False,
@@ -385,33 +582,23 @@ class MageJointAttention(nn.Module):
     def _project(
         self,
         hidden_states: torch.Tensor,
-        q_proj: nn.Linear,
-        k_proj: nn.Linear,
-        v_proj: nn.Linear,
+        qkv_proj: nn.Module,
         q_norm: nn.Module,
         k_norm: nn.Module,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        shape = (self.heads, self.dim_head)
-        query = q_norm(
-            _request_isolated_forward(
-                q_proj,
-                hidden_states,
-                attention_mask,
-            ).unflatten(-1, shape)
-        )
-        key = k_norm(
-            _request_isolated_forward(
-                k_proj,
-                hidden_states,
-                attention_mask,
-            ).unflatten(-1, shape)
-        )
-        value = _request_isolated_forward(
-            v_proj,
+        qkv = _request_isolated_forward(
+            qkv_proj,
             hidden_states,
             attention_mask,
-        ).unflatten(-1, shape)
+        )
+        query, key, value = qkv.split(
+            [self.q_size, self.kv_size, self.kv_size],
+            dim=-1,
+        )
+        query = q_norm(query.unflatten(-1, (self.local_heads, self.dim_head)))
+        key = k_norm(key.unflatten(-1, (self.local_kv_heads, self.dim_head)))
+        value = value.unflatten(-1, (self.local_kv_heads, self.dim_head))
         return query, key, value
 
     def forward(
@@ -446,18 +633,14 @@ class MageJointAttention(nn.Module):
 
         img_q, img_k, img_v = self._project(
             hidden_states,
-            self.to_q,
-            self.to_k,
-            self.to_v,
+            self.to_qkv,
             self.norm_q,
             self.norm_k,
             image_attention_mask,
         )
         txt_q, txt_k, txt_v = self._project(
             encoder_hidden_states,
-            self.add_q_proj,
-            self.add_k_proj,
-            self.add_v_proj,
+            self.add_qkv_proj,
             self.norm_added_q,
             self.norm_added_k,
             encoder_attention_mask,
@@ -466,6 +649,33 @@ class MageJointAttention(nn.Module):
         img_k = apply_rotary_emb_mage_flow(img_k, image_rotary_emb)
 
         text_length = encoder_hidden_states.shape[1]
+        if _sequence_parallel_active():
+            # Only the image stream is sharded; the text stream stays replicated.
+            # Concatenating here would mix a sharded tensor with a full one, so
+            # the text side is handed to the attention backend as joint tensors
+            # and spliced in after the all-to-all instead.
+            joint_output = self.attention(
+                img_q,
+                img_k,
+                img_v,
+                attn_metadata=AttentionMetadata(
+                    joint_query=txt_q,
+                    joint_key=txt_k,
+                    joint_value=txt_v,
+                    joint_strategy="front",
+                ),
+            )
+            txt_output, img_output = joint_output.split(
+                [text_length, hidden_states.shape[1]],
+                dim=1,
+            )
+            img_output = self.to_out[1](self.to_out[0](img_output.flatten(2, 3)))
+            txt_output = self.to_add_out(txt_output.flatten(2, 3))
+            return (
+                img_output * image_attention_mask[..., None],
+                txt_output * encoder_attention_mask[..., None],
+            )
+
         joint_attention_mask = torch.cat(
             [encoder_attention_mask, image_attention_mask],
             dim=1,
@@ -503,15 +713,18 @@ class MageJointAttention(nn.Module):
             img_output = self.to_out[1](self.to_out[0](img_output.flatten(2, 3)))
             txt_output = self.to_add_out(txt_output.flatten(2, 3))
         else:
+            # ``to_out``/``to_add_out`` are row-parallel: their outputs are
+            # already all-reduced back to the full ``query_dim``/
+            # ``added_kv_proj_dim``, not the per-GPU shard.
             projected_img_output = hidden_states.new_zeros(
                 batch_size,
                 hidden_states.shape[1],
-                self.inner_dim,
+                self.query_dim,
             )
             projected_txt_output = encoder_hidden_states.new_zeros(
                 batch_size,
                 encoder_hidden_states.shape[1],
-                self.inner_dim,
+                self.added_kv_proj_dim,
             )
             for sample_index in range(batch_size):
                 valid_image_tokens = image_attention_mask[sample_index]
@@ -555,7 +768,20 @@ class MageFlowDoubleStreamBlock(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.img_mod = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        # The modulation projections stay replicated. Their 6*dim output is
+        # consumed as six separate [B, dim] shift/scale/gate vectors that
+        # modulate the *full* (unsharded) residual stream, so column-sharding
+        # them would break the chunk() layout. Qwen-Image makes the same call.
+        self.img_mod = nn.Sequential(
+            nn.SiLU(),
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                return_bias=False,
+                prefix=f"{prefix}.img_mod.1" if prefix else "img_mod.1",
+            ),
+        )
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = MageJointAttention(
             query_dim=dim,
@@ -571,15 +797,26 @@ class MageFlowDoubleStreamBlock(nn.Module):
             dim=dim,
             dim_out=dim,
             activation_fn="gelu-approximate",
+            prefix=f"{prefix}.img_mlp" if prefix else "img_mlp",
         )
 
-        self.txt_mod = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        self.txt_mod = nn.Sequential(
+            nn.SiLU(),
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                return_bias=False,
+                prefix=f"{prefix}.txt_mod.1" if prefix else "txt_mod.1",
+            ),
+        )
         self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_mlp = FeedForward(
             dim=dim,
             dim_out=dim,
             activation_fn="gelu-approximate",
+            prefix=f"{prefix}.txt_mlp" if prefix else "txt_mlp",
         )
 
     @staticmethod

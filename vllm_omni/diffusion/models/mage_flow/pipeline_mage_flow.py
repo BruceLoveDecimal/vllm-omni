@@ -27,6 +27,9 @@ from vllm.transformers_utils.repo_utils import file_exists
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
     DiffusersPipelineLoader,
@@ -52,7 +55,10 @@ from .content_policy import (
     screen_mage_flow_edit_prompt,
     screen_mage_flow_prompt,
 )
-from .mage_flow_transformer import MageFlowTransformer2DModel
+from .mage_flow_transformer import (
+    MageFlowTransformer2DModel,
+    resolve_mage_flow_stacked_name,
+)
 from .prompt_utils import (
     encode_mage_flow_edit_prompt,
     encode_mage_flow_prompt,
@@ -294,18 +300,25 @@ class MageFlowPipeline(
         if self.od_config.vae_use_slicing or self.od_config.vae_use_tiling:
             raise ValueError("Mage-Flow's native VAE does not yet support slicing or tiling")
         parallel = self.od_config.parallel_config
+        # Tensor, CFG and sequence parallelism are supported. TP shards attention
+        # heads and FFN (validated against num_heads at build time); CFG parallel
+        # splits the positive/negative branches across exactly two ranks; SP
+        # shards the image token stream via the transformer's _sp_plan.
         unsupported = {
             "pipeline parallel": parallel.pipeline_parallel_size,
-            "tensor parallel": parallel.tensor_parallel_size,
-            "sequence parallel": parallel.sequence_parallel_size,
-            "CFG parallel": parallel.cfg_parallel_size,
             "VAE patch parallel": parallel.vae_patch_parallel_size,
         }
         enabled = [f"{name}={size}" for name, size in unsupported.items() if size not in (None, 1)]
         if enabled:
             raise ValueError(
-                "Mage-Flow initial implementation supports only single-GPU "
-                "execution; unsupported settings: " + ", ".join(enabled)
+                "Mage-Flow currently supports only tensor, CFG and sequence "
+                "parallelism for multi-GPU execution; unsupported settings: " + ", ".join(enabled)
+            )
+        cfg_parallel_size = parallel.cfg_parallel_size
+        if cfg_parallel_size not in (None, 1, 2):
+            raise ValueError(
+                "Mage-Flow CFG parallelism splits one positive and one negative "
+                f"branch, so cfg_parallel_size must be 1 or 2, got {cfg_parallel_size}"
             )
         if getattr(parallel, "use_hsdp", False):
             raise ValueError("Mage-Flow does not yet support HSDP")
@@ -633,6 +646,7 @@ class MageFlowPipeline(
             device=self.device,
         )
         do_cfg = guidance_scale > 1.0
+        cfg_parallel = get_classifier_free_guidance_world_size() > 1
 
         with self.progress_bar(total=len(scheduler.timesteps)) as progress:
             for step_index, timestep in enumerate(scheduler.timesteps):
@@ -673,12 +687,24 @@ class MageFlowPipeline(
                     if do_cfg
                     else None
                 )
-                full_noise_prediction = self._predict_noise_packed_cfg(
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    guidance_scale=guidance_scale,
-                    cfg_normalize=cfg_normalize,
-                )
+                if cfg_parallel:
+                    # One branch per rank. Packing both branches into the batch
+                    # dimension would defeat the split, so the mixin's
+                    # rank-partitioned path replaces it here.
+                    full_noise_prediction = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_cfg,
+                        true_cfg_scale=guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=cfg_normalize,
+                    )
+                else:
+                    full_noise_prediction = self._predict_noise_packed_cfg(
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        guidance_scale=guidance_scale,
+                        cfg_normalize=cfg_normalize,
+                    )
                 target_noise_prediction = torch.zeros_like(target_latents)
                 for index, target_length in enumerate(target_lengths):
                     target_noise_prediction[index, :target_length] = (
@@ -1073,7 +1099,13 @@ class MageFlowPipeline(
             name = map_mage_flow_weight_name(name)
             if name is None:
                 continue
-            param = params.get(name)
+            # Only the transformer fuses Q/K/V; the VAE's own ``.q``/``.k``/
+            # ``.v`` convolutions must never be rewritten.
+            if name.startswith("transformer."):
+                lookup_name, shard_id = resolve_mage_flow_stacked_name(name)
+            else:
+                lookup_name, shard_id = name, None
+            param = params.get(lookup_name)
             if param is None:
                 raise KeyError(f"Unexpected Mage-Flow checkpoint weight: {name}")
             weight_loader = getattr(
@@ -1081,6 +1113,10 @@ class MageFlowPipeline(
                 "weight_loader",
                 default_weight_loader,
             )
-            weight_loader(param, loaded_weight)
+            if shard_id is None:
+                weight_loader(param, loaded_weight)
+            else:
+                weight_loader(param, loaded_weight, shard_id)
             loaded.add(name)
+            loaded.add(lookup_name)
         return loaded

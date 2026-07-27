@@ -32,9 +32,10 @@ BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParams
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
     "lora_int_id"
 }
-_REQUEST_BATCH_COMPATIBILITY_FIELD_NAMES = (
-    _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES | {"lora_int_id"}
-)
+_REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
+    field.name for field in fields(RequestBatchSamplingParamsKey)
+) - {"lora_int_id"}
+_REQUEST_BATCH_COMPATIBILITY_FIELD_NAMES = _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES | {"lora_int_id"}
 
 
 def validate_request_batch_ignored_sampling_param_fields(
@@ -46,16 +47,6 @@ def validate_request_batch_ignored_sampling_param_fields(
             "Unknown request-batch compatibility fields: "
             + ", ".join(sorted(unknown))
         )
-
-
-def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey:
-    """Build a batch-compatibility key from the request's sampling params."""
-    sampling = request.sampling_params
-    lora_request = getattr(sampling, "lora_request", None)
-    return SamplingParamsKey(
-        lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
-        **{name: getattr(sampling, name) for name in _SAMPLING_PARAMS_KEY_FIELD_NAMES},
-    )
 
 
 def get_request_batch_sampling_params_key(
