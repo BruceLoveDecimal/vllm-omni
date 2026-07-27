@@ -104,7 +104,12 @@ th {
 <sup>2</sup> Mage-Flow currently supports CUDA BF16, request-level padded
 batching, packed CFG, and one output per request. A batch may contain different
 prompt lengths, output resolutions, and T2I/Edit requests; Edit accepts one to
-three PIL, NumPy, or Tensor reference images. Quantization, LoRA, TP, SP,
-multi-GPU CFG parallel, VAE parallel, step execution, and diffusion cache are
-not yet supported. The upstream checkpoints are released for research purposes
-and are not intended for product or service deployment.
+three PIL, NumPy, or Tensor reference images. Multi-GPU execution supports
+tensor parallelism, CFG parallelism (degree 2), and Ulysses sequence
+parallelism; see the [Mage-Flow recipe](../../recipes/microsoft/Mage-Flow.md)
+for tested configurations. Sequence parallelism requires uniform token counts
+across the batch, so pair it with `--cfg-parallel-size 2` rather than packed
+CFG. Quantization, LoRA, pipeline parallelism, HSDP, VAE parallel, step
+execution, and diffusion cache are not yet supported. The upstream checkpoints
+are released for research purposes and are not intended for product or service
+deployment.
