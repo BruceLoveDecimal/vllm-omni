@@ -1958,17 +1958,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         _voice = getattr(request, "voice", None)
         _voice = _voice.strip() if isinstance(_voice, str) else ""
         _voice_created = self._voice_created_at(_voice.lower()) if _voice else 0
-        # Only a registered uploaded voice may key the reference cache by name.
-        # Placeholder API values such as "default" must fall back to ref_audio
-        # content keys, or unrelated voice-clone requests will share one slot.
-        _named_voice = _voice if _voice_created > 0 else None
 
         async def _encode_ref(ref_str: str) -> torch.Tensor:
+            # The encoder normalizes the voice itself (placeholder values such
+            # as "default" fall back to ref_audio content keys).
             return await encoder.encode(
                 ref_str,
                 resolve_ref_audio=self._resolve_ref_audio,
                 get_artifact_key=self._get_resolved_ref_audio_artifact_key,
-                voice_name=_named_voice,
+                voice_name=_voice or None,
                 voice_created_at=_voice_created,
             )
 
