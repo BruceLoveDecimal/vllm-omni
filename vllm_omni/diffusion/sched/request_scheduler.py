@@ -40,9 +40,7 @@ class RequestScheduler(BaseScheduler):
         fields: frozenset[str],
     ) -> None:
         if self._request_states:
-            raise RuntimeError(
-                "request-batch compatibility fields must be configured before requests are added"
-            )
+            raise RuntimeError("request-batch compatibility fields must be configured before requests are added")
         validate_request_batch_ignored_sampling_param_fields(fields)
         self._ignored_sampling_param_fields = fields
 

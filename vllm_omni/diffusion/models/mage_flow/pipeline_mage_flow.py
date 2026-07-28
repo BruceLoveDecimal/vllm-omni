@@ -178,9 +178,7 @@ class MageFlowPipeline(
     """Native request-batched T2I and multi-reference Edit pipeline."""
 
     supports_request_batch = True
-    request_batch_ignored_sampling_param_fields = frozenset(
-        {"height", "width", "resolution"}
-    )
+    request_batch_ignored_sampling_param_fields = frozenset({"height", "width", "resolution"})
     supports_step_execution = False
     support_image_input = True
 
@@ -509,10 +507,7 @@ class MageFlowPipeline(
         feature_dim = sequences[0].shape[-1]
         for sequence in sequences:
             if sequence.ndim != 3 or sequence.shape[0] != 1:
-                raise ValueError(
-                    "Mage-Flow token sequences must have shape [1, S, D], "
-                    f"got {tuple(sequence.shape)}"
-                )
+                raise ValueError(f"Mage-Flow token sequences must have shape [1, S, D], got {tuple(sequence.shape)}")
             if sequence.shape[-1] != feature_dim:
                 raise ValueError("Mage-Flow padded token sequences must share the feature dimension")
             normalized.append(sequence[0])
@@ -589,16 +584,12 @@ class MageFlowPipeline(
                     if positive_padding:
                         positive_value = torch.nn.functional.pad(
                             positive_value,
-                            (0, positive_padding)
-                            if positive_value.ndim == 2
-                            else (0, 0, 0, positive_padding),
+                            (0, positive_padding) if positive_value.ndim == 2 else (0, 0, 0, positive_padding),
                         )
                     if negative_padding:
                         negative_value = torch.nn.functional.pad(
                             negative_value,
-                            (0, negative_padding)
-                            if negative_value.ndim == 2
-                            else (0, 0, 0, negative_padding),
+                            (0, negative_padding) if negative_value.ndim == 2 else (0, 0, 0, negative_padding),
                         )
                 packed_kwargs[key] = torch.cat(
                     [positive_value, negative_value],
@@ -660,9 +651,7 @@ class MageFlowPipeline(
                     )
                     for index, target_length in enumerate(target_lengths)
                 ]
-                combined_latents, image_attention_mask, _ = self._pad_token_sequences(
-                    combined_sequences
-                )
+                combined_latents, image_attention_mask, _ = self._pad_token_sequences(combined_sequences)
                 sigma = scheduler.sigmas[step_index].to(
                     device=self.device,
                     dtype=target_latents.dtype,
@@ -707,9 +696,7 @@ class MageFlowPipeline(
                     )
                 target_noise_prediction = torch.zeros_like(target_latents)
                 for index, target_length in enumerate(target_lengths):
-                    target_noise_prediction[index, :target_length] = (
-                        full_noise_prediction[index, :target_length]
-                    )
+                    target_noise_prediction[index, :target_length] = full_noise_prediction[index, :target_length]
                 target_latents = self.scheduler_step(
                     target_noise_prediction,
                     timestep,
@@ -995,10 +982,7 @@ class MageFlowPipeline(
             if item.sampling.cfg_normalize != first.sampling.cfg_normalize:
                 incompatible.append("cfg_normalize")
             if incompatible:
-                raise ValueError(
-                    "Mage-Flow request batch has incompatible sampling fields: "
-                    + ", ".join(incompatible)
-                )
+                raise ValueError("Mage-Flow request batch has incompatible sampling fields: " + ", ".join(incompatible))
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
@@ -1016,27 +1000,17 @@ class MageFlowPipeline(
         ]
         self._validate_batch_compatibility(items)
 
-        target_latents, target_attention_mask, target_lengths = (
-            self._pad_token_sequences([item.target_latents for item in items])
+        target_latents, target_attention_mask, target_lengths = self._pad_token_sequences(
+            [item.target_latents for item in items]
         )
-        prompt_embeds, prompt_attention_mask, _ = self._pad_token_sequences(
-            [item.prompt_embeds for item in items]
-        )
+        prompt_embeds, prompt_attention_mask, _ = self._pad_token_sequences([item.prompt_embeds for item in items])
         do_cfg = items[0].guidance_scale > 1.0
         if do_cfg:
-            negative_prompt_embeds, negative_prompt_attention_mask, _ = (
-                self._pad_token_sequences(
-                    [
-                        item.negative_prompt_embeds
-                        for item in items
-                        if item.negative_prompt_embeds is not None
-                    ]
-                )
+            negative_prompt_embeds, negative_prompt_attention_mask, _ = self._pad_token_sequences(
+                [item.negative_prompt_embeds for item in items if item.negative_prompt_embeds is not None]
             )
             if negative_prompt_embeds.shape[0] != len(items):
-                raise ValueError(
-                    "Mage-Flow CFG request batch is missing negative prompt embeddings"
-                )
+                raise ValueError("Mage-Flow CFG request batch is missing negative prompt embeddings")
         else:
             negative_prompt_embeds = None
             negative_prompt_attention_mask = None
@@ -1058,9 +1032,7 @@ class MageFlowPipeline(
 
         stage_durations = self.stage_durations if hasattr(self, "_stage_durations") else None
         outputs = []
-        for index, (item, target_length) in enumerate(
-            zip(items, target_lengths)
-        ):
+        for index, (item, target_length) in enumerate(zip(items, target_lengths)):
             latent_height = item.height // self.vae.downsample_factor
             latent_width = item.width // self.vae.downsample_factor
             latent_image = (
@@ -1076,9 +1048,7 @@ class MageFlowPipeline(
             output = (
                 latent_image
                 if item.output_type == "latent"
-                else self.vae.decode(
-                    latent_image.to(dtype=self.vae.dtype)
-                ).clamp(-1, 1)
+                else self.vae.decode(latent_image.to(dtype=self.vae.dtype)).clamp(-1, 1)
             )
             outputs.append(
                 DiffusionOutput(

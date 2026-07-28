@@ -43,10 +43,7 @@ def validate_request_batch_ignored_sampling_param_fields(
 ) -> None:
     unknown = ignored_fields - _REQUEST_BATCH_COMPATIBILITY_FIELD_NAMES
     if unknown:
-        raise ValueError(
-            "Unknown request-batch compatibility fields: "
-            + ", ".join(sorted(unknown))
-        )
+        raise ValueError("Unknown request-batch compatibility fields: " + ", ".join(sorted(unknown)))
 
 
 def get_request_batch_sampling_params_key(

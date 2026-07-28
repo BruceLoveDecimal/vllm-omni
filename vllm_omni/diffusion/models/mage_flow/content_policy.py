@@ -26,7 +26,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-
 # --- Gaussian-Shading watermark -------------------------------------------
 
 DEFAULT_GS_KEY = 20260720

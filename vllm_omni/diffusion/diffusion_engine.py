@@ -241,9 +241,7 @@ class DiffusionEngine:
             self.scheduler = RequestScheduler()
         self.scheduler.initialize(od_config)
         if self.supports_request_batch and isinstance(self.scheduler, RequestScheduler):
-            self.scheduler.set_ignored_sampling_param_fields(
-                request_batch_ignored_sampling_param_fields(od_config)
-            )
+            self.scheduler.set_ignored_sampling_param_fields(request_batch_ignored_sampling_param_fields(od_config))
 
     def _init_runtime_state(self) -> None:
         self.main_loop: asyncio.AbstractEventLoop | None = None

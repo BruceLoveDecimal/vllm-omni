@@ -96,8 +96,7 @@ def _reference_image_to_pil(image: Any) -> Image.Image:
             value = value[0]
         if value.ndim != 3:
             raise ValueError(
-                "Mage-Flow reference tensors must have shape [C,H,W], "
-                f"[H,W,C], or [1,C,H,W], got {tuple(value.shape)}"
+                f"Mage-Flow reference tensors must have shape [C,H,W], [H,W,C], or [1,C,H,W], got {tuple(value.shape)}"
             )
         if value.shape[0] in (1, 3, 4):
             value = value.permute(1, 2, 0)
@@ -110,8 +109,7 @@ def _reference_image_to_pil(image: Any) -> Image.Image:
             array = np.moveaxis(array, 0, -1)
     else:
         raise TypeError(
-            "Mage-Flow reference images must be PIL images, NumPy arrays, "
-            f"or torch tensors, got {type(image).__name__}"
+            f"Mage-Flow reference images must be PIL images, NumPy arrays, or torch tensors, got {type(image).__name__}"
         )
     if array.ndim not in (2, 3):
         raise ValueError(f"Mage-Flow reference arrays must be 2-D or 3-D, got shape {array.shape}")
@@ -203,10 +201,7 @@ def format_mage_flow_prompt(prompt: str, *, edit: bool = False) -> str:
 
 def format_mage_flow_edit_prompt(prompt: str, num_references: int) -> str:
     validate_reference_image_count([None] * num_references)
-    prefix = "".join(
-        f"Image {index}: {MAGE_FLOW_EDIT_IMAGE_PLACEHOLDER}"
-        for index in range(1, num_references + 1)
-    )
+    prefix = "".join(f"Image {index}: {MAGE_FLOW_EDIT_IMAGE_PLACEHOLDER}" for index in range(1, num_references + 1))
     return format_mage_flow_prompt(prefix + prompt, edit=True)
 
 
@@ -257,10 +252,7 @@ def encode_mage_flow_edit_prompt(
 ) -> torch.Tensor:
     """Encode an edit instruction and its ordered visual references."""
     validate_reference_image_count(reference_images)
-    visual_references = [
-        resize_mage_flow_reference_for_vision(image, vision_long_edge)
-        for image in reference_images
-    ]
+    visual_references = [resize_mage_flow_reference_for_vision(image, vision_long_edge) for image in reference_images]
     formatted = format_mage_flow_edit_prompt(prompt, len(reference_images))
     inputs = processor(
         text=[formatted],
