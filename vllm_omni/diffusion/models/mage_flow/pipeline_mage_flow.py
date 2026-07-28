@@ -20,7 +20,7 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from transformers import AutoProcessor
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_exists
@@ -39,9 +39,6 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import (
     prefetch_subfolders,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.models.internvla_a1.adapter_qwen3_vl import (
-    Qwen3VLForConditionalGeneration,
-)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
