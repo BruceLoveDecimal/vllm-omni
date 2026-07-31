@@ -152,59 +152,138 @@ def _validate_gdn_inputs(
 
 
 def _delta_scan(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
     query_rot: torch.Tensor,
     key_rot: torch.Tensor,
+    value: torch.Tensor,
     beta: torch.Tensor,
     decay: torch.Tensor,
     *,
     spatial_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_size, num_heads, head_dim, token_count = query.shape
+    query: torch.Tensor | None = None,
+    key: torch.Tensor | None = None,
+    skip_z: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """One-directional gated delta-rule recurrence over frames.
+
+    The KV stream consumes only the rotary-embedded Q/K; the Z (denominator)
+    stream consumes only the non-rotary Q/K. ``skip_z=True`` drops the Z stream
+    entirely and returns ``(numerator, None)`` — the numerator-only variant the
+    camera branch needs (NVlabs ``torch_recurrent_cam_single_path_delta_rule``),
+    so ``query``/``key`` may be omitted there.
+    """
+    if not skip_z and (query is None or key is None):
+        raise ValueError("Sana-WM delta scan needs non-rotary query/key unless skip_z is set.")
+
+    batch_size, num_heads, head_dim, token_count = query_rot.shape
     frames = beta.shape[2]
+    if token_count != frames * spatial_tokens:
+        raise ValueError(f"Sana-WM delta scan token_count={token_count} != frames*S={frames * spatial_tokens}.")
 
     def to_frames(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
 
-    query_f = to_frames(query)
-    key_f = to_frames(key)
-    value_f = to_frames(value)
     query_rot_f = to_frames(query_rot)
     key_rot_f = to_frames(key_rot)
-    state_kv = torch.zeros(batch_size, num_heads, head_dim, head_dim, device=query.device, dtype=query.dtype)
-    state_z = torch.zeros(batch_size, num_heads, head_dim, 1, device=query.device, dtype=query.dtype)
+    value_f = to_frames(value)
+    state_kv = torch.zeros(batch_size, num_heads, head_dim, head_dim, device=query_rot.device, dtype=query_rot.dtype)
     numerators: list[torch.Tensor] = []
-    denominators: list[torch.Tensor] = []
+
+    if skip_z:
+        query_f = key_f = None
+        state_z = None
+        denominators = None
+    else:
+        query_f = to_frames(query)
+        key_f = to_frames(key)
+        state_z = torch.zeros(batch_size, num_heads, head_dim, 1, device=query_rot.device, dtype=query_rot.dtype)
+        denominators = []
 
     for frame_idx in range(frames):
-        query_t = query_f[:, :, frame_idx]
-        key_t = key_f[:, :, frame_idx]
-        value_t = value_f[:, :, frame_idx]
         query_rot_t = query_rot_f[:, :, frame_idx]
         key_rot_t = key_rot_f[:, :, frame_idx]
+        value_t = value_f[:, :, frame_idx]
         beta_t = beta[:, :, frame_idx].unsqueeze(2)
         decay_t = decay[:, :, frame_idx].view(batch_size, num_heads, 1, 1)
 
         state_kv = state_kv * decay_t
-        state_z = state_z * decay_t
         value_pred = torch.matmul(state_kv, key_rot_t)
         delta_value = (value_t - value_pred) * beta_t
         state_kv = state_kv + torch.matmul(delta_value, key_rot_t.transpose(-1, -2))
+        numerators.append(torch.matmul(state_kv, query_rot_t))
 
+        if skip_z:
+            continue
+        query_t = query_f[:, :, frame_idx]
+        key_t = key_f[:, :, frame_idx]
+        state_z = state_z * decay_t
         z_pred = torch.matmul(state_z.transpose(-1, -2), key_t)
         delta_z = (1.0 - z_pred) * beta_t
         state_z = state_z + torch.matmul(key_t, delta_z.transpose(-1, -2))
-
-        numerators.append(torch.matmul(state_kv, query_rot_t))
         denominators.append(torch.matmul(state_z.transpose(-1, -2), query_t))
 
     def restore(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
         stacked = torch.stack(tensors, dim=2)
         return stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, dim, token_count)
 
-    return restore(numerators, head_dim), restore(denominators, 1)
+    return restore(numerators, head_dim), (None if skip_z else restore(denominators, 1))
+
+
+def _bidirectional_delta_scan(
+    query_rot: torch.Tensor,
+    key_rot: torch.Tensor,
+    value: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    *,
+    spatial_tokens: int,
+    query: torch.Tensor | None = None,
+    key: torch.Tensor | None = None,
+    skip_z: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Forward + backward delta scan, summed.
+
+    The backward direction shifts K/V/beta by one frame (zero pad) and the decay
+    by one frame (neutral 1.0 pad), matching the NVlabs ``flip_and_shift``
+    convention, then flips the result back onto the forward frame order.
+    """
+    batch_size, num_heads, head_dim, token_count = query_rot.shape
+    frames = beta.shape[2]
+
+    num_fwd, den_fwd = _delta_scan(
+        query_rot, key_rot, value, beta, decay,
+        spatial_tokens=spatial_tokens, query=query, key=key, skip_z=skip_z,
+    )
+
+    def to_time(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
+
+    def from_time(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, head_dim, token_count)
+
+    bwd_kwargs: dict[str, torch.Tensor] = {}
+    if not skip_z:
+        bwd_kwargs["query"] = from_time(torch.flip(to_time(query), dims=[2]))
+        bwd_kwargs["key"] = from_time(_flip_and_shift(to_time(key), dim=2, shift_value=0.0))
+
+    num_bwd_flipped, den_bwd_flipped = _delta_scan(
+        from_time(torch.flip(to_time(query_rot), dims=[2])),
+        from_time(_flip_and_shift(to_time(key_rot), dim=2, shift_value=0.0)),
+        from_time(_flip_and_shift(to_time(value), dim=2, shift_value=0.0)),
+        _flip_and_shift(beta, dim=2, shift_value=0.0),
+        _flip_and_shift(decay, dim=2, shift_value=1.0),
+        spatial_tokens=spatial_tokens,
+        skip_z=skip_z,
+        **bwd_kwargs,
+    )
+
+    def flip_back(tensor: torch.Tensor) -> torch.Tensor:
+        dim = tensor.shape[2]
+        tensor = tensor.view(batch_size, num_heads, dim, frames, spatial_tokens)
+        return torch.flip(tensor, dims=[3]).reshape(batch_size, num_heads, dim, token_count)
+
+    numerator = num_fwd + flip_back(num_bwd_flipped)
+    denominator = None if skip_z else den_fwd + flip_back(den_bwd_flipped)
+    return numerator, denominator
 
 
 def _flip_and_shift(tensor: torch.Tensor, *, dim: int, shift_value: float) -> torch.Tensor:
@@ -235,9 +314,7 @@ def reference_bidirectional_gated_delta_net(
     ``[B, H, T, S]``, and ``decay`` is ``[B, H, T]``.
     """
 
-    batch_size, num_heads, head_dim, token_count, frames = _validate_gdn_inputs(
-        query, key, value, beta, decay, spatial_tokens
-    )
+    _validate_gdn_inputs(query, key, value, beta, decay, spatial_tokens)
     if query_rot is None:
         query_rot = query
     if key_rot is None:
@@ -246,54 +323,17 @@ def reference_bidirectional_gated_delta_net(
         raise ValueError("Sana-WM GDN rotary query/key shapes must match query/key.")
 
     dtype_orig = query.dtype
-    query = query.float()
-    key = key.float()
-    value = value.float()
-    query_rot = query_rot.float()
-    key_rot = key_rot.float()
-    beta = beta.float()
-    decay = decay.float()
-
-    num_fwd, den_fwd = _delta_scan(
-        query,
-        key,
-        value,
-        query_rot,
-        key_rot,
-        beta,
-        decay,
+    numerator, denominator = _bidirectional_delta_scan(
+        query_rot.float(),
+        key_rot.float(),
+        value.float(),
+        beta.float(),
+        decay.float(),
         spatial_tokens=spatial_tokens,
+        query=query.float(),
+        key=key.float(),
     )
-
-    def to_time(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
-
-    def from_time(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, head_dim, token_count)
-
-    query_t = to_time(query)
-    key_t = to_time(key)
-    value_t = to_time(value)
-    query_rot_t = to_time(query_rot)
-    key_rot_t = to_time(key_rot)
-    num_bwd_flipped, den_bwd_flipped = _delta_scan(
-        from_time(torch.flip(query_t, dims=[2])),
-        from_time(_flip_and_shift(key_t, dim=2, shift_value=0.0)),
-        from_time(_flip_and_shift(value_t, dim=2, shift_value=0.0)),
-        from_time(torch.flip(query_rot_t, dims=[2])),
-        from_time(_flip_and_shift(key_rot_t, dim=2, shift_value=0.0)),
-        _flip_and_shift(beta, dim=2, shift_value=0.0),
-        _flip_and_shift(decay, dim=2, shift_value=1.0),
-        spatial_tokens=spatial_tokens,
-    )
-
-    def flip_back(tensor: torch.Tensor) -> torch.Tensor:
-        dim = tensor.shape[2]
-        tensor = tensor.view(batch_size, num_heads, dim, frames, spatial_tokens)
-        return torch.flip(tensor, dims=[3]).reshape(batch_size, num_heads, dim, token_count)
-
-    output = (num_fwd + flip_back(num_bwd_flipped)) / (den_fwd + flip_back(den_bwd_flipped) + eps)
-    return output.to(dtype_orig)
+    return (numerator / (denominator + eps)).to(dtype_orig)
 
 
 def _make_sharded_qk_rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
@@ -1082,112 +1122,6 @@ class SanaWmSelfAttention(nn.Module):
         out = apply_fn_o(out)
         return out.transpose(1, 2).reshape(batch_size, token_count, self.cam_dim)
 
-    @staticmethod
-    def _cam_single_path_delta_scan(
-        q_rot: torch.Tensor,  # (B, H, D, N)
-        k_rot: torch.Tensor,  # (B, H, D, N)
-        value: torch.Tensor,  # (B, H, D, N)
-        beta: torch.Tensor,  # (B, H, T, S)
-        decay: torch.Tensor,  # (B, H, T)
-        *,
-        spatial_tokens: int,
-    ) -> torch.Tensor:
-        """Numerator-only delta-rule recurrence used by the SANA-WM cam branch.
-
-        Matches NVlabs ``torch_recurrent_cam_single_path_delta_rule``: no Z
-        denominator stream, no final divide. Output is ``state_kv @ q_rot``
-        per frame, stacked back into ``(B, H, D, N)`` layout.
-
-        Runs in fp32 internally for numerical stability (matches NVlabs
-        ``fp32_attention=True``) and casts the result back to the input dtype.
-        """
-        dtype_orig = q_rot.dtype
-        q_rot = q_rot.float()
-        k_rot = k_rot.float()
-        value = value.float()
-        beta = beta.float()
-        decay = decay.float()
-
-        batch_size, num_heads, head_dim, token_count = q_rot.shape
-        frames = beta.shape[2]
-        if token_count != frames * spatial_tokens:
-            raise ValueError(f"single-path scan token_count={token_count} != frames*S={frames * spatial_tokens}.")
-
-        def to_frames(t: torch.Tensor) -> torch.Tensor:
-            return t.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
-
-        q_rot_f = to_frames(q_rot)
-        k_rot_f = to_frames(k_rot)
-        value_f = to_frames(value)
-        state_kv = torch.zeros(batch_size, num_heads, head_dim, head_dim, device=q_rot.device, dtype=torch.float32)
-        outputs: list[torch.Tensor] = []
-        for frame_idx in range(frames):
-            qrt = q_rot_f[:, :, frame_idx]
-            krt = k_rot_f[:, :, frame_idx]
-            vt = value_f[:, :, frame_idx]
-            bt = beta[:, :, frame_idx].unsqueeze(2)
-            gt = decay[:, :, frame_idx].view(batch_size, num_heads, 1, 1)
-
-            state_kv = state_kv * gt
-            v_pred = torch.matmul(state_kv, krt)
-            delta_v = (vt - v_pred) * bt
-            state_kv = state_kv + torch.matmul(delta_v, krt.transpose(-1, -2))
-            outputs.append(torch.matmul(state_kv, qrt))
-
-        stacked = torch.stack(outputs, dim=2)
-        out = stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, head_dim, token_count)
-        return out.to(dtype_orig)
-
-    def _bidi_single_path(
-        self,
-        q_rot: torch.Tensor,
-        k_rot: torch.Tensor,
-        value: torch.Tensor,
-        beta: torch.Tensor,
-        decay: torch.Tensor,
-        *,
-        spatial_tokens: int,
-    ) -> torch.Tensor:
-        """Bidirectional single-path scan: forward + backward, simple sum.
-
-        Backward direction shifts K/V/beta by one frame (with zero pad) and
-        the decay by one frame (with neutral 1.0 pad), matching NVlabs
-        ``flip_and_shift`` conventions.
-        """
-        batch_size, num_heads, head_dim, token_count = q_rot.shape
-        frames = beta.shape[2]
-
-        out_fwd = self._cam_single_path_delta_scan(q_rot, k_rot, value, beta, decay, spatial_tokens=spatial_tokens)
-
-        def to_time(t: torch.Tensor) -> torch.Tensor:
-            return t.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
-
-        def from_time(t: torch.Tensor) -> torch.Tensor:
-            return t.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, head_dim, token_count)
-
-        q_T = to_time(q_rot)
-        k_T = to_time(k_rot)
-        v_T = to_time(value)
-        q_bwd = torch.flip(q_T, dims=[2])
-        k_bwd = _flip_and_shift(k_T, dim=2, shift_value=0.0)
-        v_bwd = _flip_and_shift(v_T, dim=2, shift_value=0.0)
-        beta_bwd = _flip_and_shift(beta, dim=2, shift_value=0.0)
-        decay_bwd = _flip_and_shift(decay, dim=2, shift_value=1.0)
-
-        out_bwd_flipped = self._cam_single_path_delta_scan(
-            from_time(q_bwd),
-            from_time(k_bwd),
-            from_time(v_bwd),
-            beta_bwd,
-            decay_bwd,
-            spatial_tokens=spatial_tokens,
-        )
-        out_bwd = torch.flip(
-            out_bwd_flipped.view(batch_size, num_heads, head_dim, frames, spatial_tokens),
-            dims=[3],
-        ).reshape(batch_size, num_heads, head_dim, token_count)
-        return out_fwd + out_bwd
-
     def _forward_cam_branch(
         self,
         hidden_states: torch.Tensor,
@@ -1298,9 +1232,16 @@ class SanaWmSelfAttention(nn.Module):
 
         # 8. Single-path bidirectional delta-rule recurrence on the UCPE-
         # transformed Q/K/V (no Z denominator, no final divide).
-        cam_out_bhdn = self._bidi_single_path(
-            q_rot_bhdn, k_rot_bhdn, v_bhdn, beta_cam, decay_cam, spatial_tokens=spatial_tokens
+        cam_out_bhdn, _ = _bidirectional_delta_scan(
+            q_rot_bhdn.float(),
+            k_rot_bhdn.float(),
+            v_bhdn.float(),
+            beta_cam.float(),
+            decay_cam.float(),
+            spatial_tokens=spatial_tokens,
+            skip_z=True,
         )
+        cam_out_bhdn = cam_out_bhdn.to(q_rot_bhdn.dtype)
 
         # 9. Apply inverse UCPE transform on the recurrence output.
         # ``apply_fn_o`` expects (B, H, N, D); we currently have
