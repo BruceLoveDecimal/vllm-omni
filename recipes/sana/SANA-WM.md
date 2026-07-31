@@ -8,10 +8,9 @@
 - Model: `BBBBruce/SANA-WM_bidirectional-diffusers` (standard diffusers layout, converted offline from the NVlabs release)
 - Task: First-frame image-to-video generation with camera control
 - Mode: Online serving with the OpenAI-compatible video API
-- Model weights: approximately 102 GB for the full SANA-WM pipeline with refiner
-- Local disk: reserve approximately 180 GB for the Hugging Face cache, refiner
-  weights, and runtime artifacts
-- Recommended GPU: 1x NVIDIA RTX PRO 6000 Blackwell 96 GB, or a larger CUDA GPU
+- Model weights: TODO GB for the Stage-1 transformer and VAE
+- Local disk: reserve TODO GB for the Hugging Face cache and runtime artifacts
+- Recommended GPU: TODO GB or larger CUDA GPU
 - Maintainer: Community
 
 ## When to use this recipe
@@ -19,7 +18,8 @@
 Use this recipe when you want to serve SANA-WM through `/v1/videos` or
 `/v1/videos/sync`. The model takes a text prompt, a first-frame image, and
 either an action DSL string or explicit camera poses. vLLM-Omni serves the
-two-stage pipeline: SANA-WM Stage-1 DiT plus the bundled LTX-2 refiner.
+SANA-WM Stage-1 DiT, decoded through the SANA VAE. The optional LTX-2 refiner
+stage is not supported by this PR; it is a planned follow-up.
 
 ## References
 
@@ -36,15 +36,13 @@ two-stage pipeline: SANA-WM Stage-1 DiT plus the bundled LTX-2 refiner.
 
 #### Capacity
 
-- Model storage: the SANA-WM model weights plus the bundled refiner are about
-  102 GB.
-- Disk sizing: provision about 180 GB of local disk or Hugging Face cache volume
-  so the model, refiner, temporary downloads, and generated artifacts fit
-  without cache eviction.
-- GPU sizing: use one RTX PRO 6000 Blackwell 96 GB class GPU or larger for the
-  default 1280x704, 161-frame, 60-step serving profile below. On smaller GPUs,
-  lower `width`, `height`, `num_frames`, or refiner settings before serving
-  production requests.
+- Model storage: the Stage-1 transformer and VAE are about TODO GB.
+- Disk sizing: provision about TODO GB of local disk or Hugging Face cache volume
+  so the model, temporary downloads, and generated artifacts fit without cache
+  eviction.
+- GPU sizing: the default 1280x704, 161-frame, 60-step serving profile peaks at
+  about TODO GB of device memory. On smaller GPUs, lower `width`, `height`, or
+  `num_frames` before serving production requests.
 
 #### Environment
 
@@ -60,7 +58,7 @@ two-stage pipeline: SANA-WM Stage-1 DiT plus the bundled LTX-2 refiner.
 #### Command
 
 The repo ships the standard Diffusers layout (`model_index.json` + `transformer/`,
-`vae/`, `refiner/`). SANA-WM still needs the deploy YAML to wire its omni serving
+`vae/`). SANA-WM still needs the deploy YAML to wire its omni serving
 stages, so pass it through `--deploy-config`.
 
 ```bash
@@ -136,5 +134,6 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
   `{"fx":640,"fy":640,"cx":640,"cy":352}` (for 1280x704). This `{fx,fy,cx,cy}`
   mapping is the only accepted intrinsics form; omit `intrinsics` to derive them
   from the output resolution.
-- The deploy config enables the in-process LTX-2 refiner so the video API
-  returns decoded MP4 bytes rather than Stage-1 latents.
+- The deploy config sets `sana_wm_output_type: "np"` so the video API returns
+  decoded MP4 bytes; the pipeline default is `latent`, which serving cannot
+  render.

@@ -12,7 +12,7 @@ the [SANA-WM recipe](../../../recipes/sana/SANA-WM.md).
 ## Start Server
 
 The repository ships the standard Diffusers layout (`model_index.json` +
-`transformer/`, `vae/`, `refiner/`). SANA-WM still needs a deploy config to wire
+`transformer/`, `vae/`). SANA-WM still needs a deploy config to wire
 its omni serving stages, so use the model ID as the positional argument and pass
 the deploy YAML explicitly:
 

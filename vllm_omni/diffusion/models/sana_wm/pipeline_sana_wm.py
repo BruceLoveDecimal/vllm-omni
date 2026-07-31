@@ -4,7 +4,7 @@
 
 This module wires the registry-visible surface, release-layout validation, and
 an in-process native reference backend for GPU e2e testing. The backend executes
-the public NVlabs/Sana Stage-1 DiT/Gated-DeltaNet/refiner Python modules without
+the public NVlabs/Sana Stage-1 DiT/Gated-DeltaNet Python modules without
 shelling out to the CLI; a future optimization pass can port those large modules
 into vLLM-Omni-native layers incrementally.
 """
@@ -62,15 +62,9 @@ SANA_WM_STAGE1_DIT_FILE = "transformer/diffusion_pytorch_model.safetensors"
 SANA_WM_CONFIG_FILE = "transformer/config.json"
 SANA_WM_VAE_CONFIG_FILE = "vae/config.json"
 SANA_WM_VAE_WEIGHT_FILE = "vae/diffusion_pytorch_model.safetensors"
-SANA_WM_REFINER_TRANSFORMER_CONFIG_FILE = "refiner/transformer/config.json"
-SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE = "refiner/transformer/diffusion_pytorch_model.safetensors"
-SANA_WM_REFINER_CONNECTORS_CONFIG_FILE = "refiner/connectors/config.json"
-SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE = "refiner/connectors/diffusion_pytorch_model.safetensors"
-SANA_WM_REFINER_TEXT_ENCODER_DIR = "refiner/text_encoder"
 SANA_WM_STAGE1_TEXT_ENCODER_ID = "google/gemma-2-2b-it"
 SANA_WM_STAGE1_TEXT_ENCODER_FALLBACK_ID = "Efficient-Large-Model/gemma-2-2b-it"
 SANA_WM_STAGE1_TEXT_ENCODER_ENV = "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER"
-SANA_WM_REFINER_ROOT_ENV = "VLLM_OMNI_SANA_WM_REFINER_ROOT"
 SANA_WM_OUTPUT_HEIGHT = 704
 SANA_WM_OUTPUT_WIDTH = 1280
 # LTX-2 VAE compression ratios (SANA-WM ships ``AutoencoderKLLTX2Video``).
@@ -98,13 +92,6 @@ SANA_WM_STAGE1_PATTERNS = (
 )
 SANA_WM_STAGE1_DIT_SUBFOLDER = "transformer"
 SANA_WM_STAGE1_DIT_BASENAME = Path(SANA_WM_STAGE1_DIT_FILE).name
-SANA_WM_REFINER_PATTERNS = (
-    SANA_WM_REFINER_TRANSFORMER_CONFIG_FILE,
-    SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE,
-    SANA_WM_REFINER_CONNECTORS_CONFIG_FILE,
-    SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE,
-    f"{SANA_WM_REFINER_TEXT_ENCODER_DIR}/*",
-)
 
 
 @dataclass(frozen=True)
@@ -116,12 +103,6 @@ class SanaWmLocalPaths:
     stage1_dit: Path
     vae_config: Path
     vae_weights: Path
-    refiner_root: Path
-    refiner_transformer_config: Path
-    refiner_transformer_weights: Path
-    refiner_connectors_config: Path
-    refiner_connectors_weights: Path
-    refiner_text_encoder_dir: Path
 
 
 @dataclass(frozen=True)
@@ -144,55 +125,30 @@ class SanaWmNativeParams:
     cfg_scale: float = 1.0
 
 
-def build_sana_wm_download_patterns(*, include_refiner: bool = True) -> tuple[str, ...]:
+def build_sana_wm_download_patterns() -> tuple[str, ...]:
     """Return the minimal HF allow-patterns needed for SANA-WM."""
 
-    patterns = list(SANA_WM_STAGE1_PATTERNS)
-    if include_refiner:
-        patterns.extend(SANA_WM_REFINER_PATTERNS)
-    return tuple(patterns)
+    return tuple(SANA_WM_STAGE1_PATTERNS)
 
 
-def resolve_sana_wm_local_paths(
-    snapshot_dir: str | Path,
-    *,
-    refiner_root: str | Path | None = None,
-) -> SanaWmLocalPaths:
+def resolve_sana_wm_local_paths(snapshot_dir: str | Path) -> SanaWmLocalPaths:
     root = Path(snapshot_dir)
-    resolved_refiner_root = Path(refiner_root) if refiner_root is not None else root / "refiner"
     return SanaWmLocalPaths(
         root=root,
         config=root / SANA_WM_CONFIG_FILE,
         stage1_dit=root / SANA_WM_STAGE1_DIT_FILE,
         vae_config=root / SANA_WM_VAE_CONFIG_FILE,
         vae_weights=root / SANA_WM_VAE_WEIGHT_FILE,
-        refiner_root=resolved_refiner_root,
-        refiner_transformer_config=resolved_refiner_root / "transformer/config.json",
-        refiner_transformer_weights=resolved_refiner_root / "transformer/diffusion_pytorch_model.safetensors",
-        refiner_connectors_config=resolved_refiner_root / "connectors/config.json",
-        refiner_connectors_weights=resolved_refiner_root / "connectors/diffusion_pytorch_model.safetensors",
-        refiner_text_encoder_dir=resolved_refiner_root / "text_encoder",
     )
 
 
-def validate_sana_wm_local_paths(paths: SanaWmLocalPaths, *, include_refiner: bool = True) -> None:
+def validate_sana_wm_local_paths(paths: SanaWmLocalPaths) -> None:
     required = [
         paths.config,
         paths.stage1_dit,
         paths.vae_config,
         paths.vae_weights,
     ]
-    if include_refiner:
-        required.extend(
-            [
-                paths.refiner_transformer_config,
-                paths.refiner_transformer_weights,
-                paths.refiner_connectors_config,
-                paths.refiner_connectors_weights,
-                paths.refiner_text_encoder_dir / "config.json",
-                paths.refiner_text_encoder_dir / "model.safetensors.index.json",
-            ]
-        )
     missing = [path for path in required if not path.exists()]
     if missing:
         joined = ", ".join(str(path) for path in missing)
@@ -202,7 +158,6 @@ def validate_sana_wm_local_paths(paths: SanaWmLocalPaths, *, include_refiner: bo
 def resolve_or_download_sana_wm_checkpoint(
     model: str = SANA_WM_MODEL_ID,
     *,
-    include_refiner: bool = True,
     revision: str | None = None,
     cache_dir: str | None = None,
 ) -> SanaWmLocalPaths:
@@ -216,14 +171,13 @@ def resolve_or_download_sana_wm_checkpoint(
             download_weights_from_hf_specific(
                 model,
                 cache_dir,
-                list(build_sana_wm_download_patterns(include_refiner=include_refiner)),
+                list(build_sana_wm_download_patterns()),
                 revision=revision,
                 require_all=True,
             )
         )
-    refiner_root = os.environ.get(SANA_WM_REFINER_ROOT_ENV, "").strip() or None
-    paths = resolve_sana_wm_local_paths(snapshot_dir, refiner_root=refiner_root)
-    validate_sana_wm_local_paths(paths, include_refiner=include_refiner)
+    paths = resolve_sana_wm_local_paths(snapshot_dir)
+    validate_sana_wm_local_paths(paths)
     return paths
 
 
@@ -233,7 +187,7 @@ def build_sana_wm_output_envelope(
     output_type: str,
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    """Wrap a Stage-1/refiner result in the canonical output envelope.
+    """Wrap a Stage-1 result in the canonical output envelope.
 
     ``normalize_diffusion_postprocess_output`` splits ``{"payload": ...,
     "metadata": ...}`` into the API-facing payload and the metadata groups, so
@@ -316,7 +270,6 @@ class SanaWmPipeline(
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
     _resident_modules: ClassVar[list[str]] = []
-    include_refiner: ClassVar[bool] = False
 
     def __init__(self, *, od_config: OmniDiffusionConfig | None = None, prefix: str = "") -> None:
         super().__init__()
@@ -359,15 +312,13 @@ class SanaWmPipeline(
             prefix=f"{prefix}.transformer" if prefix else "transformer",
         )
 
-    def resolve_checkpoint(self, *, include_refiner: bool | None = None) -> SanaWmLocalPaths:
+    def resolve_checkpoint(self) -> SanaWmLocalPaths:
         if self.release_paths is not None:
             return self.release_paths
         if self.od_config is None or self.od_config.model is None:
             raise ValueError("Sana-WM checkpoint resolution requires od_config.model.")
-        include = self.include_refiner if include_refiner is None else include_refiner
         self.release_paths = resolve_or_download_sana_wm_checkpoint(
             self.od_config.model,
-            include_refiner=include,
             revision=self.od_config.revision,
         )
         self.sana_wm_config = SanaWmConfig.from_json(self.release_paths.config)
@@ -454,7 +405,7 @@ class SanaWmPipeline(
             self.vae.to(device=device, dtype=dtype)
             return
         if self.release_paths is None and self.od_config is not None and self.od_config.model is not None:
-            self.resolve_checkpoint(include_refiner=False)
+            self.resolve_checkpoint()
         if self.release_paths is None:
             raise ValueError("Sana-WM VAE loading requires a resolved checkpoint.")
 

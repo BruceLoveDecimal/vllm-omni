@@ -57,19 +57,14 @@ def _assert_sana_wm_e2e_shape(
 ) -> None:
     if output_type == "latent":
         # Latent output is channel-first: (C, T, H, W) after removing the
-        # batch dimension. The refiner uses LTX-2 latents with 128 channels.
+        # batch dimension. Stage-1 emits LTX-2 latents with 128 channels.
         assert video.shape[0] == 128
         assert 0 < video.shape[1] <= num_frames
         return
     assert 0 < video.shape[0] <= num_frames
 
 
-def _run_sana_wm_e2e(
-    *,
-    inprocess_refiner: bool,
-    output_type: str,
-    refiner_steps: int,
-) -> np.ndarray:
+def _run_sana_wm_e2e(*, output_type: str) -> np.ndarray:
     import torch
 
     from vllm_omni.diffusion.models.sana_wm import (
@@ -111,14 +106,6 @@ def _run_sana_wm_e2e(
     # Return the requested output type so the shape assertion matches the
     # pipeline output instead of the raw Stage-1 latent default.
     extra_args["sana_wm_output_type"] = output_type
-    if inprocess_refiner:
-        extra_args.update(
-            {
-                "sana_wm_inprocess_refiner": True,
-                "sana_wm_refiner_output_type": output_type,
-                "sana_wm_inprocess_refiner_steps": refiner_steps,
-            }
-        )
 
     output = omni.generate(
         {
@@ -165,12 +152,7 @@ def _run_sana_wm_e2e(
 
 def test_sana_wm_native_generates_video() -> None:
     output_type = os.environ.get("SANA_WM_E2E_OUTPUT_TYPE", "np")
-    refiner_steps = int(os.environ.get("SANA_WM_E2E_REFINER_STEPS", "1"))
-    video = _run_sana_wm_e2e(
-        inprocess_refiner=os.environ.get("SANA_WM_E2E_INPROCESS_REFINER") == "1",
-        output_type=output_type,
-        refiner_steps=refiner_steps,
-    )
+    video = _run_sana_wm_e2e(output_type=output_type)
     if output_type == "latent":
         assert video.ndim == 4
     else:

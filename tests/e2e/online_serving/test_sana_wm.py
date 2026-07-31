@@ -4,7 +4,7 @@
 """
 Online serving smoke for SANA-WM image-to-video (first-frame I2V via ``/v1/videos``).
 
-Boots the server from the SANA-WM deploy config (``SanaWmTwoStagesPipeline`` +
+Boots the server from the SANA-WM deploy config (``SanaWmPipeline`` +
 ``skip_mm_profiling``), submits one async ``/v1/videos`` job with a first-frame
 reference image, and asserts the job completes and returns video bytes.
 

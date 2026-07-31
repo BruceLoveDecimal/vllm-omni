@@ -11,7 +11,6 @@ from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import (
     get_sana_wm_post_process_func,
     get_sana_wm_pre_process_func,
 )
-from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm_two_stages import SanaWmTwoStagesPipeline
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import SanaWmTransformer3DModel
 
 __all__ = [
@@ -21,7 +20,6 @@ __all__ = [
     "SanaWmConfig",
     "SanaWmPipeline",
     "SanaWmTransformer3DModel",
-    "SanaWmTwoStagesPipeline",
     "get_sana_wm_post_process_func",
     "get_sana_wm_pre_process_func",
 ]

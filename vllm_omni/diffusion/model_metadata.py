@@ -46,11 +46,6 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=1,
         skip_dummy_run=True,
     ),
-    "SanaWmTwoStagesPipeline": DiffusionModelMetadata(
-        supports_multimodal_inputs=True,
-        max_multimodal_image_inputs=1,
-        skip_dummy_run=True,
-    ),
 }
 
 
