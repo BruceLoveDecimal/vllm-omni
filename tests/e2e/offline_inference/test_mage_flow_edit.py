@@ -40,10 +40,8 @@ def test_mage_flow_edit(
     omni_runner_handler.send_diffusion_request(
         {
             "model": MODEL,
-            "prompt": {
-                "prompt": "Use the subject from image one in the setting from image two.",
-                "multi_modal_data": {"image": reference_images},
-            },
+            "prompt": "Use the subject from image one in the setting from image two.",
+            "multi_modal_data": {"image": reference_images},
             "sampling_params": sampling,
         }
     )

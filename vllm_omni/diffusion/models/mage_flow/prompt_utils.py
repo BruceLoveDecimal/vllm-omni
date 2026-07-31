@@ -14,6 +14,9 @@ import numpy as np
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.model_metadata import MAGE_FLOW_MAX_INPUT_IMAGES
+from vllm_omni.errors import OmniClientError
+
 MAGE_FLOW_PROMPT_TEMPLATE = (
     "<|im_start|>system\n"
     "Describe the image by detailing the color, shape, size, texture, "
@@ -39,7 +42,7 @@ MAGE_FLOW_MIN_SIZE = 512
 MAGE_FLOW_MAX_SIZE = 2048
 MAGE_FLOW_SIZE_MULTIPLE = 16
 MAGE_FLOW_MAX_ASPECT_RATIO = 4.0
-MAGE_FLOW_MAX_INPUT_IMAGES = 3
+MAGE_FLOW_DEFAULT_SIZE = 1024
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,8 @@ def get_mage_flow_variant_defaults(
 
 def validate_mage_flow_size(height: int, width: int) -> None:
     for name, value in (("height", height), ("width", width)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Mage-Flow {name} must be an integer, got {value!r}")
         if not MAGE_FLOW_MIN_SIZE <= value <= MAGE_FLOW_MAX_SIZE:
             raise ValueError(f"Mage-Flow {name} must be in [{MAGE_FLOW_MIN_SIZE}, {MAGE_FLOW_MAX_SIZE}], got {value}")
         if value % MAGE_FLOW_SIZE_MULTIPLE:
@@ -134,6 +139,32 @@ def normalize_mage_flow_reference_images(images: Any | None) -> list[Image.Image
     return [_reference_image_to_pil(image) for image in values]
 
 
+def parse_mage_flow_prompt_data(
+    prompt_data: Any,
+) -> tuple[str, str, list[Image.Image]]:
+    """Normalize the shared text-to-image and edit request payload."""
+    if isinstance(prompt_data, str):
+        return prompt_data, " ", []
+    if not isinstance(prompt_data, dict) or not isinstance(prompt_data.get("prompt"), str):
+        raise ValueError("Mage-Flow prompt must contain a string 'prompt'")
+    multi_modal_data = prompt_data.get("multi_modal_data", {})
+    if multi_modal_data is None:
+        multi_modal_data = {}
+    if not isinstance(multi_modal_data, dict):
+        raise ValueError("Mage-Flow multi_modal_data must be a dictionary")
+    negative_prompt = prompt_data.get("negative_prompt")
+    if negative_prompt is None or negative_prompt == "":
+        negative_prompt = " "
+    if not isinstance(negative_prompt, str):
+        raise ValueError("Mage-Flow negative_prompt must be a string")
+    reference_images = normalize_mage_flow_reference_images(multi_modal_data.get("image"))
+    return (
+        prompt_data["prompt"],
+        negative_prompt,
+        reference_images,
+    )
+
+
 def resize_mage_flow_reference_for_vision(
     image: Image.Image,
     max_long_edge: int,
@@ -166,7 +197,10 @@ def preprocess_mage_flow_reference_for_vae(
 def parse_mage_flow_extra_args(
     extra_args: dict[str, Any] | None,
 ) -> MageFlowExtraArgs:
-    extra_args = extra_args or {}
+    if extra_args is None:
+        extra_args = {}
+    elif not isinstance(extra_args, dict):
+        raise ValueError("Mage-Flow extra_args must be a dictionary")
     known = {
         "mage_enable_safety_check",
         "mage_enable_watermark",
@@ -194,6 +228,56 @@ def parse_mage_flow_extra_args(
     )
 
 
+def parse_mage_flow_request_data(
+    prompt_data: Any,
+    sampling: Any,
+) -> tuple[str, str, list[Image.Image], int, int, MageFlowExtraArgs]:
+    """Validate and normalize all request-local Mage-Flow inputs."""
+    try:
+        prompt, negative_prompt, reference_images = parse_mage_flow_prompt_data(prompt_data)
+        if not prompt:
+            raise ValueError("Mage-Flow prompt must not be empty")
+        generator = getattr(sampling, "generator", None)
+        if isinstance(generator, list):
+            raise ValueError("Mage-Flow currently supports exactly one request generator")
+        if generator is not None and not isinstance(generator, torch.Generator):
+            raise TypeError(f"Mage-Flow generator must be a torch.Generator, got {type(generator).__name__}")
+        seed = getattr(sampling, "seed", None)
+        if (
+            seed is not None
+            and (isinstance(seed, bool) or not isinstance(seed, int) or not -(1 << 63) <= seed < 1 << 64)
+        ):
+            raise ValueError("Mage-Flow seed must be an integer in [-2**63, 2**64 - 1]")
+        generator_device = getattr(sampling, "generator_device", None)
+        if generator_device is not None:
+            if not isinstance(generator_device, str):
+                raise TypeError(f"Mage-Flow generator_device must be a string, got {type(generator_device).__name__}")
+            try:
+                device = torch.device(generator_device)
+            except (RuntimeError, TypeError) as error:
+                raise ValueError(f"Invalid Mage-Flow generator_device: {generator_device!r}") from error
+            if device.type not in {"cpu", "cuda"} or device.index is not None:
+                raise ValueError("Mage-Flow generator_device must be 'cpu' or 'cuda'")
+        latents = getattr(sampling, "latents", None)
+        if latents is not None and not isinstance(latents, torch.Tensor):
+            raise TypeError(f"Mage-Flow latents must be a torch.Tensor, got {type(latents).__name__}")
+        height = sampling.height if sampling.height is not None else MAGE_FLOW_DEFAULT_SIZE
+        width = sampling.width if sampling.width is not None else MAGE_FLOW_DEFAULT_SIZE
+        validate_mage_flow_size(height, width)
+        return (
+            prompt,
+            negative_prompt,
+            reference_images,
+            height,
+            width,
+            parse_mage_flow_extra_args(sampling.extra_args),
+        )
+    except OmniClientError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise OmniClientError(str(error)) from error
+
+
 def format_mage_flow_prompt(prompt: str, *, edit: bool = False) -> str:
     template = MAGE_FLOW_EDIT_PROMPT_TEMPLATE if edit else MAGE_FLOW_PROMPT_TEMPLATE
     return template.format(prompt)
@@ -203,6 +287,31 @@ def format_mage_flow_edit_prompt(prompt: str, num_references: int) -> str:
     validate_reference_image_count([None] * num_references)
     prefix = "".join(f"Image {index}: {MAGE_FLOW_EDIT_IMAGE_PLACEHOLDER}" for index in range(1, num_references + 1))
     return format_mage_flow_prompt(prefix + prompt, edit=True)
+
+
+def _encode_mage_flow_inputs(
+    text_encoder,
+    inputs,
+    *,
+    device: torch.device,
+    edit: bool = False,
+) -> torch.Tensor:
+    inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
+    model_input_keys = {"input_ids", "attention_mask", "position_ids"}
+    if edit:
+        model_input_keys.update({"pixel_values", "image_grid_thw", "mm_token_type_ids"})
+    hidden_states = text_encoder.model(
+        **{key: value for key, value in inputs.items() if key in model_input_keys},
+        use_cache=False,
+        return_dict=True,
+    ).last_hidden_state
+    attention_mask = inputs.get("attention_mask")
+    valid_length = int(attention_mask[0].sum().item()) if attention_mask is not None else hidden_states.shape[1]
+    start_index = MAGE_FLOW_EDIT_PROMPT_START_INDEX if edit else MAGE_FLOW_PROMPT_START_INDEX
+    if valid_length <= start_index:
+        prompt_name = "Mage-Flow Edit" if edit else "Mage-Flow"
+        raise OmniClientError(f"{prompt_name} prompt produced no conditioning tokens")
+    return hidden_states[:, start_index:valid_length].contiguous()
 
 
 @torch.no_grad()
@@ -223,21 +332,11 @@ def encode_mage_flow_prompt(
         max_length=max_length + MAGE_FLOW_PROMPT_START_INDEX,
         return_tensors="pt",
     )
-    inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
-    model_inputs = {
-        key: value for key, value in inputs.items() if key in {"input_ids", "attention_mask", "position_ids"}
-    }
-    outputs = text_encoder.model(
-        **model_inputs,
-        use_cache=False,
-        return_dict=True,
+    return _encode_mage_flow_inputs(
+        text_encoder,
+        inputs,
+        device=device,
     )
-    hidden_states = outputs.last_hidden_state
-    attention_mask = inputs.get("attention_mask")
-    valid_length = int(attention_mask[0].sum().item()) if attention_mask is not None else hidden_states.shape[1]
-    if valid_length <= MAGE_FLOW_PROMPT_START_INDEX:
-        raise ValueError("Mage-Flow prompt produced no conditioning tokens")
-    return hidden_states[:, MAGE_FLOW_PROMPT_START_INDEX:valid_length].contiguous()
 
 
 @torch.no_grad()
@@ -260,28 +359,9 @@ def encode_mage_flow_edit_prompt(
         padding=True,
         return_tensors="pt",
     )
-    inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
-    model_inputs = {
-        key: value
-        for key, value in inputs.items()
-        if key
-        in {
-            "input_ids",
-            "attention_mask",
-            "position_ids",
-            "pixel_values",
-            "image_grid_thw",
-            "mm_token_type_ids",
-        }
-    }
-    outputs = text_encoder.model(
-        **model_inputs,
-        use_cache=False,
-        return_dict=True,
+    return _encode_mage_flow_inputs(
+        text_encoder,
+        inputs,
+        device=device,
+        edit=True,
     )
-    hidden_states = outputs.last_hidden_state
-    attention_mask = inputs.get("attention_mask")
-    valid_length = int(attention_mask[0].sum().item()) if attention_mask is not None else hidden_states.shape[1]
-    if valid_length <= MAGE_FLOW_EDIT_PROMPT_START_INDEX:
-        raise ValueError("Mage-Flow Edit prompt produced no conditioning tokens")
-    return hidden_states[:, MAGE_FLOW_EDIT_PROMPT_START_INDEX:valid_length].contiguous()

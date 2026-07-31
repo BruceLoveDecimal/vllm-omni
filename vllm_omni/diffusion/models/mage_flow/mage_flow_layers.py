@@ -14,15 +14,14 @@ backend-selectable ``Attention`` layer.
 
 import math
 from functools import lru_cache
-from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding
 from diffusers.models.normalization import RMSNorm
+from torch.nn.utils.rnn import pad_sequence
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -33,6 +32,9 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
+)
+from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+    FeedForward,
 )
 
 
@@ -72,6 +74,32 @@ def _request_isolated_forward(
         output[index, valid_tokens] = sample_output[0]
     assert output is not None
     return output
+
+
+class _MageFlowAttention(Attention):
+    """Keep masked SP fallback local to Mage-Flow."""
+
+    def _run_local_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> torch.Tensor:
+        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        if attention_mask is not None:
+            return self.sdpa_fallback.forward(
+                query,
+                key,
+                value,
+                attn_metadata,
+            )
+        return super()._run_local_attention(
+            query,
+            key,
+            value,
+            attn_metadata,
+        )
 
 
 def apply_rotary_emb_mage_flow(
@@ -375,108 +403,26 @@ class MageFlowImageRopePrepare(nn.Module):
             # RoPE owns a bounded device-aware LRU. Pass the execution device
             # explicitly so cached GPU tensors cannot cross device boundaries.
             sample_frequencies = self.pos_embed(grids, device=device)
-            padding = max_image_tokens - sample_frequencies.shape[0]
-            if padding < 0:
+            if sample_frequencies.shape[0] > max_image_tokens:
                 raise ValueError("Mage-Flow image grid exceeds the padded token length")
-            if padding:
-                sample_frequencies = torch.cat(
-                    [
-                        sample_frequencies,
-                        torch.ones(
-                            padding,
-                            sample_frequencies.shape[1],
-                            dtype=sample_frequencies.dtype,
-                            device=device,
-                        ),
-                    ],
-                    dim=0,
-                )
             frequencies.append(sample_frequencies)
-        image_rotary_emb = torch.stack(frequencies)
+        image_rotary_emb = pad_sequence(
+            frequencies,
+            batch_first=True,
+            padding_value=1.0,
+        )
+        if image_rotary_emb.shape[1] < max_image_tokens:
+            image_rotary_emb = F.pad(
+                image_rotary_emb,
+                (0, 0, 0, max_image_tokens - image_rotary_emb.shape[1]),
+                value=1.0,
+            )
         hidden_states = _request_isolated_forward(
             self.img_in,
             hidden_states,
             image_attention_mask,
         )
         return hidden_states, image_rotary_emb
-
-
-class ColumnParallelApproxGELU(nn.Module):
-    """Column-sharded ``Linear`` + tanh-approximate GELU (diffusers ``GELU``)."""
-
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        *,
-        approximate: str = "tanh",
-        bias: bool = True,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim_in,
-            dim_out,
-            bias=bias,
-            gather_output=False,
-            return_bias=False,
-            prefix=f"{prefix}.proj" if prefix else "proj",
-        )
-        self.approximate = approximate
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return F.gelu(self.proj(hidden_states), approximate=self.approximate)
-
-
-class FeedForward(nn.Module):
-    """Tensor-parallel drop-in for the diffusers ``FeedForward`` used by Mage.
-
-    The submodule names (``net.0.proj`` / ``net.2``) intentionally match the
-    diffusers layout so the official checkpoint loads without remapping. Index
-    ``net.1`` is the parameter-free dropout slot and stays an ``Identity``.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        dim_out: int | None = None,
-        mult: int = 4,
-        activation_fn: str = "gelu-approximate",
-        inner_dim: int | None = None,
-        bias: bool = True,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        if activation_fn != "gelu-approximate":
-            raise ValueError(f"Mage-Flow FFN only supports 'gelu-approximate', got {activation_fn!r}")
-        inner_dim = inner_dim if inner_dim is not None else int(dim * mult)
-        dim_out = dim_out if dim_out is not None else dim
-
-        self.net = nn.ModuleList(
-            [
-                ColumnParallelApproxGELU(
-                    dim,
-                    inner_dim,
-                    approximate="tanh",
-                    bias=bias,
-                    prefix=f"{prefix}.net.0" if prefix else "net.0",
-                ),
-                nn.Identity(),  # placeholder keeping the diffusers weight names
-                RowParallelLinear(
-                    inner_dim,
-                    dim_out,
-                    bias=bias,
-                    input_is_parallel=True,
-                    return_bias=False,
-                    prefix=f"{prefix}.net.2" if prefix else "net.2",
-                ),
-            ]
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        for module in self.net:
-            hidden_states = module(hidden_states)
-        return hidden_states
 
 
 class MageJointAttention(nn.Module):
@@ -493,7 +439,6 @@ class MageJointAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.heads = heads
         self.dim_head = dim_head
         self.inner_dim = heads * dim_head
         self.query_dim = query_dim
@@ -526,7 +471,6 @@ class MageJointAttention(nn.Module):
         self.local_kv_heads = self.to_qkv.num_kv_heads
         self.q_size = self.local_heads * dim_head
         self.kv_size = self.local_kv_heads * dim_head
-        self.local_inner_dim = self.q_size
 
         # RMSNorm normalizes over ``dim_head`` only, so it never reduces across
         # the head dimension and stays correct under TP without extra comms.
@@ -558,7 +502,7 @@ class MageJointAttention(nn.Module):
 
         # ``num_kv_heads`` is left unset: Mage-Flow is pure MHA, so local_kv_heads
         # always equals local_heads and the default already matches.
-        self.attention = Attention(
+        self.attention = _MageFlowAttention(
             num_heads=self.local_heads,
             head_size=dim_head,
             softmax_scale=dim_head**-0.5,
@@ -597,10 +541,16 @@ class MageJointAttention(nn.Module):
         image_rotary_emb: torch.Tensor,
         image_attention_mask: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
+        sp_attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] != encoder_hidden_states.shape[0]:
             raise ValueError("Mage-Flow image and text batch sizes must match")
         batch_size = hidden_states.shape[0]
+        dense_single_request = (
+            batch_size == 1
+            and image_attention_mask is None
+            and encoder_attention_mask is None
+        )
         if image_attention_mask is None:
             image_attention_mask = torch.ones(
                 hidden_states.shape[:2],
@@ -648,6 +598,7 @@ class MageJointAttention(nn.Module):
                 img_k,
                 img_v,
                 attn_metadata=AttentionMetadata(
+                    attn_mask=sp_attention_mask,
                     joint_query=txt_q,
                     joint_key=txt_k,
                     joint_value=txt_v,
@@ -672,8 +623,7 @@ class MageJointAttention(nn.Module):
         joint_q = torch.cat([txt_q, img_q], dim=1)
         joint_k = torch.cat([txt_k, img_k], dim=1)
         joint_v = torch.cat([txt_v, img_v], dim=1)
-        all_tokens_valid = bool(joint_attention_mask.all())
-        if batch_size == 1 and all_tokens_valid:
+        if dense_single_request:
             joint_output = self.attention(
                 joint_q,
                 joint_k,
@@ -825,11 +775,8 @@ class MageFlowDoubleStreamBlock(nn.Module):
         image_rotary_emb: torch.Tensor,
         image_attention_mask: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
-        joint_attention_kwargs: dict[str, Any] | None = None,
+        sp_attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if joint_attention_kwargs:
-            unsupported = ", ".join(sorted(joint_attention_kwargs))
-            raise ValueError(f"Mage-Flow dense attention does not accept attention kwargs: {unsupported}")
         img_mod1, img_mod2 = _request_isolated_forward(
             self.img_mod,
             temb,
@@ -847,6 +794,7 @@ class MageFlowDoubleStreamBlock(nn.Module):
             image_rotary_emb,
             image_attention_mask=image_attention_mask,
             encoder_attention_mask=encoder_attention_mask,
+            sp_attention_mask=sp_attention_mask,
         )
         hidden_states = hidden_states + img_gate1 * img_attn
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn

@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from diffusers.models.normalization import RMSNorm
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -20,6 +21,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.forward_context import get_forward_context
 
 from .mage_flow_layers import (
     AdaLayerNormContinuous,
@@ -30,6 +32,8 @@ from .mage_flow_layers import (
     _request_isolated_forward,
     _sequence_parallel_active,
 )
+
+logger = init_logger(__name__)
 
 # The official checkpoint ships unfused ``to_q``/``to_k``/``to_v`` (and the text
 # stream's ``add_*_proj``) tensors, while the model fuses each triple into a
@@ -89,12 +93,12 @@ class MageFlowTransformer2DModel(nn.Module):
         self,
         od_config: OmniDiffusionConfig | None = None,
         *,
-        in_channels: int | None = None,
-        out_channels: int | None = None,
-        context_in_dim: int | None = None,
-        hidden_size: int | None = None,
-        num_heads: int | None = None,
-        depth: int | None = None,
+        in_channels: int = 128,
+        out_channels: int = 128,
+        context_in_dim: int = 2560,
+        hidden_size: int = 3072,
+        num_heads: int = 24,
+        depth: int = 12,
         mlp_ratio: float = 4.0,
         depth_single_blocks: int = 0,
         axes_dim: list[int] | None = None,
@@ -113,76 +117,7 @@ class MageFlowTransformer2DModel(nn.Module):
         **_: object,
     ) -> None:
         super().__init__()
-        model_config = getattr(od_config, "tf_model_config", None) if od_config is not None else None
-
-        def resolve(name: str, explicit: object, default: object = None):
-            if explicit is not None:
-                return explicit
-            return getattr(model_config, name, default)
-
-        in_channels = int(resolve("in_channels", in_channels, 128))
-        out_channels = int(resolve("out_channels", out_channels, 128))
-        context_in_dim = int(resolve("context_in_dim", context_in_dim, 2560))
-        hidden_size = int(resolve("hidden_size", hidden_size, 3072))
-        num_heads = int(resolve("num_heads", num_heads, 24))
-        depth = int(resolve("depth", depth, 12))
-        mlp_ratio = float(resolve("mlp_ratio", mlp_ratio if model_config is None else None, 4.0))
-        depth_single_blocks = int(
-            resolve(
-                "depth_single_blocks",
-                depth_single_blocks if model_config is None else None,
-                0,
-            )
-        )
-        axes_dim = list(resolve("axes_dim", axes_dim, [16, 56, 56]))
-        theta = int(resolve("theta", theta if model_config is None else None, 10000))
-        patch_size = int(resolve("patch_size", patch_size if model_config is None else None, 1))
-        qkv_bias = bool(resolve("qkv_bias", qkv_bias if model_config is None else None, True))
-        guidance_embed = bool(
-            resolve(
-                "guidance_embed",
-                guidance_embed if model_config is None else None,
-                False,
-            )
-        )
-        rope_type = str(resolve("rope_type", rope_type if model_config is None else None, "msrope"))
-        time_type = str(resolve("time_type", time_type if model_config is None else None, "qwen_proj"))
-        double_block_type = str(
-            resolve(
-                "double_block_type",
-                double_block_type if model_config is None else None,
-                "double_stream",
-            )
-        )
-        apply_text_rotary_emb = bool(
-            resolve(
-                "apply_text_rotary_emb",
-                apply_text_rotary_emb if model_config is None else None,
-                False,
-            )
-        )
-        packing = bool(resolve("packing", packing if model_config is None else None, True))
-        schedule_mode = str(
-            resolve(
-                "schedule_mode",
-                schedule_mode if model_config is None else None,
-                "z-image",
-            )
-        )
-        static_shift = float(
-            resolve(
-                "static_shift",
-                static_shift if model_config is None else None,
-                6.0,
-            )
-        )
-        use_time_shift = bool(
-            resolve(
-                "use_time_shift",
-                use_time_shift if model_config is None else None,
-                False,
-            )
-        )
+        axes_dim = list(axes_dim if axes_dim is not None else [16, 56, 56])
 
         if hidden_size % num_heads:
             raise ValueError(f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
@@ -227,16 +162,13 @@ class MageFlowTransformer2DModel(nn.Module):
         if static_shift != 6.0:
             raise ValueError(f"Unsupported Mage-Flow static_shift={static_shift}; expected 6.0")
 
-        self.od_config = od_config
+        self.parallel_config = od_config.parallel_config if od_config is not None else None
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.inner_dim = hidden_size
         self.num_attention_heads = num_heads
         self.attention_head_dim = head_dim
-        self.axes_dim = axes_dim
         self.patch_size = patch_size
-        self.schedule_mode = schedule_mode
-        self.static_shift = static_shift
 
         self.pos_embed = MageFlowEmbedRope(
             theta=theta,
@@ -367,17 +299,66 @@ class MageFlowTransformer2DModel(nn.Module):
         # The _sp_plan hook fires on image_rope_prepare's outputs, so the image
         # stream is sharded from here on while the text stream stays whole.
         sequence_parallel = _sequence_parallel_active()
-        if sequence_parallel and not (bool(image_attention_mask.all()) and bool(encoder_attention_mask.all())):
-            # Sharding splits the padded sequence blindly, so a padded request
-            # would put real tokens and filler on different ranks with no mask
-            # to tell them apart. Requests of equal length shard cleanly.
+        image_has_padding = not bool(image_attention_mask.all())
+        encoder_has_padding = not bool(encoder_attention_mask.all())
+        if sequence_parallel and image_has_padding:
+            # The image stream is sharded, while text stays replicated and can
+            # carry its padding mask through joint AttentionMetadata.
             raise ValueError(
-                "Mage-Flow sequence parallelism does not support padded token "
-                "sequences. Every request in the batch must share the same image "
-                "and text token counts; packed CFG pads the shorter prompt, so "
-                "pair --ulysses-degree with --cfg-parallel-size 2 instead of "
-                "letting one forward carry both guidance branches."
+                "Mage-Flow sequence parallelism does not support padded image "
+                "token sequences. Every request in the batch must share the "
+                "same image token count."
             )
+
+        sp_attention_mask = None
+        if sequence_parallel:
+            context = get_forward_context()
+            parallel_config = self.parallel_config
+            if parallel_config is None and context.omni_diffusion_config is not None:
+                parallel_config = context.omni_diffusion_config.parallel_config
+            auto_padding = context.sp_original_seq_len is not None and context.sp_padding_size > 0
+            mask_auto_padding = (
+                parallel_config is not None
+                and parallel_config.mask_sp_padding
+                and auto_padding
+            )
+            if auto_padding and not mask_auto_padding:
+                logger.warning_once(
+                    "SP auto-padding applied %d token(s) "
+                    "(seq_len=%d, ulysses_degree=%d). Padding tokens are not "
+                    "masked from attention (mask_sp_padding=False), which "
+                    "avoids the varlen attention path but may produce minor "
+                    "numerical differences. Set "
+                    "parallel_config.mask_sp_padding=True to restore strict "
+                    "masking.",
+                    context.sp_padding_size,
+                    context.sp_original_seq_len,
+                    getattr(parallel_config, "sequence_parallel_size", 1),
+                )
+            if encoder_has_padding or mask_auto_padding:
+                sp_image_mask = image_attention_mask
+                if auto_padding:
+                    sp_image_mask = torch.cat(
+                        [
+                            sp_image_mask,
+                            torch.full(
+                                (batch_size, context.sp_padding_size),
+                                not mask_auto_padding,
+                                dtype=torch.bool,
+                                device=hidden_states.device,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                sp_attention_mask = torch.cat(
+                    [encoder_attention_mask, sp_image_mask],
+                    dim=1,
+                )
+                if getattr(parallel_config, "ring_degree", 1) > 1:
+                    raise ValueError(
+                        "Mage-Flow masked sequence parallelism does not support "
+                        "ring_degree > 1; use Ulysses or AllGather-KV."
+                    )
 
         encoder_hidden_states = _request_isolated_forward(
             self.txt_in,
@@ -395,10 +376,17 @@ class MageFlowTransformer2DModel(nn.Module):
             raise ValueError(f"Mage-Flow timestep must have shape ({batch_size},), got {tuple(timestep.shape)}")
         temb = self.time_text_embed(timestep, hidden_states)
 
-        # Every mask below is indexed against the full sequence, which no longer
-        # matches the sharded image stream. They are all-valid under SP, so the
-        # blocks run unmasked instead.
-        block_image_mask = None if sequence_parallel else image_attention_mask
+        # Positionwise block operations need the local image shape under SP.
+        # Attention receives its separate full-sequence auto-padding mask via
+        # AttentionMetadata.
+        block_image_mask = (
+            None
+            if sequence_parallel or not image_has_padding
+            else image_attention_mask
+        )
+        block_encoder_mask = (
+            encoder_attention_mask if encoder_has_padding else None
+        )
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -407,7 +395,8 @@ class MageFlowTransformer2DModel(nn.Module):
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
                 image_attention_mask=block_image_mask,
-                encoder_attention_mask=encoder_attention_mask,
+                encoder_attention_mask=block_encoder_mask,
+                sp_attention_mask=sp_attention_mask,
             )
         # proj_out carries the _sp_plan gather hook, so its output is whole
         # again and the trailing mask applies to the full sequence.
@@ -437,4 +426,5 @@ class MageFlowTransformer2DModel(nn.Module):
             else:
                 weight_loader(param, loaded_weight, shard_id)
             loaded.add(name)
+            loaded.add(lookup_name)
         return loaded

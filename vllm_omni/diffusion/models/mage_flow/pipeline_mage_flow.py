@@ -7,7 +7,6 @@
 
 """Request-batched native Mage-Flow text-to-image and image-edit pipeline."""
 
-import copy
 import os
 import posixpath
 from collections.abc import Iterable
@@ -20,12 +19,17 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_exists
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    DiffusionOutput,
+    OmniDiffusionConfig,
+    TransformerConfig,
+)
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
@@ -44,37 +48,31 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import GuardrailViolationError, OmniClientError
 
 from .autoencoder_mage import MageVAE
 from .content_policy import (
+    MageFlowSafetyCheckError,
     make_initial_noise,
     screen_mage_flow_edit_prompt,
     screen_mage_flow_prompt,
 )
-from .mage_flow_transformer import (
-    MageFlowTransformer2DModel,
-    resolve_mage_flow_stacked_name,
-)
+from .mage_flow_transformer import MageFlowTransformer2DModel
 from .prompt_utils import (
     encode_mage_flow_edit_prompt,
     encode_mage_flow_prompt,
     get_mage_flow_variant_defaults,
-    normalize_mage_flow_reference_images,
-    parse_mage_flow_extra_args,
+    parse_mage_flow_request_data,
     preprocess_mage_flow_reference_for_vae,
-    validate_mage_flow_size,
 )
 
 
 @dataclass
 class _MageFlowBatchItem:
-    sampling: Any
     height: int
     width: int
-    num_inference_steps: int
-    guidance_scale: float
-    output_type: str
     prompt_embeds: torch.Tensor
     negative_prompt_embeds: torch.Tensor | None
     target_latents: torch.Tensor
@@ -82,61 +80,36 @@ class _MageFlowBatchItem:
     image_grids: list[tuple[int, int]]
 
 
-def make_mage_flow_request_scheduler(
-    scheduler: FlowMatchEulerDiscreteScheduler,
-    *,
-    num_inference_steps: int,
-    device: torch.device,
-) -> FlowMatchEulerDiscreteScheduler:
-    """Create an isolated static-shift schedule for one request."""
-    request_scheduler = copy.deepcopy(scheduler)
-    base_sigmas = torch.linspace(
-        1.0,
-        1.0 / num_inference_steps,
-        num_inference_steps,
-    ).tolist()
-    request_scheduler.set_timesteps(sigmas=base_sigmas, device=device)
-    return request_scheduler
-
-
-def map_mage_flow_weight_name(name: str) -> str | None:
-    """Map official MageVAE training prefixes to the inference module tree."""
-    ignored_prefixes = (
-        "vae.pipeline.y_embedder.encoder.",
-        "vae.pipeline.y_embedder.bottleneck.",
+def _resolve_mage_flow_output_type(
+    sampling_params: Any,
+    od_config: OmniDiffusionConfig,
+) -> str:
+    output_type = (
+        getattr(sampling_params, "output_type", None)
+        or getattr(od_config, "output_type", None)
+        or "pil"
     )
-    if name.startswith(ignored_prefixes):
-        return None
-    if name.startswith("vae.student.dconv_encoder."):
-        return name.replace(
-            "vae.student.dconv_encoder.",
-            "vae.dconv_encoder.",
-            1,
+    if output_type not in {"pil", "tensor", "latent"}:
+        raise OmniClientError(
+            "Mage-Flow output_type must be 'pil', 'tensor', or 'latent'"
         )
-    if name.startswith("vae.pipeline."):
-        return name.replace(
-            "vae.pipeline.",
-            "vae.decoder_model.",
-            1,
-        )
-    return name
+    return output_type
 
 
 def get_mage_flow_pre_process_func(
     od_config: OmniDiffusionConfig,
 ):
-    """Validate the shared T2I/Edit prompt contract before batching."""
+    """Validate request-local prompt data before scheduler batching."""
 
-    def pre_process_func(request: OmniDiffusionRequest):
-        prompt = request.prompt
-        if isinstance(prompt, str):
-            return request
-        multi_modal_data = prompt.get("multi_modal_data", {})
-        images = multi_modal_data.get("image")
-        if images is not None:
-            normalize_mage_flow_reference_images(images)
-        if not isinstance(prompt.get("prompt"), str):
-            raise ValueError("Mage-Flow prompt must contain a string 'prompt'")
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        parse_mage_flow_request_data(
+            request.prompt,
+            request.sampling_params,
+        )
+        _resolve_mage_flow_output_type(
+            request.sampling_params,
+            od_config,
+        )
         return request
 
     return pre_process_func
@@ -155,7 +128,7 @@ def get_mage_flow_post_process_func(
         *,
         sampling_params: Any,
     ):
-        output_type = sampling_params.output_type or od_config.output_type or "pil"
+        output_type = _resolve_mage_flow_output_type(sampling_params, od_config)
         if output_type == "latent":
             return images
         if output_type == "tensor":
@@ -196,9 +169,13 @@ class MageFlowPipeline(
 
         model = od_config.model
         local_files_only = os.path.isdir(model)
-        text_encoder_subfolder, vae_subfolder, vae_filename, vae_config, transformer_config = (
-            self._load_checkpoint_metadata()
-        )
+        (
+            text_encoder_subfolder,
+            vae_subfolder,
+            vae_filename,
+            vae_config,
+            transformer_config,
+        ) = self._load_checkpoint_metadata()
         component_subfolders = [
             "scheduler",
             text_encoder_subfolder,
@@ -253,10 +230,13 @@ class MageFlowPipeline(
             local_files_only=local_files_only,
             revision=od_config.revision,
         )
-        self.transformer = MageFlowTransformer2DModel(
-            od_config=od_config,
-            **transformer_config,
+        transformer_kwargs = get_transformer_config_kwargs(
+            TransformerConfig.from_dict(transformer_config),
+            MageFlowTransformer2DModel,
         )
+        if not transformer_kwargs:
+            raise ValueError("Mage-Flow Transformer config was not loaded")
+        self.transformer = MageFlowTransformer2DModel(od_config=od_config, **transformer_kwargs)
         self.vae = MageVAE(
             od_config=od_config,
             latent_channels=int(vae_config["latent_channels"]),
@@ -269,14 +249,12 @@ class MageFlowPipeline(
                 f"{self.transformer.in_channels} != {self.vae.latent_channels}"
             )
 
-        self.default_sample_size = 1024
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
                 "text_encoder.forward",
                 "vae.encode",
                 "vae.decode",
                 "diffuse",
-                "diffuse_batch",
             ],
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler),
         )
@@ -320,7 +298,13 @@ class MageFlowPipeline(
 
     def _load_checkpoint_metadata(
         self,
-    ) -> tuple[str, str, str, dict[str, Any], dict[str, Any]]:
+    ) -> tuple[
+        str,
+        str,
+        str,
+        dict[str, Any],
+        dict[str, Any],
+    ]:
         model_index = get_hf_file_to_dict(
             "model_index.json",
             self.od_config.model,
@@ -380,7 +364,10 @@ class MageFlowPipeline(
             self.od_config.revision,
         )
         if transformer_config is None:
-            raise ValueError("Mage-Flow Transformer config not found at transformer/config.json")
+            raise ValueError(
+                "Mage-Flow Transformer config not found at "
+                "transformer/config.json"
+            )
         return (
             text_encoder_subfolder,
             vae_subfolder,
@@ -406,11 +393,9 @@ class MageFlowPipeline(
 
     def _request_generator(
         self,
-        generator: torch.Generator | list[torch.Generator] | None,
+        generator: torch.Generator | None,
         seed: int | None,
     ) -> torch.Generator:
-        if isinstance(generator, list):
-            raise ValueError("Mage-Flow currently supports exactly one request generator")
         if generator is not None:
             if generator.device != self.device:
                 local_generator = torch.Generator(device=self.device)
@@ -454,17 +439,17 @@ class MageFlowPipeline(
             elif tuple(latents.shape) == shape:
                 latent_image = latents
             else:
-                raise ValueError(
+                raise OmniClientError(
                     f"Mage-Flow latents must have shape {shape} or "
                     f"(1, {shape[2] * shape[3]}, {shape[1]}), got "
                     f"{tuple(latents.shape)}"
                 )
             if latent_image.dtype != self.od_config.dtype:
-                raise ValueError(
+                raise OmniClientError(
                     f"Mage-Flow supplied latents must use {self.od_config.dtype}, got {latent_image.dtype}"
                 )
             if latent_image.device != self.device:
-                raise ValueError(f"Mage-Flow supplied latents must be on {self.device}, got {latent_image.device}")
+                raise OmniClientError(f"Mage-Flow supplied latents must be on {self.device}, got {latent_image.device}")
         return latent_image.flatten(2).transpose(1, 2).contiguous()
 
     def _prepare_reference_latents(
@@ -499,52 +484,25 @@ class MageFlowPipeline(
     ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
         if not sequences:
             raise ValueError("Mage-Flow cannot pad an empty token sequence list")
-        normalized = []
-        lengths = []
         feature_dim = sequences[0].shape[-1]
         for sequence in sequences:
             if sequence.ndim != 3 or sequence.shape[0] != 1:
                 raise ValueError(f"Mage-Flow token sequences must have shape [1, S, D], got {tuple(sequence.shape)}")
             if sequence.shape[-1] != feature_dim:
                 raise ValueError("Mage-Flow padded token sequences must share the feature dimension")
-            normalized.append(sequence[0])
-            lengths.append(sequence.shape[1])
-        max_length = max(lengths)
-        padded = sequences[0].new_zeros(
-            len(sequences),
-            max_length,
-            feature_dim,
+        lengths = [sequence.shape[1] for sequence in sequences]
+        padded = pad_sequence(
+            [sequence[0] for sequence in sequences],
+            batch_first=True,
         )
-        mask = torch.zeros(
-            len(sequences),
-            max_length,
-            dtype=torch.bool,
-            device=sequences[0].device,
+        mask = (
+            torch.arange(
+                padded.shape[1],
+                device=padded.device,
+            )
+            < torch.tensor(lengths, device=padded.device)[:, None]
         )
-        for index, (sequence, length) in enumerate(zip(normalized, lengths)):
-            padded[index, :length] = sequence
-            mask[index, :length] = True
         return padded, mask, lengths
-
-    def predict_noise(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
-        image_grid_hw: list[tuple[int, int]] | list[list[tuple[int, int]]],
-        image_attention_mask: torch.Tensor | None = None,
-        encoder_attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.transformer(
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            timestep=timestep,
-            image_grid_hw=image_grid_hw,
-            image_attention_mask=image_attention_mask,
-            encoder_attention_mask=encoder_attention_mask,
-            return_dict=False,
-        )[0]
 
     def _predict_noise_packed_cfg(
         self,
@@ -608,7 +566,7 @@ class MageFlowPipeline(
             raise TypeError("Mage-Flow packed CFG expects a tensor prediction")
         return combined
 
-    def diffuse_batch(
+    def diffuse(
         self,
         *,
         target_latents: torch.Tensor,
@@ -628,16 +586,20 @@ class MageFlowPipeline(
         batch_size = target_latents.shape[0]
         if len(target_lengths) != batch_size or len(reference_latents) != batch_size:
             raise ValueError("Mage-Flow batch metadata must match the latent batch size")
-        scheduler = make_mage_flow_request_scheduler(
-            self.scheduler,
-            num_inference_steps=num_inference_steps,
+        base_sigmas = torch.linspace(
+            1.0,
+            1.0 / num_inference_steps,
+            num_inference_steps,
+        ).tolist()
+        self.scheduler.set_timesteps(
+            sigmas=base_sigmas,
             device=self.device,
         )
         do_cfg = guidance_scale > 1.0
         cfg_parallel = get_classifier_free_guidance_world_size() > 1
 
-        with self.progress_bar(total=len(scheduler.timesteps)) as progress:
-            for step_index, timestep in enumerate(scheduler.timesteps):
+        with self.progress_bar(total=len(self.scheduler.timesteps)) as progress:
+            for step_index, timestep in enumerate(self.scheduler.timesteps):
                 combined_sequences = [
                     torch.cat(
                         [
@@ -649,7 +611,7 @@ class MageFlowPipeline(
                     for index, target_length in enumerate(target_lengths)
                 ]
                 combined_latents, image_attention_mask, _ = self._pad_token_sequences(combined_sequences)
-                sigma = scheduler.sigmas[step_index].to(
+                sigma = self.scheduler.sigmas[step_index].to(
                     device=self.device,
                     dtype=target_latents.dtype,
                 )
@@ -691,184 +653,34 @@ class MageFlowPipeline(
                         guidance_scale=guidance_scale,
                         cfg_normalize=cfg_normalize,
                     )
-                target_noise_prediction = torch.zeros_like(target_latents)
-                for index, target_length in enumerate(target_lengths):
-                    target_noise_prediction[index, :target_length] = full_noise_prediction[index, :target_length]
+                target_noise_prediction = full_noise_prediction[:, : target_latents.shape[1]].masked_fill(
+                    ~target_attention_mask[..., None],
+                    0,
+                )
                 target_latents = self.scheduler_step(
                     target_noise_prediction,
                     timestep,
                     target_latents,
-                    per_request_scheduler=scheduler,
                 )
                 target_latents = target_latents * target_attention_mask[..., None]
                 progress.update()
         return target_latents
 
-    def diffuse(
-        self,
-        *,
-        latents: torch.Tensor,
-        prompt_embeds: torch.Tensor,
-        negative_prompt_embeds: torch.Tensor | None,
-        height: int,
-        width: int,
-        num_inference_steps: int,
-        guidance_scale: float,
-        cfg_normalize: bool,
-    ) -> torch.Tensor:
-        scheduler = make_mage_flow_request_scheduler(
-            self.scheduler,
-            num_inference_steps=num_inference_steps,
-            device=self.device,
-        )
-        do_cfg = guidance_scale > 1.0
-        image_grid_hw = [
-            (
-                height // self.vae.downsample_factor,
-                width // self.vae.downsample_factor,
-            )
-        ]
-
-        with self.progress_bar(total=len(scheduler.timesteps)) as progress:
-            for step_index, timestep in enumerate(scheduler.timesteps):
-                sigma = scheduler.sigmas[step_index].to(
-                    device=self.device,
-                    dtype=latents.dtype,
-                )
-                positive_kwargs = {
-                    "hidden_states": latents,
-                    "encoder_hidden_states": prompt_embeds,
-                    "timestep": sigma.expand(1),
-                    "image_grid_hw": image_grid_hw,
-                }
-                negative_kwargs = (
-                    {
-                        "hidden_states": latents,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "timestep": sigma.expand(1),
-                        "image_grid_hw": image_grid_hw,
-                    }
-                    if do_cfg
-                    else None
-                )
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_cfg,
-                    true_cfg_scale=guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=cfg_normalize,
-                )
-                latents = self.scheduler_step(
-                    noise_pred,
-                    timestep,
-                    latents,
-                    per_request_scheduler=scheduler,
-                )
-                progress.update()
-        return latents
-
-    def diffuse_edit(
-        self,
-        *,
-        latents: torch.Tensor,
-        reference_latents: torch.Tensor,
-        num_reference_images: int,
-        prompt_embeds: torch.Tensor,
-        negative_prompt_embeds: torch.Tensor | None,
-        height: int,
-        width: int,
-        num_inference_steps: int,
-        guidance_scale: float,
-        cfg_normalize: bool,
-    ) -> torch.Tensor:
-        """Denoise target tokens while keeping all reference latents clean."""
-        scheduler = make_mage_flow_request_scheduler(
-            self.scheduler,
-            num_inference_steps=num_inference_steps,
-            device=self.device,
-        )
-        do_cfg = guidance_scale > 1.0
-        latent_grid = (
-            height // self.vae.downsample_factor,
-            width // self.vae.downsample_factor,
-        )
-        image_grid_hw = [latent_grid] * (1 + num_reference_images)
-        target_length = latents.shape[1]
-
-        with self.progress_bar(total=len(scheduler.timesteps)) as progress:
-            for step_index, timestep in enumerate(scheduler.timesteps):
-                sigma = scheduler.sigmas[step_index].to(
-                    device=self.device,
-                    dtype=latents.dtype,
-                )
-                combined_latents = torch.cat([latents, reference_latents], dim=1)
-                positive_kwargs = {
-                    "hidden_states": combined_latents,
-                    "encoder_hidden_states": prompt_embeds,
-                    "timestep": sigma.expand(1),
-                    "image_grid_hw": image_grid_hw,
-                }
-                negative_kwargs = (
-                    {
-                        "hidden_states": combined_latents,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "timestep": sigma.expand(1),
-                        "image_grid_hw": image_grid_hw,
-                    }
-                    if do_cfg
-                    else None
-                )
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_cfg,
-                    true_cfg_scale=guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=cfg_normalize,
-                )[:, :target_length]
-                latents = self.scheduler_step(
-                    noise_pred,
-                    timestep,
-                    latents,
-                    per_request_scheduler=scheduler,
-                )
-                progress.update()
-        return latents
-
     def _prepare_batch_item(
         self,
         prompt_data: Any,
         sampling: Any,
+        *,
+        do_cfg: bool,
     ) -> _MageFlowBatchItem:
-        defaults = get_mage_flow_variant_defaults(self.od_config.model)
-        if sampling.num_outputs_per_prompt != 1:
-            raise ValueError("Mage-Flow currently supports num_outputs_per_prompt=1")
-        reference_images = []
-        if isinstance(prompt_data, str):
-            prompt = prompt_data
-            negative_prompt = " "
-        else:
-            prompt = prompt_data.get("prompt") or ""
-            negative_prompt = prompt_data.get("negative_prompt") or " "
-            images = prompt_data.get("multi_modal_data", {}).get("image")
-            reference_images = normalize_mage_flow_reference_images(images)
-        if not prompt:
-            raise ValueError("Mage-Flow prompt must not be empty")
-
-        height = sampling.height if sampling.height is not None else self.default_sample_size
-        width = sampling.width if sampling.width is not None else self.default_sample_size
-        validate_mage_flow_size(height, width)
-        num_inference_steps = (
-            sampling.num_inference_steps if sampling.num_inference_steps is not None else defaults.num_inference_steps
-        )
-        if num_inference_steps <= 0:
-            raise ValueError("num_inference_steps must be positive")
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else defaults.guidance_scale
-        if guidance_scale < 1.0:
-            raise ValueError("Mage-Flow guidance_scale must be at least 1.0")
-        output_type = sampling.output_type or "pil"
-        if output_type not in {"pil", "tensor", "latent"}:
-            raise ValueError("Mage-Flow output_type must be 'pil', 'tensor', or 'latent'")
-        extra_args = parse_mage_flow_extra_args(sampling.extra_args)
+        (
+            prompt,
+            negative_prompt,
+            reference_images,
+            height,
+            width,
+            extra_args,
+        ) = parse_mage_flow_request_data(prompt_data, sampling)
 
         is_edit = bool(reference_images)
         if extra_args.enable_safety_check:
@@ -888,7 +700,7 @@ class MageFlowPipeline(
             )
             if verdict.violates:
                 categories = ",".join(verdict.categories) or "unknown"
-                raise ValueError(
+                raise GuardrailViolationError(
                     f"Mage-Flow content safety check rejected the request ({categories}): {verdict.reason}"
                 )
 
@@ -908,7 +720,6 @@ class MageFlowPipeline(
             device=self.device,
             **encode_kwargs,
         )
-        do_cfg = guidance_scale > 1.0
         negative_prompt_embeds = (
             encode_prompt(
                 self.text_encoder,
@@ -949,37 +760,14 @@ class MageFlowPipeline(
             width // self.vae.downsample_factor,
         )
         return _MageFlowBatchItem(
-            sampling=sampling,
             height=height,
             width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            output_type=output_type,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             target_latents=latents,
             reference_latents=reference_latents,
             image_grids=[latent_grid] * (1 + len(reference_images)),
         )
-
-    @staticmethod
-    def _validate_batch_compatibility(
-        items: list[_MageFlowBatchItem],
-    ) -> None:
-        first = items[0]
-        for item in items[1:]:
-            incompatible = []
-            for name in (
-                "num_inference_steps",
-                "guidance_scale",
-                "output_type",
-            ):
-                if getattr(item, name) != getattr(first, name):
-                    incompatible.append(name)
-            if item.sampling.cfg_normalize != first.sampling.cfg_normalize:
-                incompatible.append("cfg_normalize")
-            if incompatible:
-                raise ValueError("Mage-Flow request batch has incompatible sampling fields: " + ", ".join(incompatible))
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
@@ -988,20 +776,45 @@ class MageFlowPipeline(
         if not req.num_reqs:
             raise ValueError("Mage-Flow request batch must not be empty")
 
-        items = [
-            self._prepare_batch_item(prompt_data, sampling)
-            for prompt_data, sampling in zip(
-                req.prompts,
-                req.sampling_params_list,
-            )
-        ]
-        self._validate_batch_compatibility(items)
+        common_sampling = req.sampling_params_list[0]
+        defaults = get_mage_flow_variant_defaults(self.od_config.model)
+        if common_sampling.num_outputs_per_prompt != 1:
+            raise ValueError("Mage-Flow currently supports num_outputs_per_prompt=1")
+        num_inference_steps = (
+            common_sampling.num_inference_steps
+            if common_sampling.num_inference_steps is not None
+            else defaults.num_inference_steps
+        )
+        if num_inference_steps <= 0:
+            raise ValueError("num_inference_steps must be positive")
+        guidance_scale = (
+            common_sampling.guidance_scale if common_sampling.guidance_scale_provided else defaults.guidance_scale
+        )
+        if guidance_scale < 1.0:
+            raise ValueError("Mage-Flow guidance_scale must be at least 1.0")
+        output_type = _resolve_mage_flow_output_type(common_sampling, self.od_config)
+        do_cfg = guidance_scale > 1.0
+
+        items = []
+        failed_outputs = {}
+        for index, (prompt_data, sampling) in enumerate(zip(req.prompts, req.sampling_params_list)):
+            try:
+                item = self._prepare_batch_item(
+                    prompt_data,
+                    sampling,
+                    do_cfg=do_cfg,
+                )
+            except (OmniClientError, MageFlowSafetyCheckError) as error:
+                failed_outputs[index] = DiffusionOutput.from_exception(error)
+            else:
+                items.append(item)
+        if not items:
+            return [failed_outputs[index] for index in range(req.num_reqs)]
 
         target_latents, target_attention_mask, target_lengths = self._pad_token_sequences(
             [item.target_latents for item in items]
         )
         prompt_embeds, prompt_attention_mask, _ = self._pad_token_sequences([item.prompt_embeds for item in items])
-        do_cfg = items[0].guidance_scale > 1.0
         if do_cfg:
             negative_prompt_embeds, negative_prompt_attention_mask, _ = self._pad_token_sequences(
                 [item.negative_prompt_embeds for item in items if item.negative_prompt_embeds is not None]
@@ -1012,7 +825,7 @@ class MageFlowPipeline(
             negative_prompt_embeds = None
             negative_prompt_attention_mask = None
 
-        target_latents = self.diffuse_batch(
+        target_latents = self.diffuse(
             target_latents=target_latents,
             target_attention_mask=target_attention_mask,
             target_lengths=target_lengths,
@@ -1022,13 +835,13 @@ class MageFlowPipeline(
             negative_prompt_embeds=negative_prompt_embeds,
             negative_prompt_attention_mask=negative_prompt_attention_mask,
             image_grid_hw=[item.image_grids for item in items],
-            num_inference_steps=items[0].num_inference_steps,
-            guidance_scale=items[0].guidance_scale,
-            cfg_normalize=items[0].sampling.cfg_normalize,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            cfg_normalize=common_sampling.cfg_normalize,
         )
 
         stage_durations = self.stage_durations if hasattr(self, "_stage_durations") else None
-        outputs = []
+        generated_outputs = []
         for index, (item, target_length) in enumerate(zip(items, target_lengths)):
             latent_height = item.height // self.vae.downsample_factor
             latent_width = item.width // self.vae.downsample_factor
@@ -1044,46 +857,21 @@ class MageFlowPipeline(
             )
             output = (
                 latent_image
-                if item.output_type == "latent"
+                if output_type == "latent"
                 else self.vae.decode(latent_image.to(dtype=self.vae.dtype)).clamp(-1, 1)
             )
-            outputs.append(
+            generated_outputs.append(
                 DiffusionOutput(
                     output=output,
                     stage_durations=stage_durations,
                 )
             )
-        return outputs
+        generated = iter(generated_outputs)
+        return [failed_outputs[index] if index in failed_outputs else next(generated) for index in range(req.num_reqs)]
 
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        """Map official MageVAE prefixes and reject unexplained weights."""
-        params = dict(self.named_parameters())
-        loaded: set[str] = set()
-        for name, loaded_weight in weights:
-            name = map_mage_flow_weight_name(name)
-            if name is None:
-                continue
-            # Only the transformer fuses Q/K/V; the VAE's own ``.q``/``.k``/
-            # ``.v`` convolutions must never be rewritten.
-            if name.startswith("transformer."):
-                lookup_name, shard_id = resolve_mage_flow_stacked_name(name)
-            else:
-                lookup_name, shard_id = name, None
-            param = params.get(lookup_name)
-            if param is None:
-                raise KeyError(f"Unexpected Mage-Flow checkpoint weight: {name}")
-            weight_loader = getattr(
-                param,
-                "weight_loader",
-                default_weight_loader,
-            )
-            if shard_id is None:
-                weight_loader(param, loaded_weight)
-            else:
-                weight_loader(param, loaded_weight, shard_id)
-            loaded.add(name)
-            loaded.add(lookup_name)
-        return loaded
+        """Delegate component-specific remapping and fused loading recursively."""
+        return AutoWeightsLoader(self).load_weights(weights)

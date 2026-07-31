@@ -23,7 +23,7 @@ from functools import lru_cache
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -57,10 +57,6 @@ class LayerNorm2d(nn.LayerNorm):
         x = x.permute(0, 2, 3, 1).contiguous()
         x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
         return x.permute(0, 3, 1, 2).contiguous()
-
-
-class _EncoderLayerNorm2d(LayerNorm2d):
-    pass
 
 
 class RMSNorm(nn.Module):
@@ -172,8 +168,8 @@ class _EncoderDiCoBlock(nn.Module):
         ffn = int(mlp_ratio * hidden_size)
         self.conv4 = nn.Conv2d(hidden_size, ffn, 1, bias=True)
         self.conv5 = nn.Conv2d(ffn, hidden_size, 1, bias=True)
-        self.norm1 = _EncoderLayerNorm2d(hidden_size)
-        self.norm2 = _EncoderLayerNorm2d(hidden_size)
+        self.norm1 = LayerNorm2d(hidden_size)
+        self.norm2 = LayerNorm2d(hidden_size)
 
     def forward(self, inp):
         x = self.norm1(inp)
@@ -228,12 +224,8 @@ class NerfFinalLayer(nn.Module):
 class SimpleMLPAdaLN(nn.Module):
     """Final small MLP that maps NerfEmbedder features to per-patch RGB."""
 
-    def __init__(self, in_channels, model_channels, out_channels, z_channels, num_res_blocks, patch_size):
+    def __init__(self, in_channels, model_channels, z_channels, num_res_blocks, patch_size):
         super().__init__()
-        self.in_channels = in_channels
-        self.model_channels = model_channels
-        self.out_channels = out_channels
-        self.num_res_blocks = num_res_blocks
         self.patch_size = patch_size
 
         self.cond_embed = nn.Linear(z_channels, patch_size**2 * model_channels)
@@ -299,7 +291,6 @@ class AttnBlock(nn.Module):
 
     def __init__(self, in_channels, patch_size=32):
         super().__init__()
-        self.in_channels = in_channels
         self.patch_size = patch_size
         self.norm = Normalize(in_channels)
         self.q = nn.Conv2d(in_channels, in_channels, 1)
@@ -341,41 +332,6 @@ class AttnBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# adaLN constant-folding: at fixed t=0, adaLN_modulation(c) is constant.
-# Replace the MLP with a buffer so DiCoBlock.forward stays unchanged and
-# torch.compile can fuse the surrounding ops normally.
-# ---------------------------------------------------------------------------
-class _ConstAdaLN(nn.Module):
-    def __init__(self, modulation: torch.Tensor):
-        super().__init__()
-        self.register_buffer("modulation", modulation.detach().clone())
-
-    def forward(self, c):
-        b = c.shape[0]
-        if self.modulation.shape[0] != b:
-            return self.modulation.expand(b, *self.modulation.shape[1:])
-        return self.modulation
-
-
-def _replace_adaln_with_const(module: nn.Module, c: torch.Tensor) -> int:
-    # Only DiCoBlock is targeted: its adaLN is conditioned solely on t.
-    # Other adaLN_modulation submodules (e.g. _MLPResBlock in the decoder MLP)
-    # take a per-position latent and must not be folded.
-    n = 0
-    for child in module.modules():
-        if not isinstance(child, DiCoBlock):
-            continue
-        adaln = child.adaLN_modulation
-        if isinstance(adaln, _ConstAdaLN):
-            continue
-        with torch.no_grad():
-            mod = adaln(c)
-        child.adaLN_modulation = _ConstAdaLN(mod)
-        n += 1
-    return n
-
-
-# ---------------------------------------------------------------------------
 # CoD Decoder: latent → conditioning features for the denoiser
 # ---------------------------------------------------------------------------
 class _Decoder(nn.Module):
@@ -393,12 +349,11 @@ class _Decoder(nn.Module):
         )
         self.norm_out = Normalize(out_ch)
         self.conv_out = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1)
-        self.ada = nn.Identity()
 
     def forward(self, z):
         h = self.block(self.conv_in(z))
         h = self.conv_out(nonlinearity(self.norm_out(h)))
-        return self.ada(h)
+        return h
 
 
 # ---------------------------------------------------------------------------
@@ -468,10 +423,8 @@ class _DConvDenoiser(nn.Module):
         bottleneck_dim=128,
     ):
         super().__init__()
-        self.in_channels = in_channels
         self.patch_size = patch_size
         self.hidden_size = hidden_size
-        self.num_cond_blocks = num_cond_blocks
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder_x = nn.Conv2d(hidden_size, hidden_size_x * patch_size**2, 1, 1, 0)
@@ -481,7 +434,6 @@ class _DConvDenoiser(nn.Module):
         self.dec_net = SimpleMLPAdaLN(
             in_channels=hidden_size_x,
             model_channels=hidden_size_x,
-            out_channels=in_channels,
             z_channels=hidden_size,
             num_res_blocks=num_blocks - num_cond_blocks,
             patch_size=patch_size,
@@ -527,6 +479,14 @@ class MageVAE(nn.Module):
 
     latent_channels = 128
     downsample_factor = 16
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "pipeline.y_embedder.encoder.": None,
+            "pipeline.y_embedder.bottleneck.": None,
+            "student.dconv_encoder.": "dconv_encoder.",
+            "pipeline.": "decoder_model.",
+        }
+    )
 
     def __init__(
         self,
@@ -545,7 +505,6 @@ class MageVAE(nn.Module):
             raise ValueError(f"MageVAE requires latent_channels=128, got {latent_channels}")
         if downsample_factor != self.downsample_factor and not is_tiny_test_config:
             raise ValueError(f"MageVAE requires downsample_factor=16, got {downsample_factor}")
-        self.od_config = od_config
         self.latent_channels = latent_channels
         self.downsample_factor = downsample_factor
         self.sample_posterior = sample_posterior
@@ -574,18 +533,12 @@ class MageVAE(nn.Module):
         return mean, logvar
 
     @torch.no_grad()
-    def _encode_moments(self, x: torch.Tensor):
-        # Compile target: pure deterministic part of encode (no RNG, no
-        # asserts), so torch.compile produces a single dynamic graph.
-        return self._moments(x)
-
-    @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         ps = self.dconv_encoder.patch_size
         H, W = x.shape[-2], x.shape[-1]
         if H % ps or W % ps:
             raise ValueError(f"H, W must be multiples of {ps}, got ({H}, {W})")
-        mean, logvar = self._encode_moments(x)
+        mean, logvar = self._moments(x)
         if self.sample_posterior:
             return mean + torch.exp(0.5 * logvar) * torch.randn_like(mean)
         return mean
@@ -608,19 +561,11 @@ class MageVAE(nn.Module):
     def dtype(self):
         return next(self.parameters()).dtype
 
-    def _freeze_adaln_cache(self):
-        """Constant-fold adaLN_modulation MLPs at t=0 (encoder + decoder)."""
-        device = next(self.parameters()).device
-        dtype = next(self.parameters()).dtype
-        t = torch.zeros(1, device=device, dtype=dtype)
-        c_enc = self.dconv_encoder.t_embedder(t)
-        _replace_adaln_with_const(self.dconv_encoder, c_enc)
-        c_dec = self.decoder_model.t_embedder(t)
-        _replace_adaln_with_const(self.decoder_model, c_dec)
-
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        """Load already-mapped native MageVAE component weights."""
-        return AutoWeightsLoader(self).load_weights(weights)
+        return AutoWeightsLoader(self).load_weights(
+            weights,
+            mapper=self.hf_to_vllm_mapper,
+        )

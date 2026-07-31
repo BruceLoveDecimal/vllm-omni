@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 from PIL import Image
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # --- Gaussian-Shading watermark -------------------------------------------
 
@@ -267,16 +269,6 @@ Respond with STRICT JSON ONLY (no markdown, no preamble, no commentary):
 → {"violates": false, "categories": [], "reason": "Not a recognizable public figure; ordinary person, innocuous edit — allowed."}"""
 
 
-CATEGORY_DISPLAY = {
-    "sexual": "Sexual content",
-    "hate": "Hate / unfair imagery",
-    "self_harm": "Self-harm",
-    "violence": "Violence / gore",
-    "copyright": "Copyright / IP character",
-    "public_figure": "Real-person likeness",
-}
-
-
 @dataclass
 class FilterVerdict:
     violates: bool
@@ -284,46 +276,96 @@ class FilterVerdict:
     reason: str
     raw: str = ""
 
-    def banner(self) -> str:
-        if not self.violates:
-            return ""
-        cat = ", ".join(CATEGORY_DISPLAY.get(c, c) for c in self.categories) or "policy violation"
-        return f"🚫 **Content Filter:** Blocked — `{cat}` · {self.reason}"
+
+class MageFlowSafetyCheckError(RuntimeError):
+    """Raised when the checker cannot produce a trustworthy verdict."""
+
+
+_FILTER_CATEGORIES = frozenset(
+    {
+        "sexual",
+        "hate",
+        "self_harm",
+        "violence",
+        "copyright",
+        "public_figure",
+    }
+)
 
 
 def _extract_json_object(text: str) -> dict:
-    """Pull the first balanced top-level JSON object out of a possibly-wrapped string."""
+    """Decode the leading JSON object from a possibly-wrapped response."""
     if not text:
         raise ValueError("empty response")
-    # Strip code fences
-    if text.lstrip().startswith("```"):
-        text = text.strip().strip("`")
-        if text.lstrip().startswith("json"):
-            text = text.lstrip()[4:]
     start = text.find("{")
-    if start == -1:
+    if start < 0:
         raise ValueError(f"no JSON object found in: {text[:120]!r}")
-    depth = 0
-    for i in range(start, len(text)):
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start : i + 1])
-    raise ValueError(f"unbalanced JSON object: {text[start : start + 120]!r}")
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON object in: {text[start : start + 120]!r}") from error
+    if not isinstance(parsed, dict):
+        raise ValueError("content checker response must be a JSON object")
+    trailing = text[start + end :].strip()
+    if trailing.startswith("```"):
+        trailing = trailing[3:].strip()
+    if trailing:
+        raise ValueError("content checker returned trailing text after its JSON object")
+    return parsed
 
 
-def check_prompt(model, prompt: str, max_new_tokens: int = 160) -> FilterVerdict:
-    """Back-compat wrapper around the mandatory text-encoder screener.
+def _parse_filter_verdict(raw: str) -> FilterVerdict:
+    parsed = _extract_json_object(raw)
+    violates = parsed.get("violates")
+    categories = parsed.get("categories")
+    reason = parsed.get("reason")
+    if (
+        not isinstance(violates, bool)
+        or not isinstance(categories, list)
+        or not all(isinstance(item, str) for item in categories)
+        or not isinstance(reason, str)
+        or not reason.strip()
+        or any(item not in _FILTER_CATEGORIES for item in categories)
+        or violates != bool(categories)
+    ):
+        raise ValueError("content checker returned an invalid schema")
+    return FilterVerdict(violates, categories, reason, raw=raw)
 
-    The policy check now lives on the text encoder
-    (:meth:`TextEncoder.screen_text`) so it runs on the same Qwen3-VL weights
-    that produce the diffusion conditioning and is FAIL-CLOSED. Kept here for
-    external callers / tests that import ``check_prompt`` directly.
-    """
-    return model.txt_enc.screen_text(prompt, max_new_tokens=max_new_tokens)
+
+def _safety_check_error(kind: str) -> MageFlowSafetyCheckError:
+    logger.exception("Mage-Flow %s content safety checker failed", kind)
+    return MageFlowSafetyCheckError("Mage-Flow content safety check failed")
+
+
+def _generate_filter_verdict(
+    text_encoder,
+    tokenizer,
+    inputs,
+    *,
+    max_new_tokens: int,
+    allowed_input_keys: frozenset[str] | None = None,
+) -> FilterVerdict:
+    device = next(text_encoder.parameters()).device
+    generation_inputs = {
+        key: value.to(device) if hasattr(value, "to") else value
+        for key, value in inputs.items()
+        if value is not None and (allowed_input_keys is None or key in allowed_input_keys)
+    }
+    input_length = generation_inputs["input_ids"].shape[1]
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+    output_ids = text_encoder.generate(
+        **generation_inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=pad_id,
+        eos_token_id=eos_id,
+    )
+    raw = tokenizer.decode(
+        output_ids[0, input_length:],
+        skip_special_tokens=True,
+    ).strip()
+    return _parse_filter_verdict(raw)
 
 
 @torch.no_grad()
@@ -335,60 +377,32 @@ def screen_mage_flow_prompt(
     max_new_tokens: int = 160,
 ) -> FilterVerdict:
     """Run the official fail-closed policy prompt on the shared Qwen3-VL."""
-    tokenizer = processor.tokenizer
-    messages = [
-        {
-            "role": "system",
-            "content": CONTENT_FILTER_SYSTEM,
-        },
-        {
-            "role": "user",
-            "content": f"Prompt to classify:\n{prompt}",
-        },
-    ]
-    rendered = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = tokenizer(rendered, return_tensors="pt")
-    device = next(text_encoder.parameters()).device
-    inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
     try:
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
-        output_ids = text_encoder.generate(
-            **inputs,
+        tokenizer = processor.tokenizer
+        messages = [
+            {
+                "role": "system",
+                "content": CONTENT_FILTER_SYSTEM,
+            },
+            {
+                "role": "user",
+                "content": f"Prompt to classify:\n{prompt}",
+            },
+        ]
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = tokenizer(rendered, return_tensors="pt")
+        return _generate_filter_verdict(
+            text_encoder,
+            tokenizer,
+            inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_id,
-            eos_token_id=eos_id,
         )
-        input_length = inputs["input_ids"].shape[1]
-        raw = tokenizer.decode(
-            output_ids[0, input_length:],
-            skip_special_tokens=True,
-        ).strip()
-        parsed = _extract_json_object(raw)
-        violates = parsed.get("violates")
-        categories = parsed.get("categories")
-        reason = parsed.get("reason")
-        if (
-            not isinstance(violates, bool)
-            or not isinstance(categories, list)
-            or not all(isinstance(item, str) for item in categories)
-            or not isinstance(reason, str)
-        ):
-            raise ValueError("content checker returned an invalid schema")
-        return FilterVerdict(violates, categories, reason, raw=raw)
     except Exception as error:
-        # The official behavior is fail-closed: checker failure must not turn
-        # into an unreviewed generation.
-        return FilterVerdict(
-            violates=True,
-            categories=["safety_check_error"],
-            reason=f"content safety check failed: {error}",
-        )
+        raise _safety_check_error("prompt") from error
 
 
 @torch.no_grad()
@@ -437,101 +451,20 @@ def screen_mage_flow_edit_prompt(
             padding=True,
             return_tensors="pt",
         )
-        device = next(text_encoder.parameters()).device
-        generation_inputs = {
-            key: value.to(device) if hasattr(value, "to") else value
-            for key, value in inputs.items()
-            if key
-            in {
-                "input_ids",
-                "attention_mask",
-                "pixel_values",
-                "image_grid_thw",
-                "mm_token_type_ids",
-            }
-            and value is not None
-        }
-        input_length = generation_inputs["input_ids"].shape[1]
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
-        with _full_output_mode(text_encoder):
-            output_ids = text_encoder.generate(
-                **generation_inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=pad_id,
-                eos_token_id=eos_id,
-            )
-        raw = tokenizer.decode(
-            output_ids[0, input_length:],
-            skip_special_tokens=True,
-        ).strip()
-        parsed = _extract_json_object(raw)
-        violates = parsed.get("violates")
-        categories = parsed.get("categories")
-        reason = parsed.get("reason")
-        if (
-            not isinstance(violates, bool)
-            or not isinstance(categories, list)
-            or not all(isinstance(item, str) for item in categories)
-            or not isinstance(reason, str)
-        ):
-            raise ValueError("content checker returned an invalid schema")
-        return FilterVerdict(violates, categories, reason, raw=raw)
-    except Exception as error:
-        return FilterVerdict(
-            violates=True,
-            categories=["safety_check_error"],
-            reason=f"edit content safety check failed: {error}",
+        return _generate_filter_verdict(
+            text_encoder,
+            tokenizer,
+            inputs,
+            max_new_tokens=max_new_tokens,
+            allowed_input_keys=frozenset(
+                {
+                    "input_ids",
+                    "attention_mask",
+                    "pixel_values",
+                    "image_grid_thw",
+                    "mm_token_type_ids",
+                }
+            ),
         )
-
-
-@contextmanager
-def _full_output_mode(hf):
-    """Temporarily switch the Qwen3-VL encoder into FULL output mode so that
-    ``.generate()`` sees ``.logits`` (the diffusion path uses embedding mode).
-    Restores the original mode/skip flags on exit — side-effect free."""
-    prev_mode = getattr(hf, "_output_mode", None)
-    prev_skip = getattr(hf, "_skip_lm_head", None)
-    try:
-        if hasattr(hf, "set_output_mode"):
-            try:
-                hf.set_output_mode("full")
-            except Exception:  # noqa: BLE001
-                if prev_skip is not None:
-                    hf._skip_lm_head = False
-                if prev_mode is not None:
-                    hf._output_mode = "full"
-        elif prev_skip is not None:
-            hf._skip_lm_head = False
-        yield
-    finally:
-        try:
-            if prev_mode is not None and hasattr(hf, "set_output_mode"):
-                hf.set_output_mode(prev_mode)
-            if prev_skip is not None:
-                hf._skip_lm_head = prev_skip
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def check_edit(model, prompt: str, ref_images, max_new_tokens: int = 192) -> FilterVerdict:
-    """Back-compat wrapper around :meth:`TextEncoder.screen_edit`.
-
-    Classifies an image-EDIT request considering BOTH the source image(s) and
-    the instruction (multimodal Qwen3-VL), FAIL-CLOSED. Kept for external
-    callers / tests that import ``check_edit`` directly.
-    """
-    return model.txt_enc.screen_edit(prompt, ref_images, max_new_tokens=max_new_tokens)
-
-
-def make_refusal_image(
-    verdict: FilterVerdict,
-    height: int = 1024,
-    width: int = 1024,
-) -> Image.Image:
-    """Return a placeholder image to display when the prompt is blocked.
-
-    A plain white blank image — no text, no category/reason surfaced.
-    """
-    return Image.new("RGB", (width, height), color=(255, 255, 255))
+    except Exception as error:
+        raise _safety_check_error("edit") from error
