@@ -211,3 +211,55 @@ class RMSNormVAE(CustomOp):
         if self.bias is not None:
             out = out + self.bias
         return out
+
+
+class TensorParallelRMSNorm(nn.Module):
+    """RMSNorm whose statistics span a tensor-parallel sharded last dimension.
+
+    Models that normalize q/k across *all* heads (``qk_norm="rms_norm_across_heads"``)
+    cannot use a plain RMSNorm once the q/k projections are column-parallel: each
+    rank would then compute the RMS over its local head shard only. This
+    all-reduces the squared sum so the denominator matches the global width,
+    while the affine weight stays local.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = True,
+        tp_size: int = 1,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.tp_size = max(int(tp_size), 1)
+        self.global_hidden_size = hidden_size * self.tp_size
+        self.eps = eps
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+        else:
+            self.register_parameter("weight", None)
+
+    @staticmethod
+    def _all_reduce(tensor: torch.Tensor) -> None:
+        # Only reached when tp_size > 1, which implies the vLLM TP group is
+        # initialized. Falling back to the default process group would reduce
+        # over the data-parallel world and silently corrupt the RMS, so fail
+        # loudly instead.
+        import vllm.distributed.parallel_state as parallel_state
+
+        tp_group = getattr(parallel_state, "_TP", None)
+        if tp_group is None:
+            raise RuntimeError("TensorParallelRMSNorm requires an initialized vLLM tensor-parallel group.")
+        tp_group.all_reduce(tensor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x_float = x.float()
+        local_sum = x_float.pow(2).sum(dim=-1, keepdim=True)
+        if self.tp_size > 1:
+            self._all_reduce(local_sum)
+        out = x_float * torch.rsqrt(local_sum / self.global_hidden_size + self.eps)
+        if self.weight is not None:
+            out = out * self.weight.float()
+        return out.to(dtype=input_dtype)

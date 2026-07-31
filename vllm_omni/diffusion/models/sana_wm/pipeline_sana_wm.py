@@ -26,6 +26,13 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.ltx2.ltx2_latents import (
+    denormalize_latents,
+    normalize_latents,
+    pack_latents,
+    resolve_video_latent_shape,
+    unpack_latents,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.sana_wm.camera_control import (
     SanaWmCameraCondition,
@@ -34,12 +41,9 @@ from vllm_omni.diffusion.models.sana_wm.camera_control import (
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
-    SanaWmCameraEmbedder,
     SanaWmTransformer3DModel,
 )
-from vllm_omni.diffusion.models.sana_wm.scheduling_sana_wm import (
-    SanaWmFlowMatchScheduler,
-)
+from vllm_omni.diffusion.models.schedulers import FlowMatchEulerDiscreteScheduler
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -69,6 +73,10 @@ SANA_WM_STAGE1_TEXT_ENCODER_ENV = "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER"
 SANA_WM_REFINER_ROOT_ENV = "VLLM_OMNI_SANA_WM_REFINER_ROOT"
 SANA_WM_OUTPUT_HEIGHT = 704
 SANA_WM_OUTPUT_WIDTH = 1280
+# LTX-2 VAE compression ratios (SANA-WM ships ``AutoencoderKLLTX2Video``).
+SANA_WM_VAE_SPATIAL_COMPRESSION = 32
+SANA_WM_VAE_TEMPORAL_COMPRESSION = 8
+SANA_WM_NUM_TRAIN_TIMESTEPS = 1000
 # Maximum supported clip length (20s @16fps) — the native envelope, not a
 # request default. Request-side defaults live in
 # ``stage_input_processors/sana_wm.py``.
@@ -77,7 +85,9 @@ SANA_WM_NATIVE_NUM_FRAMES = 321
 # 704x1280 output at the maximum clip length so it only rejects genuinely
 # oversized requests. Overridable per-request via ``sana_wm_native_max_tokens``.
 SANA_WM_NATIVE_MAX_TOKENS = (
-    ((SANA_WM_NATIVE_NUM_FRAMES - 1) // 8 + 1) * (SANA_WM_OUTPUT_HEIGHT // 32) * (SANA_WM_OUTPUT_WIDTH // 32)
+    ((SANA_WM_NATIVE_NUM_FRAMES - 1) // SANA_WM_VAE_TEMPORAL_COMPRESSION + 1)
+    * (SANA_WM_OUTPUT_HEIGHT // SANA_WM_VAE_SPATIAL_COMPRESSION)
+    * (SANA_WM_OUTPUT_WIDTH // SANA_WM_VAE_SPATIAL_COMPRESSION)
 )
 
 SANA_WM_STAGE1_PATTERNS = (
@@ -132,7 +142,6 @@ class SanaWmNativeParams:
     # only when the caller passes ``guidance_scale > 1.0`` together with
     # ``guidance_scale_provided=True`` (NVlabs production uses cfg_scale=5.0).
     cfg_scale: float = 1.0
-    negative_prompt: str = ""
 
 
 def build_sana_wm_download_patterns(*, include_refiner: bool = True) -> tuple[str, ...]:
@@ -304,7 +313,7 @@ class SanaWmPipeline(
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
     _dit_modules: ClassVar[list[str]] = ["transformer"]
-    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "camera_encoder"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
     _resident_modules: ClassVar[list[str]] = []
     include_refiner: ClassVar[bool] = False
@@ -316,7 +325,6 @@ class SanaWmPipeline(
 
         self.sana_wm_config = SanaWmConfig()
         self.quant_config = getattr(od_config, "quantization_config", None) if od_config is not None else None
-        self.camera_encoder: SanaWmCameraEmbedder | None = None
 
         self.tokenizer: Any | None = None
         self.text_encoder: nn.Module | None = None
@@ -363,7 +371,6 @@ class SanaWmPipeline(
             revision=self.od_config.revision,
         )
         self.sana_wm_config = SanaWmConfig.from_json(self.release_paths.config)
-        self.camera_encoder = None
         return self.release_paths
 
     @staticmethod
@@ -378,19 +385,11 @@ class SanaWmPipeline(
         num_frames = int(getattr(sampling_params, "num_frames", None) or payload["num_frames"])
         steps = int(getattr(sampling_params, "num_inference_steps", None) or extra_args.get("num_inference_steps", 1))
         seed = int(getattr(sampling_params, "seed", None) or extra_args.get("seed", 0))
-        height = int(extra_args.get("sana_wm_native_height", height))
-        width = int(extra_args.get("sana_wm_native_width", width))
-        num_frames = int(extra_args.get("sana_wm_native_num_frames", num_frames))
-        steps = int(extra_args.get("sana_wm_native_steps", steps))
         if min(height, width, num_frames, steps) <= 0:
             raise ValueError("Sana-WM native height, width, num_frames, and steps must be positive.")
         cfg_scale = 1.0
         if sampling_params is not None and getattr(sampling_params, "guidance_scale_provided", False):
             cfg_scale = float(getattr(sampling_params, "guidance_scale", 1.0) or 1.0)
-        cfg_scale = float(extra_args.get("sana_wm_native_cfg_scale", cfg_scale))
-        # Negative prompt for CFG uncond branch; defaults to empty string
-        # matching NVlabs `GenerationParams.negative_prompt = ""`.
-        negative_prompt = str(extra_args.get("sana_wm_native_negative_prompt", "") or "")
         return SanaWmNativeParams(
             height=height,
             width=width,
@@ -398,7 +397,6 @@ class SanaWmPipeline(
             num_inference_steps=steps,
             seed=seed,
             cfg_scale=cfg_scale,
-            negative_prompt=negative_prompt,
         )
 
     def _native_dtype(self, device: torch.device) -> torch.dtype:
@@ -536,19 +534,23 @@ class SanaWmPipeline(
         """
         if self.vae is None:
             raise RuntimeError("Sana-WM VAE did not initialize.")
-        latents_mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
-        latents_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
-        scaling = float(self.vae.config.scaling_factor)
-        return (latent - latents_mean) * scaling / latents_std
+        return normalize_latents(
+            latent,
+            self.vae.latents_mean,
+            self.vae.latents_std,
+            float(self.vae.config.scaling_factor),
+        )
 
     def _vae_denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """Inverse of :meth:`_vae_normalize_latent` — match NVlabs decode."""
         if self.vae is None:
             raise RuntimeError("Sana-WM VAE did not initialize.")
-        latents_mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
-        latents_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(device=latent.device, dtype=latent.dtype)
-        scaling = float(self.vae.config.scaling_factor)
-        return latent * latents_std / scaling + latents_mean
+        return denormalize_latents(
+            latent,
+            self.vae.latents_mean,
+            self.vae.latents_std,
+            float(self.vae.config.scaling_factor),
+        )
 
     def _vae_encode_first_frame(
         self,
@@ -590,41 +592,14 @@ class SanaWmPipeline(
             return chi_prompt + user_prompt
         return user_prompt
 
-    def _hash_prompt_embeds(
-        self,
-        prompt_text: str,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, str]:
-        shape = (1, self.sana_wm_config.model_max_length, SANA_WM_STAGE1_PROMPT_CHANNELS)
-        if not prompt_text:
-            self._last_prompt_attention_mask = torch.zeros(shape[:2], device=device, dtype=torch.float32)
-            return torch.zeros(shape, device=device, dtype=dtype), "empty"
-
-        import hashlib
-
-        digest = hashlib.sha256(prompt_text.encode("utf-8")).digest()
-        seed = int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        prompt_embeds = torch.randn(shape, generator=generator, dtype=torch.float32)
-        prompt_embeds = prompt_embeds * float(self.sana_wm_config.y_norm_scale_factor)
-        self._last_prompt_attention_mask = torch.ones(shape[:2], device=device, dtype=torch.float32)
-        return prompt_embeds.to(device=device, dtype=dtype), "hash"
-
     def _native_prompt_embeds(
         self,
         prompt: dict[str, Any],
         *,
         device: torch.device,
         dtype: torch.dtype,
-        allow_hash_fallback: bool = False,
-    ) -> tuple[torch.Tensor, str]:
+    ) -> torch.Tensor:
         prompt_text = self._stage1_prompt_text(prompt)
-        if allow_hash_fallback:
-            return self._hash_prompt_embeds(prompt_text, device=device, dtype=dtype)
-
         self._ensure_stage1_text_encoder(device=device, dtype=dtype)
         tokenizer = self.tokenizer
         if tokenizer is None or self.text_encoder is None:
@@ -659,7 +634,15 @@ class SanaWmPipeline(
         # Return RAW Gemma hidden states: the transformer's ``attention_y_norm``
         # RMSNorm does the normalisation, so normalising here double-normalises.
         self._last_prompt_attention_mask = attention_mask.to(device=device, dtype=torch.float32)
-        return hidden_states.to(device=device, dtype=dtype), "gemma2"
+        return hidden_states.to(device=device, dtype=dtype)
+
+    def predict_noise(self, **kwargs: Any) -> torch.Tensor:
+        """Single transformer forward.
+
+        Overrides the mixin default, which assumes a tuple-returning transformer
+        and takes ``result[0]``; SANA-WM's returns the noise prediction directly.
+        """
+        return self.transformer(**kwargs)
 
     def _decode_native_latents(
         self,
@@ -694,17 +677,23 @@ class SanaWmPipeline(
         sampling_params: Any | None,
     ) -> DiffusionOutput:
         params = self._native_params(payload, sampling_params)
-        latent_frames = (params.num_frames - 1) // 8 + 1
-        latent_height = max(params.height // 32, 1)
-        latent_width = max(params.width // 32, 1)
+        latent_frames, latent_height, latent_width = resolve_video_latent_shape(
+            params.height,
+            params.width,
+            params.num_frames,
+            vae_spatial_compression_ratio=SANA_WM_VAE_SPATIAL_COMPRESSION,
+            vae_temporal_compression_ratio=SANA_WM_VAE_TEMPORAL_COMPRESSION,
+        )
+        latent_height = max(latent_height, 1)
+        latent_width = max(latent_width, 1)
         token_count = latent_frames * latent_height * latent_width
         extra_args = self._extra_args(sampling_params)
         max_tokens = int(extra_args.get("sana_wm_native_max_tokens", SANA_WM_NATIVE_MAX_TOKENS))
         if token_count > max_tokens:
             raise ValueError(
                 "Sana-WM native latent token count exceeds the configured cap. "
-                f"Requested latent tokens={token_count}, max={max_tokens}. Set smaller "
-                "`sana_wm_native_height/width/num_frames`, or raise the cap via "
+                f"Requested latent tokens={token_count}, max={max_tokens}. Request a smaller "
+                "`height`/`width`/`num_frames`, or raise the cap via "
                 "`sana_wm_native_max_tokens`."
             )
 
@@ -718,12 +707,19 @@ class SanaWmPipeline(
             generator=generator,
         )
 
-        # Production flow-DPM-Solver++ scheduler.
-        scheduler = SanaWmFlowMatchScheduler(
-            params.num_inference_steps,
+        # Shared flow-matching Euler scheduler. NVlabs ``LTXFlowEuler`` drives
+        # diffusers' ``FlowMatchEulerDiscreteScheduler``; this is vLLM-Omni's
+        # vendored copy of it, including the ``per_token_timesteps`` step branch.
+        # The schedule applies the shift twice (once via the shifted ``sigma_min``
+        # persisted by ``__init__``, once in ``set_timesteps``), which is what
+        # reproduces the NVlabs timestep table (e.g. shift=9.8, N=3 ->
+        # [1000, 909.0, 87.7]).
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=SANA_WM_NUM_TRAIN_TIMESTEPS,
             shift=self.sana_wm_config.inference_flow_shift,
         )
-        timesteps = scheduler.timesteps(device=device)
+        scheduler.set_timesteps(params.num_inference_steps, device=device)
+        timesteps = scheduler.timesteps
 
         # A.1: first-frame VAE encode — initialize latents from the request image.
         # Only attempt encoding for PIL/ndarray/Tensor; other types (e.g. test
@@ -764,25 +760,25 @@ class SanaWmPipeline(
             first_latent = None
             latents = noise
 
-        allow_hash_fallback = bool(extra_args.get("sana_wm_hash_prompt_fallback", False))
-        prompt_embeds, prompt_source = self._native_prompt_embeds(
+        prompt_embeds = self._native_prompt_embeds(
             prompt,
             device=device,
             dtype=dtype,
-            allow_hash_fallback=allow_hash_fallback,
         )
         prompt_attention_mask = self._last_prompt_attention_mask
 
         # Under CFG, encode the negative prompt up front; each denoise step
-        # then runs a two-branch transformer forward.
+        # then runs a two-branch transformer forward. The negative prompt comes
+        # from the request (``prompt["negative_prompt"]``, set by
+        # ``serving_video``); absent, it defaults to the empty string matching
+        # NVlabs ``GenerationParams.negative_prompt = ""``.
         do_cfg = params.cfg_scale > 1.0
         if do_cfg:
-            negative_prompt_obj = {"prompt": params.negative_prompt}
-            negative_prompt_embeds, _ = self._native_prompt_embeds(
+            negative_prompt_obj = {"prompt": str(prompt.get("negative_prompt") or "")}
+            negative_prompt_embeds = self._native_prompt_embeds(
                 negative_prompt_obj,
                 device=device,
                 dtype=dtype,
-                allow_hash_fallback=allow_hash_fallback,
             )
             negative_prompt_attention_mask = self._last_prompt_attention_mask
             # Restore the cond mask so later readers of
@@ -841,48 +837,74 @@ class SanaWmPipeline(
                 model_timestep[:, :, 0] = 0.0
             else:
                 model_timestep = timestep.expand(1)
-            noise_pred_cond = self.transformer(
-                latents,
-                model_timestep,
-                encoder_hidden_states=prompt_embeds,
-                encoder_attention_mask=prompt_attention_mask,
-                plucker=plucker,
-                raymap=raymap,
-                spatial_raymap=spatial_raymap,
+            positive_kwargs = {
+                "hidden_states": latents,
+                "timestep": model_timestep,
+                "encoder_hidden_states": prompt_embeds,
+                "encoder_attention_mask": prompt_attention_mask,
+                "plucker": plucker,
+                "raymap": raymap,
+                "spatial_raymap": spatial_raymap,
+            }
+            negative_kwargs = (
+                {
+                    **positive_kwargs,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "encoder_attention_mask": negative_prompt_attention_mask,
+                }
+                if do_cfg
+                else None
             )
-            if do_cfg:
-                noise_pred_uncond = self.transformer(
-                    latents,
-                    model_timestep,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    encoder_attention_mask=negative_prompt_attention_mask,
-                    plucker=plucker,
-                    raymap=raymap,
-                    spatial_raymap=spatial_raymap,
-                )
-                noise_pred = noise_pred_uncond + params.cfg_scale * (noise_pred_cond - noise_pred_uncond)
-            else:
-                noise_pred = noise_pred_cond
+            # ``cfg_normalize=False`` keeps the plain NVlabs combine,
+            # ``uncond + scale * (cond - uncond)``. Under cfg_parallel_size > 1
+            # the mixin runs one branch per rank and all-gathers instead of
+            # evaluating both branches serially.
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_cfg,
+                params.cfg_scale,
+                positive_kwargs,
+                negative_kwargs,
+                cfg_normalize=False,
+            )
 
+            # NVlabs ``LTXFlowEuler.sample`` calls the scheduler with the noise
+            # prediction sign-flipped; diffusers then applies
+            # ``prev = sample + dt * model_output``.
             if use_per_token_step:
                 # Broadcast the (B, 1, F) timestep to (B, 1, F, H, W) and flatten
-                # F*H*W; frame-0 conditioning tokens are already 0.
+                # F*H*W; frame-0 conditioning tokens are already 0. The flatten
+                # order (F, H, W) matches ``pack_latents``.
                 pt_t = (
                     model_timestep.unsqueeze(-1)
                     .unsqueeze(-1)
                     .expand(cam_batch, 1, cam_frames, latents.shape[3], latents.shape[4])
                     .reshape(cam_batch, -1)
                 )
-                stepped = scheduler.step_flow_euler_per_token(noise_pred, timestep, latents, pt_t)
+                # The per-token branch consumes/returns the packed (B, N, C)
+                # layout and keeps its result in fp32; cast back so the latent
+                # dtype stays stable across steps.
+                stepped_packed = scheduler.step(
+                    -pack_latents(noise_pred),
+                    timestep,
+                    pack_latents(latents),
+                    per_token_timesteps=pt_t,
+                    return_dict=False,
+                )[0]
+                stepped = unpack_latents(
+                    stepped_packed.to(latents.dtype),
+                    cam_frames,
+                    latents.shape[3],
+                    latents.shape[4],
+                )
             else:
-                stepped = scheduler.step(noise_pred, timestep, latents)
+                stepped = scheduler.step(-noise_pred, timestep, latents, return_dict=False)[0]
 
             if condition_mask is not None:
                 # Match NVlabs LTXFlowEuler exactly. This is stricter than a
                 # plain condition-frame restore: with bf16 latents, the
                 # `t=1000` comparison rounds `1 - 1e-6` to `1`, so the first
                 # full-noise step is discarded for generated tokens as well.
-                tokens_to_denoise_mask = timestep / float(scheduler.num_train_timesteps) - 1e-6 < (1.0 - condition_mask)
+                tokens_to_denoise_mask = timestep / float(SANA_WM_NUM_TRAIN_TIMESTEPS) - 1e-6 < (1.0 - condition_mask)
                 latents = torch.where(tokens_to_denoise_mask, stepped, latents)
             else:
                 latents = stepped
@@ -896,7 +918,6 @@ class SanaWmPipeline(
                 metadata={
                     "backend": "native_gdn",
                     "output_space": output_type,
-                    "prompt_source": prompt_source,
                     "chi_prompt_applied": bool(self.sana_wm_config.chi_prompt),
                     "first_frame_encoded": _is_image,
                     "num_frames": params.num_frames,

@@ -102,7 +102,7 @@ def _run_sana_wm_e2e(
         enforce_eager=True,
         tensor_parallel_size=tensor_parallel_size,
     )
-    extra_args = {"sana_wm_sampling_algo": "flow_euler_ltx", "sana_wm_offload_vae": True}
+    extra_args: dict[str, Any] = {}
     # The native Stage-1 path is latent-token capped; raise it for full-size
     # e2e runs (704x1280 exceeds the default 4096-token cap).
     native_max_tokens = os.environ.get("SANA_WM_E2E_NATIVE_MAX_TOKENS", "").strip()

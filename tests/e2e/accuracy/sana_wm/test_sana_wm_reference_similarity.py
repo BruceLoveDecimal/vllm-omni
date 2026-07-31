@@ -109,8 +109,6 @@ def _native_video(model: str, num_frames: int, steps: int) -> np.ndarray:
                 guidance_scale=CFG_SCALE,
                 guidance_scale_provided=True,
                 extra_args={
-                    "sana_wm_sampling_algo": "flow_euler_ltx",
-                    "sana_wm_offload_vae": True,
                     "sana_wm_output_type": "np",
                     "sana_wm_native_max_tokens": 30000,
                 },

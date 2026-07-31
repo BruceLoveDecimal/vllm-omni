@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.models.ltx2.ltx2_latents import pack_latents, unpack_latents
 from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import (
     SanaWmPipeline,
     build_sana_wm_output_envelope,
@@ -37,7 +38,6 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = [
         "text_encoder",
-        "camera_encoder",
         "refiner_text_encoder",
         "refiner_connectors",
     ]
@@ -232,43 +232,6 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         self._ensure_refiner_connectors(device=device, dtype=dtype)
         self._ensure_refiner_transformer(device=device, dtype=dtype)
 
-    @staticmethod
-    def _pack_refiner_latents(
-        latents: torch.Tensor,
-        patch_size: int = 1,
-        patch_size_t: int = 1,
-    ) -> torch.Tensor:
-        batch_size, num_channels, num_frames, height, width = latents.shape
-        post_patch_num_frames = num_frames // patch_size_t
-        post_patch_height = height // patch_size
-        post_patch_width = width // patch_size
-        latents = latents.reshape(
-            batch_size,
-            -1,
-            post_patch_num_frames,
-            patch_size_t,
-            post_patch_height,
-            patch_size,
-            post_patch_width,
-            patch_size,
-        )
-        latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
-        return latents
-
-    @staticmethod
-    def _unpack_refiner_latents(
-        latents: torch.Tensor,
-        num_frames: int,
-        height: int,
-        width: int,
-        patch_size: int = 1,
-        patch_size_t: int = 1,
-    ) -> torch.Tensor:
-        batch_size = latents.size(0)
-        latents = latents.reshape(batch_size, num_frames, height, width, -1, patch_size_t, patch_size, patch_size)
-        latents = latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
-        return latents
-
     def _refiner_patch_sizes(self) -> tuple[int, int]:
         config = self.refiner_transformer.config
         return int(config.patch_size), int(config.patch_size_t)
@@ -357,12 +320,12 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
         patch_size, patch_size_t = self._refiner_patch_sizes()
         full_latent = torch.cat([sink, noisy_current], dim=2)
         batch_size, _, num_frames, height, width = full_latent.shape
-        latent_tokens = self._pack_refiner_latents(
+        latent_tokens = pack_latents(
             full_latent,
             patch_size=patch_size,
             patch_size_t=patch_size_t,
         )
-        n_context_tokens = self._pack_refiner_latents(
+        n_context_tokens = pack_latents(
             sink,
             patch_size=patch_size,
             patch_size_t=patch_size_t,
@@ -503,14 +466,14 @@ class SanaWmTwoStagesPipeline(SanaWmPipeline):
                 sigma=sigma,
                 fps=frame_rate,
             )
-            noisy_tokens = self._pack_refiner_latents(
+            noisy_tokens = pack_latents(
                 noisy,
                 patch_size=patch_size,
                 patch_size_t=patch_size_t,
             )
             velocity = (noisy_tokens.float() - denoised.float()) / sigma.float()
             next_tokens = noisy_tokens.float() + velocity * (sigmas[index + 1] - sigma).float()
-            noisy = self._unpack_refiner_latents(
+            noisy = unpack_latents(
                 next_tokens.to(dtype),
                 num_frames=noisy.shape[2],
                 height=noisy.shape[3],
@@ -639,10 +602,13 @@ def _forward_refiner_video_block(
     norm_hidden_states = block.norm2(hidden_states)
     if getattr(block, "video_cross_attn_adaln", False):
         norm_hidden_states = norm_hidden_states * (1 + scale_text_q) + shift_text_q
-    attn_hidden_states = _refiner_cross_attention(
-        attn=block.attn2,
-        hidden_states=norm_hidden_states,
+    # LTX-2's own video-text cross-attention: no streaming split applies here,
+    # so go through the attention module (backend selection, mask preparation,
+    # TP rope slicing) instead of re-implementing it on raw SDPA.
+    attn_hidden_states = block.attn2(
+        norm_hidden_states,
         encoder_hidden_states=encoder_hidden_states,
+        query_rotary_emb=None,
         attention_mask=encoder_attention_mask,
     )
     if getattr(block, "video_cross_attn_adaln", False):
@@ -666,26 +632,19 @@ def _streaming_refiner_self_attention(
         return attn(hidden_states=hidden_states, encoder_hidden_states=None, query_rotary_emb=query_rotary_emb)
 
     from vllm_omni.diffusion.models.ltx2.ltx2_transformer import (
+        LTX2AudioVideoAttnProcessor,
         apply_interleaved_rotary_emb,
         apply_split_rotary_emb,
     )
 
     gate_logits = attn.to_gate_logits(hidden_states) if getattr(attn, "to_gate_logits", None) is not None else None
 
-    if getattr(attn, "to_qkv", None) is not None:
-        qkv, _ = attn.to_qkv(hidden_states)
-        q_heads = getattr(attn, "query_num_heads", attn.heads)
-        kv_heads = getattr(attn, "kv_num_heads", attn.heads)
-        q_size = q_heads * attn.head_dim
-        kv_size = kv_heads * attn.head_dim
-        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
-    else:
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
-        query = query[0] if isinstance(query, tuple) else query
-        key = key[0] if isinstance(key, tuple) else key
-        value = value[0] if isinstance(value, tuple) else value
+    query, key, value = LTX2AudioVideoAttnProcessor._project_qkv(
+        attn=attn,
+        hidden_states=hidden_states,
+        encoder_hidden_states=hidden_states,
+        is_self_attention=True,
+    )
 
     query = attn.norm_q(query)
     key = attn.norm_k(key)
@@ -693,8 +652,6 @@ def _streaming_refiner_self_attention(
     # Unit tests and standalone CPU probes run without a vLLM TP group; only
     # apply TP-aware RoPE slicing when the group is initialized.
     import vllm.distributed.parallel_state as _ps
-
-    from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2AudioVideoAttnProcessor
 
     if _ps._TP is not None:
         query_rotary_emb = LTX2AudioVideoAttnProcessor._slice_rope_for_tp(query_rotary_emb, attn)
@@ -718,43 +675,6 @@ def _streaming_refiner_self_attention(
     )
     current_hidden_states = _refiner_attention_core(query[:, n_context_tokens:], key, value)
     hidden_states = torch.cat([context_hidden_states, current_hidden_states], dim=1)
-    hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
-
-    if gate_logits is not None:
-        hidden_states = hidden_states.unflatten(2, (attn.heads, -1))
-        gates = 2.0 * torch.sigmoid(gate_logits)
-        hidden_states = hidden_states * gates.unsqueeze(-1)
-        hidden_states = hidden_states.flatten(2, 3)
-
-    hidden_states = attn.to_out[0](hidden_states)
-    hidden_states = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
-    hidden_states = attn.to_out[1](hidden_states)
-    return hidden_states
-
-
-def _refiner_cross_attention(
-    *,
-    attn: nn.Module,
-    hidden_states: torch.Tensor,
-    encoder_hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-) -> torch.Tensor:
-    gate_logits = attn.to_gate_logits(hidden_states) if getattr(attn, "to_gate_logits", None) is not None else None
-
-    query = attn.to_q(hidden_states)
-    key = attn.to_k(encoder_hidden_states)
-    value = attn.to_v(encoder_hidden_states)
-    query = query[0] if isinstance(query, tuple) else query
-    key = key[0] if isinstance(key, tuple) else key
-    value = value[0] if isinstance(value, tuple) else value
-
-    query = attn.norm_q(query)
-    key = attn.norm_k(key)
-    query = query.unflatten(2, (attn.heads, -1))
-    key = key.unflatten(2, (attn.heads, -1))
-    value = value.unflatten(2, (attn.heads, -1))
-
-    hidden_states = _refiner_attention_core(query, key, value, attention_mask=attention_mask)
     hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
 
     if gate_logits is not None:
