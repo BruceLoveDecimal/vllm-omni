@@ -63,7 +63,6 @@ class SanaWmConfig:
     inference_flow_shift: float = 9.8
     scheduler_type: str = "flow_dpm-solver"
     chi_prompt: list[str] = field(default_factory=list)
-    y_norm_scale_factor: float = 0.01
     model_max_length: int = 300
 
     @classmethod

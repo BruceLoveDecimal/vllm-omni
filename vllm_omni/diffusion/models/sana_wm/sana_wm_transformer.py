@@ -4,15 +4,13 @@
 
 Native vLLM-Omni port of the NVlabs SANA-WM DiT. Modules are built eagerly at
 construction (under the loader's target-device context) and checkpoint tensors
-are streamed in via ``load_weights``; the fused Bidirectional Gated DeltaNet
-Triton kernels live in-tree in ``gdn.py``.
+are streamed in via ``load_weights``. The Bidirectional Gated DeltaNet
+recurrence is implemented in pure PyTorch in this module.
 """
 
 from __future__ import annotations
 
 import math
-import os
-import warnings
 from collections.abc import Iterable
 from functools import reduce
 from operator import mul
@@ -21,121 +19,52 @@ from typing import Any, ClassVar
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
-from vllm_omni.diffusion.models.sana_wm.gdn import (
-    SANA_WM_REQUIRE_TRITON_GDN_ENV,
-    _flip_and_shift,
-    cam_scan_bidi_chunkwise,
-    reference_bidirectional_gated_delta_net,
-    triton_bidirectional_gated_delta_net_from_qkv,
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
 )
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
+
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
+from vllm_omni.diffusion.layers.norm import RMSNorm, TensorParallelRMSNorm
+from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.ucpe import (
     cam_prep_func,
     prepare_cam_prep_context,
     prepare_prope_fns,
 )
 
-try:
-    from vllm.distributed import (
-        get_tensor_model_parallel_rank,
-        get_tensor_model_parallel_world_size,
-    )
-    from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
-    from vllm.model_executor.layers.linear import (
-        ColumnParallelLinear,
-        QKVParallelLinear,
-        RowParallelLinear,
-    )
-    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-
-    from vllm_omni.diffusion.attention.layer import Attention
-    from vllm_omni.diffusion.distributed.sp_plan import (
-        SequenceParallelInput,
-        SequenceParallelOutput,
-    )
-except ImportError:  # pragma: no cover - local macOS/dev environments may not install vLLM.
-    Attention = None
-    ColumnParallelLinear = None
-    QKVParallelLinear = None
-    QuantizationConfig = Any  # type: ignore[misc, assignment]
-    RowParallelLinear = None
-    SequenceParallelInput = None
-    SequenceParallelOutput = None
-    VllmRMSNorm = None
-    get_tensor_model_parallel_rank = None
-    get_tensor_model_parallel_world_size = None
-
 SANA_WM_STAGE1_LATENT_CHANNELS = 128
 SANA_WM_STAGE1_PROMPT_CHANNELS = 2304
 SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
 SANA_WM_DISABLE_VLLM_OPS_ENV = "VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS"
 
-_SANA_WM_TRITON_GDN_FALLBACK_WARNED = False
 
+def _shard_param_across_tp(param: torch.Tensor | None, dim: int = 0) -> None:
+    """Attach vLLM's TP shard loader to a plain (non-parallel-layer) parameter.
 
-def _vllm_tp_group_ready() -> bool:
-    """Return True iff the vLLM tensor-parallel group is initialized."""
-    if get_tensor_model_parallel_world_size is None:
-        return False
-    import vllm.distributed.parallel_state as ps
-
-    return ps._TP is not None
-
-
-def _get_tp_rank() -> int:
-    if not _vllm_tp_group_ready():
-        return 0
-    return int(get_tensor_model_parallel_rank())
-
-
-def _get_tp_world_size() -> int:
-    if not _vllm_tp_group_ready():
-        return 1
-    return int(get_tensor_model_parallel_world_size())
-
-
-def _sana_wm_disable_vllm_ops() -> bool:
-    return os.environ.get(SANA_WM_DISABLE_VLLM_OPS_ENV, "").lower() in {"1", "true", "yes", "on"}
-
-
-def _vllm_parallel_layers_available() -> bool:
-    if _sana_wm_disable_vllm_ops():
-        return False
-    return (
-        ColumnParallelLinear is not None
-        and QKVParallelLinear is not None
-        and RowParallelLinear is not None
-        and _vllm_tp_group_ready()
-    )
-
-
-def _vllm_attention_available() -> bool:
-    if _sana_wm_disable_vllm_ops():
-        return False
-    return Attention is not None
-
-
-def _sequence_parallel_plan_available() -> bool:
-    return SequenceParallelInput is not None and SequenceParallelOutput is not None
-
-
-def _disable_tp_for_vllm_layer() -> bool:
-    return not _vllm_tp_group_ready()
-
-
-def _linear_output(output: torch.Tensor | tuple[torch.Tensor, Any]) -> torch.Tensor:
-    return output[0] if isinstance(output, tuple) else output
-
-
-def _linear_weight_dtype(module: nn.Module) -> torch.dtype:
-    return module.weight.dtype
-
-
-def _maybe_make_vllm_rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
-    if VllmRMSNorm is None or _sana_wm_disable_vllm_ops():
-        return SanaWmRMSNorm(hidden_size, eps=eps)
-    return VllmRMSNorm(hidden_size, eps=eps)
+    vLLM parallel layers narrow full checkpoint tensors to the local shard via
+    their own ``weight_loader``. SANA-WM also has plain parameters that become
+    TP-local - the GDN vectors (``A_log``, ``dt_bias``), the depthwise temporal
+    convs and the q/k norms - so they need the same behavior at load time.
+    Attached only under TP > 1: at TP = 1 the checkpoint tensor already matches
+    the parameter and ``sharded_weight_loader`` would require an initialized TP
+    group that standalone/unit-test builds do not have.
+    """
+    if param is None or sharded_weight_loader is None or get_tensor_model_parallel_world_size() <= 1:
+        return
+    param.weight_loader = sharded_weight_loader(dim)
 
 
 def _is_sana_wm_transformer_block(name: str, module: Any) -> bool:
@@ -148,7 +77,7 @@ def _prod(values: tuple[int, ...]) -> int:
     return reduce(mul, values, 1)
 
 
-def _build_sana_wm_sp_plan() -> dict[str, Any] | None:
+def _build_sana_wm_sp_plan() -> dict[str, Any]:
     """Declare Sana-WM Stage-1 sequence sharding boundaries.
 
     The first transformer block is the earliest point where video latents have
@@ -158,10 +87,6 @@ def _build_sana_wm_sp_plan() -> dict[str, Any] | None:
     layout information and needs a separate multi-card correctness pass.
     """
 
-    if not _sequence_parallel_plan_available():
-        return None
-    assert SequenceParallelInput is not None
-    assert SequenceParallelOutput is not None
     return {
         "blocks.0": {
             "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
@@ -179,62 +104,208 @@ def _to_3tuple(value: int | tuple[int, int] | tuple[int, int, int]) -> tuple[int
     return (int(value[0]), int(value[1]), int(value[2]))
 
 
-class SanaWmRMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        variance = hidden_states.float().pow(2).mean(dim=-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps).to(hidden_states.dtype)
-        return hidden_states * self.weight
+# ---------------------------------------------------------------------------
+# Bidirectional Gated DeltaNet recurrence (pure PyTorch)
+#
+# Ported from the Apache-2.0 NVlabs/Sana reference. SANA-WM's bidirectional
+# video-latent recurrence is a different contract than vLLM's autoregressive
+# Qwen3-Next GDN cache path, so it stays model-local.
+# ---------------------------------------------------------------------------
 
 
-class SanaWmTensorParallelRMSNorm(nn.Module):
-    """RMSNorm over a tensor-parallel sharded last dimension.
+def _validate_gdn_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    spatial_tokens: int,
+) -> tuple[int, int, int, int, int]:
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("Sana-WM GDN query/key/value must be shaped [B, H, D, N].")
+    if query.shape != key.shape or query.shape != value.shape:
+        raise ValueError(
+            "Sana-WM GDN query/key/value shapes must match, got "
+            f"{tuple(query.shape)}, {tuple(key.shape)}, {tuple(value.shape)}."
+        )
+    if beta.ndim != 4:
+        raise ValueError("Sana-WM GDN beta must be shaped [B, H, T, S].")
+    if decay.ndim != 3:
+        raise ValueError("Sana-WM GDN decay must be shaped [B, H, T].")
+    if spatial_tokens <= 0:
+        raise ValueError("Sana-WM GDN spatial_tokens must be positive.")
 
-    SANA-WM q/k norm is defined across all heads. Under TP, q/k projection
-    outputs are local head shards, so the RMS denominator must all-reduce the
-    squared sum across TP ranks while keeping the affine weight local.
+    batch_size, num_heads, head_dim, token_count = query.shape
+    if token_count % spatial_tokens != 0:
+        raise ValueError(f"Sana-WM GDN token count {token_count} is not divisible by spatial_tokens={spatial_tokens}.")
+    frames = token_count // spatial_tokens
+    if beta.shape != (batch_size, num_heads, frames, spatial_tokens):
+        raise ValueError(
+            "Sana-WM GDN beta shape mismatch: expected "
+            f"{(batch_size, num_heads, frames, spatial_tokens)}, got {tuple(beta.shape)}."
+        )
+    if decay.shape != (batch_size, num_heads, frames):
+        raise ValueError(
+            f"Sana-WM GDN decay shape mismatch: expected {(batch_size, num_heads, frames)}, got {tuple(decay.shape)}."
+        )
+    return batch_size, num_heads, head_dim, token_count, frames
+
+
+def _delta_scan(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_rot: torch.Tensor,
+    key_rot: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    *,
+    spatial_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, num_heads, head_dim, token_count = query.shape
+    frames = beta.shape[2]
+
+    def to_frames(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
+
+    query_f = to_frames(query)
+    key_f = to_frames(key)
+    value_f = to_frames(value)
+    query_rot_f = to_frames(query_rot)
+    key_rot_f = to_frames(key_rot)
+    state_kv = torch.zeros(batch_size, num_heads, head_dim, head_dim, device=query.device, dtype=query.dtype)
+    state_z = torch.zeros(batch_size, num_heads, head_dim, 1, device=query.device, dtype=query.dtype)
+    numerators: list[torch.Tensor] = []
+    denominators: list[torch.Tensor] = []
+
+    for frame_idx in range(frames):
+        query_t = query_f[:, :, frame_idx]
+        key_t = key_f[:, :, frame_idx]
+        value_t = value_f[:, :, frame_idx]
+        query_rot_t = query_rot_f[:, :, frame_idx]
+        key_rot_t = key_rot_f[:, :, frame_idx]
+        beta_t = beta[:, :, frame_idx].unsqueeze(2)
+        decay_t = decay[:, :, frame_idx].view(batch_size, num_heads, 1, 1)
+
+        state_kv = state_kv * decay_t
+        state_z = state_z * decay_t
+        value_pred = torch.matmul(state_kv, key_rot_t)
+        delta_value = (value_t - value_pred) * beta_t
+        state_kv = state_kv + torch.matmul(delta_value, key_rot_t.transpose(-1, -2))
+
+        z_pred = torch.matmul(state_z.transpose(-1, -2), key_t)
+        delta_z = (1.0 - z_pred) * beta_t
+        state_z = state_z + torch.matmul(key_t, delta_z.transpose(-1, -2))
+
+        numerators.append(torch.matmul(state_kv, query_rot_t))
+        denominators.append(torch.matmul(state_z.transpose(-1, -2), query_t))
+
+    def restore(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
+        stacked = torch.stack(tensors, dim=2)
+        return stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, dim, token_count)
+
+    return restore(numerators, head_dim), restore(denominators, 1)
+
+
+def _flip_and_shift(tensor: torch.Tensor, *, dim: int, shift_value: float) -> torch.Tensor:
+    flipped = torch.flip(tensor, dims=[dim])
+    shifted = flipped.narrow(dim, 0, tensor.shape[dim] - 1)
+    pad_shape = list(tensor.shape)
+    pad_shape[dim] = 1
+    padding = torch.full(pad_shape, shift_value, device=tensor.device, dtype=tensor.dtype)
+    return torch.cat([padding, shifted], dim=dim)
+
+
+def reference_bidirectional_gated_delta_net(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    spatial_tokens: int,
+    query_rot: torch.Tensor | None = None,
+    key_rot: torch.Tensor | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Run the SANA-WM bidirectional gated delta recurrence in PyTorch.
+
+    Inputs follow the layout used by the official Stage-1 operator:
+    ``query/key/value/query_rot/key_rot`` are ``[B, H, D, T*S]``, ``beta`` is
+    ``[B, H, T, S]``, and ``decay`` is ``[B, H, T]``.
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6, tp_size: int = 1) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-        self.tp_size = max(int(tp_size), 1)
-        self.global_hidden_size = hidden_size * self.tp_size
+    batch_size, num_heads, head_dim, token_count, frames = _validate_gdn_inputs(
+        query, key, value, beta, decay, spatial_tokens
+    )
+    if query_rot is None:
+        query_rot = query
+    if key_rot is None:
+        key_rot = key
+    if query_rot.shape != query.shape or key_rot.shape != key.shape:
+        raise ValueError("Sana-WM GDN rotary query/key shapes must match query/key.")
 
-    @staticmethod
-    def _all_reduce(tensor: torch.Tensor) -> None:
-        # Only invoked when tp_size > 1 (gated by forward), so the vLLM TP group
-        # must be initialized. Don't fall back to the default world group — that
-        # is the data-parallel group and would silently corrupt the RMS.
-        import vllm.distributed.parallel_state as ps
+    dtype_orig = query.dtype
+    query = query.float()
+    key = key.float()
+    value = value.float()
+    query_rot = query_rot.float()
+    key_rot = key_rot.float()
+    beta = beta.float()
+    decay = decay.float()
 
-        if ps._TP is None:
-            raise RuntimeError(
-                "SanaWmTensorParallelRMSNorm requires an initialized vLLM tensor-parallel group when tp_size > 1."
-            )
-        ps._TP.all_reduce(tensor)
+    num_fwd, den_fwd = _delta_scan(
+        query,
+        key,
+        value,
+        query_rot,
+        key_rot,
+        beta,
+        decay,
+        spatial_tokens=spatial_tokens,
+    )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_float = hidden_states.float()
-        local_sum = hidden_float.pow(2).sum(dim=-1, keepdim=True)
-        if self.tp_size > 1:
-            self._all_reduce(local_sum)
-        inv_rms = torch.rsqrt(local_sum / self.global_hidden_size + self.eps)
-        out = hidden_float * inv_rms * self.weight.float()
-        return out.to(input_dtype)
+    def to_time(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
+
+    def from_time(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, head_dim, token_count)
+
+    query_t = to_time(query)
+    key_t = to_time(key)
+    value_t = to_time(value)
+    query_rot_t = to_time(query_rot)
+    key_rot_t = to_time(key_rot)
+    num_bwd_flipped, den_bwd_flipped = _delta_scan(
+        from_time(torch.flip(query_t, dims=[2])),
+        from_time(_flip_and_shift(key_t, dim=2, shift_value=0.0)),
+        from_time(_flip_and_shift(value_t, dim=2, shift_value=0.0)),
+        from_time(torch.flip(query_rot_t, dims=[2])),
+        from_time(_flip_and_shift(key_rot_t, dim=2, shift_value=0.0)),
+        _flip_and_shift(beta, dim=2, shift_value=0.0),
+        _flip_and_shift(decay, dim=2, shift_value=1.0),
+        spatial_tokens=spatial_tokens,
+    )
+
+    def flip_back(tensor: torch.Tensor) -> torch.Tensor:
+        dim = tensor.shape[2]
+        tensor = tensor.view(batch_size, num_heads, dim, frames, spatial_tokens)
+        return torch.flip(tensor, dims=[3]).reshape(batch_size, num_heads, dim, token_count)
+
+    output = (num_fwd + flip_back(num_bwd_flipped)) / (den_fwd + flip_back(den_bwd_flipped) + eps)
+    return output.to(dtype_orig)
 
 
 def _make_sharded_qk_rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
-    tp_size = _get_tp_world_size()
-    if tp_size > 1 and _vllm_tp_group_ready():
-        return SanaWmTensorParallelRMSNorm(hidden_size, eps=eps, tp_size=tp_size)
-    return _maybe_make_vllm_rms_norm(hidden_size, eps=eps)
+    """Build the q/k norm, TP-aware.
+
+    SANA-WM normalizes q/k across all heads, so once the projections are
+    column-parallel the RMS denominator has to span the TP ranks.
+    """
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size > 1:
+        return TensorParallelRMSNorm(hidden_size, eps=eps, tp_size=tp_size)
+    return RMSNorm(hidden_size, eps=eps)
 
 
 class SanaWmTextProjection(nn.Module):
@@ -244,41 +315,31 @@ class SanaWmTextProjection(nn.Module):
         hidden_size: int,
         *,
         quant_config: QuantizationConfig | None = None,
-        use_vllm_parallel_layers: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.uses_vllm_parallel_layers = use_vllm_parallel_layers and _vllm_parallel_layers_available()
-        if self.uses_vllm_parallel_layers:
-            assert ColumnParallelLinear is not None
-            assert RowParallelLinear is not None
-            self.fc1 = ColumnParallelLinear(
-                prompt_channels,
-                hidden_size,
-                bias=True,
-                gather_output=False,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.fc1" if prefix else "fc1",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.fc2 = RowParallelLinear(
-                hidden_size,
-                hidden_size,
-                bias=True,
-                input_is_parallel=True,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.fc2" if prefix else "fc2",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-        else:
-            self.fc1 = nn.Linear(prompt_channels, hidden_size)
-            self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc1 = ColumnParallelLinear(
+            prompt_channels,
+            hidden_size,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc1" if prefix else "fc1",
+        )
+        self.fc2 = RowParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc2" if prefix else "fc2",
+        )
         self.act = nn.SiLU()
 
     def forward(self, prompt_embeds: torch.Tensor) -> torch.Tensor:
-        return _linear_output(self.fc2(self.act(_linear_output(self.fc1(prompt_embeds)))))
+        return self.fc2(self.act(self.fc1(prompt_embeds)))
 
 
 class SanaWmTextEmbedder(nn.Module):
@@ -289,7 +350,6 @@ class SanaWmTextEmbedder(nn.Module):
         max_length: int,
         *,
         quant_config: QuantizationConfig | None = None,
-        use_vllm_parallel_layers: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -298,7 +358,6 @@ class SanaWmTextEmbedder(nn.Module):
             prompt_channels,
             hidden_size,
             quant_config=quant_config,
-            use_vllm_parallel_layers=use_vllm_parallel_layers,
             prefix=f"{prefix}.y_proj" if prefix else "y_proj",
         )
 
@@ -321,38 +380,28 @@ class SanaWmTimestepEmbedder(nn.Module):
         hidden_size: int,
         *,
         quant_config: QuantizationConfig | None = None,
-        use_vllm_parallel_layers: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.in_features = in_features
-        self.uses_vllm_parallel_layers = use_vllm_parallel_layers and _vllm_parallel_layers_available()
-        if self.uses_vllm_parallel_layers:
-            assert ColumnParallelLinear is not None
-            assert RowParallelLinear is not None
-            linear_1 = ColumnParallelLinear(
-                in_features,
-                hidden_size,
-                bias=True,
-                gather_output=False,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.mlp.0" if prefix else "mlp.0",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            linear_2 = RowParallelLinear(
-                hidden_size,
-                hidden_size,
-                bias=True,
-                input_is_parallel=True,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.mlp.2" if prefix else "mlp.2",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-        else:
-            linear_1 = nn.Linear(in_features, hidden_size)
-            linear_2 = nn.Linear(hidden_size, hidden_size)
+        linear_1 = ColumnParallelLinear(
+            in_features,
+            hidden_size,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp.0" if prefix else "mlp.0",
+        )
+        linear_2 = RowParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp.2" if prefix else "mlp.2",
+        )
         self.act = nn.SiLU()
         self.mlp = nn.ModuleList([linear_1, self.act, linear_2])
 
@@ -370,9 +419,9 @@ class SanaWmTimestepEmbedder(nn.Module):
 
     def forward(self, timestep: torch.Tensor) -> torch.Tensor:
         emb = self.sinusoidal_embedding(timestep, self.in_features)
-        hidden_states = _linear_output(self.mlp[0](emb.to(dtype=_linear_weight_dtype(self.mlp[0]))))
+        hidden_states = self.mlp[0](emb.to(dtype=self.mlp[0].weight.dtype))
         hidden_states = self.act(hidden_states)
-        return _linear_output(self.mlp[2](hidden_states))
+        return self.mlp[2](hidden_states)
 
 
 class SanaWmPatchEmbedMS3D(nn.Module):
@@ -464,92 +513,6 @@ class SanaWmWanRotaryPosEmbed(nn.Module):
         return torch.cat(parts, dim=-1).reshape(1, 1, frames * height * width, -1)
 
 
-class SanaWmCameraEmbedder(nn.Module):
-    """Small camera branch used by the native path."""
-
-    def __init__(
-        self,
-        config: SanaWmConfig | None = None,
-        *,
-        use_vllm_parallel_layers: bool = True,
-        quant_config: Any = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        config = config or SanaWmConfig()
-        self.hidden_size = config.hidden_size
-        self.plucker = nn.Module()
-        # Conv3d has no vLLM parallel equivalent — kept as nn.Conv3d. Under TP>1
-        # its weight is replicated and every rank runs the same conv (redundant
-        # but cheap for a 1x1 conv); intentional, and yields a full-width output.
-        self.plucker.proj = nn.Conv3d(config.chunk_plucker_channels, config.hidden_size, kernel_size=1)
-        self.raymap = nn.Module()
-        # raymap.proj is a plain Linear over 20 Plücker features; use
-        # ColumnParallelLinear when vLLM TP layers are available.
-        if use_vllm_parallel_layers and _vllm_parallel_layers_available() and ColumnParallelLinear is not None:
-            self.raymap.proj: nn.Module = ColumnParallelLinear(
-                20,
-                config.hidden_size,
-                bias=True,
-                gather_output=True,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.raymap.proj" if prefix else "raymap.proj",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-        else:
-            self.raymap.proj = nn.Linear(20, config.hidden_size)
-
-    @staticmethod
-    def _match_tokens(hidden_states: torch.Tensor, expected_tokens: int) -> torch.Tensor:
-        if hidden_states.shape[1] == expected_tokens:
-            return hidden_states
-        if hidden_states.shape[1] > expected_tokens:
-            return hidden_states[:, :expected_tokens]
-        pad = hidden_states[:, -1:].expand(-1, expected_tokens - hidden_states.shape[1], -1)
-        return torch.cat([hidden_states, pad], dim=1)
-
-    def forward(
-        self,
-        *,
-        plucker: torch.Tensor | None = None,
-        raymap: torch.Tensor | None = None,
-        spatial_shape: tuple[int, int, int],
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        frames, height, width = spatial_shape
-        expected_tokens = frames * height * width
-        hidden_states = None
-
-        if plucker is not None:
-            if plucker.ndim == 4:
-                plucker = plucker.unsqueeze(0)
-            plucker = plucker.to(device=device, dtype=dtype)
-            if plucker.shape[0] == 1 and batch_size > 1:
-                plucker = plucker.expand(batch_size, -1, -1, -1, -1)
-            plucker_hidden = self.plucker.proj(plucker).flatten(2).transpose(1, 2)
-            hidden_states = self._match_tokens(plucker_hidden, expected_tokens)
-
-        if raymap is not None:
-            if raymap.ndim == 2:
-                raymap = raymap.unsqueeze(0)
-            raymap = raymap.to(device=device, dtype=dtype)
-            if raymap.shape[0] == 1 and batch_size > 1:
-                raymap = raymap.expand(batch_size, -1, -1)
-            ray_hidden = self.raymap.proj(raymap)
-            ray_hidden = ray_hidden.repeat_interleave(height * width, dim=1)
-            ray_hidden = self._match_tokens(ray_hidden, expected_tokens)
-            # Both branches are full-width and rank-consistent (plucker via the
-            # replicated Conv3d, ray via ColumnParallelLinear gather_output=True),
-            # so the sum is well-defined and matches the full hidden_size input
-            # expected by the downstream QKVParallelLinear (which splits by head).
-            hidden_states = ray_hidden if hidden_states is None else hidden_states + ray_hidden
-
-        return hidden_states
-
-
 class SanaWmSelfAttention(nn.Module):
     def __init__(
         self,
@@ -557,7 +520,6 @@ class SanaWmSelfAttention(nn.Module):
         *,
         use_gdn: bool = True,
         quant_config: QuantizationConfig | None = None,
-        use_vllm_parallel_layers: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -569,140 +531,101 @@ class SanaWmSelfAttention(nn.Module):
         self.eps = 1e-8
         self.attn_type = config.attn_type
         self.use_gdn = use_gdn and "GDN" in config.attn_type
-        self.use_vllm_attention = (not self.use_gdn) and _vllm_attention_available()
         self.conv_kernel_size = config.conv_kernel_size
         self.patch_size = _to_3tuple(config.patch_size)
-        self.uses_vllm_parallel_layers = use_vllm_parallel_layers and _vllm_parallel_layers_available()
         # Total camera branch width from the checkpoint. TP ColumnParallel
         # layers expose a per-rank local slice at runtime; keep both sizes so
         # layer construction uses the global contract while local conv/norm
         # tensors match q/k/v outputs.
         self.total_cam_dim = hidden_size // max(config.cam_attn_compress, 1)
         self.cam_dim = self.total_cam_dim
-        if self.uses_vllm_parallel_layers:
-            assert ColumnParallelLinear is not None
-            assert QKVParallelLinear is not None
-            assert RowParallelLinear is not None
-            self.qkv = QKVParallelLinear(
-                hidden_size=hidden_size,
-                head_size=self.head_dim,
-                total_num_heads=self.total_num_heads,
-                bias=False,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.qkv" if prefix else "qkv",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.num_heads = self.qkv.num_heads
-            self.num_kv_heads = self.qkv.num_kv_heads
-            self.proj = RowParallelLinear(
-                self.total_num_heads * self.head_dim,
-                hidden_size,
-                bias=True,
-                input_is_parallel=True,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.proj" if prefix else "proj",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.beta_proj = ColumnParallelLinear(
-                hidden_size,
-                self.total_num_heads,
-                bias=True,
-                gather_output=False,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.beta_proj" if prefix else "beta_proj",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.gate_proj = ColumnParallelLinear(
-                hidden_size,
-                self.total_num_heads,
-                bias=True,
-                gather_output=False,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.gate_proj" if prefix else "gate_proj",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.output_gate = ColumnParallelLinear(
-                hidden_size,
-                self.total_num_heads * self.head_dim,
-                bias=True,
-                gather_output=False,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.output_gate" if prefix else "output_gate",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.q_proj_cam = ColumnParallelLinear(
-                hidden_size,
-                self.total_cam_dim,
-                bias=True,
-                gather_output=False,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.q_proj_cam" if prefix else "q_proj_cam",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.k_proj_cam = ColumnParallelLinear(
-                hidden_size,
-                self.total_cam_dim,
-                bias=True,
-                gather_output=False,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.k_proj_cam" if prefix else "k_proj_cam",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.v_proj_cam = ColumnParallelLinear(
-                hidden_size,
-                self.total_cam_dim,
-                bias=True,
-                gather_output=False,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.v_proj_cam" if prefix else "v_proj_cam",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.out_proj_cam = RowParallelLinear(
-                self.total_cam_dim,
-                hidden_size,
-                bias=True,
-                input_is_parallel=True,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.out_proj_cam" if prefix else "out_proj_cam",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-        else:
-            self.qkv = nn.Linear(hidden_size, self.num_heads * self.head_dim * 3, bias=False)
-            self.proj = nn.Linear(self.num_heads * self.head_dim, hidden_size)
-            self.beta_proj = nn.Linear(hidden_size, self.num_heads)
-            self.gate_proj = nn.Linear(hidden_size, self.num_heads)
-            self.output_gate = nn.Linear(hidden_size, hidden_size)
-            self.q_proj_cam = nn.Linear(hidden_size, self.cam_dim, bias=True)
-            self.k_proj_cam = nn.Linear(hidden_size, self.cam_dim, bias=True)
-            self.v_proj_cam = nn.Linear(hidden_size, self.cam_dim, bias=True)
-            self.out_proj_cam = nn.Linear(self.cam_dim, hidden_size, bias=True)
+        self.qkv = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.total_num_heads,
+            bias=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv" if prefix else "qkv",
+        )
+        self.num_heads = self.qkv.num_heads
+        self.num_kv_heads = self.qkv.num_kv_heads
+        self.proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj" if prefix else "proj",
+        )
+        self.beta_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_heads,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.beta_proj" if prefix else "beta_proj",
+        )
+        self.gate_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_heads,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_proj" if prefix else "gate_proj",
+        )
+        self.output_gate = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_heads * self.head_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.output_gate" if prefix else "output_gate",
+        )
+        self.q_proj_cam = ColumnParallelLinear(
+            hidden_size,
+            self.total_cam_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_proj_cam" if prefix else "q_proj_cam",
+        )
+        self.k_proj_cam = ColumnParallelLinear(
+            hidden_size,
+            self.total_cam_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k_proj_cam" if prefix else "k_proj_cam",
+        )
+        self.v_proj_cam = ColumnParallelLinear(
+            hidden_size,
+            self.total_cam_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.v_proj_cam" if prefix else "v_proj_cam",
+        )
+        self.out_proj_cam = RowParallelLinear(
+            self.total_cam_dim,
+            hidden_size,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.out_proj_cam" if prefix else "out_proj_cam",
+        )
         local_inner_dim = self.num_heads * self.head_dim
         norm_cls = _make_sharded_qk_rms_norm if config.qk_norm else (lambda *_args, **_kwargs: nn.Identity())
         self.q_norm = norm_cls(local_inner_dim)
         self.k_norm = norm_cls(local_inner_dim)
-        self.softmax_attn = (
-            Attention(
-                num_heads=self.num_heads,
-                head_size=self.head_dim,
-                num_kv_heads=self.num_kv_heads,
-                softmax_scale=1.0 / (self.head_dim**0.5),
-                causal=False,
-                role="self",
-                qkv_layout="BSND",
-                prefix=prefix,
-            )
-            if self.use_vllm_attention
-            else None
-        )
 
         # These names mirror the official GDN checkpoint.
         self.A_log = nn.Parameter(torch.zeros(self.num_heads))
@@ -722,8 +645,7 @@ class SanaWmSelfAttention(nn.Module):
         self.conv_q = None
         self.conv_v = None
 
-        if self.uses_vllm_parallel_layers:
-            self.cam_dim = int(getattr(self.q_proj_cam, "output_size_per_partition", self.total_cam_dim))
+        self.cam_dim = int(getattr(self.q_proj_cam, "output_size_per_partition", self.total_cam_dim))
 
         cam_compress = max(config.cam_attn_compress, 1)
         self.cam_heads = max(self.num_heads // cam_compress, 1)
@@ -760,6 +682,19 @@ class SanaWmSelfAttention(nn.Module):
         self.conv_q_cam = None
         self.conv_v_cam = None
         self._init_short_convs()
+        self._mark_tp_sharded_params()
+
+    def _mark_tp_sharded_params(self) -> None:
+        """Declare which plain parameters are TP-local (see ``_shard_param_across_tp``)."""
+        # Per-head GDN vectors: one entry per local head.
+        _shard_param_across_tp(self.A_log)
+        _shard_param_across_tp(self.dt_bias)
+        # Depthwise temporal convs and q/k norms: one entry per local channel.
+        for module in (self.conv_q, self.conv_k, self.conv_v, self.conv_q_cam, self.conv_k_cam, self.conv_v_cam):
+            if module is not None:
+                _shard_param_across_tp(module.weight)
+        for norm in (self.q_norm, self.k_norm, self.q_norm_cam, self.k_norm_cam):
+            _shard_param_across_tp(getattr(norm, "weight", None))
 
     @staticmethod
     def _init_short_conv(conv: nn.Conv1d | None) -> None:
@@ -774,15 +709,6 @@ class SanaWmSelfAttention(nn.Module):
     def _init_short_convs(self) -> None:
         for conv in (self.conv_q, self.conv_k, self.conv_v, self.conv_q_cam, self.conv_k_cam, self.conv_v_cam):
             self._init_short_conv(conv)
-
-    @staticmethod
-    def _flip_and_shift(tensor: torch.Tensor, *, dim: int, shift_value: float) -> torch.Tensor:
-        flipped = torch.flip(tensor, dims=[dim])
-        shifted = flipped.narrow(dim, 0, tensor.shape[dim] - 1)
-        pad_shape = list(tensor.shape)
-        pad_shape[dim] = 1
-        padding = torch.full(pad_shape, shift_value, device=tensor.device, dtype=tensor.dtype)
-        return torch.cat([padding, shifted], dim=dim)
 
     @staticmethod
     def _apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -854,10 +780,10 @@ class SanaWmSelfAttention(nn.Module):
         spatial_tokens = height * width
         if token_count != frames * spatial_tokens:
             raise ValueError(f"Sana-WM GDN token layout mismatch: N={token_count}, expected {frames * spatial_tokens}.")
-        beta = torch.sigmoid(_linear_output(self.beta_proj(hidden_states)))
+        beta = torch.sigmoid(self.beta_proj(hidden_states))
         beta = beta.reshape(batch_size, frames, spatial_tokens, self.num_heads).permute(0, 3, 1, 2)
         frame_states = hidden_states.reshape(batch_size, frames, spatial_tokens, hidden_size).mean(dim=2)
-        gate = _linear_output(self.gate_proj(frame_states)).float()
+        gate = self.gate_proj(frame_states).float()
         decay = torch.exp(
             -self.A_log.float().exp().view(1, 1, -1) * F.softplus(gate + self.dt_bias.float().view(1, 1, -1))
         )
@@ -884,7 +810,7 @@ class SanaWmSelfAttention(nn.Module):
         if token_count != frames * spatial_tokens:
             raise ValueError(f"Sana-WM GDN expects N=T*H*W, got N={token_count}, THW={spatial_shape}.")
 
-        qkv = _linear_output(self.qkv(hidden_states))
+        qkv = self.qkv(hidden_states)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -895,45 +821,6 @@ class SanaWmSelfAttention(nn.Module):
         else:
             beta, decay = precomputed_gates
 
-        if hidden_states.is_cuda:
-            qkv = torch.stack(
-                (
-                    query.reshape(batch_size, token_count, self.num_heads, self.head_dim),
-                    key.reshape(batch_size, token_count, self.num_heads, self.head_dim),
-                    value.reshape(batch_size, token_count, self.num_heads, self.head_dim),
-                ),
-                dim=2,
-            )
-            try:
-                output = triton_bidirectional_gated_delta_net_from_qkv(
-                    qkv,
-                    beta=beta,
-                    decay=decay,
-                    q_norm=self.q_norm,
-                    k_norm=self.k_norm,
-                    spatial_tokens=spatial_tokens,
-                    rotary_emb=rotary_emb,
-                    k_scale=(self.head_dim**-0.5) * (spatial_tokens**-0.5),
-                    eps=self.eps,
-                )
-                output = output.permute(0, 3, 1, 2).reshape(batch_size, token_count, q_size)
-                return output, (beta, decay)
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
-                if os.environ.get(SANA_WM_REQUIRE_TRITON_GDN_ENV, "").lower() in {"1", "true", "yes", "on"}:
-                    raise
-                # The fused path is an optimization. Keep the reference path as
-                # the correctness fallback for unsupported GPUs / Triton builds.
-                # Warn once so a silent multi-second regression is observable.
-                global _SANA_WM_TRITON_GDN_FALLBACK_WARNED
-                if not _SANA_WM_TRITON_GDN_FALLBACK_WARNED:
-                    _SANA_WM_TRITON_GDN_FALLBACK_WARNED = True
-                    warnings.warn(
-                        f"Sana-WM fused Triton GDN kernel raised {type(exc).__name__}: {exc}; "
-                        "falling back to the PyTorch reference recurrence (slow). "
-                        f"Set {SANA_WM_REQUIRE_TRITON_GDN_ENV}=1 to fail fast instead.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
         query = self.q_norm(query).reshape(batch_size, token_count, self.num_heads, self.head_dim)
         key = self.k_norm(key).reshape(batch_size, token_count, self.num_heads, self.head_dim)
         value = value.reshape(batch_size, token_count, self.num_heads, self.head_dim)
@@ -973,19 +860,29 @@ class SanaWmSelfAttention(nn.Module):
         Centralised so the same shared gate/proj path is applied whether or
         not the camera branch contributes to ``combined``.
         """
-        gate = F.silu(_linear_output(self.output_gate(hidden_states)).float())
+        gate = F.silu(self.output_gate(hidden_states).float())
         gated = combined * gate
-        return _linear_output(self.proj(gated.to(_linear_weight_dtype(self.proj))))
+        return self.proj(gated.to(self.proj.weight.dtype))
 
     @staticmethod
     def _match_local_inner_dim(contrib: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
-        """Slice a full TP contribution back to the local inner dimension.
+        """Slice a replicated TP contribution down to the local inner dimension.
 
-        Some auxiliary projections, notably the camera branch's
-        ``out_proj_cam``, naturally all-reduce to the full hidden width.
-        The shared GDN raw stream is TP-local before ``output_gate`` and
-        ``proj``, so the auxiliary contribution must use the matching local
-        slice before the raw streams are added.
+        The camera branch's ``out_proj_cam`` is a ``RowParallelLinear``: every
+        rank holds a slice of the camera features, so producing the projection
+        requires summing across ranks, and the all-reduce leaves every rank with
+        the same full-width result. The GDN raw stream it is added to is TP-local
+        (``output_gate`` and ``proj`` both expect the local width), so each rank
+        takes its own head slice of that replicated tensor - the same pattern
+        t5_encoder uses for its relative-attention bias and LTX-2 for its rope
+        table.
+
+        This is the one place the model still needs the TP rank. It cannot be
+        expressed as a different parallel layer: rank r only needs slice r of a
+        cross-rank sum, which is a reduce-scatter, and ``RowParallelLinear`` only
+        offers all-reduce or no reduction at all. Switching to a reduce-scatter
+        would halve the traffic here and remove the rank math - worth doing as a
+        separate perf change, once it can be measured on multi-GPU.
         """
         if contrib.shape[-1] == reference.shape[-1]:
             return contrib
@@ -994,7 +891,7 @@ class SanaWmSelfAttention(nn.Module):
             raise ValueError(
                 f"Sana-WM TP contribution width mismatch: contrib={contrib.shape[-1]} reference={local_width}."
             )
-        tp_rank = _get_tp_rank()
+        tp_rank = get_tensor_model_parallel_rank()
         start = tp_rank * local_width
         end = start + local_width
         if end > contrib.shape[-1]:
@@ -1072,7 +969,7 @@ class SanaWmSelfAttention(nn.Module):
         if token_count != frames * height * width:
             raise ValueError(f"Sana-WM softmax attention expects N=T*H*W, got N={token_count}, THW={spatial_shape}.")
 
-        qkv = _linear_output(self.qkv(hidden_states))
+        qkv = self.qkv(hidden_states)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -1119,9 +1016,9 @@ class SanaWmSelfAttention(nn.Module):
         if token_count != frames * height * width:
             raise ValueError(f"Sana-WM softmax cam branch expects N=T*H*W, got N={token_count}, THW={spatial_shape}.")
 
-        q_cam = _linear_output(self.q_proj_cam(hidden_states))
-        k_cam = _linear_output(self.k_proj_cam(hidden_states))
-        v_cam = _linear_output(self.v_proj_cam(hidden_states))
+        q_cam = self.q_proj_cam(hidden_states)
+        k_cam = self.k_proj_cam(hidden_states)
+        v_cam = self.v_proj_cam(hidden_states)
 
         if self.conv_q_cam is not None:
             q_cam = self._bidirectional_temporal_short_conv(q_cam, self.conv_q_cam, spatial_shape)
@@ -1256,28 +1153,7 @@ class SanaWmSelfAttention(nn.Module):
         Backward direction shifts K/V/beta by one frame (with zero pad) and
         the decay by one frame (with neutral 1.0 pad), matching NVlabs
         ``flip_and_shift`` conventions.
-
-        Set ``SANA_WM_CAM_TRITON=1`` to dispatch to the in-tree Triton port
-        ``gdn.cam_scan_bidi_chunkwise``; the default is the Python reference
-        path below.
         """
-        if q_rot.is_cuda and os.environ.get("SANA_WM_CAM_TRITON", "").lower() in {"1", "true", "yes", "on"}:
-            dtype_orig = q_rot.dtype
-            B, H, D, N = q_rot.shape
-            F = beta.shape[2]
-            if N != F * spatial_tokens:
-                raise ValueError(f"cam triton path: N={N} != F*S={F * spatial_tokens}")
-            # The kernel requires fp32 contiguous q/k/v, beta (B,H,F,S), decay (B,H,F).
-            q_f = q_rot.float().contiguous()
-            k_f = k_rot.float().contiguous()
-            v_f = value.float().contiguous()
-            if beta.ndim == 3:
-                beta_f = beta.float().unsqueeze(-1).expand(B, H, F, spatial_tokens).contiguous()
-            else:
-                beta_f = beta.float().contiguous()
-            decay_f = decay.float().contiguous()
-            out = cam_scan_bidi_chunkwise(q_f, k_f, v_f, beta_f, decay_f)
-            return out.to(dtype_orig)
         batch_size, num_heads, head_dim, token_count = q_rot.shape
         frames = beta.shape[2]
 
@@ -1368,9 +1244,9 @@ class SanaWmSelfAttention(nn.Module):
         )
 
         # 1. Projections (all from x).
-        q_cam = _linear_output(self.q_proj_cam(hidden_states))
-        k_cam = _linear_output(self.k_proj_cam(hidden_states))
-        v_cam = _linear_output(self.v_proj_cam(hidden_states))
+        q_cam = self.q_proj_cam(hidden_states)
+        k_cam = self.k_proj_cam(hidden_states)
+        v_cam = self.v_proj_cam(hidden_states)
 
         # 2. Short conv on K (and optionally Q, V).
         if self.conv_k_cam is not None:
@@ -1436,12 +1312,11 @@ class SanaWmSelfAttention(nn.Module):
         # (B, H_cam, D_cam, N) → (B, N, cam_dim)
         return cam_out_bhdn.permute(0, 3, 1, 2).reshape(batch_size, token_count, self.cam_dim)
 
-    # The GDN/UCPE branch dispatches into a hand-written Triton kernel whose
-    # launch grid is computed from runtime shapes; under torch.compile those
-    # become symbolic and the grid degrades to a float ("'float' object cannot
-    # be interpreted as an integer" at Triton launch). Run the whole attention
-    # eagerly (graph break) so the kernel sees concrete int shapes; the rest of
-    # the block (MLP / norms / cross-attention) still compiles.
+    # The GDN/UCPE branch runs a sequential recurrence whose trip count is the
+    # latent frame count, i.e. data-dependent at trace time. Run the whole
+    # attention eagerly (graph break) rather than letting torch.compile unroll
+    # it per shape; the rest of the block (MLP / norms / cross-attention) still
+    # compiles.
     @torch.compiler.disable
     def forward(
         self,
@@ -1480,7 +1355,7 @@ class SanaWmSelfAttention(nn.Module):
                 rotary_emb,
                 precomputed_gates=(beta, decay),
             )
-            cam_contrib = _linear_output(self.out_proj_cam(cam_raw))
+            cam_contrib = self.out_proj_cam(cam_raw)
             cam_contrib = self._match_local_inner_dim(cam_contrib, main_raw)
             combined = main_raw + cam_contrib.to(main_raw.dtype)
             attn_out = self._apply_output_gate_and_proj(combined, hidden_states)
@@ -1495,13 +1370,13 @@ class SanaWmSelfAttention(nn.Module):
                     camera_conditions,
                     rotary_emb,
                 )
-                cam_contrib = _linear_output(self.out_proj_cam(cam_raw))
+                cam_contrib = self.out_proj_cam(cam_raw)
                 cam_contrib = self._match_local_inner_dim(cam_contrib, main_raw)
                 main_raw = main_raw + cam_contrib.to(main_raw.dtype)
             return self._apply_output_gate_and_proj(main_raw, hidden_states)
 
         # Shape-only fallback for legacy callers that do not provide a token-grid shape.
-        qkv = _linear_output(self.qkv(hidden_states))
+        qkv = self.qkv(hidden_states)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -1521,7 +1396,6 @@ class SanaWmCrossAttention(nn.Module):
         config: SanaWmConfig,
         *,
         quant_config: QuantizationConfig | None = None,
-        use_vllm_parallel_layers: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -1530,64 +1404,59 @@ class SanaWmCrossAttention(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.num_heads = self.total_num_heads
         inner = self.total_num_heads * self.head_dim
-        self.uses_vllm_parallel_layers = use_vllm_parallel_layers and _vllm_parallel_layers_available()
-        if self.uses_vllm_parallel_layers:
-            assert ColumnParallelLinear is not None
-            assert RowParallelLinear is not None
-            self.q_linear = ColumnParallelLinear(
-                hidden_size,
-                inner,
-                bias=True,
-                gather_output=False,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.q_linear" if prefix else "q_linear",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.kv_linear = ColumnParallelLinear(
-                hidden_size,
-                inner * 2,
-                bias=True,
-                gather_output=True,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.kv_linear" if prefix else "kv_linear",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-            self.num_heads = inner // max(_get_tp_world_size(), 1) // self.head_dim
-            self.proj = RowParallelLinear(
-                inner,
-                hidden_size,
-                bias=True,
-                input_is_parallel=True,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.proj" if prefix else "proj",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-        else:
-            self.q_linear = nn.Linear(hidden_size, inner)
-            self.kv_linear = nn.Linear(hidden_size, inner * 2)
-            self.proj = nn.Linear(inner, hidden_size)
+        self.q_linear = ColumnParallelLinear(
+            hidden_size,
+            inner,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_linear" if prefix else "q_linear",
+        )
+        # The checkpoint stores K and V fused as one (2 * inner, hidden)
+        # tensor. A plain ColumnParallelLinear would shard that by the
+        # concatenated output dim, handing all of K to one rank and all of V
+        # to another; MergedColumnParallelLinear knows the block structure
+        # and shards K and V by heads independently, so `chunk(2)` below
+        # yields this rank's K and V directly - no gather, no manual slice.
+        self.kv_linear = MergedColumnParallelLinear(
+            hidden_size,
+            [inner, inner],
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.kv_linear" if prefix else "kv_linear",
+        )
+        self.num_heads = self.q_linear.output_size_per_partition // self.head_dim
+        self.proj = RowParallelLinear(
+            inner,
+            hidden_size,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj" if prefix else "proj",
+        )
         local_inner = self.num_heads * self.head_dim
         norm_cls = _make_sharded_qk_rms_norm if config.cross_norm else (lambda *_args, **_kwargs: nn.Identity())
         self.q_norm = norm_cls(local_inner)
         self.k_norm = norm_cls(local_inner)
-        self.softmax_attn = (
-            Attention(
-                num_heads=self.num_heads,
-                head_size=self.head_dim,
-                num_kv_heads=self.num_heads,
-                softmax_scale=1.0 / (self.head_dim**0.5),
-                causal=False,
-                role="cross",
-                qkv_layout="BSND",
-                skip_sequence_parallel=True,
-                disable_kv_quant=True,
-                prefix=prefix,
-            )
-            if _vllm_attention_available()
-            else None
+        # q is column-parallel and k is sliced to the local width before k_norm,
+        # so both norms hold one weight entry per local channel.
+        _shard_param_across_tp(getattr(self.q_norm, "weight", None))
+        _shard_param_across_tp(getattr(self.k_norm, "weight", None))
+        self.softmax_attn = Attention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            num_kv_heads=self.num_heads,
+            softmax_scale=1.0 / (self.head_dim**0.5),
+            causal=False,
+            role="cross",
+            qkv_layout="BSND",
+            skip_sequence_parallel=True,
+            disable_kv_quant=True,
+            prefix=prefix,
         )
 
     def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -1603,37 +1472,23 @@ class SanaWmCrossAttention(nn.Module):
         batch, _, seq_len, _ = tensor.shape
         return tensor.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
 
-    @staticmethod
-    def _slice_local_inner(tensor: torch.Tensor, local_inner: int) -> torch.Tensor:
-        if tensor.shape[-1] == local_inner:
-            return tensor
-        tp_size = _get_tp_world_size()
-        if tp_size <= 1 or tensor.shape[-1] != local_inner * tp_size:
-            raise ValueError(
-                "Sana-WM cross-attention TP inner width mismatch: "
-                f"tensor={tensor.shape[-1]} local_inner={local_inner} tp={tp_size}."
-            )
-        start = _get_tp_rank() * local_inner
-        return tensor[..., start : start + local_inner].contiguous()
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        query = self.q_norm(_linear_output(self.q_linear(hidden_states)))
-        key, value = _linear_output(self.kv_linear(encoder_hidden_states)).chunk(2, dim=-1)
-        local_inner = self.num_heads * self.head_dim
-        key = self._slice_local_inner(key, local_inner)
-        value = self._slice_local_inner(value, local_inner)
+        query = self.q_norm(self.q_linear(hidden_states))
+        # MergedColumnParallelLinear emits [K_local; V_local], so the chunk is
+        # already this rank's head shard.
+        key, value = self.kv_linear(encoder_hidden_states).chunk(2, dim=-1)
         key = self.k_norm(key)
-        if self.softmax_attn is not None and attention_mask is None:
+        if attention_mask is None:
             query = self._reshape_to_seq_heads(query)
             key = self._reshape_to_seq_heads(key)
             value = self._reshape_to_seq_heads(value)
             attn = self.softmax_attn(query, key, value)
-            return _linear_output(self.proj(attn.flatten(2, 3)))
+            return self.proj(attn.flatten(2, 3))
         # vLLM Attention path does not currently take the SANA-WM prompt
         # padding mask; fall back to SDPA for exact NVlabs semantics when a
         # mask is supplied.
@@ -1649,7 +1504,7 @@ class SanaWmCrossAttention(nn.Module):
             attn_mask = (1 - attention_mask.to(query.dtype)) * -10000.0
             attn_mask = attn_mask[:, None, None].repeat(1, self.num_heads, 1, 1)
         attn = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
-        return _linear_output(self.proj(self._merge_heads(attn)))
+        return self.proj(self._merge_heads(attn))
 
 
 class _ConvWrapper(nn.Module):
@@ -1726,7 +1581,6 @@ class SanaWmBlock(nn.Module):
         *,
         block_idx: int = 0,
         quant_config: QuantizationConfig | None = None,
-        use_vllm_parallel_layers: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -1741,13 +1595,11 @@ class SanaWmBlock(nn.Module):
             config,
             use_gdn=use_gdn,
             quant_config=quant_config,
-            use_vllm_parallel_layers=use_vllm_parallel_layers,
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
         self.cross_attn = SanaWmCrossAttention(
             config,
             quant_config=quant_config,
-            use_vllm_parallel_layers=use_vllm_parallel_layers,
             prefix=f"{prefix}.cross_attn" if prefix else "cross_attn",
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -1755,19 +1607,15 @@ class SanaWmBlock(nn.Module):
         self.mlp.block_idx = block_idx
         self.attn.block_idx = block_idx
         if use_plucker_proj:
-            if use_vllm_parallel_layers and _vllm_parallel_layers_available() and ColumnParallelLinear is not None:
-                self.plucker_proj: nn.Module | None = ColumnParallelLinear(
-                    hidden_size,
-                    hidden_size,
-                    bias=True,
-                    gather_output=True,
-                    return_bias=False,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.plucker_proj" if prefix else "plucker_proj",
-                    disable_tp=_disable_tp_for_vllm_layer(),
-                )
-            else:
-                self.plucker_proj = nn.Linear(hidden_size, hidden_size)
+            self.plucker_proj: nn.Module | None = ColumnParallelLinear(
+                hidden_size,
+                hidden_size,
+                bias=True,
+                gather_output=True,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.plucker_proj" if prefix else "plucker_proj",
+            )
         else:
             self.plucker_proj = None
         self.scale_shift_table = nn.Parameter(torch.zeros(6, hidden_size))
@@ -1806,7 +1654,7 @@ class SanaWmBlock(nn.Module):
         attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
         attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_conditions)
         if camera_hidden_states is not None and self.plucker_proj is not None:
-            attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
+            attn_output = attn_output + self.plucker_proj(camera_hidden_states)
         hidden_states = hidden_states + gate_msa * attn_output
         hidden_states = hidden_states + self.cross_attn(
             hidden_states,
@@ -1859,7 +1707,7 @@ class SanaWmBlock(nn.Module):
         x_msa_in = (x_norm1 * (1 + scale_msa) + shift_msa).reshape(batch_size, token_count, hidden_size)
         attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, camera_conditions)
         if camera_hidden_states is not None and self.plucker_proj is not None:
-            attn_output = attn_output + _linear_output(self.plucker_proj(camera_hidden_states))
+            attn_output = attn_output + self.plucker_proj(camera_hidden_states)
         attn_output_4d = attn_output.reshape(batch_size, frames, spatial_tokens, hidden_size)
         hidden_states = hidden_states + (gate_msa * attn_output_4d).reshape(batch_size, token_count, hidden_size)
 
@@ -1885,7 +1733,6 @@ class SanaWmFinalLayer(nn.Module):
         out_channels: int,
         *,
         quant_config: Any = None,
-        use_vllm_parallel_layers: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -1893,19 +1740,15 @@ class SanaWmFinalLayer(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.zeros(2, hidden_size))
         self.out_channels = out_channels
         out_features = _prod(patch_size) * out_channels
-        if use_vllm_parallel_layers and _vllm_parallel_layers_available() and ColumnParallelLinear is not None:
-            self.linear: nn.Module = ColumnParallelLinear(
-                hidden_size,
-                out_features,
-                bias=True,
-                gather_output=True,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.linear" if prefix else "linear",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-        else:
-            self.linear = nn.Linear(hidden_size, out_features)
+        self.linear: nn.Module = ColumnParallelLinear(
+            hidden_size,
+            out_features,
+            bias=True,
+            gather_output=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear" if prefix else "linear",
+        )
 
     def forward(
         self,
@@ -1918,7 +1761,7 @@ class SanaWmFinalLayer(nn.Module):
             return self._forward_frame_aware(hidden_states, timestep_embed, spatial_shape)
         shift, scale = (self.scale_shift_table[None] + timestep_embed[:, None]).chunk(2, dim=1)
         hidden_states = self.norm_final(hidden_states) * (1 + scale) + shift
-        return _linear_output(self.linear(hidden_states))
+        return self.linear(hidden_states)
 
     def _forward_frame_aware(
         self,
@@ -1951,7 +1794,7 @@ class SanaWmFinalLayer(nn.Module):
         shift, scale = (self.scale_shift_table[None, None, :, :] + t_per_frame).chunk(2, dim=-2)
         x_norm = self.norm_final(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_mod = (x_norm * (1 + scale) + shift).reshape(batch_size, token_count, hidden_size)
-        return _linear_output(self.linear(x_mod))
+        return self.linear(x_mod)
 
 
 class SanaWmTransformer3DModel(nn.Module):
@@ -1960,7 +1803,7 @@ class SanaWmTransformer3DModel(nn.Module):
     _repeated_blocks: ClassVar[list[str]] = ["SanaWmBlock"]
     _layerwise_offload_blocks_attr: ClassVar[str] = "blocks"
     _hsdp_shard_conditions: ClassVar[list[Any]] = [_is_sana_wm_transformer_block]
-    _sp_plan: ClassVar[dict[str, Any] | None] = _build_sana_wm_sp_plan()
+    _sp_plan: ClassVar[dict[str, Any]] = _build_sana_wm_sp_plan()
 
     def __init__(
         self,
@@ -1971,14 +1814,12 @@ class SanaWmTransformer3DModel(nn.Module):
         latent_channels: int = SANA_WM_STAGE1_LATENT_CHANNELS,
         prompt_channels: int = SANA_WM_STAGE1_PROMPT_CHANNELS,
         quant_config: QuantizationConfig | None = None,
-        use_vllm_parallel_layers: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config or SanaWmConfig()
         self.quant_config = quant_config
         self.prefix = prefix
-        self.use_vllm_parallel_layers = use_vllm_parallel_layers and _vllm_parallel_layers_available()
         self._latent_channels = latent_channels
         self._prompt_channels = prompt_channels
         self.patch_size = _to_3tuple(self.config.patch_size)
@@ -1988,31 +1829,25 @@ class SanaWmTransformer3DModel(nn.Module):
             self.config.hidden_size,
             self.config.model_max_length,
             quant_config=self.quant_config,
-            use_vllm_parallel_layers=self.use_vllm_parallel_layers,
             prefix=f"{self.prefix}.y_embedder" if self.prefix else "y_embedder",
         )
         self.t_embedder = SanaWmTimestepEmbedder(
             SANA_WM_STAGE1_TIMESTEP_CHANNELS,
             self.config.hidden_size,
             quant_config=self.quant_config,
-            use_vllm_parallel_layers=self.use_vllm_parallel_layers,
             prefix=f"{self.prefix}.t_embedder" if self.prefix else "t_embedder",
         )
         # t_block: SiLU → Linear(hidden, 6*hidden).  Weight key is t_block.1.{weight,bias}
         # to match the Stage-1 checkpoint layout (nn.Sequential index 1).
-        if self.use_vllm_parallel_layers and ColumnParallelLinear is not None:
-            _t_block_linear: nn.Module = ColumnParallelLinear(
-                self.config.hidden_size,
-                6 * self.config.hidden_size,
-                bias=True,
-                gather_output=True,
-                return_bias=False,
-                quant_config=self.quant_config,
-                prefix=f"{self.prefix}.t_block.1" if self.prefix else "t_block.1",
-                disable_tp=_disable_tp_for_vllm_layer(),
-            )
-        else:
-            _t_block_linear = nn.Linear(self.config.hidden_size, 6 * self.config.hidden_size)
+        _t_block_linear: nn.Module = ColumnParallelLinear(
+            self.config.hidden_size,
+            6 * self.config.hidden_size,
+            bias=True,
+            gather_output=True,
+            return_bias=False,
+            quant_config=self.quant_config,
+            prefix=f"{self.prefix}.t_block.1" if self.prefix else "t_block.1",
+        )
         self.t_block = nn.Sequential(nn.SiLU(), _t_block_linear)
         self.plucker_embedder = SanaWmPatchEmbedMS3D(
             self.patch_size,
@@ -2026,7 +1861,6 @@ class SanaWmTransformer3DModel(nn.Module):
                     self.config,
                     block_idx=i,
                     quant_config=self.quant_config,
-                    use_vllm_parallel_layers=self.use_vllm_parallel_layers,
                     prefix=f"{self.prefix}.blocks.{i}" if self.prefix else f"blocks.{i}",
                 )
                 for i in range(self.config.num_blocks)
@@ -2037,64 +1871,13 @@ class SanaWmTransformer3DModel(nn.Module):
             self.patch_size,
             self._latent_channels,
             quant_config=self.quant_config,
-            use_vllm_parallel_layers=self.use_vllm_parallel_layers,
             prefix=f"{self.prefix}.final_layer" if self.prefix else "final_layer",
         )
         self.pos_embed = nn.Parameter(torch.zeros(1, 484, self.config.hidden_size))
         self.rope = SanaWmWanRotaryPosEmbed(self.config.linear_head_dim)
-        self.attention_y_norm = _maybe_make_vllm_rms_norm(self.config.hidden_size)
+        self.attention_y_norm = RMSNorm(self.config.hidden_size)
         if device is not None or dtype is not None:
             self.to(device=device, dtype=dtype)
-
-    @staticmethod
-    def _maybe_shard_loaded_tensor(
-        name: str,
-        tensor: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """Shard simple non-vLLM parameters that become TP-local.
-
-        vLLM parallel linear parameters have their own `weight_loader`.
-        SANA-WM also has model-local GDN vectors and depthwise temporal
-        convolution weights (`A_log`, `dt_bias`, `conv_k`) whose checkpoint
-        tensors are full-sized. Narrow those along the single changed dimension
-        when TP makes the materialized parameter local.
-        """
-
-        if tensor.ndim != target.ndim:
-            return tensor
-        differing_dims = [
-            dim
-            for dim, (target_size, loaded_size) in enumerate(zip(target.shape, tensor.shape, strict=True))
-            if target_size != loaded_size
-        ]
-        if len(differing_dims) != 1:
-            return tensor
-        dim = differing_dims[0]
-        target_size = target.shape[dim]
-        loaded_size = tensor.shape[dim]
-        tp_size = _get_tp_world_size()
-        tp_rank = _get_tp_rank()
-        if tp_size <= 1 or target_size * tp_size != loaded_size:
-            return tensor
-        if not any(
-            token in name
-            for token in (
-                ".A_log",
-                ".dt_bias",
-                ".conv_k.",
-                ".conv_k_cam.",
-                ".conv_q_cam.",
-                ".conv_v_cam.",
-                ".q_norm.",
-                ".k_norm.",
-                ".q_norm_cam.",
-                ".k_norm_cam.",
-            )
-        ):
-            return tensor
-        start = tp_rank * target_size
-        return tensor.narrow(dim, start, target_size)
 
     def _positional_embedding(self, token_count: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         pos_embed = self.pos_embed.to(device=device, dtype=dtype)
@@ -2179,7 +1962,6 @@ class SanaWmTransformer3DModel(nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         camera_hidden_states: torch.Tensor | None = None,
-        camera_encoder: SanaWmCameraEmbedder | None = None,
         plucker: torch.Tensor | None = None,
         raymap: torch.Tensor | None = None,
         spatial_raymap: torch.Tensor | None = None,
@@ -2231,10 +2013,9 @@ class SanaWmTransformer3DModel(nn.Module):
         # frame-aware paths that broadcast modulation over spatial tokens.
         timestep_shape = tuple(timestep.shape)
         time_embed = self.t_embedder(timestep)  # (numel, D)
-        # t_block is Sequential(SiLU, Linear|ColumnParallelLinear); index explicitly
-        # so _linear_output can unwrap the (tensor, None) tuple from parallel layers.
+        # t_block is Sequential(SiLU, ColumnParallelLinear); index explicitly.
         _t_silu = self.t_block[0](time_embed)
-        timestep_modulation = _linear_output(self.t_block[1](_t_silu)).to(hidden_states.dtype)
+        timestep_modulation = self.t_block[1](_t_silu).to(hidden_states.dtype)
         if len(timestep_shape) > 1:
             time_embed = time_embed.unflatten(0, timestep_shape)
             timestep_modulation = timestep_modulation.unflatten(0, timestep_shape)
@@ -2243,16 +2024,6 @@ class SanaWmTransformer3DModel(nn.Module):
             camera_hidden_states = self._camera_hidden_states_from_conditions(
                 plucker=plucker,
                 spatial_raymap=spatial_raymap,
-                spatial_shape=spatial_shape,
-                batch_size=batch_size,
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-
-        if camera_hidden_states is None and camera_encoder is not None:
-            camera_hidden_states = camera_encoder(
-                plucker=plucker,
-                raymap=raymap,
                 spatial_shape=spatial_shape,
                 batch_size=batch_size,
                 dtype=hidden_states.dtype,
@@ -2291,10 +2062,10 @@ class SanaWmTransformer3DModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
         """Stream checkpoint tensors into the eagerly-built modules.
 
-        Follows the wan2_2 idiom: one ``named_parameters`` lookup table, the
-        per-tensor ``weight_loader`` for vLLM parallel layers (which narrows
-        full checkpoint tensors to the TP-local shard at copy time), and a
-        manual narrow for the model-local GDN/conv vectors. The source tensor
+        Follows the wan2_2 idiom: one ``named_parameters`` lookup table plus the
+        per-tensor ``weight_loader``, which narrows full checkpoint tensors to
+        the TP-local shard at copy time for both vLLM parallel layers and the
+        plain parameters marked by ``_shard_param_across_tp``. The source tensor
         is dropped each iteration — no copy of the checkpoint is retained.
         """
         params_dict = dict(self.named_parameters())
@@ -2319,10 +2090,10 @@ class SanaWmTransformer3DModel(nn.Module):
                 continue
             weight_loader = getattr(target, "weight_loader", None)
             if callable(weight_loader):
+                # vLLM parallel layers and the plain params marked by
+                # `_shard_param_across_tp` narrow to the local shard here.
                 weight_loader(target, tensor)
             else:
-                if tuple(target.shape) != tuple(tensor.shape):
-                    tensor = self._maybe_shard_loaded_tensor(source_name, tensor, target)
                 if tuple(target.shape) != tuple(tensor.shape):
                     raise ValueError(
                         f"Sana-WM weight shape mismatch for {source_name}: "
