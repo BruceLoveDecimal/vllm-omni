@@ -24,7 +24,6 @@ two-stage pipeline: SANA-WM Stage-1 DiT plus the bundled LTX-2 refiner.
 ## References
 
 - Upstream model card: <https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional>
-- Online serving example: [`examples/online_serving/sana_wm/README.md`](../../examples/online_serving/sana_wm/README.md)
 - Deploy config: [`vllm_omni/deploy/sana_wm.yaml`](../../vllm_omni/deploy/sana_wm.yaml)
 - Video API: [`docs/serving/videos_api.md`](../../docs/serving/videos_api.md)
 
@@ -115,6 +114,31 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
   -F "seed=42" \
   --form-string 'sana_wm={"action":"w-160","translation_speed":0.055,"rotation_speed_deg":1.2,"intrinsics":{"fx":640,"fy":640,"cx":640,"cy":352}}' \
   -o sana_wm_output.mp4
+```
+
+#### Async API
+
+Use `POST /v1/videos` when you want job storage and polling instead of inline
+MP4 bytes. It accepts the same form fields as `/v1/videos/sync`.
+
+```bash
+create_response=$(curl -sS -X POST http://localhost:8091/v1/videos \
+  -H "Accept: application/json" \
+  -F "prompt=A slow forward camera move through a quiet city street." \
+  -F "negative_prompt=blurry, low quality, distorted, watermark" \
+  -F "input_reference=@/path/to/first_frame.png;type=image/png" \
+  -F "width=1280" \
+  -F "height=704" \
+  -F "num_frames=9" \
+  -F "fps=16" \
+  -F "num_inference_steps=2" \
+  -F "guidance_scale=5.0" \
+  -F "seed=42" \
+  --form-string 'sana_wm={"action":"w-8","translation_speed":0.055,"rotation_speed_deg":1.2,"intrinsics":{"fx":640,"fy":640,"cx":640,"cy":352}}')
+
+video_id=$(echo "$create_response" | jq -r '.id')
+curl -sS "http://localhost:8091/v1/videos/${video_id}" | jq .
+curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o sana_wm_output.mp4
 ```
 
 #### Notes
