@@ -32,6 +32,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.norm import RMSNorm, TensorParallelRMSNorm
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
@@ -1378,19 +1379,6 @@ class SanaWmCrossAttention(nn.Module):
             prefix=prefix,
         )
 
-    def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, hidden_size = tensor.shape
-        tensor = tensor.reshape(batch, seq_len, self.num_heads, hidden_size // self.num_heads)
-        return tensor.transpose(1, 2)
-
-    def _reshape_to_seq_heads(self, tensor: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, hidden_size = tensor.shape
-        return tensor.reshape(batch, seq_len, self.num_heads, hidden_size // self.num_heads)
-
-    def _merge_heads(self, tensor: torch.Tensor) -> torch.Tensor:
-        batch, _, seq_len, _ = tensor.shape
-        return tensor.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1402,28 +1390,22 @@ class SanaWmCrossAttention(nn.Module):
         # already this rank's head shard.
         key, value = self.kv_linear(encoder_hidden_states).chunk(2, dim=-1)
         key = self.k_norm(key)
-        if attention_mask is None:
-            query = self._reshape_to_seq_heads(query)
-            key = self._reshape_to_seq_heads(key)
-            value = self._reshape_to_seq_heads(value)
-            attn = self.softmax_attn(query, key, value)
-            return self.proj(attn.flatten(2, 3))
-        # vLLM Attention path does not currently take the SANA-WM prompt
-        # padding mask; fall back to SDPA for exact NVlabs semantics when a
-        # mask is supplied.
-        query = self._split_heads(query)
-        key = self._split_heads(key)
-        value = self._split_heads(value)
-        attn_mask = None
-        if attention_mask is not None:
-            if attention_mask.ndim != 2:
-                raise ValueError(
-                    f"Sana-WM cross-attention mask must be shaped [B, text_len], got {tuple(attention_mask.shape)}."
-                )
-            attn_mask = (1 - attention_mask.to(query.dtype)) * -10000.0
-            attn_mask = attn_mask[:, None, None].repeat(1, self.num_heads, 1, 1)
-        attn = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
-        return self.proj(self._merge_heads(attn))
+        if attention_mask is not None and attention_mask.ndim != 2:
+            raise ValueError(
+                f"Sana-WM cross-attention mask must be shaped [B, text_len], got {tuple(attention_mask.shape)}."
+            )
+        query = self._reshape_to_seq_heads(query)
+        key = self._reshape_to_seq_heads(key)
+        value = self._reshape_to_seq_heads(value)
+        # The prompt padding mask goes to the shared Attention through
+        # ``AttentionMetadata``: backends take the [B, text_len] form directly
+        # and convert/reshape it themselves (``_maybe_reshape_attn_mask``), so
+        # cross-attention keeps backend selection instead of dropping to raw
+        # SDPA. ``None`` keeps the mask-free fast path - callers normalise an
+        # all-ones mask to ``None`` rather than paying for a no-op mask.
+        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        attn = self.softmax_attn(query, key, value, attn_metadata)
+        return self.proj(attn.flatten(2, 3))
 
 
 class _ConvWrapper(nn.Module):
@@ -1903,13 +1885,10 @@ class SanaWmTransformer3DModel(nn.Module):
             dtype=hidden_states.dtype,
         )
         encoder_hidden_states = self.attention_y_norm(encoder_hidden_states)
-        if encoder_attention_mask is None:
-            encoder_attention_mask = torch.ones(
-                encoder_hidden_states.shape[:2],
-                device=hidden_states.device,
-                dtype=torch.float32,
-            )
-        else:
+        # No mask means "attend to every prompt token"; keep it ``None`` so
+        # cross-attention takes the mask-free attention path rather than
+        # building an all-ones mask the backend would have to reshape per block.
+        if encoder_attention_mask is not None:
             encoder_attention_mask = encoder_attention_mask.to(device=hidden_states.device)
             if encoder_attention_mask.shape != encoder_hidden_states.shape[:2]:
                 raise ValueError(

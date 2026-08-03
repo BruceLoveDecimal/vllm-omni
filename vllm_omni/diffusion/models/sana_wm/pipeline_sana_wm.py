@@ -12,7 +12,7 @@ into vLLM-Omni-native layers incrementally.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -207,16 +207,29 @@ def get_sana_wm_pre_process_func(od_config: OmniDiffusionConfig):
         sampling_params = getattr(request, "sampling_params", None)
         prompt = request.prompt
         prompt_mapping = OmniTextPrompt(prompt=prompt) if isinstance(prompt, str) else prompt
+        prompt_mapping = dict(prompt_mapping)
+
+        # The camera block travels as extra_params["sana_wm"], which serving
+        # merges into extra_args. Offline callers may also put it straight on
+        # the prompt.
         if sampling_params is not None:
-            prompt_mapping = dict(prompt_mapping)
-            if getattr(sampling_params, "num_frames", None) not in (None, 1):
-                prompt_mapping.setdefault("num_frames", sampling_params.num_frames)
-            if getattr(sampling_params, "height", None) is not None:
-                prompt_mapping.setdefault("height", sampling_params.height)
-            if getattr(sampling_params, "width", None) is not None:
-                prompt_mapping.setdefault("width", sampling_params.width)
+            extra_args = getattr(sampling_params, "extra_args", None)
+            if isinstance(extra_args, Mapping):
+                block = extra_args.get("sana_wm")
+                if isinstance(block, Mapping):
+                    merged = dict(block)
+                    merged.update(prompt_mapping.get("sana_wm") or {})
+                    prompt_mapping["sana_wm"] = merged
+            # Geometry always comes from the standard sampling fields.
+            for field in ("num_frames", "height", "width"):
+                value = getattr(sampling_params, field, None)
+                if value is not None and not (field == "num_frames" and value == 1):
+                    prompt_mapping[field] = value
+
         request.prompt = normalize_sana_wm_payload(prompt_mapping)
 
+        # Preprocess is the only place the request is normalised, so publish the
+        # canonical geometry back onto sampling_params for the rest of the stack.
         if sampling_params is not None:
             payload = request.prompt["additional_information"]["sana_wm"]
             sampling_params.num_frames = payload["num_frames"]
@@ -861,18 +874,12 @@ class SanaWmPipeline(
         prompt = req.prompts[0]
         if isinstance(prompt, str):
             raise ValueError("Sana-WM requires a mapping prompt with first-frame image and camera/action metadata.")
+        # get_sana_wm_pre_process_func is the single canonical entry point: it
+        # normalises the request and republishes the geometry onto
+        # sampling_params. normalize_sana_wm_payload is idempotent, so this only
+        # covers offline callers that bypass the preprocess hook.
         prompt = normalize_sana_wm_payload(prompt)
         payload = prompt["additional_information"]["sana_wm"]
-
-        if getattr(req.sampling_params, "num_frames", None) not in (None, 1) and int(
-            req.sampling_params.num_frames
-        ) != int(payload["num_frames"]):
-            payload = dict(payload)
-            payload["num_frames"] = int(req.sampling_params.num_frames)
-            prompt = dict(prompt)
-            additional = dict(prompt["additional_information"])
-            additional["sana_wm"] = payload
-            prompt["additional_information"] = additional
 
         # The checkpoint is resolved once in __init__; this is a cached no-op
         # kept as a guard for pipelines constructed without od_config.model.
