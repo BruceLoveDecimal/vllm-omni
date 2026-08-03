@@ -139,6 +139,5 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
   `{"fx":640,"fy":640,"cx":640,"cy":352}` (for 1280x704). This `{fx,fy,cx,cy}`
   mapping is the only accepted intrinsics form; omit `intrinsics` to derive them
   from the output resolution.
-- The deploy config sets `sana_wm_output_type: "np"` so the video API returns
-  decoded MP4 bytes; the pipeline default is `latent`, which serving cannot
-  render.
+- The video API returns decoded MP4 bytes by default. Pass the standard
+  `output_type: "latent"` sampling field when you want raw Stage-1 latents.

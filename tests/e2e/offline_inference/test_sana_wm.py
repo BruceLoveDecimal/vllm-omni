@@ -105,7 +105,6 @@ def _run_sana_wm_e2e(*, output_type: str) -> np.ndarray:
         extra_args["sana_wm_native_max_tokens"] = int(native_max_tokens)
     # Return the requested output type so the shape assertion matches the
     # pipeline output instead of the raw Stage-1 latent default.
-    extra_args["sana_wm_output_type"] = output_type
 
     output = omni.generate(
         {
@@ -135,6 +134,7 @@ def _run_sana_wm_e2e(*, output_type: str) -> np.ndarray:
             num_inference_steps=stage1_steps,
             guidance_scale=1.0,
             guidance_scale_provided=True,
+            output_type=output_type,
             extra_args=extra_args,
         ),
     )

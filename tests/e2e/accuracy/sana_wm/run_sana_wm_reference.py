@@ -24,7 +24,7 @@ carries neither, so the reference root is resolved separately from the native
 pre-conversion snapshots.
 
 ``refiner=None`` keeps the comparison on the Stage-1 DiT + SANA VAE decode,
-matching the native ``SanaWmPipeline`` (``sana_wm_output_type="np"``) path.
+matching the native ``SanaWmPipeline`` (``output_type="np"``) path.
 """
 
 from __future__ import annotations

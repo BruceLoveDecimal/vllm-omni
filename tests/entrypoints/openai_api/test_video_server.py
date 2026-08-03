@@ -1876,7 +1876,7 @@ def test_sync_sana_wm_extra_params_payload_passes_to_engine_prompt(test_client, 
             "extra_params": json.dumps(
                 {
                     "sana_wm": {"action": "d-4", "rotation_speed_deg": 1.5},
-                    "sana_wm_output_type": "np",
+                    "sana_wm_native_max_tokens": 30000,
                 }
             ),
         },
@@ -1888,7 +1888,7 @@ def test_sync_sana_wm_extra_params_payload_passes_to_engine_prompt(test_client, 
     captured_params = engine.captured_sampling_params_list[0]
     assert captured_prompt["sana_wm"]["action"] == "d-4"
     assert captured_prompt["sana_wm"]["rotation_speed_deg"] == 1.5
-    assert captured_params.extra_args["sana_wm_output_type"] == "np"
+    assert captured_params.extra_args["sana_wm_native_max_tokens"] == 30000
 
 
 def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):

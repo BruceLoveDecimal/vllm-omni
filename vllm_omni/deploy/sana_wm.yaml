@@ -31,7 +31,3 @@ stages:
       fps: 16
       num_inference_steps: 60
       guidance_scale: 5.0
-      extra_args:
-        # Decode through the SANA VAE so /v1/videos returns RGB frames. The
-        # pipeline default is "latent", which the serving path cannot render.
-        sana_wm_output_type: "np"

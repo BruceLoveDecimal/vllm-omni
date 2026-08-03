@@ -108,10 +108,8 @@ def _native_video(model: str, num_frames: int, steps: int) -> np.ndarray:
                 num_inference_steps=steps,
                 guidance_scale=CFG_SCALE,
                 guidance_scale_provided=True,
-                extra_args={
-                    "sana_wm_output_type": "np",
-                    "sana_wm_native_max_tokens": 30000,
-                },
+                output_type="np",
+                extra_args={"sana_wm_native_max_tokens": 30000},
             ),
         )
         req = out[0] if isinstance(out, list) else out

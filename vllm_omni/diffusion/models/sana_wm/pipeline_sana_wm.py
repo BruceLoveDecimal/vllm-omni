@@ -833,7 +833,7 @@ class SanaWmPipeline(
             else:
                 latents = stepped
 
-        output_type = str(extra_args.get("sana_wm_output_type", "latent"))
+        output_type = getattr(sampling_params, "output_type", None) or "np"
         output = self._decode_native_latents(latents, output_type=output_type, device=device, dtype=dtype)
         return DiffusionOutput(
             output=build_sana_wm_output_envelope(
