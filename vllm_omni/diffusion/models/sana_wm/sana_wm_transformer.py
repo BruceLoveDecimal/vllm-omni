@@ -706,6 +706,33 @@ class SanaWmSelfAttention(nn.Module):
         )
         self.conv_q_cam = None
         self.conv_v_cam = None
+        # Softmax hybrid blocks (every ``softmax_every_n``-th) and the camera
+        # branch both run plain non-causal self-attention. Routing them through
+        # the shared Attention buys platform backend selection and the fp32
+        # fallback instead of hand-rolled SDPA calls. The camera branch gets its
+        # own module because ``cam_attn_compress`` may give it fewer heads.
+        self.softmax_attn = Attention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            num_kv_heads=self.num_kv_heads,
+            softmax_scale=self.head_dim**-0.5,
+            causal=False,
+            role="self",
+            qkv_layout="BSND",
+            skip_sequence_parallel=True,
+            prefix=prefix,
+        )
+        self.softmax_attn_cam = Attention(
+            num_heads=self.cam_heads,
+            head_size=self.cam_head_dim,
+            num_kv_heads=self.cam_heads,
+            softmax_scale=self.cam_head_dim**-0.5,
+            causal=False,
+            role="self",
+            qkv_layout="BSND",
+            skip_sequence_parallel=True,
+            prefix=prefix,
+        )
         self._init_short_convs()
         self._mark_tp_sharded_params()
 
@@ -945,10 +972,6 @@ class SanaWmSelfAttention(nn.Module):
         batch, seq_len, hidden_size = tensor.shape
         return tensor.reshape(batch, seq_len, self.num_heads, hidden_size // self.num_heads)
 
-    def _merge_heads(self, tensor: torch.Tensor) -> torch.Tensor:
-        batch, _, seq_len, _ = tensor.shape
-        return tensor.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
-
     @staticmethod
     def _downscale_to_reference_rms(
         ref: torch.Tensor,
@@ -1007,21 +1030,14 @@ class SanaWmSelfAttention(nn.Module):
             query = self._apply_rotary_emb(query.permute(0, 2, 3, 1), rotary_emb).permute(0, 3, 1, 2)
             key = self._apply_rotary_emb(key.permute(0, 2, 3, 1), rotary_emb).permute(0, 3, 1, 2)
 
-        query = query.transpose(1, 2)  # (B, H, N, D)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-
-        dtype_orig = hidden_states.dtype
-        # NVlabs runs SDPA in bf16 even under ``fp32_attention=True``, since
-        # FlashAttention only supports bf16/fp16 and fp32 falls back to the math
-        # backend. Demote Q/K/V that an upstream step promoted to fp32. See
+        # NVlabs runs the attention in bf16 even under ``fp32_attention=True``,
+        # since FlashAttention only supports bf16/fp16 and fp32 falls back to
+        # the math backend. Keep Q/K/V at the module dtype so an upstream step
+        # that promoted to fp32 does not silently change the kernel. See
         # ``sana_gdn_camctrl_blocks.py::_forward_softmax_attn_sdpa``.
-        if query.dtype == torch.float32:
-            query = query.bfloat16()
-            key = key.bfloat16()
-            value = value.bfloat16()
-        attn = F.scaled_dot_product_attention(query, key, value)
-        return attn.transpose(1, 2).reshape(batch_size, token_count, q_size).to(dtype_orig)
+        dtype_orig = hidden_states.dtype
+        attn = self.softmax_attn(query.to(dtype_orig), key.to(dtype_orig), value.to(dtype_orig))
+        return attn.reshape(batch_size, token_count, q_size)
 
     def _forward_softmax_cam_branch(
         self,
@@ -1075,36 +1091,17 @@ class SanaWmSelfAttention(nn.Module):
         k_cam_trans = self._downscale_to_reference_rms(k_cam, k_cam_trans)
         v_cam_trans = self._downscale_to_reference_rms(v_cam, v_cam_trans)
 
+        # The shared Attention takes BSND and selects a backend that supports
+        # ``cam_head_dim``, so the branch no longer pads odd head dims up to the
+        # next SDPA-friendly size. Q/K/V stay at the module dtype for the same
+        # reason as the main softmax path above.
         dtype_orig = hidden_states.dtype
-        query = q_cam_trans
-        key = k_cam_trans
-        value = v_cam_trans
-        # Compose Q/K/V in fp32 to honor ``fp32_attention``, then demote for the
-        # bf16 SDPA (see the softmax-attention path above).
-        if getattr(self, "fp32_attention", True):
-            query = query.float()
-            key = key.float()
-            value = value.float()
-        if query.dtype == torch.float32:
-            query = query.bfloat16()
-            key = key.bfloat16()
-            value = value.bfloat16()
-
-        head_dim = query.shape[-1]
-        needs_pad = head_dim not in (32, 64, 128, 256) and head_dim < 256
-        if needs_pad:
-            pad_to = 128 if head_dim <= 128 else 256
-            pad_size = pad_to - head_dim
-            query = F.pad(query, (0, pad_size))
-            key = F.pad(key, (0, pad_size))
-            value = F.pad(value, (0, pad_size))
-
-        out = F.scaled_dot_product_attention(query, key, value)
-        if needs_pad:
-            out = out[..., :head_dim]
-        if out.dtype != dtype_orig:
-            out = out.to(dtype_orig)
-        out = apply_fn_o(out)
+        out = self.softmax_attn_cam(
+            q_cam_trans.transpose(1, 2).to(dtype_orig),
+            k_cam_trans.transpose(1, 2).to(dtype_orig),
+            v_cam_trans.transpose(1, 2).to(dtype_orig),
+        )
+        out = apply_fn_o(out.transpose(1, 2))
         return out.transpose(1, 2).reshape(batch_size, token_count, self.cam_dim)
 
     def _forward_cam_branch(
@@ -1313,8 +1310,8 @@ class SanaWmSelfAttention(nn.Module):
         if rotary_emb is not None:
             query = self._apply_rotary_emb_to_sdpa(query, rotary_emb)
             key = self._apply_rotary_emb_to_sdpa(key, rotary_emb)
-        attn = F.scaled_dot_product_attention(query, key, value)
-        return self._apply_output_gate_and_proj(self._merge_heads(attn), hidden_states)
+        attn = self.softmax_attn(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
+        return self._apply_output_gate_and_proj(attn.flatten(2, 3), hidden_states)
 
 
 class SanaWmCrossAttention(nn.Module):
