@@ -119,6 +119,11 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
 
 #### Notes
 
+- Sequence parallelism is not supported. The bidirectional gated delta
+  recurrence carries state across frames, so a rank cannot denoise a slice
+  of the token sequence in isolation; supporting it needs a distributed scan
+  or an all-gather before the GDN blocks.
+
 - `input_reference` is required for the first frame. Use `image_reference` only
   when you need a JSON-safe image URL or data URL instead of a multipart upload.
 - `sana_wm` must provide exactly one of `action` or `camera`.
