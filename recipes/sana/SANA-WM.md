@@ -8,9 +8,9 @@
 - Model: `BBBBruce/SANA-WM_bidirectional-diffusers` (standard diffusers layout, converted offline from the NVlabs release)
 - Task: First-frame image-to-video generation with camera control
 - Mode: Online serving with the OpenAI-compatible video API
-- Model weights: TODO GB for the Stage-1 transformer and VAE
-- Local disk: reserve TODO GB for the Hugging Face cache and runtime artifacts
-- Recommended GPU: TODO GB or larger CUDA GPU
+- Model weights: about 13 GB for the Stage-1 transformer (10 GB) and VAE (2.3 GB)
+- Local disk: reserve about 40 GB for the Hugging Face cache and runtime artifacts
+- Recommended GPU: 24 GB or larger CUDA GPU
 - Maintainer: Community
 
 ## When to use this recipe
@@ -35,13 +35,18 @@ stage is not supported by this PR; it is a planned follow-up.
 
 #### Capacity
 
-- Model storage: the Stage-1 transformer and VAE are about TODO GB.
-- Disk sizing: provision about TODO GB of local disk or Hugging Face cache volume
+- Model storage: the Stage-1 transformer is about 10 GB and the VAE about
+  2.3 GB. The Gemma text encoder is a separate 4.9 GB repo. Only the
+  `transformer/` and `vae/` subfolders are fetched; the `refiner/` subfolder in
+  the same repo belongs to the two-stage variant and is not downloaded.
+- Disk sizing: provision about 40 GB of local disk or Hugging Face cache volume
   so the model, temporary downloads, and generated artifacts fit without cache
   eviction.
 - GPU sizing: the default 1280x704, 161-frame, 60-step serving profile peaks at
-  about TODO GB of device memory. On smaller GPUs, lower `width`, `height`, or
-  `num_frames` before serving production requests.
+  22.6 GB of device memory and takes about 136 s to generate on one RTX PRO
+  6000 Blackwell. The peak lands in the VAE decode, so keep `vae_use_tiling`
+  on — without it the same request costs about 9 GB more. On smaller GPUs,
+  lower `width`, `height`, or `num_frames` before serving production requests.
 
 #### Environment
 
