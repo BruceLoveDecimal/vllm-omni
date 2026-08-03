@@ -20,6 +20,9 @@ stages:
     enforce_eager: true
     skip_mm_profiling: true
     devices: "0"
+    # The SANA VAE decodes a 161-frame clip about 9 GiB cheaper with tiling on,
+    # and needs it outright for longer requests.
+    vae_use_tiling: true
     engine_args:
       model_class_name: "SanaWmPipeline"
     default_sampling_params:

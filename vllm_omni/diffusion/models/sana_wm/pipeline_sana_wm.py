@@ -441,10 +441,6 @@ class SanaWmPipeline(
                 torch_dtype=dtype,
                 local_files_only=self._component_local_files_only(self.release_paths.root),
             )
-        # Match NVlabs' inference_video_scripts/inference_sana_wm.py VAE
-        # construction. Long videos (e.g. 321 frames -> 41 latent frames)
-        # otherwise decode as one large 3D volume and OOM on a 98GB RTX 6000.
-        self.vae.enable_tiling()
         self.vae.use_framewise_encoding = True
         self.vae.use_framewise_decoding = True
         # NVlabs reads these from its YAML VAE config with 64/96 defaults; the
@@ -456,6 +452,16 @@ class SanaWmPipeline(
     def _ensure_vae(self, *, device: torch.device, dtype: torch.dtype) -> None:
         if self.vae is None:
             self._load_vae(dtype=dtype)
+        # Tiling is re-asserted here, not in _load_vae: registry.py assigns
+        # ``model.vae.use_tiling = od_config.vae_use_tiling`` after the pipeline
+        # is constructed, and that flag defaults to False. Matching NVlabs'
+        # inference_video_scripts/inference_sana_wm.py, the SANA VAE has to
+        # tile — a 161-frame decode costs about 9 GiB more without it, and a
+        # 321-frame request (41 latent frames) decodes as one 3D volume and
+        # OOMs. The deploy YAML sets vae_use_tiling so the intent is visible in
+        # config too; this keeps offline callers that pass no deploy config
+        # from silently losing it.
+        self.vae.use_tiling = True
         self.vae.to(device=device, dtype=dtype)
 
     @staticmethod
