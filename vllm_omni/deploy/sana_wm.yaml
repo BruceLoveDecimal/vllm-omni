@@ -6,8 +6,7 @@
 # dummy_run for SanaWmPipeline.
 #
 # default_sampling_params mirror the NVlabs-recommended production inference
-# config. See recipes/sana/SANA-WM.md and examples/online_serving/sana_wm/README.md
-# for launch and request examples:
+# config. See recipes/sana/SANA-WM.md for launch and request examples:
 #   num_frames=161 (10 s @ 16 fps), num_inference_steps=60, guidance_scale=5.0,
 #   seed=42, fps=16. CFG=5.0 is the real production knob; the native pipeline
 #   honors guidance_scale via the CFG implementation. Callers can override any
