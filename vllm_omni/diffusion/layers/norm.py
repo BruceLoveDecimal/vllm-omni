@@ -3,6 +3,7 @@ from importlib.util import find_spec
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
@@ -240,26 +241,49 @@ class TensorParallelRMSNorm(nn.Module):
         else:
             self.register_parameter("weight", None)
 
-    @staticmethod
-    def _all_reduce(tensor: torch.Tensor) -> None:
-        # Only reached when tp_size > 1, which implies the vLLM TP group is
-        # initialized. Falling back to the default process group would reduce
-        # over the data-parallel world and silently corrupt the RMS, so fail
-        # loudly instead.
-        import vllm.distributed.parallel_state as parallel_state
-
-        tp_group = getattr(parallel_state, "_TP", None)
-        if tp_group is None:
-            raise RuntimeError("TensorParallelRMSNorm requires an initialized vLLM tensor-parallel group.")
-        tp_group.all_reduce(tensor)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
+    def _local_sum_sq(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x_float = x.float()
-        local_sum = x_float.pow(2).sum(dim=-1, keepdim=True)
-        if self.tp_size > 1:
-            self._all_reduce(local_sum)
-        out = x_float * torch.rsqrt(local_sum / self.global_hidden_size + self.eps)
+        return x_float, x_float.pow(2).sum(dim=-1, keepdim=True)
+
+    def _scale(self, x_float: torch.Tensor, global_sum_sq: torch.Tensor, input_dtype: torch.dtype) -> torch.Tensor:
+        out = x_float * torch.rsqrt(global_sum_sq / self.global_hidden_size + self.eps)
         if self.weight is not None:
             out = out * self.weight.float()
         return out.to(dtype=input_dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_float, sum_sq = self._local_sum_sq(x)
+        if self.tp_size > 1:
+            sum_sq = tensor_model_parallel_all_reduce(sum_sq)
+        return self._scale(x_float, sum_sq, x.dtype)
+
+
+def fused_qk_rms_norm(
+    norm_q: nn.Module,
+    norm_k: nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply q/k :class:`TensorParallelRMSNorm` with a SINGLE fused all-reduce.
+
+    Self-attention normalizes q and k every step, and under TP each norm issues
+    its own tiny all-reduce of the per-token sum-of-squares. These collectives
+    are latency-bound, so packing both sums into one tensor halves the count
+    (2 collectives -> 1) for free.
+
+    Numerically identical to ``norm_q(q), norm_k(k)``: all-reduce is
+    elementwise, so packing along the last dim reduces each slice independently
+    with the same fp32 accumulation. Falls back to independent application when
+    either norm is not a :class:`TensorParallelRMSNorm` (e.g. ``nn.Identity``
+    when qk_norm is off, or plain ``RMSNorm`` at TP=1).
+    """
+    if not (isinstance(norm_q, TensorParallelRMSNorm) and isinstance(norm_k, TensorParallelRMSNorm)):
+        return norm_q(q), norm_k(k)
+    if norm_q.tp_size <= 1:
+        return norm_q(q), norm_k(k)
+
+    q_float, q_sum_sq = norm_q._local_sum_sq(q)
+    k_float, k_sum_sq = norm_k._local_sum_sq(k)
+    packed = tensor_model_parallel_all_reduce(torch.cat([q_sum_sq, k_sum_sq], dim=-1))
+    q_sum_sq, k_sum_sq = packed[..., 0:1], packed[..., 1:2]
+    return norm_q._scale(q_float, q_sum_sq, q.dtype), norm_k._scale(k_float, k_sum_sq, k.dtype)

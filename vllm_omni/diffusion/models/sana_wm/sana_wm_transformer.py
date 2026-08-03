@@ -34,7 +34,7 @@ from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.layers.norm import RMSNorm, TensorParallelRMSNorm
+from vllm_omni.diffusion.layers.norm import RMSNorm, TensorParallelRMSNorm, fused_qk_rms_norm
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.ucpe import (
     cam_prep_func,
@@ -873,8 +873,9 @@ class SanaWmSelfAttention(nn.Module):
         else:
             beta, decay = precomputed_gates
 
-        query = self.q_norm(query).reshape(batch_size, token_count, self.num_heads, self.head_dim)
-        key = self.k_norm(key).reshape(batch_size, token_count, self.num_heads, self.head_dim)
+        query, key = fused_qk_rms_norm(self.q_norm, self.k_norm, query, key)
+        query = query.reshape(batch_size, token_count, self.num_heads, self.head_dim)
+        key = key.reshape(batch_size, token_count, self.num_heads, self.head_dim)
         value = value.reshape(batch_size, token_count, self.num_heads, self.head_dim)
 
         query = F.relu(query).permute(0, 2, 3, 1)
@@ -1022,8 +1023,9 @@ class SanaWmSelfAttention(nn.Module):
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        query = self.q_norm(query).reshape(batch_size, token_count, self.num_heads, self.head_dim)
-        key = self.k_norm(key).reshape(batch_size, token_count, self.num_kv_heads, self.head_dim)
+        query, key = fused_qk_rms_norm(self.q_norm, self.k_norm, query, key)
+        query = query.reshape(batch_size, token_count, self.num_heads, self.head_dim)
+        key = key.reshape(batch_size, token_count, self.num_kv_heads, self.head_dim)
         value = value.reshape(batch_size, token_count, self.num_kv_heads, self.head_dim)
 
         if rotary_emb is not None:
@@ -1068,8 +1070,9 @@ class SanaWmSelfAttention(nn.Module):
         if self.conv_v_cam is not None:
             v_cam = self._bidirectional_temporal_short_conv(v_cam, self.conv_v_cam, spatial_shape)
 
-        q_cam = self.q_norm_cam(q_cam).reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
-        k_cam = self.k_norm_cam(k_cam).reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
+        q_cam, k_cam = fused_qk_rms_norm(self.q_norm_cam, self.k_norm_cam, q_cam, k_cam)
+        q_cam = q_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
+        k_cam = k_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
         v_cam = v_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
 
         q_cam = q_cam.transpose(1, 2).contiguous()  # (B, H_cam, N, D)
@@ -1175,9 +1178,11 @@ class SanaWmSelfAttention(nn.Module):
         # 3. q/k RMSNorm through the model's norm modules. Under TP the norm is
         # a TensorParallelRMSNorm, which all-reduces the squared sum so the
         # denominator spans the global channel width; doing the RMS inside
-        # cam_prep_func would normalise over this rank's head shard only.
-        q_normed = self.q_norm_cam(q_cam).reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
-        k_normed = self.k_norm_cam(k_cam).reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
+        # cam_prep_func would normalise over this rank's head shard only. q and
+        # k share a shape here, so the two reductions fuse into one.
+        q_cam, k_cam = fused_qk_rms_norm(self.q_norm_cam, self.k_norm_cam, q_cam, k_cam)
+        q_normed = q_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
+        k_normed = k_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
 
         # 4-6. Cam-prep semantics: ReLU/K-scale, UCPE projection, RoPE, and K
         # inflation tracking. Outputs already use NVlabs' ``(B, H, D, N)`` scan
@@ -1304,8 +1309,9 @@ class SanaWmSelfAttention(nn.Module):
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
-        query = self._split_heads(self.q_norm(query))
-        key = self._split_heads(self.k_norm(key))
+        query, key = fused_qk_rms_norm(self.q_norm, self.k_norm, query, key)
+        query = self._split_heads(query)
+        key = self._split_heads(key)
         value = self._split_heads(value)
         if rotary_emb is not None:
             query = self._apply_rotary_emb_to_sdpa(query, rotary_emb)
