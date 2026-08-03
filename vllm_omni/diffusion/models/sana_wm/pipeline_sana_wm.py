@@ -24,6 +24,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import (
@@ -44,6 +45,7 @@ from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SanaWmTransformer3DModel,
 )
 from vllm_omni.diffusion.models.schedulers import FlowMatchEulerDiscreteScheduler
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -297,6 +299,9 @@ class SanaWmPipeline(
             quant_config=self.quant_config,
             prefix=f"{prefix}.transformer" if prefix else "transformer",
         )
+        self.device = get_local_device()
+        if od_config is not None and od_config.model is not None:
+            self._build_aux_components()
 
     def resolve_checkpoint(self) -> SanaWmLocalPaths:
         if self.release_paths is not None:
@@ -340,27 +345,57 @@ class SanaWmPipeline(
         dtype = getattr(self.od_config, "dtype", None) if self.od_config is not None else None
         if isinstance(dtype, torch.dtype):
             return dtype
-        return torch.bfloat16 if device.type == "cuda" else torch.float32
+        return torch.float32 if device.type == "cpu" else torch.bfloat16
 
     def _runtime_device_dtype(self) -> tuple[torch.device, torch.dtype]:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return device, self._native_dtype(device)
+        return self.device, self._native_dtype(self.device)
 
-    def _checkpoint_local_files_only(self) -> bool:
-        if self.release_paths is not None:
-            return True
-        if self.od_config is None or self.od_config.model is None:
-            return False
-        return Path(str(self.od_config.model)).expanduser().exists()
+    def _build_aux_components(self) -> None:
+        """Construct the text encoder and VAE at startup, on CPU.
 
-    def _ensure_stage1_text_encoder(self, *, device: torch.device, dtype: torch.dtype) -> None:
-        if self.text_encoder is not None:
-            self.text_encoder.to(device=device, dtype=dtype)
+        ``ModuleDiscovery`` skips attributes that are ``None``, so components
+        created lazily on the first request are invisible to sequential
+        offload, HSDP auxiliary placement, and the shared device/memory
+        lifecycle. Building them here and deferring placement to the common
+        logic mirrors LTX-2's ``initialize_pipeline_components``.
+        """
+        dtype = self._native_dtype(self.device)
+        self._load_stage1_text_encoder(dtype=dtype)
+        self._load_vae(dtype=dtype)
+        self._place_aux_components()
+
+    def _place_aux_components(self) -> None:
+        """Move the discovered auxiliary components onto the local device.
+
+        Skipped when offload or HSDP owns placement — those paths expect the
+        components to still be on CPU when they take over.
+        """
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        if (
+            getattr(self.od_config, "enable_cpu_offload", False)
+            or getattr(self.od_config, "enable_layerwise_offload", False)
+            or getattr(parallel_config, "use_hsdp", False)
+        ):
             return
+        modules = ModuleDiscovery.discover(self)
+        for module in (*modules.encoders, *modules.vaes, *modules.resident_modules):
+            module.to(self.device)
 
+    @staticmethod
+    def _component_local_files_only(model_id: Any) -> bool:
+        """Decide download policy per component, from its own model id.
+
+        The Stage-1 release directory is local once ``resolve_checkpoint`` has
+        run, but the Gemma text encoder lives in a separate Hub repo. Deriving
+        locality from the release paths forced ``local_files_only=True`` onto
+        Gemma as well, which forbids the download on a box that has not cached
+        it yet.
+        """
+        return Path(str(model_id)).expanduser().exists()
+
+    def _load_stage1_text_encoder(self, *, dtype: torch.dtype) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        local_files_only = self._checkpoint_local_files_only()
         model_ids = [os.environ.get(SANA_WM_STAGE1_TEXT_ENCODER_ENV, "").strip()]
         model_ids.extend([SANA_WM_STAGE1_TEXT_ENCODER_ID, SANA_WM_STAGE1_TEXT_ENCODER_FALLBACK_ID])
         errors: list[str] = []
@@ -368,7 +403,7 @@ class SanaWmPipeline(
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     model_id,
-                    local_files_only=local_files_only,
+                    local_files_only=self._component_local_files_only(model_id),
                 )
                 text_encoder_model_id = model_id
                 break
@@ -383,13 +418,15 @@ class SanaWmPipeline(
             self.text_encoder = AutoModelForCausalLM.from_pretrained(
                 text_encoder_model_id,
                 torch_dtype=dtype,
-                local_files_only=local_files_only,
-            ).to(device)
+                local_files_only=self._component_local_files_only(text_encoder_model_id),
+            )
 
-    def _ensure_vae(self, *, device: torch.device, dtype: torch.dtype) -> None:
-        if self.vae is not None:
-            self.vae.to(device=device, dtype=dtype)
-            return
+    def _ensure_stage1_text_encoder(self, *, device: torch.device, dtype: torch.dtype) -> None:
+        if self.text_encoder is None:
+            self._load_stage1_text_encoder(dtype=dtype)
+        self.text_encoder.to(device=device, dtype=dtype)
+
+    def _load_vae(self, *, dtype: torch.dtype) -> None:
         if self.release_paths is None and self.od_config is not None and self.od_config.model is not None:
             self.resolve_checkpoint()
         if self.release_paths is None:
@@ -402,8 +439,8 @@ class SanaWmPipeline(
                 str(self.release_paths.root),
                 subfolder="vae",
                 torch_dtype=dtype,
-                local_files_only=True,
-            ).to(device)
+                local_files_only=self._component_local_files_only(self.release_paths.root),
+            )
         # Match NVlabs' inference_video_scripts/inference_sana_wm.py VAE
         # construction. Long videos (e.g. 321 frames -> 41 latent frames)
         # otherwise decode as one large 3D volume and OOM on a 98GB RTX 6000.
@@ -415,6 +452,11 @@ class SanaWmPipeline(
         # are load-bearing (the keys are genuinely absent here).
         self.vae.tile_sample_stride_num_frames = int(getattr(self.vae.config, "tile_sample_stride_num_frames", 64))
         self.vae.tile_sample_min_num_frames = int(getattr(self.vae.config, "tile_sample_min_num_frames", 96))
+
+    def _ensure_vae(self, *, device: torch.device, dtype: torch.dtype) -> None:
+        if self.vae is None:
+            self._load_vae(dtype=dtype)
+        self.vae.to(device=device, dtype=dtype)
 
     @staticmethod
     def _preprocess_first_frame(
