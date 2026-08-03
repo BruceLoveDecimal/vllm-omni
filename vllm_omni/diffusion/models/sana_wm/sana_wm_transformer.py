@@ -1386,6 +1386,10 @@ class SanaWmCrossAttention(nn.Module):
             prefix=prefix,
         )
 
+    def _reshape_to_seq_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, hidden_size = tensor.shape
+        return tensor.reshape(batch, seq_len, self.num_heads, hidden_size // self.num_heads)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
