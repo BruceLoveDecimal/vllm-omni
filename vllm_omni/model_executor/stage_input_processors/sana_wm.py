@@ -24,6 +24,10 @@ SANA_WM_DEFAULT_HEIGHT = 704
 SANA_WM_DEFAULT_WIDTH = 1280
 SANA_WM_DEFAULT_CAMERA_FORMAT = "c2w_4x4"
 SANA_WM_DEFAULT_COORDINATE_SYSTEM = "official"
+# LTX-2 VAE compression ratios. Duplicated from pipeline_sana_wm to keep the
+# request path free of a circular import back into the pipeline module.
+SANA_WM_VAE_SPATIAL_COMPRESSION = 32
+SANA_WM_VAE_TEMPORAL_COMPRESSION = 8
 
 
 def _unwrap_single(value: Any) -> Any:
@@ -118,6 +122,24 @@ def _first_present(*values: Any) -> Any:
     return None
 
 
+def _validate_latent_geometry(*, num_frames: int, height: int, width: int) -> None:
+    """Reject geometry the VAE would silently floor.
+
+    The SANA-WM VAE compresses 32x spatially and 8x temporally, so a request
+    that is not aligned loses pixels/frames instead of failing.
+    """
+    if height % SANA_WM_VAE_SPATIAL_COMPRESSION or width % SANA_WM_VAE_SPATIAL_COMPRESSION:
+        raise ValueError(
+            f"Sana-WM height and width must be divisible by {SANA_WM_VAE_SPATIAL_COMPRESSION}, "
+            f"got {height} and {width}."
+        )
+    if (num_frames - 1) % SANA_WM_VAE_TEMPORAL_COMPRESSION:
+        raise ValueError(
+            f"Sana-WM num_frames must satisfy (num_frames - 1) % {SANA_WM_VAE_TEMPORAL_COMPRESSION} == 0, "
+            f"got {num_frames}."
+        )
+
+
 def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool = True) -> dict[str, Any]:
     """Return a prompt copy with canonical Sana-WM request metadata.
 
@@ -153,6 +175,7 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool 
         name="height",
     )
     width = _as_positive_int(_first_present(raw.get("width"), result.get("width"), SANA_WM_DEFAULT_WIDTH), name="width")
+    _validate_latent_geometry(num_frames=num_frames, height=height, width=width)
 
     camera = raw.get("camera")
     camera = _as_dict(camera, name="camera") if camera is not None else None

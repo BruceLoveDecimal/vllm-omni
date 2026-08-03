@@ -228,8 +228,15 @@ def _bidirectional_delta_scan(
     frames = beta.shape[2]
 
     num_fwd, den_fwd = _delta_scan(
-        query_rot, key_rot, value, beta, decay,
-        spatial_tokens=spatial_tokens, query=query, key=key, skip_z=skip_z,
+        query_rot,
+        key_rot,
+        value,
+        beta,
+        decay,
+        spatial_tokens=spatial_tokens,
+        query=query,
+        key=key,
+        skip_z=skip_z,
     )
 
     def to_time(tensor: torch.Tensor) -> torch.Tensor:
