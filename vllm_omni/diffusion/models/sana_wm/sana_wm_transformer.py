@@ -22,6 +22,7 @@ from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -643,6 +644,13 @@ class SanaWmSelfAttention(nn.Module):
             hidden_size,
             bias=True,
             input_is_parallel=True,
+            # The camera contribution is summed into the TP-local GDN stream, so
+            # the cross-rank sum and the slice down to the local width collapse
+            # into a single reduce-scatter (see _reduce_scatter_cam_contrib).
+            # RowParallelLinear must therefore not all-reduce, and its bias is
+            # applied after the scatter rather than inside the matmul.
+            reduce_results=False,
+            skip_bias_add=True,
             return_bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj_cam" if prefix else "out_proj_cam",
@@ -917,42 +925,36 @@ class SanaWmSelfAttention(nn.Module):
         gated = combined * gate
         return self.proj(gated.to(self.proj.weight.dtype))
 
-    @staticmethod
-    def _match_local_inner_dim(contrib: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
-        """Slice a replicated TP contribution down to the local inner dimension.
+    def _reduce_scatter_cam_contrib(self, contrib: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        """Reduce the partial camera projection straight down to the local shard.
 
-        The camera branch's ``out_proj_cam`` is a ``RowParallelLinear``: every
-        rank holds a slice of the camera features, so producing the projection
-        requires summing across ranks, and the all-reduce leaves every rank with
-        the same full-width result. The GDN raw stream it is added to is TP-local
-        (``output_gate`` and ``proj`` both expect the local width), so each rank
-        takes its own head slice of that replicated tensor - the same pattern
-        t5_encoder uses for its relative-attention bias and LTX-2 for its rope
-        table.
+        ``out_proj_cam`` is row-parallel over the camera features, so each rank
+        produces a partial sum spanning the full hidden width. The GDN stream it
+        is added to is TP-local (``output_gate`` and ``proj`` both expect the
+        local width), so an all-reduce would hand every rank the full result
+        only for all but one slice of it to be discarded. Reduce-scatter does
+        both steps in one collective and moves 1/tp of the bytes.
 
-        This is the one place the model still needs the TP rank. It cannot be
-        expressed as a different parallel layer: rank r only needs slice r of a
-        cross-rank sum, which is a reduce-scatter, and ``RowParallelLinear`` only
-        offers all-reduce or no reduction at all. Switching to a reduce-scatter
-        would halve the traffic here and remove the rank math - worth doing as a
-        separate perf change, once it can be measured on multi-GPU.
+        ``skip_bias_add`` keeps the bias out of the matmul so it can be applied
+        to the scattered shard; that slice is the only remaining use of the TP
+        rank here, and it is a 1-D view rather than a copy of the hidden tensor.
         """
-        if contrib.shape[-1] == reference.shape[-1]:
-            return contrib
+        bias = self.out_proj_cam.bias
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return contrib if bias is None else contrib + bias
+
         local_width = reference.shape[-1]
-        if local_width <= 0 or contrib.shape[-1] % local_width != 0:
+        if local_width <= 0 or contrib.shape[-1] != local_width * tp_size:
             raise ValueError(
-                f"Sana-WM TP contribution width mismatch: contrib={contrib.shape[-1]} reference={local_width}."
+                "Sana-WM TP camera contribution width mismatch: "
+                f"contrib={contrib.shape[-1]} expected={local_width * tp_size} (local={local_width}, tp={tp_size})."
             )
-        tp_rank = get_tensor_model_parallel_rank()
-        start = tp_rank * local_width
-        end = start + local_width
-        if end > contrib.shape[-1]:
-            raise ValueError(
-                "Sana-WM TP contribution slice is out of range: "
-                f"rank={tp_rank} slice=({start}, {end}) width={contrib.shape[-1]}."
-            )
-        return contrib[..., start:end].contiguous()
+        out = tensor_model_parallel_reduce_scatter(contrib.contiguous(), dim=-1)
+        if bias is not None:
+            start = get_tensor_model_parallel_rank() * local_width
+            out = out + bias[start : start + local_width]
+        return out
 
     def _forward_gdn(
         self,
@@ -1285,7 +1287,7 @@ class SanaWmSelfAttention(nn.Module):
                 precomputed_gates=(beta, decay),
             )
             cam_contrib = self.out_proj_cam(cam_raw)
-            cam_contrib = self._match_local_inner_dim(cam_contrib, main_raw)
+            cam_contrib = self._reduce_scatter_cam_contrib(cam_contrib, main_raw)
             combined = main_raw + cam_contrib.to(main_raw.dtype)
             attn_out = self._apply_output_gate_and_proj(combined, hidden_states)
             return attn_out
@@ -1300,7 +1302,7 @@ class SanaWmSelfAttention(nn.Module):
                     rotary_emb,
                 )
                 cam_contrib = self.out_proj_cam(cam_raw)
-                cam_contrib = self._match_local_inner_dim(cam_contrib, main_raw)
+                cam_contrib = self._reduce_scatter_cam_contrib(cam_contrib, main_raw)
                 main_raw = main_raw + cam_contrib.to(main_raw.dtype)
             return self._apply_output_gate_and_proj(main_raw, hidden_states)
 
