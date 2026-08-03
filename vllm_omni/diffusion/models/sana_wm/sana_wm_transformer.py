@@ -33,10 +33,6 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed.sp_plan import (
-    SequenceParallelInput,
-    SequenceParallelOutput,
-)
 from vllm_omni.diffusion.layers.norm import RMSNorm, TensorParallelRMSNorm
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.ucpe import (
@@ -75,25 +71,6 @@ def _is_sana_wm_transformer_block(name: str, module: Any) -> bool:
 
 def _prod(values: tuple[int, ...]) -> int:
     return reduce(mul, values, 1)
-
-
-def _build_sana_wm_sp_plan() -> dict[str, Any]:
-    """Declare Sana-WM Stage-1 sequence sharding boundaries.
-
-    The first transformer block is the earliest point where video latents have
-    already been patchified to ``[B, seq, hidden]``. The final layer is the last
-    sequence-shaped output before unpatchify, so it is the natural gather point.
-    RoPE is kept unsharded for now because the native GDN path consumes temporal
-    layout information and needs a separate multi-card correctness pass.
-    """
-
-    return {
-        "blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
-            "camera_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
-        },
-        "final_layer": SequenceParallelOutput(gather_dim=1, expected_dims=3),
-    }
 
 
 def _to_3tuple(value: int | tuple[int, int] | tuple[int, int, int]) -> tuple[int, int, int]:
@@ -1256,26 +1233,27 @@ class SanaWmSelfAttention(nn.Module):
         if self.conv_v_cam is not None:
             v_cam = self._bidirectional_temporal_short_conv(v_cam, self.conv_v_cam, spatial_shape)
 
-        # 3-6. Fused cam-prep semantics: RMSNorm/ReLU/K-scale, UCPE
-        # projection, RoPE, and K inflation tracking. Outputs already use
-        # NVlabs' ``(B, H, D, N)`` scan layout.
-        q_raw = q_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).contiguous()
-        k_raw = k_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).contiguous()
+        # 3. q/k RMSNorm through the model's norm modules. Under TP the norm is
+        # a TensorParallelRMSNorm, which all-reduces the squared sum so the
+        # denominator spans the global channel width; doing the RMS inside
+        # cam_prep_func would normalise over this rank's head shard only.
+        q_normed = self.q_norm_cam(q_cam).reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
+        k_normed = self.k_norm_cam(k_cam).reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
+
+        # 4-6. Cam-prep semantics: ReLU/K-scale, UCPE projection, RoPE, and K
+        # inflation tracking. Outputs already use NVlabs' ``(B, H, D, N)`` scan
+        # layout.
         v_raw = v_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).contiguous()
         k_scale = (self.cam_head_dim**-0.5) * (spatial_tokens**-0.5)
-        norm_eps_val = float(getattr(self.q_norm_cam, "eps", getattr(self.q_norm_cam, "variance_epsilon", 1e-6)))
         q_rot_bhdn, k_rot_bhdn, v_bhdn, inflation_sq = cam_prep_func(
-            q_raw,
-            k_raw,
+            q_normed.contiguous(),
+            k_normed.contiguous(),
             v_raw,
-            q_norm_weight=self.q_norm_cam.weight.float().contiguous(),
-            k_norm_weight=self.k_norm_cam.weight.float().contiguous(),
             proj_q=cam_prep_context.proj_q,
             proj_kv=cam_prep_context.proj_kv,
             rope_cos=cam_prep_context.rope_cos,
             rope_sin=cam_prep_context.rope_sin,
             k_scale=k_scale,
-            norm_eps=norm_eps_val,
         )
 
         # 7. Dynamic Beta Discounting (per-frame mean over spatial tokens).
@@ -1803,7 +1781,6 @@ class SanaWmTransformer3DModel(nn.Module):
     _repeated_blocks: ClassVar[list[str]] = ["SanaWmBlock"]
     _layerwise_offload_blocks_attr: ClassVar[str] = "blocks"
     _hsdp_shard_conditions: ClassVar[list[Any]] = [_is_sana_wm_transformer_block]
-    _sp_plan: ClassVar[dict[str, Any]] = _build_sana_wm_sp_plan()
 
     def __init__(
         self,

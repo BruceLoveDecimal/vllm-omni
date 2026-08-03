@@ -435,8 +435,6 @@ def _validate_cam_prep_inputs(
     q_raw: torch.Tensor,
     k_raw: torch.Tensor,
     v_raw: torch.Tensor,
-    q_norm_weight: torch.Tensor,
-    k_norm_weight: torch.Tensor,
     proj_q: torch.Tensor,
     proj_kv: torch.Tensor,
     rope_cos: torch.Tensor,
@@ -459,20 +457,7 @@ def _validate_cam_prep_inputs(
             "Sana-WM cam prep rope table shapes must be "
             f"{(token_count, half_dim)}, got {tuple(rope_cos.shape)} and {tuple(rope_sin.shape)}."
         )
-    channel_count = num_heads * head_dim
-    if q_norm_weight.numel() != channel_count or k_norm_weight.numel() != channel_count:
-        raise ValueError(
-            "Sana-WM cam prep norm weights must have H*D elements, got "
-            f"{q_norm_weight.numel()} and {k_norm_weight.numel()} for H*D={channel_count}."
-        )
     return batch, token_count, num_heads, head_dim, half_dim
-
-
-def _rms_norm_cam(raw: torch.Tensor, weight: torch.Tensor, norm_eps: float) -> torch.Tensor:
-    batch, token_count, num_heads, head_dim = raw.shape
-    inv_rms = torch.rsqrt(raw.float().square().sum(dim=(-1, -2)) / float(num_heads * head_dim) + norm_eps)
-    weight_view = weight.float().reshape(num_heads, head_dim)
-    return raw.float() * inv_rms.reshape(batch, token_count, 1, 1) * weight_view.reshape(1, 1, num_heads, head_dim)
 
 
 def _apply_ray_projection(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
@@ -492,53 +477,50 @@ def _apply_interleaved_rope(feats: torch.Tensor, rope_cos: torch.Tensor, rope_si
 
 
 def cam_prep_func(
-    q_raw: torch.Tensor,
-    k_raw: torch.Tensor,
+    q_normed: torch.Tensor,
+    k_normed: torch.Tensor,
     v_raw: torch.Tensor,
     *,
-    q_norm_weight: torch.Tensor,
-    k_norm_weight: torch.Tensor,
     proj_q: torch.Tensor,
     proj_kv: torch.Tensor,
     rope_cos: torch.Tensor,
     rope_sin: torch.Tensor,
     k_scale: float,
-    norm_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Native equivalent of NVlabs ``cam_prep_func``.
 
+    The caller is responsible for the q/k RMSNorm, which must run through the
+    model's norm modules so a tensor-parallel shard still normalises over the
+    global channel width. This function only applies ReLU, the K scale, the
+    UCPE ray projection and RoPE.
+
     Args:
-        q_raw: ``(B, N, H, D)`` raw camera Q.
-        k_raw: ``(B, N, H, D)`` raw camera K. K must already include the
-            temporal short convolution.
+        q_normed: ``(B, N, H, D)`` camera Q, already RMSNorm'd.
+        k_normed: ``(B, N, H, D)`` camera K, already RMSNorm'd. K must also
+            include the temporal short convolution.
         v_raw: ``(B, N, H, D)`` raw camera V.
-        q_norm_weight: flattened ``(H*D,)`` Q RMSNorm weight.
-        k_norm_weight: flattened ``(H*D,)`` K RMSNorm weight.
         proj_q: ``(B, N, 4, 4)`` Q ray projection matrices.
         proj_kv: ``(B, N, 4, 4)`` K/V ray projection matrices.
         rope_cos: ``(N, D//2)`` interleaved-pair RoPE cosine table.
         rope_sin: ``(N, D//2)`` interleaved-pair RoPE sine table.
         k_scale: ``D^-0.5 * spatial_tokens^-0.5``.
-        norm_eps: RMSNorm epsilon.
 
     Returns:
         ``q_trans``, ``k_trans``, ``v_trans`` in ``(B, H, D, N)`` layout, and
         ``inflation_sq`` in ``(B, H, N)``.
     """
     batch, token_count, num_heads, head_dim, half_dim = _validate_cam_prep_inputs(
-        q_raw,
-        k_raw,
+        q_normed,
+        k_normed,
         v_raw,
-        q_norm_weight,
-        k_norm_weight,
         proj_q,
         proj_kv,
         rope_cos,
         rope_sin,
     )
 
-    q_norm = torch.relu(_rms_norm_cam(q_raw, q_norm_weight, norm_eps))
-    k_norm = torch.relu(_rms_norm_cam(k_raw, k_norm_weight, norm_eps)) * float(k_scale)
+    q_norm = torch.relu(q_normed.float())
+    k_norm = torch.relu(k_normed.float()) * float(k_scale)
     value = v_raw.float()
 
     q_half = _apply_ray_projection(q_norm[..., :half_dim], proj_q)
@@ -555,7 +537,7 @@ def cam_prep_func(
     inflation_sq = k_post_sq.clamp_min(1e-12) / k_pre_sq.clamp_min(1e-12)
 
     def to_bhdn(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.permute(0, 2, 3, 1).contiguous().to(q_raw.dtype)
+        return tensor.permute(0, 2, 3, 1).contiguous().to(v_raw.dtype)
 
     q_out = to_bhdn(torch.cat((q_half, q_rope), dim=-1))
     k_out = to_bhdn(k_post)
