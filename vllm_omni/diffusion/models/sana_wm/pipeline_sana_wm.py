@@ -198,33 +198,6 @@ def build_sana_wm_output_envelope(
     return {"payload": {payload_key: output}, "metadata": {"sana_wm": metadata}}
 
 
-def read_sana_wm_envelope_payload(output: Any) -> Any:
-    """Return the single payload value carried by a SANA-WM output envelope."""
-    payload = output.get("payload") if isinstance(output, dict) else None
-    if not isinstance(payload, dict) or len(payload) != 1:
-        raise ValueError("Expected a single-entry SANA-WM output envelope from the Stage-1 backend.")
-    return next(iter(payload.values()))
-
-
-def read_sana_wm_envelope_metadata(output: Any) -> dict[str, Any]:
-    """Return the ``sana_wm`` metadata group of a SANA-WM output envelope."""
-    metadata = output.get("metadata") if isinstance(output, dict) else None
-    group = metadata.get("sana_wm") if isinstance(metadata, dict) else None
-    return dict(group) if isinstance(group, dict) else {}
-
-
-def get_sana_wm_post_process_func(od_config: OmniDiffusionConfig):
-    del od_config
-
-    def post_process_func(output: Any) -> Any:
-        # The pipeline already decodes to the requested output type and emits the
-        # payload/metadata envelope the formatter normalizes, so postprocess is a
-        # pass-through.
-        return output
-
-    return post_process_func
-
-
 def get_sana_wm_pre_process_func(od_config: OmniDiffusionConfig):
     del od_config
 

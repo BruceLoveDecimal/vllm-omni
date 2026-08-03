@@ -540,7 +540,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
-    "SanaWmPipeline": "get_sana_wm_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
