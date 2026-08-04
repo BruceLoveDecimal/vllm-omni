@@ -796,8 +796,6 @@ class SanaWmPipeline(
         if spatial_raymap is not None:
             spatial_raymap = spatial_raymap.to(device=device, dtype=dtype)
 
-        self.transformer.config = self.sana_wm_config
-
         # Build a per-frame condition mask matching NVlabs ``LTXFlowEuler``:
         # frame 0 is the conditioning frame at sigma=0 (preserved after
         # each ``scheduler.step``), all other frames carry the current

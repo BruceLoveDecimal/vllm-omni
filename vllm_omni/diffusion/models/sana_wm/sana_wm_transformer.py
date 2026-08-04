@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from functools import reduce
-from operator import mul
 from typing import Any, ClassVar
 
 import torch
@@ -46,7 +44,6 @@ from vllm_omni.diffusion.models.sana_wm.ucpe import (
 SANA_WM_STAGE1_LATENT_CHANNELS = 128
 SANA_WM_STAGE1_PROMPT_CHANNELS = 2304
 SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
-SANA_WM_DISABLE_VLLM_OPS_ENV = "VLLM_OMNI_SANA_WM_DISABLE_VLLM_OPS"
 
 
 def _shard_param_across_tp(param: torch.Tensor | None, dim: int = 0) -> None:
@@ -69,10 +66,6 @@ def _is_sana_wm_transformer_block(name: str, module: Any) -> bool:
     del module
     parts = name.split(".")
     return len(parts) == 2 and parts[0] == "blocks" and parts[1].isdigit()
-
-
-def _prod(values: tuple[int, ...]) -> int:
-    return reduce(mul, values, 1)
 
 
 def _to_3tuple(value: int | tuple[int, int] | tuple[int, int, int]) -> tuple[int, int, int]:
@@ -776,10 +769,6 @@ class SanaWmSelfAttention(nn.Module):
         output = torch.view_as_real(rotated * freqs).flatten(3, 4).permute(0, 1, 3, 2)
         return output.type_as(hidden_states)
 
-    @classmethod
-    def _apply_rotary_emb_to_sdpa(cls, hidden_states: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        return cls._apply_rotary_emb(hidden_states.transpose(2, 3), freqs).transpose(2, 3)
-
     @staticmethod
     def _reshape_to_temporal(
         hidden_states: torch.Tensor,
@@ -965,15 +954,6 @@ class SanaWmSelfAttention(nn.Module):
         """Main-branch only GDN forward with output_gate + proj applied."""
         raw, _ = self._forward_gdn_raw(hidden_states, spatial_shape, rotary_emb)
         return self._apply_output_gate_and_proj(raw, hidden_states)
-
-    def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, hidden_size = tensor.shape
-        tensor = tensor.reshape(batch, seq_len, self.num_heads, hidden_size // self.num_heads)
-        return tensor.transpose(1, 2)
-
-    def _reshape_to_seq_heads(self, tensor: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, hidden_size = tensor.shape
-        return tensor.reshape(batch, seq_len, self.num_heads, hidden_size // self.num_heads)
 
     @staticmethod
     def _downscale_to_reference_rms(
@@ -1238,7 +1218,7 @@ class SanaWmSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        spatial_shape: tuple[int, int, int] | None = None,
+        spatial_shape: tuple[int, int, int],
         rotary_emb: torch.Tensor | None = None,
         cam_geometry: SanaWmCamGeometry | None = None,
     ) -> torch.Tensor:
@@ -1250,7 +1230,7 @@ class SanaWmSelfAttention(nn.Module):
         branch consumes ``hidden_states`` as its sole Q/K/V source and applies
         those transforms to the Q/K/V channels via UCPE.
         """
-        if spatial_shape is not None and self.use_gdn:
+        if self.use_gdn:
             if cam_geometry is None or self.q_proj_cam is None:
                 # Main branch only — preserves legacy path when the request
                 # has no camera info or the cam projections were not built.
@@ -1277,34 +1257,18 @@ class SanaWmSelfAttention(nn.Module):
             attn_out = self._apply_output_gate_and_proj(combined, hidden_states)
             return attn_out
 
-        if spatial_shape is not None:
-            main_raw = self._forward_softmax_raw(hidden_states, spatial_shape, rotary_emb)
-            if cam_geometry is not None and self.q_proj_cam is not None:
-                cam_raw = self._forward_softmax_cam_branch(
-                    hidden_states,
-                    spatial_shape,
-                    cam_geometry,
-                    rotary_emb,
-                )
-                cam_contrib = self.out_proj_cam(cam_raw)
-                cam_contrib = self._reduce_scatter_cam_contrib(cam_contrib, main_raw)
-                main_raw = main_raw + cam_contrib.to(main_raw.dtype)
-            return self._apply_output_gate_and_proj(main_raw, hidden_states)
-
-        # Shape-only fallback for legacy callers that do not provide a token-grid shape.
-        qkv = self.qkv(hidden_states)
-        q_size = self.num_heads * self.head_dim
-        kv_size = self.num_kv_heads * self.head_dim
-        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
-        query, key = fused_qk_rms_norm(self.q_norm, self.k_norm, query, key)
-        query = self._split_heads(query)
-        key = self._split_heads(key)
-        value = self._split_heads(value)
-        if rotary_emb is not None:
-            query = self._apply_rotary_emb_to_sdpa(query, rotary_emb)
-            key = self._apply_rotary_emb_to_sdpa(key, rotary_emb)
-        attn = self.softmax_attn(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
-        return self._apply_output_gate_and_proj(attn.flatten(2, 3), hidden_states)
+        main_raw = self._forward_softmax_raw(hidden_states, spatial_shape, rotary_emb)
+        if cam_geometry is not None and self.q_proj_cam is not None:
+            cam_raw = self._forward_softmax_cam_branch(
+                hidden_states,
+                spatial_shape,
+                cam_geometry,
+                rotary_emb,
+            )
+            cam_contrib = self.out_proj_cam(cam_raw)
+            cam_contrib = self._reduce_scatter_cam_contrib(cam_contrib, main_raw)
+            main_raw = main_raw + cam_contrib.to(main_raw.dtype)
+        return self._apply_output_gate_and_proj(main_raw, hidden_states)
 
 
 class SanaWmCrossAttention(nn.Module):
@@ -1641,7 +1605,7 @@ class SanaWmFinalLayer(nn.Module):
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.scale_shift_table = nn.Parameter(torch.zeros(2, hidden_size))
         self.out_channels = out_channels
-        out_features = _prod(patch_size) * out_channels
+        out_features = math.prod(patch_size) * out_channels
         self.linear: nn.Module = ColumnParallelLinear(
             hidden_size,
             out_features,
