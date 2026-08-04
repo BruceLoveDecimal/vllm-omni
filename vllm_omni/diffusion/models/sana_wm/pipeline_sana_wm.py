@@ -394,7 +394,7 @@ class SanaWmPipeline(
         return Path(str(model_id)).expanduser().exists()
 
     def _load_stage1_text_encoder(self, *, dtype: torch.dtype) -> None:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModel, AutoTokenizer
 
         model_ids = [os.environ.get(SANA_WM_STAGE1_TEXT_ENCODER_ENV, "").strip()]
         model_ids.extend([SANA_WM_STAGE1_TEXT_ENCODER_ID, SANA_WM_STAGE1_TEXT_ENCODER_FALLBACK_ID])
@@ -415,7 +415,10 @@ class SanaWmPipeline(
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
         with torch.device("cpu"):
-            self.text_encoder = AutoModelForCausalLM.from_pretrained(
+            # AutoModel, not AutoModelForCausalLM: only the final hidden state is
+            # used, so the LM head would compute a [seq, 256k] logits tensor
+            # that is thrown away on every prompt encode.
+            self.text_encoder = AutoModel.from_pretrained(
                 text_encoder_model_id,
                 torch_dtype=dtype,
                 local_files_only=self._component_local_files_only(text_encoder_model_id),
@@ -604,8 +607,10 @@ class SanaWmPipeline(
             add_special_tokens=True,
             return_tensors="pt",
         ).to(device)
-        outputs = self.text_encoder(**encoded, output_hidden_states=True)
-        hidden_states = outputs.hidden_states[-1]
+        # last_hidden_state is the same tensor the CausalLM wrapper exposed as
+        # hidden_states[-1] (both are post-final-norm), without retaining every
+        # intermediate layer.
+        hidden_states = self.text_encoder(**encoded).last_hidden_state
         attention_mask = encoded.attention_mask
         if chi_prompt:
             select_index = [0] + list(range(-model_max_length + 1, 0))
