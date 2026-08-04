@@ -5,7 +5,7 @@
 ## Summary
 
 - Vendor: Efficient-Large-Model / NVlabs SANA
-- Model: `BBBBruce/SANA-WM_bidirectional-diffusers` (standard diffusers layout, converted offline from the NVlabs release)
+- Model: `BBBBruce/SANA-WM_bidirectional-stage1-diffusers` (standard diffusers layout, converted offline from the NVlabs release; Stage-1 transformer + VAE only)
 - Task: First-frame image-to-video generation with camera control
 - Mode: Online serving with the OpenAI-compatible video API
 - Model weights: about 13 GB for the Stage-1 transformer (10 GB) and VAE (2.3 GB)
@@ -36,9 +36,10 @@ stage is not supported by this PR; it is a planned follow-up.
 #### Capacity
 
 - Model storage: the Stage-1 transformer is about 10 GB and the VAE about
-  2.3 GB. The Gemma text encoder is a separate 4.9 GB repo. Only the
-  `transformer/` and `vae/` subfolders are fetched; the `refiner/` subfolder in
-  the same repo belongs to the two-stage variant and is not downloaded.
+  2.3 GB. The Gemma text encoder is a separate 4.9 GB repo. The engine prefetches
+  the whole model repo at startup (`allow_patterns=["*"]`), which is why the
+  Stage-1 weights live in their own repo — the two-stage one carries an
+  additional 84 GB `refiner/` that this path never loads.
 - Disk sizing: provision about 40 GB of local disk or Hugging Face cache volume
   so the model, temporary downloads, and generated artifacts fit without cache
   eviction.
@@ -61,22 +62,32 @@ stage is not supported by this PR; it is a planned follow-up.
 
 #### Command
 
-The repo ships the standard Diffusers layout (`model_index.json` + `transformer/`,
-`vae/`). SANA-WM still needs the deploy YAML to wire its omni serving
-stages, so pass it through `--deploy-config`.
+The repo ships the standard Diffusers layout (`model_index.json` +
+`transformer/`, `vae/`), and its `model_index.json` names `SanaWmPipeline`, so
+the pipeline class resolves on its own.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-vllm serve BBBBruce/SANA-WM_bidirectional-diffusers \
+vllm serve BBBBruce/SANA-WM_bidirectional-stage1-diffusers \
   --omni \
   --deploy-config vllm_omni/deploy/sana_wm.yaml \
   --host 0.0.0.0 \
   --port 8091
 ```
 
-The deploy YAML path is `vllm_omni/deploy/sana_wm.yaml`. Some wrappers document
-this target as `vllm serve vllm_omni/deploy/sana_wm.yaml`; with the standard
-vLLM-Omni CLI, pass it through `--deploy-config` as shown above.
+Two things to know about `--deploy-config` here. Single-stage diffusion models
+are deliberately absent from `OMNI_PIPELINES`
+(`vllm_omni/config/pipeline_registry.py`), so stage resolution falls back to the
+default stage config and the YAML's stage settings — including
+`default_sampling_params` — are not applied. The path is still validated, so a
+bad one errors and a good one looks like it took effect. The request examples
+below therefore pass every generation field explicitly.
+
+If you point this at the older two-stage repo
+(`BBBBruce/SANA-WM_bidirectional-diffusers`), startup fails with `Model class
+SanaWmTwoStagesPipeline not found in diffusion model registry`, because that
+repo's `model_index.json` names a class this build does not register. Add
+`--model-class-name SanaWmPipeline` to override it.
 
 #### Verification
 
@@ -99,8 +110,8 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
   -o sana_wm_smoke.mp4
 ```
 
-For a production-length request using the deploy defaults, use an action length
-that matches `num_frames - 1`:
+For a production-length request, use an action length that matches
+`num_frames - 1`:
 
 ```bash
 curl -sS -X POST http://localhost:8091/v1/videos/sync \
@@ -159,7 +170,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o sana_wm_output.
   `"camera": {"poses": [...]}` where `poses` is a list of `num_frames`
   camera-to-world 4x4 matrices (row-major, OpenCV `+X right, +Y down, +Z forward`
   convention), e.g.
-  `sana_wm={"camera":{"poses":[[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]], ...]},"intrinsics":{...}}`.
+  `extra_params={"sana_wm":{"camera":{"poses":[[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]], ...]},"intrinsics":{...}}}`.
   Most callers should prefer `action`; explicit poses exist for callers that
   already have a per-frame trajectory.
 - Explicit `intrinsics` are recommended and take the mapping form

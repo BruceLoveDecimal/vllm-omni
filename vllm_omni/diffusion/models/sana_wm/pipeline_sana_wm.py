@@ -58,7 +58,14 @@ from vllm_omni.model_executor.stage_input_processors.sana_wm import normalize_sa
 # repo is that layout, converted offline from the NVlabs bespoke weights; the
 # original bespoke repo (Efficient-Large-Model/SANA-WM_bidirectional) no longer
 # loads as-is.
-SANA_WM_MODEL_ID = "BBBBruce/SANA-WM_bidirectional-diffusers"
+#
+# Stage-1 only: transformer/ + vae/, and a model_index.json whose _class_name is
+# SanaWmPipeline. The earlier BBBBruce/SANA-WM_bidirectional-diffusers repo
+# names the two-stage class — which this build does not register, so startup
+# fails — and carries an 84 GB refiner/ that this path never loads but that
+# omni_base's startup prefetch (allow_patterns=["*"]) downloads anyway. It is
+# kept as the two-stage archive.
+SANA_WM_MODEL_ID = "BBBBruce/SANA-WM_bidirectional-stage1-diffusers"
 
 SANA_WM_STAGE1_DIT_FILE = "transformer/diffusion_pytorch_model.safetensors"
 SANA_WM_CONFIG_FILE = "transformer/config.json"
