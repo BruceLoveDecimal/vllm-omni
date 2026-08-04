@@ -8,17 +8,17 @@ SANA-WM bidirectional 1600M release. Scope is intentionally narrow:
 * Pinhole camera only (xi=0); the UCM ``xi`` parameter is fixed.
 * Inference path only — no training-time camera-branch dropout.
 * Online computation only — the precomputed ``cam_pos_embeds`` shortcut
-  used by NVlabs' fused kernels is omitted because vLLM-Omni recomputes
-  the matrices once per request and shares the resulting closures across
-  all blocks via the per-block ``precomputed_gates`` plumbing.
+  used by NVlabs' fused kernels is omitted because vLLM-Omni builds the
+  matrices once per transformer forward and shares them across all blocks.
 * ``apply_vo=True`` only — the SANA-WM checkpoint always uses the
   inverse-output transform.
 
 Public surface:
-    ``prepare_prope_fns(head_dim, camera_conditions, HW, patch_size,
-                        rotary_emb=None)`` -> ``(apply_q, apply_kv, apply_o)``
-    ``prepare_cam_prep_context(...)`` and ``cam_prep_func(...)`` for the
-    NVlabs fused camera-prep contract used by the transformer camera branch.
+    ``prepare_cam_geometry(...)`` -> :class:`SanaWmCamGeometry`, built once per
+    transformer forward and threaded through every block. It carries both the
+    ``(apply_q, apply_kv, apply_output)`` closures used by the softmax camera
+    branch and the projection/RoPE tensors used by ``cam_prep_func(...)``, the
+    NVlabs fused camera-prep contract on the GDN camera branch.
 
 Each closure transforms a tensor of shape ``(B, num_heads, N, D)`` where
 ``N = T * H * W`` (matching the GDN token layout) and ``D == head_dim``,
@@ -320,48 +320,28 @@ def _prepare_ray_apply_fns(
     return apply_q, apply_kv, apply_o
 
 
-def prepare_prope_fns(
-    head_dim: int,
-    camera_conditions: torch.Tensor,
-    hw: tuple[int, int, int],
-    patch_size: tuple[int, int, int] = (1, 1, 1),
-    rotary_emb: torch.Tensor | None = None,
-) -> tuple[Callable, Callable, Callable]:
-    """Precompute the UCPE ``(apply_q, apply_kv, apply_o)`` callables once
-    per request. Shared across all transformer blocks via the per-block
-    ``precomputed_gates`` plumbing in ``SanaWmSelfAttention``.
-
-    Args:
-        head_dim: per-head channel count. Must be divisible by 4.
-        camera_conditions: ``(B, T, 20)`` SANA-WM camera payload.
-        hw: ``(T_latent, H_latent, W_latent)`` latent-grid shape.
-        patch_size: 3D transformer patch size. The spatial patch size maps
-            the packed camera intrinsics to the token grid, matching NVlabs
-            ``_process_camera_conditions_ucpe``.
-        rotary_emb: complex rotary embeddings ``(1, 1, N, D//2)`` produced
-            by the main-branch RoPE module, or ``None`` to skip the rope
-            block in the block-diagonal transform.
-    """
-    if head_dim % 4 != 0:
-        raise ValueError(f"UCPE head_dim must be divisible by 4, got {head_dim}.")
-    B = camera_conditions.shape[0]
-    raymats = _process_camera_conditions(camera_conditions, hw, patch_size=patch_size)
-    raymats_flat = raymats.reshape(B, -1, 4, 4)
-    proj = raymats_flat
-    proj_t = proj.transpose(-1, -2)
-    proj_inv = _invert_se3(proj)
-    rotary_emb_cam = _slice_rope_for_cam(rotary_emb, head_dim // 2)
-    return _prepare_ray_apply_fns(head_dim, proj, proj_t, proj_inv, rotary_emb=rotary_emb_cam)
-
-
 @dataclass(frozen=True)
-class SanaWmCamPrepContext:
-    """Precomputed per-request tensors needed by ``cam_prep_func``."""
+class SanaWmCamGeometry:
+    """UCPE geometry shared by every block of one transformer forward.
+
+    The ray grid, its SE(3) inverse and the camera RoPE tables depend only on
+    the camera payload, the latent grid, the patch size and the head dim — all
+    fixed for the whole forward — yet each block's camera branch used to
+    rebuild them. At 20 blocks x 60 steps x 2 CFG branches that is ~2400
+    rebuilds of an 18480-token ray grid and its 4x4 inverses per request.
+
+    ``apply_q``/``apply_kv``/``apply_output`` serve the softmax camera branch;
+    ``proj_q``/``proj_kv``/``rope_cos``/``rope_sin`` serve the fused
+    ``cam_prep_func`` contract on the GDN branch. Both are derived from the
+    same projection matrices, so they are built together.
+    """
 
     proj_q: torch.Tensor
     proj_kv: torch.Tensor
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
+    apply_q: Callable[[torch.Tensor], torch.Tensor]
+    apply_kv: Callable[[torch.Tensor], torch.Tensor]
     apply_output: Callable[[torch.Tensor], torch.Tensor]
 
 
@@ -392,15 +372,21 @@ def _prepare_ucpe_rope_tables(
     return rope_cos, rope_sin
 
 
-def prepare_cam_prep_context(
+def prepare_cam_geometry(
     *,
     camera_conditions: torch.Tensor,
     spatial_shape: tuple[int, int, int],
     patch_size: tuple[int, int, int],
     head_dim: int,
     rotary_emb: torch.Tensor | None,
-) -> SanaWmCamPrepContext:
-    """Precompute ray projection matrices, RoPE tables, and inverse output fn."""
+) -> SanaWmCamGeometry:
+    """Build the per-forward UCPE geometry: ray projections, RoPE tables, apply fns.
+
+    Call once per transformer forward and share the result across every block —
+    see :class:`SanaWmCamGeometry` for why.
+    """
+    if head_dim % 4 != 0:
+        raise ValueError(f"UCPE head_dim must be divisible by 4, got {head_dim}.")
     if head_dim % 2 != 0 or (head_dim // 2) % 4 != 0:
         raise ValueError(f"Sana-WM cam prep head_dim={head_dim} must satisfy D % 2 == 0 and (D/2) % 4 == 0.")
 
@@ -421,12 +407,16 @@ def prepare_cam_prep_context(
     else:
         rope_cos, rope_sin = _prepare_ucpe_rope_tables(rotary_emb_cam, token_count, half_dim)
 
-    _, _, apply_output = _prepare_ray_apply_fns(head_dim, proj, proj_q, proj_kv, rotary_emb=rotary_emb_cam)
-    return SanaWmCamPrepContext(
+    apply_q, apply_kv, apply_output = _prepare_ray_apply_fns(
+        head_dim, proj, proj_q, proj_kv, rotary_emb=rotary_emb_cam
+    )
+    return SanaWmCamGeometry(
         proj_q=proj_q,
         proj_kv=proj_kv,
         rope_cos=rope_cos,
         rope_sin=rope_sin,
+        apply_q=apply_q,
+        apply_kv=apply_kv,
         apply_output=apply_output,
     )
 
@@ -546,8 +536,7 @@ def cam_prep_func(
 
 
 __all__ = [
-    "SanaWmCamPrepContext",
+    "SanaWmCamGeometry",
     "cam_prep_func",
-    "prepare_cam_prep_context",
-    "prepare_prope_fns",
+    "prepare_cam_geometry",
 ]

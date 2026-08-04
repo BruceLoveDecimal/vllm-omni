@@ -38,9 +38,9 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.norm import RMSNorm, TensorParallelRMSNorm, fused_qk_rms_norm
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.ucpe import (
+    SanaWmCamGeometry,
     cam_prep_func,
-    prepare_cam_prep_context,
-    prepare_prope_fns,
+    prepare_cam_geometry,
 )
 
 SANA_WM_STAGE1_LATENT_CHANNELS = 128
@@ -1047,7 +1047,7 @@ class SanaWmSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spatial_shape: tuple[int, int, int],
-        camera_conditions: torch.Tensor,
+        cam_geometry: SanaWmCamGeometry,
         rotary_emb: torch.Tensor | None,
     ) -> torch.Tensor:
         """UCPE camera branch for softmax hybrid blocks.
@@ -1081,15 +1081,8 @@ class SanaWmSelfAttention(nn.Module):
         k_cam = k_cam.transpose(1, 2).contiguous()
         v_cam = v_cam.transpose(1, 2).contiguous()
 
-        apply_fn_q, apply_fn_kv, apply_fn_o = prepare_prope_fns(
-            head_dim=self.cam_head_dim,
-            camera_conditions=camera_conditions,
-            hw=spatial_shape,
-            patch_size=self.patch_size,
-            rotary_emb=self._ucpe_rotary_freqs(rotary_emb),
-        )
-        q_cam_trans = apply_fn_q(q_cam)
-        kv_cam_trans = apply_fn_kv(torch.cat([k_cam, v_cam], dim=1))
+        q_cam_trans = cam_geometry.apply_q(q_cam)
+        kv_cam_trans = cam_geometry.apply_kv(torch.cat([k_cam, v_cam], dim=1))
         k_cam_trans, v_cam_trans = torch.chunk(kv_cam_trans, chunks=2, dim=1)
 
         q_cam_trans = self._downscale_to_reference_rms(q_cam, q_cam_trans)
@@ -1106,14 +1099,14 @@ class SanaWmSelfAttention(nn.Module):
             k_cam_trans.transpose(1, 2).to(dtype_orig),
             v_cam_trans.transpose(1, 2).to(dtype_orig),
         )
-        out = apply_fn_o(out.transpose(1, 2))
+        out = cam_geometry.apply_output(out.transpose(1, 2))
         return out.transpose(1, 2).reshape(batch_size, token_count, self.cam_dim)
 
     def _forward_cam_branch(
         self,
         hidden_states: torch.Tensor,
         spatial_shape: tuple[int, int, int],
-        camera_conditions: torch.Tensor,
+        cam_geometry: SanaWmCamGeometry,
         rotary_emb: torch.Tensor | None,
         *,
         precomputed_gates: tuple[torch.Tensor, torch.Tensor],
@@ -1131,8 +1124,8 @@ class SanaWmSelfAttention(nn.Module):
         2. Short conv on K (and optionally Q/V).
         3. ``q_norm_cam`` / ``k_norm_cam`` (RMSNorm over cam_dim).
         4. ReLU kernel + ``k_scale = D^-0.5 * S^-0.5``.
-        5. UCPE per-token block-diagonal transforms via ``apply_fn_q`` and
-           ``apply_fn_kv`` (per-ray 4x4 projection on first half + sliced
+        5. UCPE per-token block-diagonal transforms via ``cam_geometry.apply_q`` and
+           ``cam_geometry.apply_kv`` (per-ray 4x4 projection on first half + sliced
            complex RoPE on second half).
         6. Dynamic Beta Discounting: β_cam = β / frame_inflation_sq.clamp_min(1).
            The released NVlabs ``BothTriton`` cam path does not apply the
@@ -1141,7 +1134,7 @@ class SanaWmSelfAttention(nn.Module):
            inflation.
         7. **Single-path** delta-rule recurrence (numerator only, no Z
            denominator) — forward + backward, simple sum.
-        8. **Inverse output transform**: ``apply_fn_o`` brings the recurrence
+        8. **Inverse output transform**: ``cam_geometry.apply_output`` brings the recurrence
            output from the per-ray frame back to the world frame.
 
         Returns ``(B, N, cam_dim)`` raw — caller applies ``out_proj_cam`` and
@@ -1153,16 +1146,9 @@ class SanaWmSelfAttention(nn.Module):
         if token_count != frames * spatial_tokens:
             raise ValueError(f"Sana-WM cam branch expects N=T*H*W, got N={token_count}, THW={spatial_shape}.")
 
-        # Build the cam-prep context once per call. This mirrors NVlabs'
-        # fused ``cam_prep_func`` input contract instead of routing through
-        # the Python ``prepare_prope_fns`` Q/K/V closures.
-        cam_prep_context = prepare_cam_prep_context(
-            camera_conditions=camera_conditions,
-            spatial_shape=spatial_shape,
-            patch_size=self.patch_size,
-            head_dim=self.cam_head_dim,
-            rotary_emb=self._ucpe_rotary_freqs(rotary_emb),
-        )
+        # This branch feeds NVlabs' fused ``cam_prep_func`` contract from the
+        # shared geometry's projection/RoPE tensors rather than routing through
+        # its Python Q/K/V closures, which the softmax branch uses.
 
         # 1. Projections (all from x).
         q_cam = self.q_proj_cam(hidden_states)
@@ -1195,10 +1181,10 @@ class SanaWmSelfAttention(nn.Module):
             q_normed.contiguous(),
             k_normed.contiguous(),
             v_raw,
-            proj_q=cam_prep_context.proj_q,
-            proj_kv=cam_prep_context.proj_kv,
-            rope_cos=cam_prep_context.rope_cos,
-            rope_sin=cam_prep_context.rope_sin,
+            proj_q=cam_geometry.proj_q,
+            proj_kv=cam_geometry.proj_kv,
+            rope_cos=cam_geometry.rope_cos,
+            rope_sin=cam_geometry.rope_sin,
             k_scale=k_scale,
         )
 
@@ -1234,10 +1220,10 @@ class SanaWmSelfAttention(nn.Module):
         cam_out_bhdn = cam_out_bhdn.to(q_rot_bhdn.dtype)
 
         # 9. Apply inverse UCPE transform on the recurrence output.
-        # ``apply_fn_o`` expects (B, H, N, D); we currently have
+        # ``apply_output`` expects (B, H, N, D); we currently have
         # (B, H, D, N) — transpose, apply, transpose back.
         cam_out_bhnd = cam_out_bhdn.transpose(-1, -2).contiguous()
-        cam_out_bhnd = cam_prep_context.apply_output(cam_out_bhnd)
+        cam_out_bhnd = cam_geometry.apply_output(cam_out_bhnd)
         cam_out_bhdn = cam_out_bhnd.transpose(-1, -2).contiguous()
 
         # (B, H_cam, D_cam, N) → (B, N, cam_dim)
@@ -1254,19 +1240,18 @@ class SanaWmSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         spatial_shape: tuple[int, int, int] | None = None,
         rotary_emb: torch.Tensor | None = None,
-        camera_conditions: torch.Tensor | None = None,
+        cam_geometry: SanaWmCamGeometry | None = None,
     ) -> torch.Tensor:
-        """Forward with dual-branch GDN+UCPE when ``camera_conditions`` is
+        """Forward with dual-branch GDN+UCPE when ``cam_geometry`` is
         provided, otherwise main-branch-only GDN or softmax fallback.
 
-        ``camera_conditions`` is the raw ``(B, T_latent, 20)`` raymap tensor
-        produced by :func:`camera_control._pack_camera_conditions` — NOT the
-        embedder output. The cam branch consumes ``hidden_states`` as the
-        sole Q/K/V source and uses ``camera_conditions`` to build per-pixel
-        4x4 transforms that are applied to the Q/K/V channels via UCPE.
+        ``cam_geometry`` holds the per-pixel 4x4 transforms built once per
+        transformer forward from the raw ``(B, T_latent, 20)`` raymap. The cam
+        branch consumes ``hidden_states`` as its sole Q/K/V source and applies
+        those transforms to the Q/K/V channels via UCPE.
         """
         if spatial_shape is not None and self.use_gdn:
-            if camera_conditions is None or self.q_proj_cam is None:
+            if cam_geometry is None or self.q_proj_cam is None:
                 # Main branch only — preserves legacy path when the request
                 # has no camera info or the cam projections were not built.
                 return self._forward_gdn(hidden_states, spatial_shape, rotary_emb)
@@ -1282,7 +1267,7 @@ class SanaWmSelfAttention(nn.Module):
             cam_raw = self._forward_cam_branch(
                 hidden_states,
                 spatial_shape,
-                camera_conditions,
+                cam_geometry,
                 rotary_emb,
                 precomputed_gates=(beta, decay),
             )
@@ -1294,11 +1279,11 @@ class SanaWmSelfAttention(nn.Module):
 
         if spatial_shape is not None:
             main_raw = self._forward_softmax_raw(hidden_states, spatial_shape, rotary_emb)
-            if camera_conditions is not None and self.q_proj_cam is not None:
+            if cam_geometry is not None and self.q_proj_cam is not None:
                 cam_raw = self._forward_softmax_cam_branch(
                     hidden_states,
                     spatial_shape,
-                    camera_conditions,
+                    cam_geometry,
                     rotary_emb,
                 )
                 cam_contrib = self.out_proj_cam(cam_raw)
@@ -1549,7 +1534,7 @@ class SanaWmBlock(nn.Module):
         spatial_shape: tuple[int, int, int],
         rotary_emb: torch.Tensor | None = None,
         camera_hidden_states: torch.Tensor | None = None,
-        camera_conditions: torch.Tensor | None = None,
+        cam_geometry: SanaWmCamGeometry | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Per-frame timestep contract (see SanaWmTransformer3DModel.forward).
@@ -1561,7 +1546,7 @@ class SanaWmBlock(nn.Module):
                 spatial_shape,
                 rotary_emb,
                 camera_hidden_states,
-                camera_conditions,
+                cam_geometry,
                 encoder_attention_mask,
             )
         batch_size = hidden_states.shape[0]
@@ -1569,7 +1554,7 @@ class SanaWmBlock(nn.Module):
             self.scale_shift_table[None] + timestep_modulation.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
         attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
-        attn_output = self.attn(attn_input, spatial_shape, rotary_emb, camera_conditions)
+        attn_output = self.attn(attn_input, spatial_shape, rotary_emb, cam_geometry)
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + self.plucker_proj(camera_hidden_states)
         hidden_states = hidden_states + gate_msa * attn_output
@@ -1590,7 +1575,7 @@ class SanaWmBlock(nn.Module):
         spatial_shape: tuple[int, int, int],
         rotary_emb: torch.Tensor | None,
         camera_hidden_states: torch.Tensor | None,
-        camera_conditions: torch.Tensor | None,
+        cam_geometry: SanaWmCamGeometry | None,
         encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-frame timestep modulation path matching NVlabs
@@ -1622,7 +1607,7 @@ class SanaWmBlock(nn.Module):
         # scale/shift over the spatial axis, then flattening back.
         x_norm1 = self.norm1(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_msa_in = (x_norm1 * (1 + scale_msa) + shift_msa).reshape(batch_size, token_count, hidden_size)
-        attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, camera_conditions)
+        attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, cam_geometry)
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + self.plucker_proj(camera_hidden_states)
         attn_output_4d = attn_output.reshape(batch_size, frames, spatial_tokens, hidden_size)
@@ -1943,16 +1928,30 @@ class SanaWmTransformer3DModel(nn.Module):
                 device=hidden_states.device,
             )
 
-        # Build (B, T_latent, 20) camera_conditions from the raw raymap so
-        # the per-block UCPE branch can compute its per-pixel apply_fns.
-        # When the caller passes pre-embedded camera_hidden_states without
-        # raymap, the cam branch becomes a no-op (main-branch only).
-        camera_conditions: torch.Tensor | None = None
+        # Build (B, T_latent, 20) camera_conditions from the raw raymap, then
+        # derive the UCPE geometry ONCE for the whole forward. The ray grid,
+        # its SE(3) inverse and the camera RoPE tables are identical in every
+        # block, so building them per block cost ~2400 rebuilds per request
+        # (20 blocks x 60 steps x 2 CFG branches). When the caller passes
+        # pre-embedded camera_hidden_states without raymap, the cam branch
+        # becomes a no-op (main-branch only).
+        cam_geometry: SanaWmCamGeometry | None = None
         if raymap is not None:
             camera_conditions = raymap if raymap.ndim == 3 else raymap.unsqueeze(0)
             if camera_conditions.shape[0] == 1 and batch_size > 1:
                 camera_conditions = camera_conditions.expand(batch_size, -1, -1)
             camera_conditions = camera_conditions.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            # cam_head_dim comes from the attention module rather than being
+            # re-derived here: __init__ already asserts it equals the main
+            # head_dim and is consistent across blocks.
+            attn = self.blocks[0].attn
+            cam_geometry = prepare_cam_geometry(
+                camera_conditions=camera_conditions,
+                spatial_shape=spatial_shape,
+                patch_size=self.patch_size,
+                head_dim=attn.cam_head_dim,
+                rotary_emb=attn._ucpe_rotary_freqs(rotary_emb),
+            )
 
         for block in self.blocks:
             hidden_states = block(
@@ -1962,7 +1961,7 @@ class SanaWmTransformer3DModel(nn.Module):
                 spatial_shape,
                 rotary_emb,
                 camera_hidden_states,
-                camera_conditions,
+                cam_geometry,
                 encoder_attention_mask,
             )
 
