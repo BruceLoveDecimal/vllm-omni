@@ -483,35 +483,23 @@ class SanaWmPipeline(
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Return the first-frame image as ``[1, 3, 1, H, W]`` in ``[-1, 1]``."""
+        """Return the first-frame image as ``[1, 3, 1, H, W]`` in ``[-1, 1]``.
+
+        ``VideoProcessor.preprocess`` already covers the PIL / ndarray / tensor
+        cases this used to branch on by hand. ``resample="bicubic"`` keeps the
+        filter PIL's ``Image.resize`` defaulted to; the processor's own default
+        is lanczos, which would move the conditioning latent.
+        """
         import numpy as np
+        from diffusers.video_processor import VideoProcessor
 
-        if hasattr(image, "convert"):
-            image = image.convert("RGB").resize((width, height))
-            arr = np.array(image, dtype=np.float32) / 127.5 - 1.0
-        elif isinstance(image, np.ndarray):
-            if image.shape[:2] != (height, width):
-                from PIL import Image
+        # The processor normalises to [-1, 1] assuming float inputs in [0, 1].
+        if isinstance(image, np.ndarray) and image.dtype == np.uint8:
+            image = image.astype(np.float32) / 255.0
 
-                image = Image.fromarray(image).resize((width, height))
-                arr = np.array(image, dtype=np.float32) / 127.5 - 1.0
-            else:
-                arr = image.astype(np.float32) / 127.5 - 1.0
-        elif isinstance(image, torch.Tensor):
-            t = image.float()
-            if t.ndim == 3:
-                t = t.unsqueeze(0)
-            if t.shape[1] != 3:
-                t = t.permute(0, 3, 1, 2)
-            t = F.interpolate(t, size=(height, width), mode="bilinear", align_corners=False)
-            t = t * 2.0 - 1.0 if t.max() <= 1.0 + 1e-3 else t / 127.5 - 1.0
-            return t.unsqueeze(2).to(device=device, dtype=dtype)
-        else:
-            raise TypeError(f"Sana-WM first-frame image must be PIL/ndarray/Tensor, got {type(image).__name__}.")
-
-        # arr: [H, W, 3] → [1, 3, 1, H, W]
-        tensor = torch.from_numpy(arr.transpose(2, 0, 1)[np.newaxis, :, np.newaxis])
-        return tensor.to(device=device, dtype=dtype)
+        processor = VideoProcessor(vae_scale_factor=SANA_WM_VAE_SPATIAL_COMPRESSION, resample="bicubic")
+        frame = processor.preprocess(image, height=height, width=width)
+        return frame.unsqueeze(2).to(device=device, dtype=dtype)
 
     def _vae_normalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """LTX-2 VAE per-channel latent normalisation matching NVlabs.
@@ -630,7 +618,15 @@ class SanaWmPipeline(
             )
         # Return RAW Gemma hidden states: the transformer's ``attention_y_norm``
         # RMSNorm does the normalisation, so normalising here double-normalises.
-        self._last_prompt_attention_mask = attention_mask.to(device=device, dtype=torch.float32)
+        prompt_attention_mask = attention_mask.to(device=device, dtype=torch.float32)
+        # An all-ones mask carries no information. Keep it ``None`` so
+        # cross-attention takes the mask-free attention path instead of handing
+        # every block, on every step, a mask the backend must reshape to no
+        # effect. Evaluated once per prompt encode, so the device sync is paid
+        # twice per request (cond + uncond), not once per denoising step.
+        if bool(prompt_attention_mask.all()):
+            prompt_attention_mask = None
+        self._last_prompt_attention_mask = prompt_attention_mask
         return hidden_states.to(device=device, dtype=dtype)
 
     def predict_noise(self, **kwargs: Any) -> torch.Tensor:

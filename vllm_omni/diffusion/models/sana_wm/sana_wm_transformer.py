@@ -16,6 +16,7 @@ from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
+from diffusers.models.embeddings import Timesteps
 from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -424,21 +425,15 @@ class SanaWmTimestepEmbedder(nn.Module):
         )
         self.act = nn.SiLU()
         self.mlp = nn.ModuleList([linear_1, self.act, linear_2])
-
-    @staticmethod
-    def sinusoidal_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(10000) * torch.arange(half, device=timestep.device, dtype=torch.float32) / max(half, 1)
-        )
-        args = timestep.float().reshape(-1, 1) * freqs.reshape(1, -1)
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if emb.shape[-1] < dim:
-            emb = F.pad(emb, (0, dim - emb.shape[-1]))
-        return emb
+        # diffusers' Timesteps reproduces this model's sinusoid exactly:
+        # downscale_freq_shift=0 makes the exponent denominator half_dim, and
+        # flip_sin_to_cos=True emits [cos, sin] in that order. The MLP stays
+        # model-local because its checkpoint keys are mlp.0/mlp.2 and it is
+        # tensor-parallel.
+        self.timesteps_proj = Timesteps(num_channels=in_features, flip_sin_to_cos=True, downscale_freq_shift=0)
 
     def forward(self, timestep: torch.Tensor) -> torch.Tensor:
-        emb = self.sinusoidal_embedding(timestep, self.in_features)
+        emb = self.timesteps_proj(timestep.flatten())
         hidden_states = self.mlp[0](emb.to(dtype=self.mlp[0].weight.dtype))
         hidden_states = self.act(hidden_states)
         return self.mlp[2](hidden_states)
