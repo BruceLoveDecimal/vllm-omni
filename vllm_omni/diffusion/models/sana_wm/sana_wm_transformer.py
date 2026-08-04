@@ -20,8 +20,9 @@ from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_reduce_scatter,
+    tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -927,6 +928,13 @@ class SanaWmSelfAttention(nn.Module):
         ``skip_bias_add`` keeps the bias out of the matmul so it can be applied
         to the scattered shard; that slice is the only remaining use of the TP
         rank here, and it is a 1-D view rather than a copy of the hidden tensor.
+
+        ``tensor_model_parallel_reduce_scatter`` is not usable here: it calls
+        ``get_tp_group().reduce_scatter()``, and vLLM-Omni's diffusion
+        ``GroupCoordinator`` deliberately does not implement that method (see
+        the note in ``diffusion/distributed/parallel_state.py``). Drive
+        ``torch.distributed`` on the group's process group instead, and fall
+        back to all-reduce plus a slice if the group is not exposed.
         """
         bias = self.out_proj_cam.bias
         tp_size = get_tensor_model_parallel_world_size()
@@ -939,7 +947,27 @@ class SanaWmSelfAttention(nn.Module):
                 "Sana-WM TP camera contribution width mismatch: "
                 f"contrib={contrib.shape[-1]} expected={local_width * tp_size} (local={local_width}, tp={tp_size})."
             )
-        out = tensor_model_parallel_reduce_scatter(contrib.contiguous(), dim=-1)
+
+        device_group = getattr(get_tp_group(), "device_group", None)
+        if device_group is None:
+            out = tensor_model_parallel_all_reduce(contrib.contiguous())
+            start = get_tensor_model_parallel_rank() * local_width
+            out = out[..., start : start + local_width].contiguous()
+        else:
+            # reduce_scatter_tensor splits along dim 0, so move the rank axis to
+            # the front first. Rank r then receives the summed columns
+            # [r * local_width, (r + 1) * local_width), matching what the
+            # all-reduce-and-slice fallback produces.
+            batch, tokens, _ = contrib.shape
+            source = (
+                contrib.reshape(batch, tokens, tp_size, local_width)
+                .permute(2, 0, 1, 3)
+                .contiguous()
+                .reshape(tp_size * batch, tokens, local_width)
+            )
+            out = torch.empty((batch, tokens, local_width), device=contrib.device, dtype=contrib.dtype)
+            torch.distributed.reduce_scatter_tensor(out, source, group=device_group)
+
         if bias is not None:
             start = get_tensor_model_parallel_rank() * local_width
             out = out + bias[start : start + local_width]
