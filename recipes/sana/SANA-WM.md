@@ -95,7 +95,7 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
   -F "num_inference_steps=2" \
   -F "guidance_scale=5.0" \
   -F "seed=42" \
-  --form-string 'sana_wm={"action":"w-8","translation_speed":0.055,"rotation_speed_deg":1.2,"intrinsics":{"fx":640,"fy":640,"cx":640,"cy":352}}' \
+  --form-string 'extra_params={"sana_wm":{"action":"w-8","translation_speed":0.055,"rotation_speed_deg":1.2,"intrinsics":{"fx":640,"fy":640,"cx":640,"cy":352}}}' \
   -o sana_wm_smoke.mp4
 ```
 
@@ -115,7 +115,7 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
   -F "num_inference_steps=60" \
   -F "guidance_scale=5.0" \
   -F "seed=42" \
-  --form-string 'sana_wm={"action":"w-160","translation_speed":0.055,"rotation_speed_deg":1.2,"intrinsics":{"fx":640,"fy":640,"cx":640,"cy":352}}' \
+  --form-string 'extra_params={"sana_wm":{"action":"w-160","translation_speed":0.055,"rotation_speed_deg":1.2,"intrinsics":{"fx":640,"fy":640,"cx":640,"cy":352}}}' \
   -o sana_wm_output.mp4
 ```
 
@@ -135,7 +135,7 @@ create_response=$(curl -sS -X POST http://localhost:8091/v1/videos \
   -F "num_inference_steps=60" \
   -F "guidance_scale=5.0" \
   -F "seed=42" \
-  --form-string 'sana_wm={"action":"w-160","translation_speed":0.055,"rotation_speed_deg":1.2,"intrinsics":{"fx":640,"fy":640,"cx":640,"cy":352}}')
+  --form-string 'extra_params={"sana_wm":{"action":"w-160","translation_speed":0.055,"rotation_speed_deg":1.2,"intrinsics":{"fx":640,"fy":640,"cx":640,"cy":352}}}')
 
 video_id=$(echo "$create_response" | jq -r '.id')
 curl -sS "http://localhost:8091/v1/videos/${video_id}" | jq .

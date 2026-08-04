@@ -89,7 +89,11 @@ def test_image_to_video_001(omni_server: OmniServer, openai_client: OpenAIClient
         "form_data": {
             "prompt": PROMPT,
             "negative_prompt": NEGATIVE_PROMPT,
-            "sana_wm": json.dumps(SANA_WM_PARAMS),
+            # The camera payload rides inside extra_params; there is no
+            # top-level sana_wm form field on the video endpoints, so sending
+            # one is silently dropped and the request fails in the
+            # preprocessor for missing camera control.
+            "extra_params": json.dumps({"sana_wm": SANA_WM_PARAMS}),
             "height": SANA_WM_OUTPUT_HEIGHT,
             "width": SANA_WM_OUTPUT_WIDTH,
             "num_frames": SMOKE_NUM_FRAMES,
