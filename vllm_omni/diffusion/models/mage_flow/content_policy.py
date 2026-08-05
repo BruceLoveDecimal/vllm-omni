@@ -455,5 +455,3 @@ def screen_mage_flow_edit_prompt(
             categories=["safety_check_error"],
             reason=f"edit content safety check failed: {error}",
         )
-
-

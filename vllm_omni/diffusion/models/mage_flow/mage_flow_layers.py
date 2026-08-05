@@ -56,10 +56,7 @@ def _request_isolated_forward(
         return module(hidden_states)
     if attention_mask is None:
         return torch.cat(
-            [
-                module(hidden_states[index : index + 1])
-                for index in range(hidden_states.shape[0])
-            ],
+            [module(hidden_states[index : index + 1]) for index in range(hidden_states.shape[0])],
             dim=0,
         )
 
@@ -199,9 +196,7 @@ class MageFlowEmbedRope(nn.Module):
         # on torch.arange()'s ambient device would silently reintroduce the
         # CUDA pow/polar rounding that this cache is intended to avoid.
         positive_indices = torch.arange(max_positions, device="cpu")
-        negative_indices = (
-            torch.arange(max_positions, device="cpu").flip(0) * -1 - 1
-        )
+        negative_indices = torch.arange(max_positions, device="cpu").flip(0) * -1 - 1
 
         # Match Qwen-Image and upstream Mage: build the canonical complex64
         # tables on CPU, then lazily move the complete tables to the device
@@ -292,11 +287,7 @@ class MageFlowEmbedRope(nn.Module):
             [axis_dim // 2 for axis_dim in self.axes_dim],
             dim=1,
         )
-        if (
-            frame_offset + frame > positive[0].shape[0]
-            or height > positive[1].shape[0]
-            or width > positive[2].shape[0]
-        ):
+        if frame_offset + frame > positive[0].shape[0] or height > positive[1].shape[0] or width > positive[2].shape[0]:
             raise ValueError(f"image grid {(frame, height, width)} exceeds the RoPE cache")
 
         frame_freqs = (
@@ -341,9 +332,7 @@ class MageFlowEmbedRope(nn.Module):
         grids = [image_grid_fhw] if isinstance(image_grid_fhw, tuple) else image_grid_fhw
         if not grids:
             raise ValueError("image_grid_fhw must contain one grid")
-        target_device = self._canonical_device(
-            self.pos_freqs.device if device is None else device
-        )
+        target_device = self._canonical_device(self.pos_freqs.device if device is None else device)
         return torch.cat(
             [
                 self._compute_grid(
@@ -826,9 +815,7 @@ class AdaLayerNormContinuous(DiffusersAdaLayerNormContinuous):
         hidden_states: torch.Tensor,
         conditioning_embedding: torch.Tensor,
     ) -> torch.Tensor:
-        conditioning_embedding = self.silu(conditioning_embedding).to(
-            hidden_states.dtype
-        )
+        conditioning_embedding = self.silu(conditioning_embedding).to(hidden_states.dtype)
         scale, shift = _request_isolated_forward(
             self.linear,
             conditioning_embedding,

@@ -64,10 +64,7 @@ def test_mage_flow_four_to_one_aspect_ratio(
         {
             "model": omni_server.model,
             "messages": dummy_messages_from_mix_data(
-                content_text=(
-                    "A geometric paper sculpture photographed on a neutral "
-                    f"background, composition {index}."
-                )
+                content_text=(f"A geometric paper sculpture photographed on a neutral background, composition {index}.")
             ),
             "extra_body": {
                 "height": height,

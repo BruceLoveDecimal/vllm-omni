@@ -44,8 +44,7 @@ def test_mage_flow_three_different_reference_sizes(
     openai_client: OpenAIClientHandler,
 ) -> None:
     image_data_urls = [
-        "data:image/jpeg;base64,"
-        + generate_synthetic_image(width, height)["base64"]
+        "data:image/jpeg;base64," + generate_synthetic_image(width, height)["base64"]
         for width, height in [(512, 512), (384, 512), (512, 384)]
     ]
     request_config = {
@@ -53,8 +52,7 @@ def test_mage_flow_three_different_reference_sizes(
         "messages": dummy_messages_from_mix_data(
             image_data_url=image_data_urls,
             content_text=(
-                "Combine the main subject, background, and color palette from "
-                "the three images into one coherent scene."
+                "Combine the main subject, background, and color palette from the three images into one coherent scene."
             ),
         ),
         "extra_body": {
@@ -71,13 +69,9 @@ def test_mage_flow_three_different_reference_sizes(
     openai_client.send_diffusion_request(request_config)
 
     references = [
+        ["data:image/jpeg;base64," + generate_synthetic_image(512, 512)["base64"]],
         [
-            "data:image/jpeg;base64,"
-            + generate_synthetic_image(512, 512)["base64"]
-        ],
-        [
-            "data:image/jpeg;base64,"
-            + generate_synthetic_image(width, height)["base64"]
+            "data:image/jpeg;base64," + generate_synthetic_image(width, height)["base64"]
             for width, height in [(512, 512), (384, 512), (512, 384)]
         ],
     ]
@@ -100,9 +94,7 @@ def test_mage_flow_three_different_reference_sizes(
                 "mage_vision_long_edge": 384,
             },
         }
-        for index, ((height, width), reference_images) in enumerate(
-            zip(sizes, references)
-        )
+        for index, ((height, width), reference_images) in enumerate(zip(sizes, references))
     ]
 
     responses = openai_client.send_diffusion_request(requests)

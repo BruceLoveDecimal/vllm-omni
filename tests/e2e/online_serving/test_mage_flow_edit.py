@@ -36,10 +36,7 @@ def test_mage_flow_edit(
     omni_server: OmniServer,
     openai_client: OpenAIClientHandler,
 ) -> None:
-    image_data_url = (
-        "data:image/jpeg;base64,"
-        + generate_synthetic_image(512, 512)["base64"]
-    )
+    image_data_url = "data:image/jpeg;base64," + generate_synthetic_image(512, 512)["base64"]
     request_config = {
         "model": omni_server.model,
         "messages": dummy_messages_from_mix_data(
