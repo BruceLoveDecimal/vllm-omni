@@ -177,9 +177,6 @@ class MageFlowPipeline(
     """Native request-batched T2I and multi-reference Edit pipeline."""
 
     supports_request_batch = True
-    request_batch_ignored_sampling_param_fields = frozenset(
-        {"height", "width", "resolution"}
-    )
     supports_step_execution = False
     support_image_input = True
 

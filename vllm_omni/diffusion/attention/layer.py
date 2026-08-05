@@ -292,19 +292,6 @@ class Attention(nn.Module):
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
-        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
-        if (
-            attention_mask is not None
-            and torch.any(~attention_mask.to(torch.bool))
-            and not self.attn_backend.supports_attention_mask()
-        ):
-            logger.warning_once(
-                "Attention backend %s does not support padded attention masks; "
-                "falling back to SDPA for this layer.",
-                self.attn_backend.get_name(),
-            )
-            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
-
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
 

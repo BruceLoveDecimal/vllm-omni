@@ -131,20 +131,11 @@ def format_diffusion_outputs(
 
     primary_payload = _primary_payload(postprocess_output)
     outputs = _ensure_list(primary_payload)
-    height = request.sampling_params.height
-    width = request.sampling_params.width
-    if height is not None and width is not None:
-        metric_resolution = max(int(height), int(width))
-    elif request.sampling_params.resolution is not None:
-        metric_resolution = int(request.sampling_params.resolution)
-    else:
-        metric_resolution = max(
-            int(height) if height is not None else 0,
-            int(width) if width is not None else 0,
-        )
     metrics = {
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
-        "resolution": metric_resolution,
+        "resolution": (
+            int(request.sampling_params.resolution) if request.sampling_params.resolution is not None else None
+        ),
         "width": request.sampling_params.width,
         "height": request.sampling_params.height,
     }

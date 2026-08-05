@@ -610,16 +610,11 @@ class MageJointAttention(nn.Module):
         joint_q = torch.cat([txt_q, img_q], dim=1)
         joint_k = torch.cat([txt_k, img_k], dim=1)
         joint_v = torch.cat([txt_v, img_v], dim=1)
-        if batch_size == 1:
-            attn_metadata = (
-                AttentionMetadata(attn_mask=joint_attention_mask) if not bool(joint_attention_mask.all()) else None
-            )
-            joint_output = self.attention(
-                joint_q,
-                joint_k,
-                joint_v,
-                attn_metadata=attn_metadata,
-            )
+        # Padding is dropped by slicing rather than by an attention mask, so no
+        # mask is ever handed to the backend and every backend stays usable.
+        dense_single_request = batch_size == 1 and bool(joint_attention_mask.all())
+        if dense_single_request:
+            joint_output = self.attention(joint_q, joint_k, joint_v)
         else:
             # BF16 attention kernels can select a different reduction path when
             # the request-batch dimension changes. The small per-layer drift is
@@ -636,7 +631,7 @@ class MageJointAttention(nn.Module):
                 )
                 joint_output[sample_index, valid_tokens] = sample_output[0]
         txt_output, img_output = joint_output.split([text_length, hidden_states.shape[1]], dim=1)
-        if batch_size == 1:
+        if dense_single_request:
             img_output = self.to_out[1](self.to_out[0](img_output.flatten(2, 3)))
             txt_output = self.to_add_out(txt_output.flatten(2, 3))
         else:

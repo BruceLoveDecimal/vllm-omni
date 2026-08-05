@@ -94,20 +94,6 @@ Admission is conservative:
 - an incompatible request at the head of the waiting queue blocks later
   compatible requests
 
-A pipeline that implements its own padding for selected request-local sampling
-fields may declare them explicitly:
-
-```python
-supports_request_batch = True
-request_batch_ignored_sampling_param_fields = frozenset(
-    {"height", "width", "resolution"}
-)
-```
-
-The engine applies this declaration only to that pipeline's request scheduler.
-Unknown field names fail fast. A model must not ignore a field unless its
-batched forward path preserves per-request semantics for that field.
-
 ## Engine
 
 [`DiffusionEngine`](gh-file:vllm_omni/diffusion/diffusion_engine.py) resolves
@@ -161,9 +147,8 @@ outputs do not fall back to pickle IPC for tensor payloads.
 
 - Only pipelines that declare the request-batch contract use fused batch
   execution.
-- Batches are homogeneous under `RequestBatchSamplingParamsKey` unless a pipeline
-  explicitly declares selected request-local fields as described above.
-  Incompatible guidance and scheduling settings remain separate batches.
+- Batches are homogeneous under `RequestBatchSamplingParamsKey`; heterogeneous resolution or
+  incompatible guidance settings do not co-batch yet.
 - FIFO scheduling can reduce batching opportunities when an incompatible
   request is at the front of the queue.
 - `request_batch_max_wait_ms` improves burst coalescing but can add latency to
