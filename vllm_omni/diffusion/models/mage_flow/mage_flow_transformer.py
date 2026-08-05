@@ -13,7 +13,6 @@ from diffusers.models.normalization import RMSNorm
 from vllm.distributed import get_tensor_model_parallel_world_size
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -28,7 +27,6 @@ from .mage_flow_layers import (
     _request_isolated_forward,
     _sequence_parallel_active,
 )
-
 
 # The official checkpoint ships unfused ``to_q``/``to_k``/``to_v`` (and the text
 # stream's ``add_*_proj``) tensors, while the model fuses each triple into a
@@ -88,12 +86,12 @@ class MageFlowTransformer2DModel(nn.Module):
         self,
         od_config: OmniDiffusionConfig | None = None,
         *,
-        in_channels: int | None = None,
-        out_channels: int | None = None,
-        context_in_dim: int | None = None,
-        hidden_size: int | None = None,
-        num_heads: int | None = None,
-        depth: int | None = None,
+        in_channels: int = 128,
+        out_channels: int = 128,
+        context_in_dim: int = 2560,
+        hidden_size: int = 3072,
+        num_heads: int = 24,
+        depth: int = 12,
         mlp_ratio: float = 4.0,
         depth_single_blocks: int = 0,
         axes_dim: list[int] | None = None,
@@ -112,76 +110,9 @@ class MageFlowTransformer2DModel(nn.Module):
         **_: object,
     ) -> None:
         super().__init__()
-        model_config = getattr(od_config, "tf_model_config", None) if od_config is not None else None
-
-        def resolve(name: str, explicit: object, default: object = None):
-            if explicit is not None:
-                return explicit
-            return getattr(model_config, name, default)
-
-        in_channels = int(resolve("in_channels", in_channels, 128))
-        out_channels = int(resolve("out_channels", out_channels, 128))
-        context_in_dim = int(resolve("context_in_dim", context_in_dim, 2560))
-        hidden_size = int(resolve("hidden_size", hidden_size, 3072))
-        num_heads = int(resolve("num_heads", num_heads, 24))
-        depth = int(resolve("depth", depth, 12))
-        mlp_ratio = float(resolve("mlp_ratio", mlp_ratio if model_config is None else None, 4.0))
-        depth_single_blocks = int(
-            resolve(
-                "depth_single_blocks",
-                depth_single_blocks if model_config is None else None,
-                0,
-            )
-        )
-        axes_dim = list(resolve("axes_dim", axes_dim, [16, 56, 56]))
-        theta = int(resolve("theta", theta if model_config is None else None, 10000))
-        patch_size = int(resolve("patch_size", patch_size if model_config is None else None, 1))
-        qkv_bias = bool(resolve("qkv_bias", qkv_bias if model_config is None else None, True))
-        guidance_embed = bool(
-            resolve(
-                "guidance_embed",
-                guidance_embed if model_config is None else None,
-                False,
-            )
-        )
-        rope_type = str(resolve("rope_type", rope_type if model_config is None else None, "msrope"))
-        time_type = str(resolve("time_type", time_type if model_config is None else None, "qwen_proj"))
-        double_block_type = str(
-            resolve(
-                "double_block_type",
-                double_block_type if model_config is None else None,
-                "double_stream",
-            )
-        )
-        apply_text_rotary_emb = bool(
-            resolve(
-                "apply_text_rotary_emb",
-                apply_text_rotary_emb if model_config is None else None,
-                False,
-            )
-        )
-        packing = bool(resolve("packing", packing if model_config is None else None, True))
-        schedule_mode = str(
-            resolve(
-                "schedule_mode",
-                schedule_mode if model_config is None else None,
-                "z-image",
-            )
-        )
-        static_shift = float(
-            resolve(
-                "static_shift",
-                static_shift if model_config is None else None,
-                6.0,
-            )
-        )
-        use_time_shift = bool(
-            resolve(
-                "use_time_shift",
-                use_time_shift if model_config is None else None,
-                False,
-            )
-        )
+        # The pipeline expands transformer/config.json into these keyword
+        # arguments, so no separate lookup against od_config is needed.
+        axes_dim = list(axes_dim) if axes_dim is not None else [16, 56, 56]
 
         if hidden_size % num_heads:
             raise ValueError(f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")

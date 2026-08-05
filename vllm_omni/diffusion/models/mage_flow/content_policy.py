@@ -19,13 +19,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 from PIL import Image
-
 
 # --- Gaussian-Shading watermark -------------------------------------------
 
@@ -300,6 +299,48 @@ def _extract_json_object(text: str) -> dict:
     raise ValueError(f"unbalanced JSON object: {text[start : start + 120]!r}")
 
 
+def _generate_verdict(
+    text_encoder,
+    tokenizer,
+    generation_inputs: dict,
+    *,
+    max_new_tokens: int,
+    full_output_mode: bool,
+) -> FilterVerdict:
+    """Generate and parse one classifier verdict.
+
+    Raises on any generation, decoding, or schema failure; each caller decides
+    how to fail closed.
+    """
+    input_length = generation_inputs["input_ids"].shape[1]
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+    with _full_output_mode(text_encoder) if full_output_mode else nullcontext():
+        output_ids = text_encoder.generate(
+            **generation_inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
+        )
+    raw = tokenizer.decode(
+        output_ids[0, input_length:],
+        skip_special_tokens=True,
+    ).strip()
+    parsed = _extract_json_object(raw)
+    violates = parsed.get("violates")
+    categories = parsed.get("categories")
+    reason = parsed.get("reason")
+    if (
+        not isinstance(violates, bool)
+        or not isinstance(categories, list)
+        or not all(isinstance(item, str) for item in categories)
+        or not isinstance(reason, str)
+    ):
+        raise ValueError("content checker returned an invalid schema")
+    return FilterVerdict(violates, categories, reason, raw=raw)
+
+
 @torch.no_grad()
 def screen_mage_flow_prompt(
     text_encoder,
@@ -329,32 +370,13 @@ def screen_mage_flow_prompt(
     device = next(text_encoder.parameters()).device
     inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
     try:
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
-        output_ids = text_encoder.generate(
-            **inputs,
+        return _generate_verdict(
+            text_encoder,
+            tokenizer,
+            inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_id,
-            eos_token_id=eos_id,
+            full_output_mode=False,
         )
-        input_length = inputs["input_ids"].shape[1]
-        raw = tokenizer.decode(
-            output_ids[0, input_length:],
-            skip_special_tokens=True,
-        ).strip()
-        parsed = _extract_json_object(raw)
-        violates = parsed.get("violates")
-        categories = parsed.get("categories")
-        reason = parsed.get("reason")
-        if (
-            not isinstance(violates, bool)
-            or not isinstance(categories, list)
-            or not all(isinstance(item, str) for item in categories)
-            or not isinstance(reason, str)
-        ):
-            raise ValueError("content checker returned an invalid schema")
-        return FilterVerdict(violates, categories, reason, raw=raw)
     except Exception as error:
         # The official behavior is fail-closed: checker failure must not turn
         # into an unreviewed generation.
@@ -425,33 +447,13 @@ def screen_mage_flow_edit_prompt(
             }
             and value is not None
         }
-        input_length = generation_inputs["input_ids"].shape[1]
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
-        with _full_output_mode(text_encoder):
-            output_ids = text_encoder.generate(
-                **generation_inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=pad_id,
-                eos_token_id=eos_id,
-            )
-        raw = tokenizer.decode(
-            output_ids[0, input_length:],
-            skip_special_tokens=True,
-        ).strip()
-        parsed = _extract_json_object(raw)
-        violates = parsed.get("violates")
-        categories = parsed.get("categories")
-        reason = parsed.get("reason")
-        if (
-            not isinstance(violates, bool)
-            or not isinstance(categories, list)
-            or not all(isinstance(item, str) for item in categories)
-            or not isinstance(reason, str)
-        ):
-            raise ValueError("content checker returned an invalid schema")
-        return FilterVerdict(violates, categories, reason, raw=raw)
+        return _generate_verdict(
+            text_encoder,
+            tokenizer,
+            generation_inputs,
+            max_new_tokens=max_new_tokens,
+            full_output_mode=True,
+        )
     except Exception as error:
         return FilterVerdict(
             violates=True,

@@ -60,7 +60,6 @@ from .mage_flow_transformer import (
     resolve_mage_flow_stacked_name,
 )
 from .prompt_utils import (
-    encode_mage_flow_edit_prompt,
     encode_mage_flow_prompt,
     get_mage_flow_variant_defaults,
     normalize_mage_flow_reference_images,
@@ -777,7 +776,6 @@ class MageFlowPipeline(
                     f"Mage-Flow content safety check rejected the request ({categories}): {verdict.reason}"
                 )
 
-        encode_prompt = encode_mage_flow_edit_prompt if is_edit else encode_mage_flow_prompt
         encode_kwargs = (
             {
                 "reference_images": reference_images,
@@ -786,7 +784,7 @@ class MageFlowPipeline(
             if is_edit
             else {}
         )
-        prompt_embeds = encode_prompt(
+        prompt_embeds = encode_mage_flow_prompt(
             self.text_encoder,
             self.processor,
             prompt,
@@ -795,7 +793,7 @@ class MageFlowPipeline(
         )
         do_cfg = guidance_scale > 1.0
         negative_prompt_embeds = (
-            encode_prompt(
+            encode_mage_flow_prompt(
                 self.text_encoder,
                 self.processor,
                 negative_prompt,

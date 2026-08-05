@@ -18,11 +18,12 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding
+from diffusers.models.normalization import (
+    AdaLayerNormContinuous as DiffusersAdaLayerNormContinuous,
+)
 from diffusers.models.normalization import RMSNorm
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -34,6 +35,10 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+
+# Mage's FFN is the Qwen-Image tensor-parallel FeedForward: same ``net.0.proj``/
+# ``net.2`` diffusers weight layout, same tanh-approximate GELU, same sharding.
+from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import FeedForward
 
 
 def _sequence_parallel_active() -> bool:
@@ -410,84 +415,6 @@ class MageFlowImageRopePrepare(nn.Module):
             image_attention_mask,
         )
         return hidden_states, image_rotary_emb
-
-
-class ColumnParallelApproxGELU(nn.Module):
-    """Column-sharded ``Linear`` + tanh-approximate GELU (diffusers ``GELU``)."""
-
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        *,
-        approximate: str = "tanh",
-        bias: bool = True,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim_in,
-            dim_out,
-            bias=bias,
-            gather_output=False,
-            return_bias=False,
-            prefix=f"{prefix}.proj" if prefix else "proj",
-        )
-        self.approximate = approximate
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return F.gelu(self.proj(hidden_states), approximate=self.approximate)
-
-
-class FeedForward(nn.Module):
-    """Tensor-parallel drop-in for the diffusers ``FeedForward`` used by Mage.
-
-    The submodule names (``net.0.proj`` / ``net.2``) intentionally match the
-    diffusers layout so the official checkpoint loads without remapping. Index
-    ``net.1`` is the parameter-free dropout slot and stays an ``Identity``.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        dim_out: int | None = None,
-        mult: int = 4,
-        activation_fn: str = "gelu-approximate",
-        inner_dim: int | None = None,
-        bias: bool = True,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        if activation_fn != "gelu-approximate":
-            raise ValueError(f"Mage-Flow FFN only supports 'gelu-approximate', got {activation_fn!r}")
-        inner_dim = inner_dim if inner_dim is not None else int(dim * mult)
-        dim_out = dim_out if dim_out is not None else dim
-
-        self.net = nn.ModuleList(
-            [
-                ColumnParallelApproxGELU(
-                    dim,
-                    inner_dim,
-                    approximate="tanh",
-                    bias=bias,
-                    prefix=f"{prefix}.net.0" if prefix else "net.0",
-                ),
-                nn.Identity(),  # placeholder keeping the diffusers weight names
-                RowParallelLinear(
-                    inner_dim,
-                    dim_out,
-                    bias=bias,
-                    input_is_parallel=True,
-                    return_bias=False,
-                    prefix=f"{prefix}.net.2" if prefix else "net.2",
-                ),
-            ]
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        for module in self.net:
-            hidden_states = module(hidden_states)
-        return hidden_states
 
 
 class MageJointAttention(nn.Module):
@@ -892,24 +819,12 @@ class MageFlowDoubleStreamBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class AdaLayerNormContinuous(nn.Module):
-    def __init__(
-        self,
-        embedding_dim: int,
-        conditioning_embedding_dim: int,
-        elementwise_affine: bool = True,
-        eps: float = 1e-5,
-        bias: bool = True,
-    ) -> None:
-        super().__init__()
-        self.silu = nn.SiLU()
-        self.linear = nn.Linear(conditioning_embedding_dim, embedding_dim * 2, bias=bias)
-        self.norm = nn.LayerNorm(
-            embedding_dim,
-            eps=eps,
-            elementwise_affine=elementwise_affine,
-            bias=bias,
-        )
+class AdaLayerNormContinuous(DiffusersAdaLayerNormContinuous):
+    """diffusers' ``AdaLayerNormContinuous`` with request-isolated modulation.
+
+    The modulation projection is the only difference: it runs one request at a
+    time so its GEMM shape matches standalone execution.
+    """
 
     def forward(
         self,
