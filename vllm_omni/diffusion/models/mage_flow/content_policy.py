@@ -268,28 +268,12 @@ Respond with STRICT JSON ONLY (no markdown, no preamble, no commentary):
 → {"violates": false, "categories": [], "reason": "Not a recognizable public figure; ordinary person, innocuous edit — allowed."}"""
 
 
-CATEGORY_DISPLAY = {
-    "sexual": "Sexual content",
-    "hate": "Hate / unfair imagery",
-    "self_harm": "Self-harm",
-    "violence": "Violence / gore",
-    "copyright": "Copyright / IP character",
-    "public_figure": "Real-person likeness",
-}
-
-
 @dataclass
 class FilterVerdict:
     violates: bool
     categories: list[str]
     reason: str
     raw: str = ""
-
-    def banner(self) -> str:
-        if not self.violates:
-            return ""
-        cat = ", ".join(CATEGORY_DISPLAY.get(c, c) for c in self.categories) or "policy violation"
-        return f"🚫 **Content Filter:** Blocked — `{cat}` · {self.reason}"
 
 
 def _extract_json_object(text: str) -> dict:
@@ -314,17 +298,6 @@ def _extract_json_object(text: str) -> dict:
             if depth == 0:
                 return json.loads(text[start : i + 1])
     raise ValueError(f"unbalanced JSON object: {text[start : start + 120]!r}")
-
-
-def check_prompt(model, prompt: str, max_new_tokens: int = 160) -> FilterVerdict:
-    """Back-compat wrapper around the mandatory text-encoder screener.
-
-    The policy check now lives on the text encoder
-    (:meth:`TextEncoder.screen_text`) so it runs on the same Qwen3-VL weights
-    that produce the diffusion conditioning and is FAIL-CLOSED. Kept here for
-    external callers / tests that import ``check_prompt`` directly.
-    """
-    return model.txt_enc.screen_text(prompt, max_new_tokens=max_new_tokens)
 
 
 @torch.no_grad()
@@ -516,23 +489,3 @@ def _full_output_mode(hf):
             pass
 
 
-def check_edit(model, prompt: str, ref_images, max_new_tokens: int = 192) -> FilterVerdict:
-    """Back-compat wrapper around :meth:`TextEncoder.screen_edit`.
-
-    Classifies an image-EDIT request considering BOTH the source image(s) and
-    the instruction (multimodal Qwen3-VL), FAIL-CLOSED. Kept for external
-    callers / tests that import ``check_edit`` directly.
-    """
-    return model.txt_enc.screen_edit(prompt, ref_images, max_new_tokens=max_new_tokens)
-
-
-def make_refusal_image(
-    verdict: FilterVerdict,
-    height: int = 1024,
-    width: int = 1024,
-) -> Image.Image:
-    """Return a placeholder image to display when the prompt is blocked.
-
-    A plain white blank image — no text, no category/reason surfaced.
-    """
-    return Image.new("RGB", (width, height), color=(255, 255, 255))

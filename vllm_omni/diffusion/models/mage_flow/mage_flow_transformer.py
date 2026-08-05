@@ -7,13 +7,10 @@
 
 """Native vLLM-Omni implementation of the Mage-Flow NR-MMDiT."""
 
-from collections.abc import Iterable
-
 import torch
 import torch.nn as nn
 from diffusers.models.normalization import RMSNorm
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -431,23 +428,3 @@ class MageFlowTransformer2DModel(nn.Module):
         )
         output = output * image_attention_mask[..., None]
         return (output,)
-
-    def load_weights(
-        self,
-        weights: Iterable[tuple[str, torch.Tensor]],
-    ) -> set[str]:
-        """Load transformer weights, fusing the unfused Q/K/V checkpoint tensors."""
-        params = dict(self.named_parameters())
-        loaded: set[str] = set()
-        for name, loaded_weight in weights:
-            lookup_name, shard_id = resolve_mage_flow_stacked_name(name)
-            param = params.get(lookup_name)
-            if param is None:
-                raise KeyError(f"Unexpected Mage-Flow transformer weight: {name}")
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if shard_id is None:
-                weight_loader(param, loaded_weight)
-            else:
-                weight_loader(param, loaded_weight, shard_id)
-            loaded.add(name)
-        return loaded
