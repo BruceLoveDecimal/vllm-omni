@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
 import numpy as np
@@ -305,7 +304,6 @@ def _generate_verdict(
     generation_inputs: dict,
     *,
     max_new_tokens: int,
-    full_output_mode: bool,
 ) -> FilterVerdict:
     """Generate and parse one classifier verdict.
 
@@ -315,14 +313,13 @@ def _generate_verdict(
     input_length = generation_inputs["input_ids"].shape[1]
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
-    with _full_output_mode(text_encoder) if full_output_mode else nullcontext():
-        output_ids = text_encoder.generate(
-            **generation_inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_id,
-            eos_token_id=eos_id,
-        )
+    output_ids = text_encoder.generate(
+        **generation_inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=pad_id,
+        eos_token_id=eos_id,
+    )
     raw = tokenizer.decode(
         output_ids[0, input_length:],
         skip_special_tokens=True,
@@ -375,7 +372,6 @@ def screen_mage_flow_prompt(
             tokenizer,
             inputs,
             max_new_tokens=max_new_tokens,
-            full_output_mode=False,
         )
     except Exception as error:
         # The official behavior is fail-closed: checker failure must not turn
@@ -452,7 +448,6 @@ def screen_mage_flow_edit_prompt(
             tokenizer,
             generation_inputs,
             max_new_tokens=max_new_tokens,
-            full_output_mode=True,
         )
     except Exception as error:
         return FilterVerdict(
@@ -460,34 +455,5 @@ def screen_mage_flow_edit_prompt(
             categories=["safety_check_error"],
             reason=f"edit content safety check failed: {error}",
         )
-
-
-@contextmanager
-def _full_output_mode(hf):
-    """Temporarily switch the Qwen3-VL encoder into FULL output mode so that
-    ``.generate()`` sees ``.logits`` (the diffusion path uses embedding mode).
-    Restores the original mode/skip flags on exit — side-effect free."""
-    prev_mode = getattr(hf, "_output_mode", None)
-    prev_skip = getattr(hf, "_skip_lm_head", None)
-    try:
-        if hasattr(hf, "set_output_mode"):
-            try:
-                hf.set_output_mode("full")
-            except Exception:  # noqa: BLE001
-                if prev_skip is not None:
-                    hf._skip_lm_head = False
-                if prev_mode is not None:
-                    hf._output_mode = "full"
-        elif prev_skip is not None:
-            hf._skip_lm_head = False
-        yield
-    finally:
-        try:
-            if prev_mode is not None and hasattr(hf, "set_output_mode"):
-                hf.set_output_mode(prev_mode)
-            if prev_skip is not None:
-                hf._skip_lm_head = prev_skip
-        except Exception:  # noqa: BLE001
-            pass
 
 
