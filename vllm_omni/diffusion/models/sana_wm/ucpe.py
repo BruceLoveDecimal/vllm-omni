@@ -63,9 +63,9 @@ def _unproject_pinhole(
     """Unproject a pixel grid into camera-frame direction vectors.
 
     Args:
-        fx, fy, cx, cy: shape ``(B, T)`` intrinsics in latent-pixel units
-            (caller divides ``cx``/``cy`` by patch size before calling).
-        height, width: latent grid size.
+        fx, fy, cx, cy: shape ``(B, T)`` intrinsics in token-grid units — the
+            caller divides all four by patch size before calling.
+        height, width: token-grid size.
 
     Returns:
         ``(B, T, H, W, 3)`` direction tensor (NOT normalised).
@@ -143,7 +143,8 @@ def _process_camera_conditions(
 
     Args:
         camera_conditions: ``(B, T, 20)`` from ``_pack_camera_conditions``.
-        hw: ``(T_latent, H_latent, W_latent)`` latent-grid shape.
+        hw: ``(T, H, W)`` token-grid shape. Equal to the latent grid only
+            because the released config patches by ``(1, 1, 1)``.
     """
     B, T_cond, last = camera_conditions.shape
     if last != 20:
@@ -240,11 +241,11 @@ def _slice_rope_for_cam(
     """Re-slice WAN-style RoPE frequencies for a smaller ``rope_dim`` using the
     same ``(T, H, W)`` split as the main branch. Mirrors NVlabs slicing logic.
 
-    The WAN RoPE T/H/W band layout is derived from the input tensor shape
-    (``rotary_emb.shape[-1] * 2``), not from a separately supplied head_dim.
-    This makes the function correct under tensor parallelism even when
-    ``cam_head_dim`` differs from the main-branch ``head_dim`` that was used to
-    build the WAN RoPE table.
+    The T/H/W band layout is read off the input shape
+    (``rotary_emb.shape[-1] * 2``) rather than a separately supplied head_dim,
+    so the split stays correct without the caller passing it. ``cam_head_dim``
+    still has to equal the main ``head_dim`` — ``SanaWmSelfAttention.__init__``
+    rejects anything else.
     """
     if rotary_emb is None:
         return None

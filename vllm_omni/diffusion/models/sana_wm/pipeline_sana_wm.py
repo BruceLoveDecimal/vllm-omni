@@ -3,10 +3,9 @@
 """Sana-WM pipeline integration.
 
 This module wires the registry-visible surface, release-layout validation, and
-an in-process native reference backend for GPU e2e testing. The backend executes
-the public NVlabs/Sana Stage-1 DiT/Gated-DeltaNet Python modules without
-shelling out to the CLI; a future optimization pass can port those large modules
-into vLLM-Omni-native layers incrementally.
+the Stage-1 sampling loop. The DiT, Gated-DeltaNet and camera stack are
+vLLM-Omni-native layers (``sana_wm_transformer.py`` / ``ucpe.py``); nothing here
+calls into NVlabs code at runtime.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ from typing import Any, ClassVar
 import torch
 import torch.nn.functional as F
 from torch import nn
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -56,6 +56,8 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+
+logger = init_logger(__name__)
 
 # The loader expects the standard diffusers layout (transformer/config.json +
 # transformer/diffusion_pytorch_model.safetensors + model_index.json). This
@@ -117,11 +119,10 @@ class SanaWmLocalPaths:
 
 @dataclass(frozen=True)
 class SanaWmNativeParams:
-    """Small native fallback generation settings.
+    """Resolved generation settings for one Stage-1 request.
 
-    This is not the production SANA-WM sampler; it exists to exercise the
-    vLLM-Omni-native transformer/camera/scheduler stack at bounded sizes while
-    the exact GDN path is being ported.
+    Built by ``_native_params`` from the request payload and sampling params,
+    and consumed by ``_run_native_backend`` — this is the production path.
     """
 
     height: int
@@ -258,7 +259,7 @@ class SanaWmPipeline(
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
 ):
-    """Stage-1 SANA-WM image-to-video pipeline placeholder."""
+    """Stage-1 SANA-WM image-to-video pipeline."""
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
@@ -469,9 +470,10 @@ class SanaWmPipeline(
         # inference_video_scripts/inference_sana_wm.py, the SANA VAE has to
         # tile — a 161-frame decode costs about 9 GiB more without it, and a
         # 321-frame request (41 latent frames) decodes as one 3D volume and
-        # OOMs. The deploy YAML sets vae_use_tiling so the intent is visible in
-        # config too; this keeps offline callers that pass no deploy config
-        # from silently losing it.
+        # OOMs. Overriding is deliberate, but say so rather than dropping the
+        # caller's setting silently.
+        if not self.vae.use_tiling:
+            logger.warning("Sana-WM forces VAE tiling on; ignoring vae_use_tiling=False (the VAE OOMs without it).")
         self.vae.use_tiling = True
         self.vae.to(device=device, dtype=dtype)
 
@@ -716,8 +718,9 @@ class SanaWmPipeline(
         timesteps = scheduler.timesteps
 
         # A.1: first-frame VAE encode — initialize latents from the request image.
-        # Only attempt encoding for PIL/ndarray/Tensor; other types (e.g. test
-        # placeholder objects) fall through to pure-noise initialization.
+        # A missing image means pure noise; a present but unusable one is an
+        # error, since falling back to noise would silently drop the
+        # conditioning and produce a plausible-looking but wrong video.
         import numpy as _np
 
         first_frame_image = (prompt.get("multi_modal_data") or {}).get("image")
@@ -859,9 +862,13 @@ class SanaWmPipeline(
                 cfg_normalize=False,
             )
 
-            # NVlabs ``LTXFlowEuler.sample`` calls the scheduler with the noise
-            # prediction sign-flipped; diffusers then applies
-            # ``prev = sample + dt * model_output``.
+            # Both branches end at ``prev = sample + dt * model_output``, but the
+            # scheduler defines dt with opposite signs: ``sigma - sigma_next``
+            # per-token, ``sigma_next - sigma`` standard. So the per-token call
+            # takes the sign-flipped prediction (matching NVlabs
+            # ``LTXFlowEuler.sample``) and the standard call takes it as-is.
+            # Passing the same sign to both would integrate one of them towards
+            # more noise.
             if use_per_token_step:
                 # Broadcast the (B, 1, F) timestep to (B, 1, F, H, W) and flatten
                 # F*H*W; frame-0 conditioning tokens are already 0. The flatten
@@ -889,7 +896,7 @@ class SanaWmPipeline(
                     latents.shape[4],
                 )
             else:
-                stepped = scheduler.step(-noise_pred, timestep, latents, return_dict=False)[0]
+                stepped = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
             if condition_mask is not None:
                 # Match NVlabs LTXFlowEuler exactly. This is stricter than a

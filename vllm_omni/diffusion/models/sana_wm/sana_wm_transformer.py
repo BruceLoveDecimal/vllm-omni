@@ -703,9 +703,6 @@ class SanaWmSelfAttention(nn.Module):
                 f"main QKV (cam_dim={self.cam_dim}, cam_heads={self.cam_heads}, "
                 f"total_cam_dim={self.total_cam_dim})."
             )
-        # q_proj_cam / k_proj_cam / v_proj_cam / out_proj_cam are initialised
-        # in the TP/fallback conditional above so they follow the same
-        # ColumnParallelLinear / RowParallelLinear pattern as qkv and proj.
         self.q_norm_cam = norm_cls(self.cam_dim)
         self.k_norm_cam = norm_cls(self.cam_dim)
         self.conv_k_cam = (
@@ -1193,9 +1190,8 @@ class SanaWmSelfAttention(nn.Module):
         q_normed = q_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
         k_normed = k_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim)
 
-        # 4-6. Cam-prep semantics: ReLU/K-scale, UCPE projection, RoPE, and K
-        # inflation tracking. Outputs already use NVlabs' ``(B, H, D, N)`` scan
-        # layout.
+        # 4-5. Cam-prep: ReLU/K-scale, UCPE projection, RoPE, and K inflation
+        # tracking. Outputs already use NVlabs' ``(B, H, D, N)`` scan layout.
         v_raw = v_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).contiguous()
         k_scale = (self.cam_head_dim**-0.5) * (spatial_tokens**-0.5)
         q_rot_bhdn, k_rot_bhdn, v_bhdn, inflation_sq = cam_prep_func(
@@ -1209,25 +1205,23 @@ class SanaWmSelfAttention(nn.Module):
             k_scale=k_scale,
         )
 
-        # 7. Dynamic Beta Discounting (per-frame mean over spatial tokens).
+        # 6. Dynamic Beta Discounting (per-frame mean over spatial tokens).
         beta, decay = precomputed_gates
         inflation_per_token = inflation_sq.reshape(batch_size, self.cam_heads, frames, spatial_tokens)
         frame_inflation_sq = inflation_per_token.mean(dim=-1)  # (B, H_cam, T)
+        # β/decay come from the main branch, so the cam branch can only reuse
+        # them head-for-head. cam_attn_compress > 1 would give the cam branch
+        # fewer heads and needs a grouping rule this port does not implement;
+        # __init__ already rejects it via the cam_head_dim check.
         if beta.shape[1] != self.cam_heads:
-            repeat_factor = self.cam_heads // beta.shape[1]
-            if repeat_factor * beta.shape[1] != self.cam_heads:
-                raise ValueError(
-                    "Sana-WM cam branch expects cam_heads to be a multiple of main heads,"
-                    f" got cam_heads={self.cam_heads} main_heads={beta.shape[1]}."
-                )
-            beta_cam = beta.repeat_interleave(repeat_factor, dim=1)
-            decay_cam = decay.repeat_interleave(repeat_factor, dim=1)
-        else:
-            beta_cam = beta
-            decay_cam = decay
-        beta_cam = beta_cam / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
+            raise ValueError(
+                "Sana-WM cam branch requires cam_heads == main heads (cam_attn_compress=1),"
+                f" got cam_heads={self.cam_heads} main_heads={beta.shape[1]}."
+            )
+        beta_cam = beta / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
+        decay_cam = decay
 
-        # 8. Single-path bidirectional delta-rule recurrence on the UCPE-
+        # 7. Single-path bidirectional delta-rule recurrence on the UCPE-
         # transformed Q/K/V (no Z denominator, no final divide).
         cam_out_bhdn, _ = _bidirectional_delta_scan(
             q_rot_bhdn.float(),
@@ -1240,7 +1234,7 @@ class SanaWmSelfAttention(nn.Module):
         )
         cam_out_bhdn = cam_out_bhdn.to(q_rot_bhdn.dtype)
 
-        # 9. Apply inverse UCPE transform on the recurrence output.
+        # 8. Apply inverse UCPE transform on the recurrence output.
         # ``apply_output`` expects (B, H, N, D); we currently have
         # (B, H, D, N) — transpose, apply, transpose back.
         cam_out_bhnd = cam_out_bhdn.transpose(-1, -2).contiguous()
@@ -1272,9 +1266,8 @@ class SanaWmSelfAttention(nn.Module):
         those transforms to the Q/K/V channels via UCPE.
         """
         if self.use_gdn:
-            if cam_geometry is None or self.q_proj_cam is None:
-                # Main branch only — preserves legacy path when the request
-                # has no camera info or the cam projections were not built.
+            if cam_geometry is None:
+                # No camera conditioning on this request — main branch only.
                 return self._forward_gdn(hidden_states, spatial_shape, rotary_emb)
             # Dual-branch: precompute β/decay once, run main raw, cam raw,
             # combine, then apply shared output_gate + proj exactly once.
@@ -1705,10 +1698,11 @@ class SanaWmFinalLayer(nn.Module):
 
 
 class SanaWmTransformer3DModel(nn.Module):
-    """SANA-WM Stage-1 DiT with a runnable pure-PyTorch GDN fallback path."""
+    """SANA-WM Stage-1 DiT: bidirectional Gated DeltaNet blocks with a softmax
+    attention block every ``softmax_every_n``."""
 
     _repeated_blocks: ClassVar[list[str]] = ["SanaWmBlock"]
-    _layerwise_offload_blocks_attr: ClassVar[str] = "blocks"
+    _layerwise_offload_blocks_attrs: ClassVar[list[str]] = ["blocks"]
     _hsdp_shard_conditions: ClassVar[list[Any]] = [_is_sana_wm_transformer_block]
 
     def __init__(
