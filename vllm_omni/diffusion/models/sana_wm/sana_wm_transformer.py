@@ -220,8 +220,11 @@ def _bidirectional_delta_scan(
     by one frame (neutral 1.0 pad), matching the NVlabs ``flip_and_shift``
     convention, then flips the result back onto the forward frame order.
     """
-    batch_size, num_heads, head_dim, token_count = query_rot.shape
+    batch_size, num_heads, _, token_count = query_rot.shape
     frames = beta.shape[2]
+
+    def reverse(tensor: torch.Tensor, *, shift_value: float | None = None) -> torch.Tensor:
+        return _reverse_frames(tensor, frames=frames, spatial_tokens=spatial_tokens, shift_value=shift_value)
 
     num_fwd, den_fwd = _delta_scan(
         query_rot,
@@ -235,21 +238,15 @@ def _bidirectional_delta_scan(
         skip_z=skip_z,
     )
 
-    def to_time(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
-
-    def from_time(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, head_dim, token_count)
-
     bwd_kwargs: dict[str, torch.Tensor] = {}
     if not skip_z:
-        bwd_kwargs["query"] = from_time(torch.flip(to_time(query), dims=[2]))
-        bwd_kwargs["key"] = from_time(_flip_and_shift(to_time(key), dim=2, shift_value=0.0))
+        bwd_kwargs["query"] = reverse(query)
+        bwd_kwargs["key"] = reverse(key, shift_value=0.0)
 
-    num_bwd_flipped, den_bwd_flipped = _delta_scan(
-        from_time(torch.flip(to_time(query_rot), dims=[2])),
-        from_time(_flip_and_shift(to_time(key_rot), dim=2, shift_value=0.0)),
-        from_time(_flip_and_shift(to_time(value), dim=2, shift_value=0.0)),
+    num_bwd, den_bwd = _delta_scan(
+        reverse(query_rot),
+        reverse(key_rot, shift_value=0.0),
+        reverse(value, shift_value=0.0),
         _flip_and_shift(beta, dim=2, shift_value=0.0),
         _flip_and_shift(decay, dim=2, shift_value=1.0),
         spatial_tokens=spatial_tokens,
@@ -257,14 +254,34 @@ def _bidirectional_delta_scan(
         **bwd_kwargs,
     )
 
-    def flip_back(tensor: torch.Tensor) -> torch.Tensor:
-        dim = tensor.shape[2]
-        tensor = tensor.view(batch_size, num_heads, dim, frames, spatial_tokens)
-        return torch.flip(tensor, dims=[3]).reshape(batch_size, num_heads, dim, token_count)
+    def merge(forward: torch.Tensor, backward: torch.Tensor) -> torch.Tensor:
+        dim = backward.shape[2]
+        backward = backward.reshape(batch_size, num_heads, dim, frames, spatial_tokens)
+        return forward + torch.flip(backward, dims=[3]).reshape(batch_size, num_heads, dim, token_count)
 
-    numerator = num_fwd + flip_back(num_bwd_flipped)
-    denominator = None if skip_z else den_fwd + flip_back(den_bwd_flipped)
-    return numerator, denominator
+    return merge(num_fwd, num_bwd), (None if skip_z else merge(den_fwd, den_bwd))
+
+
+def _reverse_frames(
+    tensor: torch.Tensor,
+    *,
+    frames: int,
+    spatial_tokens: int,
+    shift_value: float | None = None,
+) -> torch.Tensor:
+    """Reverse frame order on a ``[..., T*S]`` tensor, optionally shifting by one frame.
+
+    The frame axis is the outer half of the flat token axis, so unfolding it in
+    place keeps the tensor's own layout: the flip writes a contiguous result and
+    the reshape back is a view. Routing this through a ``[..., T, D, S]``
+    permutation instead would cost a second full materialization.
+    """
+    lead = tensor.shape[:-1]
+    reversed_ = torch.flip(tensor.reshape(*lead, frames, spatial_tokens), dims=[-2])
+    if shift_value is not None:
+        padding = torch.full((*lead, 1, spatial_tokens), shift_value, device=tensor.device, dtype=tensor.dtype)
+        reversed_ = torch.cat([padding, reversed_.narrow(-2, 0, frames - 1)], dim=-2)
+    return reversed_.reshape(*lead, frames * spatial_tokens)
 
 
 def _flip_and_shift(tensor: torch.Tensor, *, dim: int, shift_value: float) -> torch.Tensor:
