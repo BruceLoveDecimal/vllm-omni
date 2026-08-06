@@ -1,9 +1,9 @@
 # SANA-WM I2V deploy: Stage-1 DiT + SANA VAE decode.
 #
-# model_class_name is an explicit override: the published checkpoint's
-# model_index.json still names the two-stage class, which this build no longer
-# registers.  skip_mm_profiling is required because diffusion_engine.py skips
-# dummy_run for SanaWmPipeline.
+# No model_class_name override: the Stage-1 repo's model_index.json names
+# SanaWmPipeline, so enrich_config resolves the class on its own. See
+# SANA_WM_MODEL_ID in models/sana_wm/pipeline_sana_wm.py. skip_mm_profiling is
+# required because diffusion_engine.py skips dummy_run for SanaWmPipeline.
 #
 # default_sampling_params mirror the NVlabs-recommended production inference
 # config. See recipes/sana/SANA-WM.md for launch and request examples:
@@ -23,8 +23,6 @@ stages:
     # The SANA VAE decodes a 161-frame clip about 9 GiB cheaper with tiling on,
     # and needs it outright for longer requests.
     vae_use_tiling: true
-    engine_args:
-      model_class_name: "SanaWmPipeline"
     default_sampling_params:
       seed: 42
       height: 704

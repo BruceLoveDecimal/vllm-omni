@@ -19,7 +19,7 @@ Use this recipe when you want to serve SANA-WM through `/v1/videos` or
 `/v1/videos/sync`. The model takes a text prompt, a first-frame image, and
 either an action DSL string or explicit camera poses. vLLM-Omni serves the
 SANA-WM Stage-1 DiT, decoded through the SANA VAE. The optional LTX-2 refiner
-stage is not supported by this PR; it is a planned follow-up.
+stage is not supported by this integration; it is a planned follow-up.
 
 ## References
 
@@ -40,11 +40,17 @@ stage is not supported by this PR; it is a planned follow-up.
   the whole model repo at startup (`allow_patterns=["*"]`), which is why the
   Stage-1 weights live in their own repo — the two-stage one carries an
   additional 84 GB `refiner/` that this path never loads.
+- Text encoder: the pipeline tries `google/gemma-2-2b-it` first, then falls back
+  to the ungated mirror `Efficient-Large-Model/gemma-2-2b-it`. The first repo is
+  gated, so without an accepted licence and `hf auth login` you will see one
+  failed load before the fallback succeeds — that is expected, not an error to
+  chase. Set `VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER` to pin a specific repo or a
+  local path and skip both.
 - Disk sizing: provision about 40 GB of local disk or Hugging Face cache volume
   so the model, temporary downloads, and generated artifacts fit without cache
   eviction.
 - GPU sizing: the default 1280x704, 161-frame, 60-step serving profile peaks at
-  22.6 GB of device memory and takes about 136 s to generate on one RTX PRO
+  22.6 GB of device memory and takes about 133 s to generate on one RTX PRO
   6000 Blackwell. The peak lands in the VAE decode, so keep `vae_use_tiling`
   on — without it the same request costs about 9 GB more. On smaller GPUs,
   lower `width`, `height`, or `num_frames` before serving production requests.
