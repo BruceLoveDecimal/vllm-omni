@@ -136,6 +136,7 @@ def _delta_scan(
     query: torch.Tensor | None = None,
     key: torch.Tensor | None = None,
     skip_z: bool = False,
+    flip_output: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """One-directional gated delta-rule recurrence over frames.
 
@@ -144,6 +145,10 @@ def _delta_scan(
     entirely and returns ``(numerator, None)`` — the numerator-only variant the
     camera branch needs (NVlabs ``torch_recurrent_cam_single_path_delta_rule``),
     so ``query``/``key`` may be omitted there.
+
+    ``flip_output=True`` emits the frames in reverse of the order they were
+    computed, which is what a caller running on flipped inputs wants; it costs a
+    list reversal instead of a flip over the assembled result.
     """
     if not skip_z and (query is None or key is None):
         raise ValueError("Sana-WM delta scan needs non-rotary query/key unless skip_z is set.")
@@ -196,7 +201,7 @@ def _delta_scan(
         denominators.append(torch.matmul(state_z.transpose(-1, -2), query_t))
 
     def restore(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
-        stacked = torch.stack(tensors, dim=2)
+        stacked = torch.stack(tensors[::-1] if flip_output else tensors, dim=2)
         return stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, dim, token_count)
 
     return restore(numerators, head_dim), (None if skip_z else restore(denominators, 1))
@@ -218,9 +223,9 @@ def _bidirectional_delta_scan(
 
     The backward direction shifts K/V/beta by one frame (zero pad) and the decay
     by one frame (neutral 1.0 pad), matching the NVlabs ``flip_and_shift``
-    convention, then flips the result back onto the forward frame order.
+    convention. The backward scan also emits its frames in forward order, so the
+    two directions add directly instead of flipping the assembled result back.
     """
-    batch_size, num_heads, _, token_count = query_rot.shape
     frames = beta.shape[2]
 
     def reverse(tensor: torch.Tensor, *, shift_value: float | None = None) -> torch.Tensor:
@@ -251,15 +256,11 @@ def _bidirectional_delta_scan(
         _flip_and_shift(decay, dim=2, shift_value=1.0),
         spatial_tokens=spatial_tokens,
         skip_z=skip_z,
+        flip_output=True,
         **bwd_kwargs,
     )
 
-    def merge(forward: torch.Tensor, backward: torch.Tensor) -> torch.Tensor:
-        dim = backward.shape[2]
-        backward = backward.reshape(batch_size, num_heads, dim, frames, spatial_tokens)
-        return forward + torch.flip(backward, dims=[3]).reshape(batch_size, num_heads, dim, token_count)
-
-    return merge(num_fwd, num_bwd), (None if skip_z else merge(den_fwd, den_bwd))
+    return num_fwd + num_bwd, (None if skip_z else den_fwd + den_bwd)
 
 
 def _reverse_frames(
