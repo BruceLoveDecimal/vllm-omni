@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for the SANA-WM stage input processor."""
+"""Unit tests for SANA-WM request normalization."""
 
 import pytest
 
-from vllm_omni.model_executor.stage_input_processors.sana_wm import (
+from vllm_omni.diffusion.models.sana_wm.request import (
     SANA_WM_DEFAULT_HEIGHT,
     SANA_WM_DEFAULT_NUM_FRAMES,
     SANA_WM_DEFAULT_WIDTH,

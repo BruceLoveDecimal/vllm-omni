@@ -30,6 +30,13 @@ def _as_tuple3(value: Any, default: tuple[int, int, int]) -> tuple[int, int, int
     return default
 
 
+# LTX-2 VAE compression ratios (SANA-WM ships ``AutoencoderKLLTX2Video``).
+# They live here rather than in the pipeline so the request-normalisation module
+# can validate latent geometry without importing the pipeline.
+SANA_WM_VAE_SPATIAL_COMPRESSION = 32
+SANA_WM_VAE_TEMPORAL_COMPRESSION = 8
+
+
 @dataclass(frozen=True)
 class SanaWmConfig:
     """SANA-WM Stage-1 architecture and runtime config.

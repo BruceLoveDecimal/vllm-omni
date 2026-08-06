@@ -39,7 +39,12 @@ from vllm_omni.diffusion.models.sana_wm.camera_control import (
     SanaWmCameraCondition,
     build_plucker_condition,
 )
-from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
+from vllm_omni.diffusion.models.sana_wm.config import (
+    SANA_WM_VAE_SPATIAL_COMPRESSION,
+    SANA_WM_VAE_TEMPORAL_COMPRESSION,
+    SanaWmConfig,
+)
+from vllm_omni.diffusion.models.sana_wm.request import normalize_sana_wm_payload
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
     SanaWmTransformer3DModel,
@@ -51,7 +56,6 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
-from vllm_omni.model_executor.stage_input_processors.sana_wm import normalize_sana_wm_payload
 
 # The loader expects the standard diffusers layout (transformer/config.json +
 # transformer/diffusion_pytorch_model.safetensors + model_index.json). This
@@ -76,13 +80,10 @@ SANA_WM_STAGE1_TEXT_ENCODER_FALLBACK_ID = "Efficient-Large-Model/gemma-2-2b-it"
 SANA_WM_STAGE1_TEXT_ENCODER_ENV = "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER"
 SANA_WM_OUTPUT_HEIGHT = 704
 SANA_WM_OUTPUT_WIDTH = 1280
-# LTX-2 VAE compression ratios (SANA-WM ships ``AutoencoderKLLTX2Video``).
-SANA_WM_VAE_SPATIAL_COMPRESSION = 32
-SANA_WM_VAE_TEMPORAL_COMPRESSION = 8
 SANA_WM_NUM_TRAIN_TIMESTEPS = 1000
 # Maximum supported clip length (20s @16fps) — the native envelope, not a
 # request default. Request-side defaults live in
-# ``stage_input_processors/sana_wm.py``.
+# ``models/sana_wm/request.py``.
 SANA_WM_NATIVE_NUM_FRAMES = 321
 # Fail-fast latent-token cap for the native Stage-1 path, sized to the native
 # 704x1280 output at the maximum clip length so it only rejects genuinely
