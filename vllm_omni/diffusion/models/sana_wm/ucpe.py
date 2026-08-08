@@ -402,9 +402,7 @@ def prepare_cam_geometry(
     else:
         rope_cos, rope_sin = _prepare_ucpe_rope_tables(rotary_emb_cam, token_count, half_dim)
 
-    apply_q, apply_kv, apply_output = _prepare_ray_apply_fns(
-        head_dim, proj, proj_q, proj_kv, rotary_emb=rotary_emb_cam
-    )
+    apply_q, apply_kv, apply_output = _prepare_ray_apply_fns(head_dim, proj, proj_q, proj_kv, rotary_emb=rotary_emb_cam)
     return SanaWmCamGeometry(
         proj_q=proj_q,
         proj_kv=proj_kv,
