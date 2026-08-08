@@ -118,9 +118,7 @@ def _as_positive_float(value: Any, *, name: str) -> float:
     return parsed
 
 
-def _extract_image(mm_data: Any) -> Any:
-    if not isinstance(mm_data, Mapping):
-        return None
+def _extract_image(mm_data: Mapping[str, Any]) -> Any:
     return _unwrap_single(mm_data.get("image"))
 
 
@@ -149,7 +147,7 @@ def _validate_latent_geometry(*, num_frames: int, height: int, width: int) -> No
         )
 
 
-def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool = True) -> dict[str, Any]:
+def normalize_sana_wm_payload(prompt: Mapping[str, Any]) -> dict[str, Any]:
     """Return a prompt copy with canonical Sana-WM request metadata.
 
     The ``sana_wm`` block is read from the top-level ``sana_wm`` key, falling
@@ -164,7 +162,7 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool 
     result = dict(prompt)
     mm_data = _as_dict(result.get("multi_modal_data"), name="multi_modal_data")
     image = _extract_image(mm_data)
-    if require_image and image is None:
+    if image is None:
         raise ValueError("Sana-WM requires a first-frame image in `multi_modal_data['image']`.")
 
     additional = _as_dict(result.get("additional_information"), name="additional_information")
@@ -226,9 +224,8 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any], *, require_image: bool 
     if rotation_speed_deg is not None:
         canonical["rotation_speed_deg"] = _as_positive_float(rotation_speed_deg, name="rotation_speed_deg")
 
-    if image is not None:
-        mm_data["image"] = image
-        result["multi_modal_data"] = mm_data
+    mm_data["image"] = image
+    result["multi_modal_data"] = mm_data
     additional[SANA_WM_CANONICAL_KEY] = canonical
     result["additional_information"] = additional
     result.pop(SANA_WM_CANONICAL_KEY, None)

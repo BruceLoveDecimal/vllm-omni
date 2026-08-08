@@ -227,14 +227,13 @@ def _pack_camera_conditions(
     intrinsics_latent: torch.Tensor,
     *,
     num_frames: int,
-    latent_frames: int,
     latent_height: int,
     latent_width: int,
     vae_time_stride: int,
 ) -> dict[str, torch.Tensor]:
+    # This yields exactly the latent frame count the VAE produces:
+    # ``len(arange(0, n, s)) == ceil(n / s) == (n - 1) // s + 1``.
     time_indices = torch.arange(0, num_frames, vae_time_stride)
-    if len(time_indices) > latent_frames:
-        time_indices = time_indices[:latent_frames]
 
     raymap = torch.cat([poses[time_indices].reshape(len(time_indices), -1), intrinsics_latent[time_indices]], dim=-1)
 
@@ -314,7 +313,6 @@ def build_plucker_condition(
     vae_spatial_stride = int(vae_stride[-1])
     latent_height = condition.height // vae_spatial_stride
     latent_width = condition.width // vae_spatial_stride
-    latent_frames = (num_frames - 1) // vae_time_stride + 1
 
     poses = torch.from_numpy(poses_c2w).float()
     first_inv = get_pose_inverse(poses[0:1]).squeeze(0)
@@ -329,7 +327,6 @@ def build_plucker_condition(
         poses,
         intrinsics_latent,
         num_frames=num_frames,
-        latent_frames=latent_frames,
         latent_height=latent_height,
         latent_width=latent_width,
         vae_time_stride=vae_time_stride,

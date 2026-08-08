@@ -60,7 +60,7 @@ def _shard_param_across_tp(param: torch.Tensor | None, dim: int = 0) -> None:
     the parameter and ``sharded_weight_loader`` would require an initialized TP
     group that standalone/unit-test builds do not have.
     """
-    if param is None or sharded_weight_loader is None or get_tensor_model_parallel_world_size() <= 1:
+    if param is None or get_tensor_model_parallel_world_size() <= 1:
         return
     param.weight_loader = sharded_weight_loader(dim)
 
@@ -423,7 +423,6 @@ class SanaWmTimestepEmbedder(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.in_features = in_features
         linear_1 = ColumnParallelLinear(
             in_features,
             hidden_size,
@@ -502,8 +501,6 @@ class SanaWmWanRotaryPosEmbed(nn.Module):
         theta: float = 10000.0,
     ) -> None:
         super().__init__()
-        self.attention_head_dim = attention_head_dim
-        self.max_seq_len = max_seq_len
         self.theta = theta
         h_dim = w_dim = 2 * (attention_head_dim // 6)
         t_dim = attention_head_dim - h_dim - w_dim
@@ -563,9 +560,7 @@ class SanaWmSelfAttention(nn.Module):
         self.num_heads = self.total_num_heads
         self.num_kv_heads = self.total_num_heads
         self.eps = 1e-8
-        self.attn_type = config.attn_type
         self.use_gdn = use_gdn and "GDN" in config.attn_type
-        self.conv_kernel_size = config.conv_kernel_size
         self.patch_size = _to_3tuple(config.patch_size)
         # Total camera branch width from the checkpoint. TP ColumnParallel
         # layers expose a per-rank local slice at runtime; keep both sizes so
@@ -768,8 +763,6 @@ class SanaWmSelfAttention(nn.Module):
         with torch.no_grad():
             conv.weight.zero_()
             conv.weight[:, 0, -1] = 1.0
-            if conv.bias is not None:
-                conv.bias.zero_()
 
     def _init_short_convs(self) -> None:
         for conv in (self.conv_q, self.conv_k, self.conv_v, self.conv_q_cam, self.conv_k_cam, self.conv_v_cam):
@@ -1013,14 +1006,10 @@ class SanaWmSelfAttention(nn.Module):
 
     @staticmethod
     def _ucpe_rotary_freqs(rotary_emb: torch.Tensor | None) -> torch.Tensor | None:
+        # SanaWmRope emits (1, 1, N, D//2) complex; the cam path wants (N, D//2).
         if rotary_emb is None:
             return None
-        rotary_emb_freqs = rotary_emb.squeeze(0).squeeze(0)
-        if rotary_emb_freqs.ndim == 3:
-            # vLLM-Omni packs RoPE as (1, 1, N, D//2) complex. Some
-            # call-sites may pass an already squeezed (N, D//2) tensor.
-            rotary_emb_freqs = rotary_emb_freqs.squeeze(0)
-        return rotary_emb_freqs
+        return rotary_emb.squeeze(0).squeeze(0)
 
     def _forward_softmax_raw(
         self,
@@ -1293,7 +1282,7 @@ class SanaWmSelfAttention(nn.Module):
             return attn_out
 
         main_raw = self._forward_softmax_raw(hidden_states, spatial_shape, rotary_emb)
-        if cam_geometry is not None and self.q_proj_cam is not None:
+        if cam_geometry is not None:
             cam_raw = self._forward_softmax_cam_branch(
                 hidden_states,
                 spatial_shape,
@@ -1485,7 +1474,6 @@ class SanaWmBlock(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.block_idx = block_idx
         hidden_size = config.hidden_size
         use_gdn = config.softmax_every_n <= 0 or (block_idx + 1) % config.softmax_every_n != 0
         use_plucker_proj = config.use_chunk_plucker_post_attn and (
@@ -1505,8 +1493,6 @@ class SanaWmBlock(nn.Module):
         )
         self.norm2 = AdaLayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp = SanaWmMbConvFfn(config)
-        self.mlp.block_idx = block_idx
-        self.attn.block_idx = block_idx
         if use_plucker_proj:
             self.plucker_proj: nn.Module | None = ColumnParallelLinear(
                 hidden_size,
@@ -1934,8 +1920,9 @@ class SanaWmTransformer3DModel(nn.Module):
         # becomes a no-op (main-branch only).
         cam_geometry: SanaWmCamGeometry | None = None
         if raymap is not None:
-            camera_conditions = raymap if raymap.ndim == 3 else raymap.unsqueeze(0)
-            if camera_conditions.shape[0] == 1 and batch_size > 1:
+            # ``_pack_camera_conditions`` emits an unbatched (T_latent, 20).
+            camera_conditions = raymap.unsqueeze(0)
+            if batch_size > 1:
                 camera_conditions = camera_conditions.expand(batch_size, -1, -1)
             camera_conditions = camera_conditions.to(device=hidden_states.device, dtype=hidden_states.dtype)
             # cam_head_dim comes from the attention module rather than being

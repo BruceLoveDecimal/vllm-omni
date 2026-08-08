@@ -249,12 +249,6 @@ def _slice_rope_for_cam(
     """
     if rotary_emb is None:
         return None
-    target_complex_dim = rope_dim // 2
-    if rotary_emb.shape[-1] == target_complex_dim:
-        # Input already at the target camera-RoPE size (e.g. pre-sliced by a
-        # caller). Re-slicing would use the wrong band offsets for a tensor
-        # this small, so return as-is.
-        return rotary_emb
     # Derive WAN RoPE T/H/W band offsets from the actual input tensor size,
     # not from a head_dim argument. This is correct regardless of whether
     # cam_head_dim == main_head_dim.
@@ -430,12 +424,13 @@ def _validate_cam_prep_inputs(
     proj_kv: torch.Tensor,
     rope_cos: torch.Tensor,
     rope_sin: torch.Tensor,
-) -> tuple[int, int, int, int, int]:
+) -> int:
+    """Validate the fused cam-prep contract and return ``head_dim // 2``."""
     if q_raw.shape != k_raw.shape or q_raw.shape != v_raw.shape:
         raise ValueError(f"Sana-WM cam prep q/k/v shapes must match, got {q_raw.shape}, {k_raw.shape}, {v_raw.shape}.")
     if q_raw.ndim != 4:
         raise ValueError(f"Sana-WM cam prep q/k/v must be (B,N,H,D), got {tuple(q_raw.shape)}.")
-    batch, token_count, num_heads, head_dim = q_raw.shape
+    batch, token_count, _num_heads, head_dim = q_raw.shape
     if head_dim % 2 != 0 or (head_dim // 2) % 4 != 0:
         raise ValueError(f"Sana-WM cam prep head_dim={head_dim} must satisfy D % 2 == 0 and (D/2) % 4 == 0.")
     half_dim = head_dim // 2
@@ -448,7 +443,7 @@ def _validate_cam_prep_inputs(
             "Sana-WM cam prep rope table shapes must be "
             f"{(token_count, half_dim)}, got {tuple(rope_cos.shape)} and {tuple(rope_sin.shape)}."
         )
-    return batch, token_count, num_heads, head_dim, half_dim
+    return half_dim
 
 
 def _apply_ray_projection(feats: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
@@ -500,7 +495,7 @@ def cam_prep_func(
         ``q_trans``, ``k_trans``, ``v_trans`` in ``(B, H, D, N)`` layout, and
         ``inflation_sq`` in ``(B, H, N)``.
     """
-    batch, token_count, num_heads, head_dim, half_dim = _validate_cam_prep_inputs(
+    half_dim = _validate_cam_prep_inputs(
         q_normed,
         k_normed,
         v_raw,

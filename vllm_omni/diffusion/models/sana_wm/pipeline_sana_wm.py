@@ -680,8 +680,6 @@ class SanaWmPipeline(
             vae_spatial_compression_ratio=SANA_WM_VAE_SPATIAL_COMPRESSION,
             vae_temporal_compression_ratio=SANA_WM_VAE_TEMPORAL_COMPRESSION,
         )
-        latent_height = max(latent_height, 1)
-        latent_width = max(latent_width, 1)
         token_count = latent_frames * latent_height * latent_width
         extra_args = self._extra_args(sampling_params)
         max_tokens = int(extra_args.get("sana_wm_native_max_tokens", SANA_WM_NATIVE_MAX_TOKENS))
