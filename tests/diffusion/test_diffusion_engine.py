@@ -14,6 +14,7 @@ import torch
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import (
     DiffusionEngine,
@@ -29,6 +30,8 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput as RealDiffusionSchedulerOutput,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @dataclass
@@ -56,6 +59,8 @@ class MockScheduler:
     def __init__(self):
         self._waiting_queue = []
         self._step_id = 0
+        # Match RequestScheduler API used by request-batch admission wait.
+        self.max_num_running_reqs = 5
 
     def add_request(self, request):
         self._waiting_queue.append(request)
@@ -63,6 +68,12 @@ class MockScheduler:
 
     def has_requests(self):
         return len(self._waiting_queue) > 0
+
+    def num_waiting_requests(self) -> int:
+        return len(self._waiting_queue)
+
+    def num_running_requests(self) -> int:
+        return 0
 
     def schedule(self) -> DiffusionSchedulerOutput:
         if not self._waiting_queue:
@@ -80,6 +91,21 @@ class MockScheduler:
     def update_from_output(self, sched_output, runner_output):
         # assume all new req finished
         return [req.request_id for req in sched_output.scheduled_new_reqs]
+
+    def get_request_state(self, request_id):
+        return None
+
+    def pop_request_state(self, request_id):
+        return None
+
+    def finish_requests(self, request_id, status):
+        pass
+
+    def close(self):
+        pass
+
+    def initialize(self, od_config):
+        pass
 
 
 class _BatchCapablePipeline:
@@ -304,6 +330,55 @@ class TestRequestBatchCapability:
         with pytest.raises(ValueError, match="max_num_seqs=1"):
             DiffusionEngine(od_config)
         fake_executor_cls.assert_not_called()
+
+    def test_engine_allows_independent_dlo_dp_requests_for_single_request_pipeline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="SinglePipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+            max_num_seqs=2,
+            request_batch_max_wait_ms=0,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+        )
+        fake_executor = SimpleNamespace(
+            execute_request=mocker.Mock(return_value="per-request"),
+            execute_batch=mocker.Mock(return_value="batch"),
+            execute_step=mocker.Mock(return_value="step"),
+        )
+        fake_executor_cls = mocker.Mock(return_value=fake_executor)
+
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _SingleRequestPipeline,
+        )
+
+        engine = DiffusionEngine(od_config)
+
+        assert engine.execution_mode == DiffusionExecutionMode.REQUEST_BATCH
+        assert engine.supports_request_batch is False
+        assert engine.dp_concurrent is True
+        assert engine.scheduler.max_num_running_reqs == 2
+        assert od_config.request_batch_max_wait_ms == 0
+        fake_executor_cls.assert_called_once_with(od_config)
 
     @pytest.mark.parametrize("request_ids", [("req-a",), ("req-a", "req-b")])
     def test_engine_enables_batch_dispatch_for_request_batch_pipeline(
@@ -582,9 +657,7 @@ def test_move_tensor_tree_returns_non_tensor_values_unchanged() -> None:
     assert moved is value
 
 
-@pytest.mark.diffusion
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_move_tensor_tree_moves_nested_cuda_tensors_to_cpu() -> None:
     tensor = torch.arange(8, dtype=torch.float32, device="cuda")
     other = torch.arange(4, dtype=torch.int64, device="cuda")
@@ -610,6 +683,7 @@ async def _consume_final_output(generator):
     return final_output
 
 
+@pytest.mark.cpu
 @pytest.mark.asyncio
 async def test_async_add_req_and_stream_response():
     engine = object.__new__(DiffusionEngine)
@@ -621,13 +695,24 @@ async def test_async_add_req_and_stream_response():
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._init_lock = asyncio.Lock()
     engine._closed = False
-    engine.od_config = SimpleNamespace(streaming_output=False)
+    # Enable admission wait so concurrent adds land in one schedule wave;
+    # otherwise the first request can execute alone (~1s) and the rest in a
+    # second wave (~2s), failing the latency-spread assertion.
+    engine.od_config = SimpleNamespace(
+        streaming_output=False,
+        request_batch_max_wait_ms=500.0,
+    )
     engine._loop_started = False
     engine.main_loop = None
-    engine.supports_request_batch = False
+    engine.supports_request_batch = True
+    engine.step_execution = False
     engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
 
-    engine._finalize_finished_request = lambda rid, out, err: out.result
+    def _finalize(rid, out, err=None, **kwargs):
+        # Stream consumers stop on ``finished``; keep result_data for assertions.
+        return SimpleNamespace(result_data=out.result.result_data, finished=True)
+
+    engine._finalize_finished_request = _finalize
 
     def mock_execute_batch(sched_output):
         request_ids = sched_output.scheduled_request_ids

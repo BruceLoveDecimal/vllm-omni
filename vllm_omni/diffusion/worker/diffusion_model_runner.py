@@ -14,7 +14,7 @@ import copy
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch.profiler import record_function
@@ -32,7 +32,13 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import supports_step_execution
+from vllm_omni.diffusion.models.interface import (
+    SupportsPromptUpdate,
+    adopt_request_scoped_cache_dit,
+    is_request_scoped_cache_dit_enabled,
+    supports_prompt_update,
+    supports_step_execution,
+)
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -52,6 +58,9 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+
+if TYPE_CHECKING:
+    from vllm_omni.inputs.data import OmniInteractionPrompt
 
 logger = init_logger(__name__)
 
@@ -202,8 +211,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if load_format == "dummy":
             return
 
+        current_omni_platform.init_diffusion_model_runner_runtime(
+            vllm_config=self.vllm_config,
+            od_config=self.od_config,
+            device=self.device,
+        )
+
         load_device = (
-            "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
+            "cpu"
+            if self.od_config.enable_cpu_offload
+            or self.od_config.enable_layerwise_offload
+            or getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+            else str(self.device)
         )
 
         def get_memory_context() -> AbstractContextManager[Any]:
@@ -267,8 +286,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             exc,
                         )
                 else:
-                    self._compile_transformer("transformer")
-                    self._compile_transformer("transformer_2")
+                    transformer_attrs = getattr(self.pipeline, "_dit_modules", None)
+                    if not transformer_attrs:
+                        transformer_attrs = ("transformer", "transformer_2")
+                    for attr_name in transformer_attrs:
+                        self._compile_transformer(attr_name)
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
@@ -288,7 +310,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self.cache_backend = None
                 self.od_config.cache_backend = None
             else:
+                # Install configured cache capability once at startup. A model
+                # may explicitly adopt the enabled Cache-DiT backend and then
+                # own all later request-boundary enable/disable transitions.
                 self.cache_backend.enable(self.pipeline)
+                if str(self.od_config.cache_backend).lower() == "cache_dit" and adopt_request_scoped_cache_dit(
+                    self.pipeline,
+                    self.cache_backend,
+                ):
+                    logger.info(
+                        "Pipeline %s owns request-scoped Cache-DiT transitions.",
+                        type(self.pipeline).__name__,
+                    )
+                    self.cache_backend = None
 
         # Install prompt-embedding cache (transparent wrapper around
         # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op
@@ -469,7 +503,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
         # counters, which inference tensors do not track.
         use_hsdp = od_config.parallel_config.use_hsdp
-        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        use_distributed_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+        grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
         with grad_context:
             for req in reqs:
                 self._prepare_request_for_forward(
@@ -506,11 +541,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary and prompt_embed_cache is not None:
                 logger.debug("prompt-embed cache: %s", prompt_embed_cache.stats())
 
+            runner_cache_dit_enabled = self.cache_backend is not None and self.cache_backend.is_enabled()
             if (
-                self.cache_backend is not None
-                and self.cache_backend.is_enabled()
-                and od_config.cache_backend == "cache_dit"
+                od_config.cache_backend == "cache_dit"
                 and od_config.enable_cache_dit_summary
+                and (runner_cache_dit_enabled or is_request_scoped_cache_dit_enabled(self.pipeline))
             ):
                 cache_summary(self.pipeline, details=True)
 
@@ -803,3 +838,48 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self._update_states_after(states, input_batch, pipeline_interrupted)
 
                 return BatchRunnerOutput.from_list(runner_output_list)
+
+    def submit_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Route a midway interaction to the matching active stepwise request feature."""
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        if not self.od_config.streaming_output:
+            raise ValueError("submit_interaction requires streaming_output=True")
+        if not self._supports_step_mode():
+            raise ValueError("submit_interaction requires step execution support")
+
+        event = interaction.get("event")
+        if isinstance(event, dict) and "prompt" in event and "multi_modal_data" not in event:
+            # Is a prompt update interaction.
+            self._submit_prompt_update_interaction(request_id, interaction)
+            return
+
+        raise NotImplementedError(
+            "Only text-only prompt update interactions with 'event.prompt' and optional "
+            "'transition_chunks' are supported in this release"
+        )
+
+    def _submit_prompt_update_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Queue a prompt-update interaction for an active stepwise request."""
+        if not supports_prompt_update(self.pipeline):
+            raise ValueError(f"prompt_update is not supported by pipeline {self.od_config.model_class_name!r}")
+
+        state = self.state_cache.get(request_id)
+        if state is None:
+            raise ValueError(f"No active request state for prompt_update: {request_id!r}")
+
+        event = cast(dict[str, Any], interaction.get("event"))
+        prompt = event["prompt"]
+        transition_chunks = interaction.get("transition_chunks")
+        event_id = interaction.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            raise ValueError("event_id must be non-empty")
+        pipeline = cast(SupportsPromptUpdate, self.pipeline)
+        pipeline.prepare_prompt_update(state, prompt, event_id, transition_chunks)
