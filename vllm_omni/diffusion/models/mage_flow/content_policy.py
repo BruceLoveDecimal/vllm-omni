@@ -19,13 +19,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 from PIL import Image
-
 
 # --- Gaussian-Shading watermark -------------------------------------------
 
@@ -268,28 +267,12 @@ Respond with STRICT JSON ONLY (no markdown, no preamble, no commentary):
 → {"violates": false, "categories": [], "reason": "Not a recognizable public figure; ordinary person, innocuous edit — allowed."}"""
 
 
-CATEGORY_DISPLAY = {
-    "sexual": "Sexual content",
-    "hate": "Hate / unfair imagery",
-    "self_harm": "Self-harm",
-    "violence": "Violence / gore",
-    "copyright": "Copyright / IP character",
-    "public_figure": "Real-person likeness",
-}
-
-
 @dataclass
 class FilterVerdict:
     violates: bool
     categories: list[str]
     reason: str
     raw: str = ""
-
-    def banner(self) -> str:
-        if not self.violates:
-            return ""
-        cat = ", ".join(CATEGORY_DISPLAY.get(c, c) for c in self.categories) or "policy violation"
-        return f"🚫 **Content Filter:** Blocked — `{cat}` · {self.reason}"
 
 
 def _extract_json_object(text: str) -> dict:
@@ -316,15 +299,46 @@ def _extract_json_object(text: str) -> dict:
     raise ValueError(f"unbalanced JSON object: {text[start : start + 120]!r}")
 
 
-def check_prompt(model, prompt: str, max_new_tokens: int = 160) -> FilterVerdict:
-    """Back-compat wrapper around the mandatory text-encoder screener.
+def _generate_verdict(
+    text_encoder,
+    tokenizer,
+    generation_inputs: dict,
+    *,
+    max_new_tokens: int,
+    full_output_mode: bool,
+) -> FilterVerdict:
+    """Generate and parse one classifier verdict.
 
-    The policy check now lives on the text encoder
-    (:meth:`TextEncoder.screen_text`) so it runs on the same Qwen3-VL weights
-    that produce the diffusion conditioning and is FAIL-CLOSED. Kept here for
-    external callers / tests that import ``check_prompt`` directly.
+    Raises on any generation, decoding, or schema failure; each caller decides
+    how to fail closed.
     """
-    return model.txt_enc.screen_text(prompt, max_new_tokens=max_new_tokens)
+    input_length = generation_inputs["input_ids"].shape[1]
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+    with _full_output_mode(text_encoder) if full_output_mode else nullcontext():
+        output_ids = text_encoder.generate(
+            **generation_inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
+        )
+    raw = tokenizer.decode(
+        output_ids[0, input_length:],
+        skip_special_tokens=True,
+    ).strip()
+    parsed = _extract_json_object(raw)
+    violates = parsed.get("violates")
+    categories = parsed.get("categories")
+    reason = parsed.get("reason")
+    if (
+        not isinstance(violates, bool)
+        or not isinstance(categories, list)
+        or not all(isinstance(item, str) for item in categories)
+        or not isinstance(reason, str)
+    ):
+        raise ValueError("content checker returned an invalid schema")
+    return FilterVerdict(violates, categories, reason, raw=raw)
 
 
 @torch.no_grad()
@@ -356,32 +370,13 @@ def screen_mage_flow_prompt(
     device = next(text_encoder.parameters()).device
     inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
     try:
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
-        output_ids = text_encoder.generate(
-            **inputs,
+        return _generate_verdict(
+            text_encoder,
+            tokenizer,
+            inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_id,
-            eos_token_id=eos_id,
+            full_output_mode=False,
         )
-        input_length = inputs["input_ids"].shape[1]
-        raw = tokenizer.decode(
-            output_ids[0, input_length:],
-            skip_special_tokens=True,
-        ).strip()
-        parsed = _extract_json_object(raw)
-        violates = parsed.get("violates")
-        categories = parsed.get("categories")
-        reason = parsed.get("reason")
-        if (
-            not isinstance(violates, bool)
-            or not isinstance(categories, list)
-            or not all(isinstance(item, str) for item in categories)
-            or not isinstance(reason, str)
-        ):
-            raise ValueError("content checker returned an invalid schema")
-        return FilterVerdict(violates, categories, reason, raw=raw)
     except Exception as error:
         # The official behavior is fail-closed: checker failure must not turn
         # into an unreviewed generation.
@@ -452,33 +447,13 @@ def screen_mage_flow_edit_prompt(
             }
             and value is not None
         }
-        input_length = generation_inputs["input_ids"].shape[1]
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
-        with _full_output_mode(text_encoder):
-            output_ids = text_encoder.generate(
-                **generation_inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=pad_id,
-                eos_token_id=eos_id,
-            )
-        raw = tokenizer.decode(
-            output_ids[0, input_length:],
-            skip_special_tokens=True,
-        ).strip()
-        parsed = _extract_json_object(raw)
-        violates = parsed.get("violates")
-        categories = parsed.get("categories")
-        reason = parsed.get("reason")
-        if (
-            not isinstance(violates, bool)
-            or not isinstance(categories, list)
-            or not all(isinstance(item, str) for item in categories)
-            or not isinstance(reason, str)
-        ):
-            raise ValueError("content checker returned an invalid schema")
-        return FilterVerdict(violates, categories, reason, raw=raw)
+        return _generate_verdict(
+            text_encoder,
+            tokenizer,
+            generation_inputs,
+            max_new_tokens=max_new_tokens,
+            full_output_mode=True,
+        )
     except Exception as error:
         return FilterVerdict(
             violates=True,
@@ -516,23 +491,3 @@ def _full_output_mode(hf):
             pass
 
 
-def check_edit(model, prompt: str, ref_images, max_new_tokens: int = 192) -> FilterVerdict:
-    """Back-compat wrapper around :meth:`TextEncoder.screen_edit`.
-
-    Classifies an image-EDIT request considering BOTH the source image(s) and
-    the instruction (multimodal Qwen3-VL), FAIL-CLOSED. Kept for external
-    callers / tests that import ``check_edit`` directly.
-    """
-    return model.txt_enc.screen_edit(prompt, ref_images, max_new_tokens=max_new_tokens)
-
-
-def make_refusal_image(
-    verdict: FilterVerdict,
-    height: int = 1024,
-    width: int = 1024,
-) -> Image.Image:
-    """Return a placeholder image to display when the prompt is blocked.
-
-    A plain white blank image — no text, no category/reason surfaced.
-    """
-    return Image.new("RGB", (width, height), color=(255, 255, 255))

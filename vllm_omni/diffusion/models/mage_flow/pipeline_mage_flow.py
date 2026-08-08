@@ -20,7 +20,7 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from transformers import AutoProcessor
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_exists
@@ -39,9 +39,6 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import (
     prefetch_subfolders,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.models.internvla_a1.adapter_qwen3_vl import (
-    Qwen3VLForConditionalGeneration,
-)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
@@ -60,7 +57,6 @@ from .mage_flow_transformer import (
     resolve_mage_flow_stacked_name,
 )
 from .prompt_utils import (
-    encode_mage_flow_edit_prompt,
     encode_mage_flow_prompt,
     get_mage_flow_variant_defaults,
     normalize_mage_flow_reference_images,
@@ -178,9 +174,6 @@ class MageFlowPipeline(
     """Native request-batched T2I and multi-reference Edit pipeline."""
 
     supports_request_batch = True
-    request_batch_ignored_sampling_param_fields = frozenset(
-        {"height", "width", "resolution"}
-    )
     supports_step_execution = False
     support_image_input = True
 
@@ -280,7 +273,6 @@ class MageFlowPipeline(
                 "text_encoder.forward",
                 "vae.encode",
                 "vae.decode",
-                "diffuse",
                 "diffuse_batch",
             ],
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler),
@@ -720,136 +712,6 @@ class MageFlowPipeline(
                 progress.update()
         return target_latents
 
-    def diffuse(
-        self,
-        *,
-        latents: torch.Tensor,
-        prompt_embeds: torch.Tensor,
-        negative_prompt_embeds: torch.Tensor | None,
-        height: int,
-        width: int,
-        num_inference_steps: int,
-        guidance_scale: float,
-        cfg_normalize: bool,
-    ) -> torch.Tensor:
-        scheduler = make_mage_flow_request_scheduler(
-            self.scheduler,
-            num_inference_steps=num_inference_steps,
-            device=self.device,
-        )
-        do_cfg = guidance_scale > 1.0
-        image_grid_hw = [
-            (
-                height // self.vae.downsample_factor,
-                width // self.vae.downsample_factor,
-            )
-        ]
-
-        with self.progress_bar(total=len(scheduler.timesteps)) as progress:
-            for step_index, timestep in enumerate(scheduler.timesteps):
-                sigma = scheduler.sigmas[step_index].to(
-                    device=self.device,
-                    dtype=latents.dtype,
-                )
-                positive_kwargs = {
-                    "hidden_states": latents,
-                    "encoder_hidden_states": prompt_embeds,
-                    "timestep": sigma.expand(1),
-                    "image_grid_hw": image_grid_hw,
-                }
-                negative_kwargs = (
-                    {
-                        "hidden_states": latents,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "timestep": sigma.expand(1),
-                        "image_grid_hw": image_grid_hw,
-                    }
-                    if do_cfg
-                    else None
-                )
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_cfg,
-                    true_cfg_scale=guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=cfg_normalize,
-                )
-                latents = self.scheduler_step(
-                    noise_pred,
-                    timestep,
-                    latents,
-                    per_request_scheduler=scheduler,
-                )
-                progress.update()
-        return latents
-
-    def diffuse_edit(
-        self,
-        *,
-        latents: torch.Tensor,
-        reference_latents: torch.Tensor,
-        num_reference_images: int,
-        prompt_embeds: torch.Tensor,
-        negative_prompt_embeds: torch.Tensor | None,
-        height: int,
-        width: int,
-        num_inference_steps: int,
-        guidance_scale: float,
-        cfg_normalize: bool,
-    ) -> torch.Tensor:
-        """Denoise target tokens while keeping all reference latents clean."""
-        scheduler = make_mage_flow_request_scheduler(
-            self.scheduler,
-            num_inference_steps=num_inference_steps,
-            device=self.device,
-        )
-        do_cfg = guidance_scale > 1.0
-        latent_grid = (
-            height // self.vae.downsample_factor,
-            width // self.vae.downsample_factor,
-        )
-        image_grid_hw = [latent_grid] * (1 + num_reference_images)
-        target_length = latents.shape[1]
-
-        with self.progress_bar(total=len(scheduler.timesteps)) as progress:
-            for step_index, timestep in enumerate(scheduler.timesteps):
-                sigma = scheduler.sigmas[step_index].to(
-                    device=self.device,
-                    dtype=latents.dtype,
-                )
-                combined_latents = torch.cat([latents, reference_latents], dim=1)
-                positive_kwargs = {
-                    "hidden_states": combined_latents,
-                    "encoder_hidden_states": prompt_embeds,
-                    "timestep": sigma.expand(1),
-                    "image_grid_hw": image_grid_hw,
-                }
-                negative_kwargs = (
-                    {
-                        "hidden_states": combined_latents,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "timestep": sigma.expand(1),
-                        "image_grid_hw": image_grid_hw,
-                    }
-                    if do_cfg
-                    else None
-                )
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_cfg,
-                    true_cfg_scale=guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=cfg_normalize,
-                )[:, :target_length]
-                latents = self.scheduler_step(
-                    noise_pred,
-                    timestep,
-                    latents,
-                    per_request_scheduler=scheduler,
-                )
-                progress.update()
-        return latents
-
     def _prepare_batch_item(
         self,
         prompt_data: Any,
@@ -908,7 +770,6 @@ class MageFlowPipeline(
                     f"Mage-Flow content safety check rejected the request ({categories}): {verdict.reason}"
                 )
 
-        encode_prompt = encode_mage_flow_edit_prompt if is_edit else encode_mage_flow_prompt
         encode_kwargs = (
             {
                 "reference_images": reference_images,
@@ -917,7 +778,7 @@ class MageFlowPipeline(
             if is_edit
             else {}
         )
-        prompt_embeds = encode_prompt(
+        prompt_embeds = encode_mage_flow_prompt(
             self.text_encoder,
             self.processor,
             prompt,
@@ -926,7 +787,7 @@ class MageFlowPipeline(
         )
         do_cfg = guidance_scale > 1.0
         negative_prompt_embeds = (
-            encode_prompt(
+            encode_mage_flow_prompt(
                 self.text_encoder,
                 self.processor,
                 negative_prompt,

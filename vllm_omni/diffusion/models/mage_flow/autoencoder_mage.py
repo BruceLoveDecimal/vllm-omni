@@ -23,6 +23,7 @@ from functools import lru_cache
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from diffusers.models.normalization import RMSNorm
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -57,24 +58,6 @@ class LayerNorm2d(nn.LayerNorm):
         x = x.permute(0, 2, 3, 1).contiguous()
         x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
         return x.permute(0, 3, 1, 2).contiguous()
-
-
-class _EncoderLayerNorm2d(LayerNorm2d):
-    pass
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, x):
-        in_dtype = x.dtype
-        x = x.to(torch.float32)
-        var = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.variance_epsilon)
-        return self.weight * x.to(in_dtype)
 
 
 class TimestepEmbedder(nn.Module):
@@ -117,10 +100,16 @@ class BottleneckPatchEmbed(nn.Module):
 
 
 class DiCoBlock(nn.Module):
-    """DConv block with adaLN modulation."""
+    """DConv block, with adaLN modulation on the timestep-conditioned pathway.
 
-    def __init__(self, hidden_size, mlp_ratio=4.0):
+    The encoder's head blocks run the same conv stack unconditioned (``adaln=
+    False``); their norms keep their own affine parameters, whereas a modulated
+    block takes scale and shift from ``adaLN_modulation`` instead.
+    """
+
+    def __init__(self, hidden_size, mlp_ratio=4.0, adaln=True):
         super().__init__()
+        self.adaln = adaln
         self.conv1 = nn.Conv2d(hidden_size, hidden_size, 1, bias=True)
         self.conv2 = nn.Conv2d(hidden_size, hidden_size, 3, padding=1, groups=hidden_size, bias=True)
         self.conv3 = nn.Conv2d(hidden_size, hidden_size, 1, bias=True)
@@ -135,53 +124,31 @@ class DiCoBlock(nn.Module):
         self.conv4 = nn.Conv2d(hidden_size, ffn, 1, bias=True)
         self.conv5 = nn.Conv2d(ffn, hidden_size, 1, bias=True)
 
-        self.norm1 = LayerNorm2d(hidden_size, affine=False)
-        self.norm2 = LayerNorm2d(hidden_size, affine=False)
+        self.norm1 = LayerNorm2d(hidden_size, affine=not adaln)
+        self.norm2 = LayerNorm2d(hidden_size, affine=not adaln)
 
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
-        )
+        if adaln:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 6 * hidden_size, bias=True),
+            )
 
-    def forward(self, inp, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = modulate(self.norm1(inp), shift_msa, scale_msa)
+    def forward(self, inp, c=None):
+        if self.adaln:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+            x = modulate(self.norm1(inp), shift_msa, scale_msa)
+        else:
+            x = self.norm1(inp)
         x = F.gelu(self.conv2(self.conv1(x)))
         x = x * self.ca(x)
         x = self.conv3(x)
-        x = inp + gate_msa[..., None, None] * x
-        x = x + gate_mlp[..., None, None] * self.conv5(
-            F.gelu(self.conv4(modulate(self.norm2(x), shift_mlp, scale_mlp)))
-        )
-        return x
+        x = inp + (gate_msa[..., None, None] * x if self.adaln else x)
 
-
-class _EncoderDiCoBlock(nn.Module):
-    """DiCoBlock without adaLN, for the encoder pathway."""
-
-    def __init__(self, hidden_size, mlp_ratio=4.0):
-        super().__init__()
-        self.conv1 = nn.Conv2d(hidden_size, hidden_size, 1, bias=True)
-        self.conv2 = nn.Conv2d(hidden_size, hidden_size, 3, padding=1, groups=hidden_size, bias=True)
-        self.conv3 = nn.Conv2d(hidden_size, hidden_size, 1, bias=True)
-        self.ca = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(hidden_size, hidden_size, 1, bias=True),
-            nn.Sigmoid(),
-        )
-        ffn = int(mlp_ratio * hidden_size)
-        self.conv4 = nn.Conv2d(hidden_size, ffn, 1, bias=True)
-        self.conv5 = nn.Conv2d(ffn, hidden_size, 1, bias=True)
-        self.norm1 = _EncoderLayerNorm2d(hidden_size)
-        self.norm2 = _EncoderLayerNorm2d(hidden_size)
-
-    def forward(self, inp):
-        x = self.norm1(inp)
-        x = F.gelu(self.conv2(self.conv1(x)))
-        x = x * self.ca(x)
-        x = self.conv3(x)
-        x = inp + x
-        return x + self.conv5(F.gelu(self.conv4(self.norm2(x))))
+        h = self.norm2(x)
+        if self.adaln:
+            h = modulate(h, shift_mlp, scale_mlp)
+        h = self.conv5(F.gelu(self.conv4(h)))
+        return x + (gate_mlp[..., None, None] * h if self.adaln else h)
 
 
 class NerfEmbedder(nn.Module):
@@ -218,7 +185,7 @@ class NerfEmbedder(nn.Module):
 class NerfFinalLayer(nn.Module):
     def __init__(self, hidden_size, out_channels):
         super().__init__()
-        self.norm = RMSNorm(hidden_size)
+        self.norm = RMSNorm(hidden_size, eps=1e-6)
         self.linear = nn.Linear(hidden_size, out_channels, bias=True)
 
     def forward(self, x):
@@ -358,12 +325,13 @@ class _ConstAdaLN(nn.Module):
 
 
 def _replace_adaln_with_const(module: nn.Module, c: torch.Tensor) -> int:
-    # Only DiCoBlock is targeted: its adaLN is conditioned solely on t.
-    # Other adaLN_modulation submodules (e.g. _MLPResBlock in the decoder MLP)
+    # Only modulated DiCoBlocks are targeted: their adaLN is conditioned solely
+    # on t. The encoder's unconditioned head blocks have no adaLN at all, and
+    # other adaLN_modulation submodules (e.g. _MLPResBlock in the decoder MLP)
     # take a per-position latent and must not be folded.
     n = 0
     for child in module.modules():
-        if not isinstance(child, DiCoBlock):
+        if not isinstance(child, DiCoBlock) or not child.adaln:
             continue
         adaln = child.adaLN_modulation
         if isinstance(adaln, _ConstAdaLN):
@@ -421,7 +389,7 @@ class _DConvEncoder(nn.Module):
         self.patch_size = patch_size
         self.patch_cond_embed = nn.Conv2d(3, head_size, kernel_size=patch_size, stride=patch_size, bias=True)
         self.head_blocks = nn.ModuleList(
-            [_EncoderDiCoBlock(head_size, mlp_ratio=mlp_ratio) for _ in range(num_head_blocks)]
+            [DiCoBlock(head_size, mlp_ratio=mlp_ratio, adaln=False) for _ in range(num_head_blocks)]
         )
         self.proj_down = nn.Conv2d(head_size, hidden_size, kernel_size=1, bias=True)
         self.z_proj = nn.Conv2d(z_ch, hidden_size, kernel_size=1, bias=True)

@@ -217,70 +217,46 @@ def encode_mage_flow_prompt(
     prompt: str,
     *,
     device: torch.device,
+    reference_images: list[Image.Image] | None = None,
     max_length: int = 2048,
-) -> torch.Tensor:
-    """Encode one T2I prompt without upstream's global Qwen monkeypatch."""
-    formatted = format_mage_flow_prompt(prompt)
-    inputs = processor(
-        text=[formatted],
-        padding=True,
-        truncation=True,
-        max_length=max_length + MAGE_FLOW_PROMPT_START_INDEX,
-        return_tensors="pt",
-    )
-    inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
-    model_inputs = {
-        key: value for key, value in inputs.items() if key in {"input_ids", "attention_mask", "position_ids"}
-    }
-    outputs = text_encoder.model(
-        **model_inputs,
-        use_cache=False,
-        return_dict=True,
-    )
-    hidden_states = outputs.last_hidden_state
-    attention_mask = inputs.get("attention_mask")
-    valid_length = int(attention_mask[0].sum().item()) if attention_mask is not None else hidden_states.shape[1]
-    if valid_length <= MAGE_FLOW_PROMPT_START_INDEX:
-        raise ValueError("Mage-Flow prompt produced no conditioning tokens")
-    return hidden_states[:, MAGE_FLOW_PROMPT_START_INDEX:valid_length].contiguous()
-
-
-@torch.no_grad()
-def encode_mage_flow_edit_prompt(
-    text_encoder,
-    processor,
-    prompt: str,
-    reference_images: list[Image.Image],
-    *,
-    device: torch.device,
     vision_long_edge: int = 384,
 ) -> torch.Tensor:
-    """Encode an edit instruction and its ordered visual references."""
-    validate_reference_image_count(reference_images)
-    visual_references = [
-        resize_mage_flow_reference_for_vision(image, vision_long_edge)
-        for image in reference_images
-    ]
-    formatted = format_mage_flow_edit_prompt(prompt, len(reference_images))
+    """Encode a prompt without upstream's global Qwen monkeypatch.
+
+    Passing ``reference_images`` switches to the Edit template and conditions on
+    the ordered visual references; otherwise this is the plain T2I encode.
+    """
+    if reference_images:
+        validate_reference_image_count(reference_images)
+        formatted = format_mage_flow_edit_prompt(prompt, len(reference_images))
+        start_index = MAGE_FLOW_EDIT_PROMPT_START_INDEX
+        vision_keys = {"pixel_values", "image_grid_thw", "mm_token_type_ids"}
+        processor_kwargs = {
+            "images": [
+                resize_mage_flow_reference_for_vision(image, vision_long_edge)
+                for image in reference_images
+            ],
+        }
+    else:
+        formatted = format_mage_flow_prompt(prompt)
+        start_index = MAGE_FLOW_PROMPT_START_INDEX
+        vision_keys = set()
+        processor_kwargs = {
+            "truncation": True,
+            "max_length": max_length + MAGE_FLOW_PROMPT_START_INDEX,
+        }
+
     inputs = processor(
         text=[formatted],
-        images=visual_references,
         padding=True,
         return_tensors="pt",
+        **processor_kwargs,
     )
     inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
     model_inputs = {
         key: value
         for key, value in inputs.items()
-        if key
-        in {
-            "input_ids",
-            "attention_mask",
-            "position_ids",
-            "pixel_values",
-            "image_grid_thw",
-            "mm_token_type_ids",
-        }
+        if key in {"input_ids", "attention_mask", "position_ids"} | vision_keys
     }
     outputs = text_encoder.model(
         **model_inputs,
@@ -290,6 +266,6 @@ def encode_mage_flow_edit_prompt(
     hidden_states = outputs.last_hidden_state
     attention_mask = inputs.get("attention_mask")
     valid_length = int(attention_mask[0].sum().item()) if attention_mask is not None else hidden_states.shape[1]
-    if valid_length <= MAGE_FLOW_EDIT_PROMPT_START_INDEX:
-        raise ValueError("Mage-Flow Edit prompt produced no conditioning tokens")
-    return hidden_states[:, MAGE_FLOW_EDIT_PROMPT_START_INDEX:valid_length].contiguous()
+    if valid_length <= start_index:
+        raise ValueError("Mage-Flow prompt produced no conditioning tokens")
+    return hidden_states[:, start_index:valid_length].contiguous()
