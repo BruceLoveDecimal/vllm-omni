@@ -2,6 +2,28 @@
 
 This example demonstrates how to deploy Qwen-Image model for online image generation service using vLLM-Omni.
 
+### Mage-Flow
+
+Mage-Flow uses the same text-to-image endpoint. It supports CUDA BF16
+request-level batching on one GPU:
+
+```bash
+vllm serve microsoft/Mage-Flow --omni --port 8091 --dtype bfloat16 \
+  --max-num-seqs 2 --request-batch-max-wait-ms 20
+```
+
+Compatible requests are padded and processed together; prompt lengths and
+output resolutions may differ. Increase `max_num_seqs` only after measuring
+available activation-memory headroom.
+
+The `microsoft/Mage-Flow-Base`, `microsoft/Mage-Flow`, and
+`microsoft/Mage-Flow-Turbo` checkpoints default to 30/20/4 denoising steps and
+CFG 5.0/5.0/1.0 respectively when those values are omitted. Official content
+safety checking and Gaussian-Shading watermarking are enabled by default.
+Per-request controls are `mage_enable_safety_check` and
+`mage_enable_watermark`; deployments should review their safety policy before
+allowing either control to be disabled.
+
 ## Start Server
 
 ### Basic Start
@@ -233,6 +255,9 @@ count, use `size` and `n` rather than `height`, `width`, or
 | `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |
 | `use_system_prompt` | str | None | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text string. Only for HunyuanImage-3.0. |
 | `system_prompt` | str | None | Custom system prompt text. Only used when `use_system_prompt` is set to `custom`. Only for HunyuanImage-3.0. |
+| `mage_enable_safety_check` | bool | true | Mage-Flow official prompt safety check |
+| `mage_enable_watermark` | bool | true | Mage-Flow Gaussian-Shading watermark |
+| `mage_vision_long_edge` | int | 384 | Mage-Flow Edit Qwen3-VL visual-conditioning long edge |
 
 ## Response Format
 

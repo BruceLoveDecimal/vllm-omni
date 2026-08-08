@@ -26,6 +26,7 @@ th {
 | `InternVLAA1Pipeline` | InternVLA-A1 | `InternRobotics/InternVLA-A1-3B` | ✅︎ | ✅︎ | | |
 | `Gr00tN1d7Pipeline` | GR00T N1.7 | `nvidia/GR00T-N1.7-3B` | ✅︎ | | | |
 | `HunyuanImage3ForCausalMM` | HunyuanImage3.0 (DiT-only) | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
+| `MageFlowPipeline` | Mage-Flow (T2I and Edit, Base / RL / Turbo)<sup>2</sup> | `microsoft/Mage-Flow-Base`, `microsoft/Mage-Flow`, `microsoft/Mage-Flow-Turbo`, `microsoft/Mage-Flow-Edit-Base`, `microsoft/Mage-Flow-Edit`, `microsoft/Mage-Flow-Edit-Turbo` | ✅︎ | | | |
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `QwenImagePipeline` | Qwen-Image-2512 | `Qwen/Qwen-Image-2512` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
@@ -99,3 +100,11 @@ th {
 |`HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | |
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+<sup>2</sup> Mage-Flow currently supports CUDA BF16, request-level padded
+batching, packed CFG, and one output per request. A batch may contain different
+prompt lengths, output resolutions, and T2I/Edit requests; Edit accepts one to
+three PIL, NumPy, or Tensor reference images. Quantization, LoRA, TP, SP,
+multi-GPU CFG parallel, VAE parallel, step execution, and diffusion cache are
+not yet supported. The upstream checkpoints are released for research purposes
+and are not intended for product or service deployment.

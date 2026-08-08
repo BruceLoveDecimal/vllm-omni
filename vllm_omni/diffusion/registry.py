@@ -21,6 +21,11 @@ logger = init_logger(__name__)
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
+    "MageFlowPipeline": (
+        "mage_flow",
+        "pipeline_mage_flow",
+        "MageFlowPipeline",
+    ),
     "QwenImagePipeline": (
         "qwen_image",
         "pipeline_qwen_image",
@@ -341,6 +346,7 @@ DiffusionModelRegistry = _ModelRegistry(
 
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
+    "MageFlowPipeline",
     "NextStep11Pipeline",
     "AudioXPipeline",
 }
@@ -509,6 +515,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     # arch: post_process_func
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
+    "MageFlowPipeline": "get_mage_flow_post_process_func",
     "QwenImagePipeline": "get_qwen_image_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
@@ -578,6 +585,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
+    "MageFlowPipeline": "get_mage_flow_pre_process_func",
     "GlmImagePipeline": "get_glm_image_pre_process_func",
     "BooguImagePipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",

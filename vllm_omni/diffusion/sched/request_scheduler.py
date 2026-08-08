@@ -7,7 +7,11 @@ from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
+from vllm_omni.diffusion.sched.base_scheduler import (
+    BaseScheduler,
+    get_request_batch_sampling_params_key,
+    validate_request_batch_ignored_sampling_param_fields,
+)
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
@@ -27,14 +31,32 @@ _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
 class RequestScheduler(BaseScheduler):
     """Diffusion scheduler with vLLM-style waiting/running queues."""
 
-    def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-        """Build a request-batch compatibility key from sampling parameters."""
-        sampling = request.sampling_params
-        # LoRA identity is optional on sampling params (and on test stubs).
-        lora_request = getattr(sampling, "lora_request", None)
-        key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
-        key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
-        return RequestBatchSamplingParamsKey(**key_kwargs)
+    def __init__(self) -> None:
+        super().__init__()
+        self._ignored_sampling_param_fields: frozenset[str] = frozenset()
+
+    def set_ignored_sampling_param_fields(
+        self,
+        fields: frozenset[str],
+    ) -> None:
+        if self._request_states:
+            raise RuntimeError(
+                "request-batch compatibility fields must be configured before requests are added"
+            )
+        validate_request_batch_ignored_sampling_param_fields(fields)
+        self._ignored_sampling_param_fields = fields
+
+    def _build_sampling_params_key(self, request: OmniDiffusionRequest):
+        return get_request_batch_sampling_params_key(
+            request,
+            self._ignored_sampling_param_fields,
+        )
+
+    def add_request(self, request: OmniDiffusionRequest) -> str:
+        return super().add_request(request)
+
+    def schedule(self) -> DiffusionSchedulerOutput:
+        return super().schedule()
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
