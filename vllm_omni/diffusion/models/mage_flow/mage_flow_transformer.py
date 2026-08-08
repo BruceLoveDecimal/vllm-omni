@@ -289,7 +289,6 @@ class MageFlowTransformer2DModel(nn.Module):
         ),
         image_attention_mask: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
-        return_dict: bool = False,
     ) -> tuple[torch.Tensor]:
         if hidden_states.ndim != 3 or encoder_hidden_states.ndim != 3:
             raise ValueError("Mage-Flow hidden_states and encoder_hidden_states must be 3-D")

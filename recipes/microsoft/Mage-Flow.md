@@ -169,9 +169,11 @@ settings would conflate the guidance change with the parallelism effect.
   padded sequence blindly, leaving real tokens and filler on different ranks
   with no mask to separate them. Packed CFG pads the shorter of the two
   prompts, which is why `--usp` is paired with `--cfg-parallel-size 2` rather
-  than left to run against packed CFG. Serving hits the same rule: requests
-  batched together must share token counts, so `--usp` suits uniform-shape
-  traffic.
+  than left to run against packed CFG. Serving hits the same rule: `--usp`
+  requires `--max-num-seqs 1`, which is the default. Raising it is refused at
+  startup, because prompt length is not part of the request-batch key: any two
+  concurrent requests could then land in one batch with differing token counts
+  and fail mid-generation.
 - Combining dimensions beats the product of the parts (SP2 x CFG2 reaches
   7.12x). Attention is quadratic in sequence length, so sharding the sequence
   pays off super-linearly.
@@ -191,7 +193,8 @@ settings would conflate the guidance change with the parallelism effect.
 | Highest fidelity to single-GPU output | `--usp N` |
 
 Unsupported multi-GPU modes (pipeline parallelism, VAE patch parallelism,
-HSDP) fail at startup with an explicit error rather than degrading silently.
+HSDP) fail at startup with an explicit error rather than degrading silently, as
+does sequence parallelism combined with `--max-num-seqs > 1`.
 
 ## A note on output differences
 

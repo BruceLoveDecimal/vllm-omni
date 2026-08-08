@@ -19,6 +19,19 @@ HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
+# Request-scoped controls MageFlowPipeline accepts through
+# OmniDiffusionSamplingParams.extra_args. This lives here rather than in
+# model_extras so that the entrypoint layer (which advertises the keys) and the
+# pipeline (which rejects everything else) cannot drift apart; a drift would let
+# a key pass request validation and then fail mid-request.
+MAGE_FLOW_EXTRA_BODY_PARAMS = frozenset(
+    {
+        "mage_enable_safety_check",
+        "mage_enable_watermark",
+        "mage_vision_long_edge",
+    }
+)
+
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "MageFlowPipeline": DiffusionModelMetadata(

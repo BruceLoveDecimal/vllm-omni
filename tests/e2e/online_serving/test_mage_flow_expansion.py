@@ -59,16 +59,23 @@ def test_mage_flow_four_to_one_aspect_ratio(
     }
     openai_client.send_diffusion_request(request_config)
 
-    sizes = [(512, 512), (512, 1024)]
+    # Output resolution is part of the request-batch key, so these two share one
+    # and land in the same padded batch. Their prompt lengths differ, which is
+    # what makes the batch ragged and exercises the padding.
+    prompts = [
+        "A paper sculpture.",
+        (
+            "A geometric paper sculpture photographed on a neutral background, lit "
+            "from the left, with long soft shadows falling across the whole frame."
+        ),
+    ]
     requests = [
         {
             "model": omni_server.model,
-            "messages": dummy_messages_from_mix_data(
-                content_text=(f"A geometric paper sculpture photographed on a neutral background, composition {index}.")
-            ),
+            "messages": dummy_messages_from_mix_data(content_text=prompt),
             "extra_body": {
-                "height": height,
-                "width": width,
+                "height": 512,
+                "width": 512,
                 "num_inference_steps": 2,
                 "guidance_scale": 5.0,
                 "seed": 40 + index,
@@ -76,7 +83,7 @@ def test_mage_flow_four_to_one_aspect_ratio(
                 "mage_enable_watermark": False,
             },
         }
-        for index, (height, width) in enumerate(sizes)
+        for index, prompt in enumerate(prompts)
     ]
 
     responses = openai_client.send_diffusion_request(requests)

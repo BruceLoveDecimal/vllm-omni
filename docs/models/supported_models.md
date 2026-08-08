@@ -103,8 +103,8 @@ th {
 
 <sup>2</sup> Mage-Flow currently supports CUDA BF16, request-level padded
 batching, packed CFG, and one output per request. A batch may contain different
-prompt lengths, output resolutions, and T2I/Edit requests; Edit accepts one to
-three PIL, NumPy, or Tensor reference images. Multi-GPU execution supports
+prompt lengths and a mix of T2I and Edit requests, but not differing output
+resolutions; Edit accepts one to three PIL, NumPy, or Tensor reference images. Multi-GPU execution supports
 tensor parallelism, CFG parallelism (degree 2), and Ulysses sequence
 parallelism; see the [Mage-Flow recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/microsoft/Mage-Flow.md)
 for tested configurations. Sequence parallelism requires uniform token counts

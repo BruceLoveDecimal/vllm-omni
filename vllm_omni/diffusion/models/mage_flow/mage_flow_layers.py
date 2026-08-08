@@ -46,6 +46,11 @@ def _sequence_parallel_active() -> bool:
     return is_forward_context_available() and get_forward_context().sp_active
 
 
+def _mask_tokens(hidden_states: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """Zero out padded tokens. ``None`` means every token is real."""
+    return hidden_states if mask is None else hidden_states * mask[..., None]
+
+
 def _request_isolated_forward(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -420,11 +425,8 @@ class MageJointAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.heads = heads
         self.dim_head = dim_head
         self.inner_dim = heads * dim_head
-        self.query_dim = query_dim
-        self.added_kv_proj_dim = added_kv_proj_dim
 
         # Fused Q/K/V projections. The official checkpoint ships separate
         # ``to_q``/``to_k``/``to_v`` (and ``add_*_proj``) tensors; they are
@@ -453,7 +455,6 @@ class MageJointAttention(nn.Module):
         self.local_kv_heads = self.to_qkv.num_kv_heads
         self.q_size = self.local_heads * dim_head
         self.kv_size = self.local_kv_heads * dim_head
-        self.local_inner_dim = self.q_size
 
         # RMSNorm normalizes over ``dim_head`` only, so it never reduces across
         # the head dimension and stays correct under TP without extra comms.
@@ -527,25 +528,16 @@ class MageJointAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] != encoder_hidden_states.shape[0]:
             raise ValueError("Mage-Flow image and text batch sizes must match")
-        batch_size = hidden_states.shape[0]
-        if image_attention_mask is None:
-            image_attention_mask = torch.ones(
-                hidden_states.shape[:2],
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-        if encoder_attention_mask is None:
-            encoder_attention_mask = torch.ones(
-                encoder_hidden_states.shape[:2],
-                dtype=torch.bool,
-                device=encoder_hidden_states.device,
-            )
-        if image_attention_mask.shape != hidden_states.shape[:2]:
+        # ``None`` stays ``None``: it means "every token is real", the same thing
+        # the enclosing block assumes when it skips its own masking. Expanding it
+        # into an all-ones mask here would contradict that and, under sequence
+        # parallelism -- where the caller passes ``None`` precisely because a
+        # full-sequence mask no longer lines up with this rank's shard -- would
+        # add a batch of no-op multiplies per layer.
+        if image_attention_mask is not None and image_attention_mask.shape != hidden_states.shape[:2]:
             raise ValueError("image_attention_mask must match image token dimensions")
-        if encoder_attention_mask.shape != encoder_hidden_states.shape[:2]:
+        if encoder_attention_mask is not None and encoder_attention_mask.shape != encoder_hidden_states.shape[:2]:
             raise ValueError("encoder_attention_mask must match encoder token dimensions")
-        if image_attention_mask.shape[0] != batch_size:
-            raise ValueError("Mage-Flow attention masks must match the request batch")
 
         img_q, img_k, img_v = self._project(
             hidden_states,
@@ -564,12 +556,15 @@ class MageJointAttention(nn.Module):
         img_q = apply_rotary_emb_mage_flow(img_q, image_rotary_emb)
         img_k = apply_rotary_emb_mage_flow(img_k, image_rotary_emb)
 
-        text_length = encoder_hidden_states.shape[1]
         if _sequence_parallel_active():
             # Only the image stream is sharded; the text stream stays replicated.
             # Concatenating here would mix a sharded tensor with a full one, so
             # the text side is handed to the attention backend as joint tensors
-            # and spliced in after the all-to-all instead.
+            # and spliced in after the all-to-all instead. The masks are all-valid
+            # under SP (the transformer rejects padded sequences there), and a
+            # full-sequence mask would not line up with this rank's shard anyway.
+            image_mask = image_attention_mask
+            encoder_mask = encoder_attention_mask
             joint_output = self.attention(
                 img_q,
                 img_k,
@@ -581,92 +576,49 @@ class MageJointAttention(nn.Module):
                     joint_strategy="front",
                 ),
             )
-            txt_output, img_output = joint_output.split(
-                [text_length, hidden_states.shape[1]],
-                dim=1,
-            )
-            img_output = self.to_out[1](self.to_out[0](img_output.flatten(2, 3)))
-            txt_output = self.to_add_out(txt_output.flatten(2, 3))
-            return (
-                img_output * image_attention_mask[..., None],
-                txt_output * encoder_attention_mask[..., None],
+        else:
+            # Padding is handed to the attention backend as a joint mask, the
+            # same contract Qwen-Image and Flux use: the backend unpads, runs
+            # varlen attention and repads with zeros.
+            #
+            # Two absent masks stay absent rather than being materialised into
+            # an all-ones mask. Passing a mask is not free even when nothing is
+            # padded: FLASH_ATTN and FlashInfer short-circuit an all-valid mask
+            # back to the dense kernel, but CUDNN_ATTN -- the platform default
+            # on sm_120 -- forwards it to SDPA unconditionally, which selects a
+            # different kernel and shifts the output (measured: SSIM 0.9977 on
+            # an unpadded single request that is bit-identical under
+            # FLASH_ATTN).
+            image_mask = image_attention_mask
+            encoder_mask = encoder_attention_mask
+            attn_metadata = None
+            if image_mask is not None or encoder_mask is not None:
+                if image_mask is None:
+                    image_mask = hidden_states.new_ones(hidden_states.shape[:2], dtype=torch.bool)
+                if encoder_mask is None:
+                    encoder_mask = encoder_hidden_states.new_ones(encoder_hidden_states.shape[:2], dtype=torch.bool)
+                attn_metadata = AttentionMetadata(
+                    attn_mask=torch.cat([encoder_mask, image_mask], dim=1).to(torch.bool),
+                )
+            joint_output = self.attention(
+                torch.cat([txt_q, img_q], dim=1),
+                torch.cat([txt_k, img_k], dim=1),
+                torch.cat([txt_v, img_v], dim=1),
+                attn_metadata=attn_metadata,
             )
 
-        joint_attention_mask = torch.cat(
-            [encoder_attention_mask, image_attention_mask],
+        txt_output, img_output = joint_output.split(
+            [encoder_hidden_states.shape[1], hidden_states.shape[1]],
             dim=1,
-        ).to(torch.bool)
-        joint_q = torch.cat([txt_q, img_q], dim=1)
-        joint_k = torch.cat([txt_k, img_k], dim=1)
-        joint_v = torch.cat([txt_v, img_v], dim=1)
-        # Padding is dropped by slicing rather than by an attention mask, so no
-        # mask is ever handed to the backend and every backend stays usable.
-        dense_single_request = batch_size == 1 and bool(joint_attention_mask.all())
-        if dense_single_request:
-            joint_output = self.attention(joint_q, joint_k, joint_v)
-        else:
-            # BF16 attention kernels can select a different reduction path when
-            # the request-batch dimension changes. The small per-layer drift is
-            # amplified by Mage-Flow's residual stack, so execute each request
-            # through the same kernel shape as standalone inference. QKV
-            # projection, MLP, and residual computation remain request-batched.
-            joint_output = torch.zeros_like(joint_q)
-            for sample_index in range(batch_size):
-                valid_tokens = joint_attention_mask[sample_index]
-                sample_output = self.attention(
-                    joint_q[sample_index : sample_index + 1, valid_tokens],
-                    joint_k[sample_index : sample_index + 1, valid_tokens],
-                    joint_v[sample_index : sample_index + 1, valid_tokens],
-                )
-                joint_output[sample_index, valid_tokens] = sample_output[0]
-        txt_output, img_output = joint_output.split([text_length, hidden_states.shape[1]], dim=1)
-        if dense_single_request:
-            img_output = self.to_out[1](self.to_out[0](img_output.flatten(2, 3)))
-            txt_output = self.to_add_out(txt_output.flatten(2, 3))
-        else:
-            # ``to_out``/``to_add_out`` are row-parallel: their outputs are
-            # already all-reduced back to the full ``query_dim``/
-            # ``added_kv_proj_dim``, not the per-GPU shard.
-            projected_img_output = hidden_states.new_zeros(
-                batch_size,
-                hidden_states.shape[1],
-                self.query_dim,
-            )
-            projected_txt_output = encoder_hidden_states.new_zeros(
-                batch_size,
-                encoder_hidden_states.shape[1],
-                self.added_kv_proj_dim,
-            )
-            for sample_index in range(batch_size):
-                valid_image_tokens = image_attention_mask[sample_index]
-                valid_text_tokens = encoder_attention_mask[sample_index]
-                sample_img_output = self.to_out[1](
-                    self.to_out[0](
-                        img_output[
-                            sample_index : sample_index + 1,
-                            valid_image_tokens,
-                        ].flatten(2, 3)
-                    )
-                )
-                sample_txt_output = self.to_add_out(
-                    txt_output[
-                        sample_index : sample_index + 1,
-                        valid_text_tokens,
-                    ].flatten(2, 3)
-                )
-                projected_img_output[
-                    sample_index,
-                    valid_image_tokens,
-                ] = sample_img_output[0]
-                projected_txt_output[
-                    sample_index,
-                    valid_text_tokens,
-                ] = sample_txt_output[0]
-            img_output = projected_img_output
-            txt_output = projected_txt_output
-        img_output = img_output * image_attention_mask[..., None]
-        txt_output = txt_output * encoder_attention_mask[..., None]
-        return img_output, txt_output
+        )
+        # ``to_out``/``to_add_out`` are row-parallel: their outputs are already
+        # all-reduced back to the full query/context dim, not the per-GPU shard.
+        img_output = self.to_out[1](self.to_out[0](img_output.flatten(2, 3)))
+        txt_output = self.to_add_out(txt_output.flatten(2, 3))
+        return (
+            _mask_tokens(img_output, image_mask),
+            _mask_tokens(txt_output, encoder_mask),
+        )
 
 
 class MageFlowDoubleStreamBlock(nn.Module):
@@ -774,10 +726,8 @@ class MageFlowDoubleStreamBlock(nn.Module):
         )
         hidden_states = hidden_states + img_gate1 * img_attn
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn
-        if image_attention_mask is not None:
-            hidden_states = hidden_states * image_attention_mask[..., None]
-        if encoder_attention_mask is not None:
-            encoder_hidden_states = encoder_hidden_states * encoder_attention_mask[..., None]
+        hidden_states = _mask_tokens(hidden_states, image_attention_mask)
+        encoder_hidden_states = _mask_tokens(encoder_hidden_states, encoder_attention_mask)
 
         img_normed, img_gate2 = self._modulate(self.img_norm2(hidden_states), img_mod2)
         txt_normed, txt_gate2 = self._modulate(self.txt_norm2(encoder_hidden_states), txt_mod2)
@@ -793,13 +743,8 @@ class MageFlowDoubleStreamBlock(nn.Module):
             encoder_attention_mask,
         )
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
-        if image_attention_mask is not None:
-            hidden_states = hidden_states * image_attention_mask[..., None]
-        if encoder_attention_mask is not None:
-            encoder_hidden_states = encoder_hidden_states * encoder_attention_mask[..., None]
-        if hidden_states.dtype == torch.float16:
-            hidden_states = hidden_states.clamp(-65504, 65504)
-            encoder_hidden_states = encoder_hidden_states.clamp(-65504, 65504)
+        hidden_states = _mask_tokens(hidden_states, image_attention_mask)
+        encoder_hidden_states = _mask_tokens(encoder_hidden_states, encoder_attention_mask)
         return encoder_hidden_states, hidden_states
 
 

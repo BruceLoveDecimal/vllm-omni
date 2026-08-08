@@ -24,6 +24,9 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from PIL import Image
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # --- Gaussian-Shading watermark -------------------------------------------
 
@@ -375,7 +378,10 @@ def screen_mage_flow_prompt(
         )
     except Exception as error:
         # The official behavior is fail-closed: checker failure must not turn
-        # into an unreviewed generation.
+        # into an unreviewed generation. Log it, because an infrastructure
+        # failure (OOM, a bad processor) otherwise reaches the caller
+        # indistinguishable from a genuine policy rejection.
+        logger.warning("Mage-Flow prompt safety check failed, rejecting the request: %s", error, exc_info=True)
         return FilterVerdict(
             violates=True,
             categories=["safety_check_error"],
@@ -450,6 +456,7 @@ def screen_mage_flow_edit_prompt(
             max_new_tokens=max_new_tokens,
         )
     except Exception as error:
+        logger.warning("Mage-Flow edit safety check failed, rejecting the request: %s", error, exc_info=True)
         return FilterVerdict(
             violates=True,
             categories=["safety_check_error"],

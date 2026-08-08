@@ -12,8 +12,8 @@ vllm serve microsoft/Mage-Flow --omni --port 8091 --dtype bfloat16 \
   --max-num-seqs 2 --request-batch-max-wait-ms 20
 ```
 
-Compatible requests are padded and processed together; prompt lengths and
-output resolutions may differ. Increase `max_num_seqs` only after measuring
+Compatible requests are padded and processed together; prompt lengths may
+differ, output resolution may not. Increase `max_num_seqs` only after measuring
 available activation-memory headroom.
 
 The `microsoft/Mage-Flow-Base`, `microsoft/Mage-Flow`, and

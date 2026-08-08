@@ -75,7 +75,9 @@ def test_mage_flow_three_different_reference_sizes(
             for width, height in [(512, 512), (384, 512), (512, 384)]
         ],
     ]
-    sizes = [(512, 512), (512, 1024)]
+    # Output resolution is part of the request-batch key, so these two share one
+    # and land in the same padded batch. The 1-vs-3 reference counts above give
+    # them differing token counts, which is what exercises the padding.
     requests = [
         {
             "model": omni_server.model,
@@ -84,8 +86,8 @@ def test_mage_flow_three_different_reference_sizes(
                 content_text="Restyle the subject as a watercolor illustration.",
             ),
             "extra_body": {
-                "height": height,
-                "width": width,
+                "height": 512,
+                "width": 512,
                 "num_inference_steps": 2,
                 "guidance_scale": 1.0,
                 "seed": 50 + index,
@@ -94,7 +96,7 @@ def test_mage_flow_three_different_reference_sizes(
                 "mage_vision_long_edge": 384,
             },
         }
-        for index, ((height, width), reference_images) in enumerate(zip(sizes, references))
+        for index, reference_images in enumerate(references)
     ]
 
     responses = openai_client.send_diffusion_request(requests)

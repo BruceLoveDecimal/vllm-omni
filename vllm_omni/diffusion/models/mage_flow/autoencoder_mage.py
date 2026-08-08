@@ -16,7 +16,6 @@ Supports only the kl0.1 CoD ckpt layout:
 Latent shape: [B, 128, H/16, W/16] — no patch packing, no BN normalization.
 """
 
-import math
 from collections.abc import Iterable
 from functools import lru_cache
 
@@ -27,6 +26,7 @@ from diffusers.models.normalization import RMSNorm
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 
 # ---------------------------------------------------------------------------
@@ -72,18 +72,11 @@ class TimestepEmbedder(nn.Module):
         )
         self.frequency_embedding_size = frequency_embedding_size
 
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(-math.log(max_period) * torch.arange(0, half, dtype=torch.float32) / half).to(t.device)
-        args = t[:, None].float() * freqs[None]
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
-        return emb
-
     def forward(self, t):
-        emb = self.timestep_embedding(t, self.frequency_embedding_size)
+        # Same GLIDE/DiT cos-then-sin convention the DConv checkpoint was
+        # trained with. Both call sites feed t=0, so the frequency table never
+        # reaches the output and the shared helper is bit-identical here.
+        emb = timestep_embedding(t, self.frequency_embedding_size)
         return self.mlp(emb.to(self.mlp[0].weight.dtype))
 
 
@@ -308,42 +301,6 @@ class AttnBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# adaLN constant-folding: at fixed t=0, adaLN_modulation(c) is constant.
-# Replace the MLP with a buffer so DiCoBlock.forward stays unchanged and
-# torch.compile can fuse the surrounding ops normally.
-# ---------------------------------------------------------------------------
-class _ConstAdaLN(nn.Module):
-    def __init__(self, modulation: torch.Tensor):
-        super().__init__()
-        self.register_buffer("modulation", modulation.detach().clone())
-
-    def forward(self, c):
-        b = c.shape[0]
-        if self.modulation.shape[0] != b:
-            return self.modulation.expand(b, *self.modulation.shape[1:])
-        return self.modulation
-
-
-def _replace_adaln_with_const(module: nn.Module, c: torch.Tensor) -> int:
-    # Only modulated DiCoBlocks are targeted: their adaLN is conditioned solely
-    # on t. The encoder's unconditioned head blocks have no adaLN at all, and
-    # other adaLN_modulation submodules (e.g. _MLPResBlock in the decoder MLP)
-    # take a per-position latent and must not be folded.
-    n = 0
-    for child in module.modules():
-        if not isinstance(child, DiCoBlock) or not child.adaln:
-            continue
-        adaln = child.adaLN_modulation
-        if isinstance(adaln, _ConstAdaLN):
-            continue
-        with torch.no_grad():
-            mod = adaln(c)
-        child.adaLN_modulation = _ConstAdaLN(mod)
-        n += 1
-    return n
-
-
-# ---------------------------------------------------------------------------
 # CoD Decoder: latent → conditioning features for the denoiser
 # ---------------------------------------------------------------------------
 class _Decoder(nn.Module):
@@ -361,12 +318,10 @@ class _Decoder(nn.Module):
         )
         self.norm_out = Normalize(out_ch)
         self.conv_out = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1)
-        self.ada = nn.Identity()
 
     def forward(self, z):
         h = self.block(self.conv_in(z))
-        h = self.conv_out(nonlinearity(self.norm_out(h)))
-        return self.ada(h)
+        return self.conv_out(nonlinearity(self.norm_out(h)))
 
 
 # ---------------------------------------------------------------------------
@@ -502,24 +457,19 @@ class MageVAE(nn.Module):
         *,
         latent_channels: int = 128,
         downsample_factor: int = 16,
-        sample_posterior: bool = False,
-        encoder_kwargs: dict | None = None,
-        decoder_kwargs: dict | None = None,
         **_: object,
     ):
         super().__init__()
-        is_tiny_test_config = od_config is None and encoder_kwargs is not None and decoder_kwargs is not None
-        if latent_channels != self.latent_channels and not is_tiny_test_config:
+        if latent_channels != self.latent_channels:
             raise ValueError(f"MageVAE requires latent_channels=128, got {latent_channels}")
-        if downsample_factor != self.downsample_factor and not is_tiny_test_config:
+        if downsample_factor != self.downsample_factor:
             raise ValueError(f"MageVAE requires downsample_factor=16, got {downsample_factor}")
         self.od_config = od_config
         self.latent_channels = latent_channels
         self.downsample_factor = downsample_factor
-        self.sample_posterior = sample_posterior
 
-        self.dconv_encoder = _DConvEncoder(**(encoder_kwargs or {}))
-        self.decoder_model = _DConvDenoiser(**(decoder_kwargs or {}))
+        self.dconv_encoder = _DConvEncoder()
+        self.decoder_model = _DConvDenoiser()
         if self.dconv_encoder.z_ch != latent_channels:
             raise ValueError(
                 f"MageVAE encoder z_ch must match latent_channels, got {self.dconv_encoder.z_ch} and {latent_channels}"
@@ -531,32 +481,19 @@ class MageVAE(nn.Module):
             )
 
     @torch.no_grad()
-    def _moments(self, x: torch.Tensor):
-        B, _, H, W = x.shape
-        ps = self.dconv_encoder.patch_size
-        z_t = torch.zeros(B, self.dconv_encoder.z_ch, H // ps, W // ps, device=x.device, dtype=x.dtype)
-        t = torch.zeros(B, device=x.device, dtype=x.dtype)
-        out = self.dconv_encoder.forward_pred(z_t, t, x)
-        mean = out[:, : self.latent_channels]
-        logvar = out[:, self.latent_channels :].clamp(min=-20.0, max=10.0)
-        return mean, logvar
-
-    @torch.no_grad()
-    def _encode_moments(self, x: torch.Tensor):
-        # Compile target: pure deterministic part of encode (no RNG, no
-        # asserts), so torch.compile produces a single dynamic graph.
-        return self._moments(x)
-
-    @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         ps = self.dconv_encoder.patch_size
         H, W = x.shape[-2], x.shape[-1]
         if H % ps or W % ps:
             raise ValueError(f"H, W must be multiples of {ps}, got ({H}, {W})")
-        mean, logvar = self._encode_moments(x)
-        if self.sample_posterior:
-            return mean + torch.exp(0.5 * logvar) * torch.randn_like(mean)
-        return mean
+        B = x.shape[0]
+        z_t = torch.zeros(B, self.dconv_encoder.z_ch, H // ps, W // ps, device=x.device, dtype=x.dtype)
+        t = torch.zeros(B, device=x.device, dtype=x.dtype)
+        # The encoder emits packed (mean, logvar); only the posterior mode is
+        # used. Sampling would need ``sample_posterior``, which the pipeline
+        # rejects at load time, so the logvar half is dropped here.
+        out = self.dconv_encoder.forward_pred(z_t, t, x)
+        return out[:, : self.latent_channels]
 
     @torch.no_grad()
     def decode(self, z: torch.Tensor) -> torch.Tensor:
@@ -575,16 +512,6 @@ class MageVAE(nn.Module):
     @property
     def dtype(self):
         return next(self.parameters()).dtype
-
-    def _freeze_adaln_cache(self):
-        """Constant-fold adaLN_modulation MLPs at t=0 (encoder + decoder)."""
-        device = next(self.parameters()).device
-        dtype = next(self.parameters()).dtype
-        t = torch.zeros(1, device=device, dtype=dtype)
-        c_enc = self.dconv_encoder.t_embedder(t)
-        _replace_adaln_with_const(self.dconv_encoder, c_enc)
-        c_dec = self.decoder_model.t_embedder(t)
-        _replace_adaln_with_const(self.decoder_model, c_dec)
 
     def load_weights(
         self,

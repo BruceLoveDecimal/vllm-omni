@@ -14,6 +14,11 @@ import numpy as np
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.model_metadata import (
+    MAGE_FLOW_EXTRA_BODY_PARAMS,
+    MAGE_FLOW_MAX_INPUT_IMAGES,
+)
+
 MAGE_FLOW_PROMPT_TEMPLATE = (
     "<|im_start|>system\n"
     "Describe the image by detailing the color, shape, size, texture, "
@@ -39,7 +44,6 @@ MAGE_FLOW_MIN_SIZE = 512
 MAGE_FLOW_MAX_SIZE = 2048
 MAGE_FLOW_SIZE_MULTIPLE = 16
 MAGE_FLOW_MAX_ASPECT_RATIO = 4.0
-MAGE_FLOW_MAX_INPUT_IMAGES = 3
 
 
 @dataclass(frozen=True)
@@ -167,12 +171,8 @@ def parse_mage_flow_extra_args(
     extra_args: dict[str, Any] | None,
 ) -> MageFlowExtraArgs:
     extra_args = extra_args or {}
-    known = {
-        "mage_enable_safety_check",
-        "mage_enable_watermark",
-        "mage_vision_long_edge",
-    }
-    unknown = sorted(key for key in extra_args if key.startswith("mage_") and key not in known)
+    # The serving layer advertises exactly these keys, so accept exactly these.
+    unknown = sorted(key for key in extra_args if key.startswith("mage_") and key not in MAGE_FLOW_EXTRA_BODY_PARAMS)
     if unknown:
         raise ValueError("Unknown Mage-Flow extra_args: " + ", ".join(unknown))
 

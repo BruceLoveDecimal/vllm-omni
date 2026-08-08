@@ -255,11 +255,13 @@ class MageFlowPipeline(
             od_config=od_config,
             **transformer_config,
         )
+        # ``sample_posterior`` is not forwarded: _load_checkpoint_metadata
+        # already rejects any value but False, so the VAE only ever needs the
+        # posterior mode.
         self.vae = MageVAE(
             od_config=od_config,
             latent_channels=int(vae_config["latent_channels"]),
             downsample_factor=int(vae_config["downsample_factor"]),
-            sample_posterior=bool(vae_config["sample_posterior"]),
         )
         if self.transformer.in_channels != self.vae.latent_channels:
             raise ValueError(
@@ -312,7 +314,19 @@ class MageFlowPipeline(
                 "Mage-Flow CFG parallelism splits one positive and one negative "
                 f"branch, so cfg_parallel_size must be 1 or 2, got {cfg_parallel_size}"
             )
-        if getattr(parallel, "use_hsdp", False):
+        if parallel.sequence_parallel_size > 1 and self.od_config.max_num_seqs > 1:
+            # Sharding splits the padded sequence blindly, so the transformer
+            # rejects a batch whose requests differ in token count. Prompt
+            # length is not part of the request-batch key, so any two concurrent
+            # requests can trip that. Refusing here turns a mid-generation
+            # failure into a startup one.
+            raise ValueError(
+                f"Mage-Flow sequence parallelism requires max_num_seqs=1, got "
+                f"{self.od_config.max_num_seqs}. Requests of differing token counts "
+                f"share a batch and cannot be sharded; run with --max-num-seqs 1, or "
+                f"drop --ulysses-degree/--ring-degree to keep request batching."
+            )
+        if parallel.use_hsdp:
             raise ValueError("Mage-Flow does not yet support HSDP")
 
     def _load_checkpoint_metadata(
@@ -540,7 +554,6 @@ class MageFlowPipeline(
             image_grid_hw=image_grid_hw,
             image_attention_mask=image_attention_mask,
             encoder_attention_mask=encoder_attention_mask,
-            return_dict=False,
         )[0]
 
     def _predict_noise_packed_cfg(

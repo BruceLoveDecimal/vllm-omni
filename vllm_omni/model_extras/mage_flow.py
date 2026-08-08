@@ -3,13 +3,10 @@
 
 from __future__ import annotations
 
-# Request-scoped controls consumed by MageFlowPipeline from
-# OmniDiffusionSamplingParams.extra_args.
-MAGE_FLOW_EXTRA_BODY_PARAMS = frozenset(
-    {
-        "mage_enable_safety_check",
-        "mage_enable_watermark",
-        "mage_vision_long_edge",
-    }
-)
-MAGE_FLOW_EXTRA_OUTPUT_PARAMS = frozenset()
+# Re-exported from the shared metadata module so the advertised key set and the
+# pipeline's own validation stay one definition. ``model_metadata`` is import-safe
+# here: ``vllm_omni.diffusion.__init__`` is empty and the module itself only
+# depends on ``dataclasses``.
+from vllm_omni.diffusion.model_metadata import MAGE_FLOW_EXTRA_BODY_PARAMS
+
+__all__ = ["MAGE_FLOW_EXTRA_BODY_PARAMS"]
