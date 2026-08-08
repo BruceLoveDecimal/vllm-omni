@@ -11,11 +11,16 @@ import torch
 import torch.nn as nn
 from diffusers.models.normalization import RMSNorm
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
+)
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
 )
 
 from .mage_flow_layers import (
@@ -27,6 +32,8 @@ from .mage_flow_layers import (
     _request_isolated_forward,
     _sequence_parallel_active,
 )
+
+logger = init_logger(__name__)
 
 # The official checkpoint ships unfused ``to_q``/``to_k``/``to_v`` (and the text
 # stream's ``add_*_proj``) tensors, while the model fuses each triple into a
@@ -40,6 +47,33 @@ MAGE_FLOW_STACKED_PARAMS_MAPPING: list[tuple[str, str, str]] = [
     (".add_qkv_proj", ".add_k_proj", "k"),
     (".add_qkv_proj", ".add_v_proj", "v"),
 ]
+
+
+def _warn_on_unmasked_sp_padding() -> None:
+    """Report the numerical caveat when SP auto-padding is in play.
+
+    ``_sp_plan`` declares ``auto_pad=True``, so a token count that is not
+    divisible by the sequence-parallel degree is zero-padded at split time and
+    trimmed again at gather time. Those filler tokens still take part in
+    attention, exactly as they do for Wan under ``mask_sp_padding=False``.
+    Masking them would need a mask that survives the Ulysses all-to-all, which
+    this model's joint attention does not build, so ``mask_sp_padding`` is not
+    honoured here and says so rather than implying strict masking.
+    """
+    if not is_forward_context_available():
+        return
+    ctx = get_forward_context()
+    if ctx.sp_original_seq_len is None or ctx.sp_padding_size <= 0:
+        return
+    logger.warning_once(
+        "SP auto-padding applied %d token(s) (seq_len=%d). Padding tokens are "
+        "not masked from attention, which avoids the varlen attention path but "
+        "may produce minor numerical differences. Mage-Flow does not honour "
+        "parallel_config.mask_sp_padding; choose a token count divisible by the "
+        "sequence-parallel degree if you need every token masked exactly.",
+        ctx.sp_padding_size,
+        ctx.sp_original_seq_len,
+    )
 
 
 def resolve_mage_flow_stacked_name(name: str) -> tuple[str, str | None]:
@@ -232,15 +266,12 @@ class MageFlowTransformer2DModel(nn.Module):
         batch_size: int,
     ) -> list[list[tuple[int, int, int]]]:
         if batch_size == 1 and (
-            isinstance(image_grid_hw, tuple)
-            or not image_grid_hw
-            or isinstance(image_grid_hw[0], tuple)
+            isinstance(image_grid_hw, tuple) or not image_grid_hw or isinstance(image_grid_hw[0], tuple)
         ):
             return [self._normalize_image_grids(image_grid_hw)]
         if not isinstance(image_grid_hw, list) or len(image_grid_hw) != batch_size:
             raise ValueError(
-                "batched Mage-Flow image_grid_hw must provide one grid list "
-                f"per request, got batch_size={batch_size}"
+                f"batched Mage-Flow image_grid_hw must provide one grid list per request, got batch_size={batch_size}"
             )
         return [self._normalize_image_grids(grids) for grids in image_grid_hw]
 
@@ -284,15 +315,11 @@ class MageFlowTransformer2DModel(nn.Module):
             )
 
         grids_per_sample = self._normalize_batched_image_grids(image_grid_hw, batch_size)
-        expected_tokens = [
-            sum(frame * height * width for frame, height, width in grids)
-            for grids in grids_per_sample
-        ]
+        expected_tokens = [sum(frame * height * width for frame, height, width in grids) for grids in grids_per_sample]
         actual_tokens = image_attention_mask.to(torch.int64).sum(dim=1).tolist()
         if actual_tokens != expected_tokens:
             raise ValueError(
-                "valid image token counts do not match image grids: "
-                f"got {actual_tokens}, expected {expected_tokens}"
+                f"valid image token counts do not match image grids: got {actual_tokens}, expected {expected_tokens}"
             )
 
         hidden_states, image_rotary_emb = self.image_rope_prepare(
@@ -304,12 +331,11 @@ class MageFlowTransformer2DModel(nn.Module):
         # The _sp_plan hook fires on image_rope_prepare's outputs, so the image
         # stream is sharded from here on while the text stream stays whole.
         sequence_parallel = _sequence_parallel_active()
-        if sequence_parallel and not (
-            bool(image_attention_mask.all()) and bool(encoder_attention_mask.all())
-        ):
-            # Sharding splits the padded sequence blindly, so a padded request
-            # would put real tokens and filler on different ranks with no mask
-            # to tell them apart. Requests of equal length shard cleanly.
+        if sequence_parallel and not (bool(image_attention_mask.all()) and bool(encoder_attention_mask.all())):
+            # Batch padding, not shard padding: sharding splits the padded
+            # sequence blindly, so a padded request would put real tokens and
+            # filler on different ranks with no mask to tell them apart.
+            # Requests of equal length shard cleanly.
             raise ValueError(
                 "Mage-Flow sequence parallelism does not support padded token "
                 "sequences. Every request in the batch must share the same image "
@@ -317,6 +343,8 @@ class MageFlowTransformer2DModel(nn.Module):
                 "pair --ulysses-degree with --cfg-parallel-size 2 instead of "
                 "letting one forward carry both guidance branches."
             )
+        if sequence_parallel:
+            _warn_on_unmasked_sp_padding()
 
         encoder_hidden_states = _request_isolated_forward(
             self.txt_in,
@@ -331,9 +359,7 @@ class MageFlowTransformer2DModel(nn.Module):
         encoder_hidden_states = encoder_hidden_states * encoder_attention_mask[..., None]
         timestep = timestep.to(hidden_states.dtype)
         if timestep.shape != (batch_size,):
-            raise ValueError(
-                f"Mage-Flow timestep must have shape ({batch_size},), got {tuple(timestep.shape)}"
-            )
+            raise ValueError(f"Mage-Flow timestep must have shape ({batch_size},), got {tuple(timestep.shape)}")
         temb = self.time_text_embed(timestep, hidden_states)
 
         # Every mask below is indexed against the full sequence, which no longer
