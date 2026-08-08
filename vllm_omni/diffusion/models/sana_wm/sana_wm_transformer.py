@@ -35,6 +35,7 @@ from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import RMSNorm, TensorParallelRMSNorm, fused_qk_rms_norm
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.ucpe import (
@@ -1490,7 +1491,7 @@ class SanaWmBlock(nn.Module):
         use_plucker_proj = config.use_chunk_plucker_post_attn and (
             config.chunk_plucker_post_attn_blocks < 0 or block_idx < config.chunk_plucker_post_attn_blocks
         )
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm1 = AdaLayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = SanaWmSelfAttention(
             config,
             use_gdn=use_gdn,
@@ -1502,7 +1503,7 @@ class SanaWmBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.cross_attn" if prefix else "cross_attn",
         )
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = AdaLayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp = SanaWmMbConvFfn(config)
         self.mlp.block_idx = block_idx
         self.attn.block_idx = block_idx
@@ -1519,10 +1520,6 @@ class SanaWmBlock(nn.Module):
         else:
             self.plucker_proj = None
         self.scale_shift_table = nn.Parameter(torch.zeros(6, hidden_size))
-
-    @staticmethod
-    def _modulate(hidden_states: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return hidden_states * (1 + scale) + shift
 
     def forward(
         self,
@@ -1551,7 +1548,7 @@ class SanaWmBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.scale_shift_table[None] + timestep_modulation.reshape(batch_size, 6, -1)
         ).chunk(6, dim=1)
-        attn_input = self._modulate(self.norm1(hidden_states), shift_msa, scale_msa)
+        attn_input = self.norm1(hidden_states, scale_msa, shift_msa)
         attn_output = self.attn(attn_input, spatial_shape, rotary_emb, cam_geometry)
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + self.plucker_proj(camera_hidden_states)
@@ -1561,7 +1558,7 @@ class SanaWmBlock(nn.Module):
             encoder_hidden_states,
             encoder_attention_mask,
         )
-        mlp_input = self._modulate(self.norm2(hidden_states), shift_mlp, scale_mlp)
+        mlp_input = self.norm2(hidden_states, scale_mlp, shift_mlp)
         hidden_states = hidden_states + gate_mlp * self.mlp(mlp_input, spatial_shape)
         return hidden_states
 
@@ -1602,9 +1599,11 @@ class SanaWmBlock(nn.Module):
         ).chunk(6, dim=-2)  # each: (B, F, 1, D)
 
         # Apply per-frame modulation by reshaping x to (B, F, S, D), broadcasting
-        # scale/shift over the spatial axis, then flattening back.
-        x_norm1 = self.norm1(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
-        x_msa_in = (x_norm1 * (1 + scale_msa) + shift_msa).reshape(batch_size, token_count, hidden_size)
+        # scale/shift over the spatial axis, then flattening back. The reshape
+        # comes first because the norm only reduces over the last axis, so it is
+        # unaffected, and the modulation then broadcasts as written.
+        x_4d = hidden_states.reshape(batch_size, frames, spatial_tokens, hidden_size)
+        x_msa_in = self.norm1(x_4d, scale_msa, shift_msa).reshape(batch_size, token_count, hidden_size)
         attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, cam_geometry)
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + self.plucker_proj(camera_hidden_states)
@@ -1617,8 +1616,8 @@ class SanaWmBlock(nn.Module):
             encoder_attention_mask,
         )
 
-        x_norm2 = self.norm2(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
-        x_mlp_in = (x_norm2 * (1 + scale_mlp) + shift_mlp).reshape(batch_size, token_count, hidden_size)
+        x_4d = hidden_states.reshape(batch_size, frames, spatial_tokens, hidden_size)
+        x_mlp_in = self.norm2(x_4d, scale_mlp, shift_mlp).reshape(batch_size, token_count, hidden_size)
         mlp_out = self.mlp(x_mlp_in, spatial_shape)
         mlp_out_4d = mlp_out.reshape(batch_size, frames, spatial_tokens, hidden_size)
         hidden_states = hidden_states + (gate_mlp * mlp_out_4d).reshape(batch_size, token_count, hidden_size)
@@ -1636,7 +1635,7 @@ class SanaWmFinalLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_final = AdaLayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.scale_shift_table = nn.Parameter(torch.zeros(2, hidden_size))
         self.out_channels = out_channels
         out_features = math.prod(patch_size) * out_channels
@@ -1660,8 +1659,7 @@ class SanaWmFinalLayer(nn.Module):
         if timestep_embed.ndim > 2:
             return self._forward_frame_aware(hidden_states, timestep_embed, spatial_shape)
         shift, scale = (self.scale_shift_table[None] + timestep_embed[:, None]).chunk(2, dim=1)
-        hidden_states = self.norm_final(hidden_states) * (1 + scale) + shift
-        return self.linear(hidden_states)
+        return self.linear(self.norm_final(hidden_states, scale, shift))
 
     def _forward_frame_aware(
         self,
@@ -1692,8 +1690,8 @@ class SanaWmFinalLayer(nn.Module):
         # (B, 1, F, D) -> (B, F, 1, D); add (1, 1, 2, D); chunk into shift/scale: each (B, F, 1, D).
         t_per_frame = timestep_embed.transpose(1, 2)
         shift, scale = (self.scale_shift_table[None, None, :, :] + t_per_frame).chunk(2, dim=-2)
-        x_norm = self.norm_final(hidden_states).reshape(batch_size, frames, spatial_tokens, hidden_size)
-        x_mod = (x_norm * (1 + scale) + shift).reshape(batch_size, token_count, hidden_size)
+        x_4d = hidden_states.reshape(batch_size, frames, spatial_tokens, hidden_size)
+        x_mod = self.norm_final(x_4d, scale, shift).reshape(batch_size, token_count, hidden_size)
         return self.linear(x_mod)
 
 
