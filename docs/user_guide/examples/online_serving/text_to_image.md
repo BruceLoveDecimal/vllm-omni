@@ -19,6 +19,26 @@ Compatible requests are padded and processed together; prompt lengths and
 output resolutions may differ. Increase `max_num_seqs` only after measuring
 available activation-memory headroom.
 
+For multi-GPU serving, CFG parallelism gives the largest single-dimension gain
+because it exchanges only one prediction per denoising step:
+
+```bash
+# 2 GPUs: one guidance branch per rank
+vllm serve microsoft/Mage-Flow --omni --port 8091 --dtype bfloat16 \
+  --cfg-parallel-size 2
+
+# 4 GPUs: shard the image sequence on top of the guidance split
+vllm serve microsoft/Mage-Flow --omni --port 8091 --dtype bfloat16 \
+  --cfg-parallel-size 2 --usp 2
+```
+
+Tensor parallelism (`--tensor-parallel-size`) mainly reduces per-GPU memory
+rather than latency; reach for it when the model plus activations do not fit,
+not to speed up a single request. Sequence parallelism cannot shard a padded
+batch, so combine `--usp` with `--cfg-parallel-size 2` instead of relying on
+packed CFG. See the [Mage-Flow recipe](../../../../recipes/microsoft/Mage-Flow.md)
+for measured latency, memory, and quality across these configurations.
+
 The `microsoft/Mage-Flow-Base`, `microsoft/Mage-Flow`, and
 `microsoft/Mage-Flow-Turbo` checkpoints default to 30/20/4 denoising steps and
 CFG 5.0/5.0/1.0 respectively when those values are omitted. Official content

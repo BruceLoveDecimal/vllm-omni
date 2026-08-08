@@ -12,17 +12,51 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from diffusers.models.normalization import RMSNorm
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
 
 from .mage_flow_layers import (
     AdaLayerNormContinuous,
     MageFlowDoubleStreamBlock,
     MageFlowEmbedRope,
+    MageFlowImageRopePrepare,
     MageFlowTimestepProjEmbeddings,
     _request_isolated_forward,
+    _sequence_parallel_active,
 )
+
+
+# The official checkpoint ships unfused ``to_q``/``to_k``/``to_v`` (and the text
+# stream's ``add_*_proj``) tensors, while the model fuses each triple into a
+# single ``QKVParallelLinear`` so tensor parallelism can shard whole heads.
+MAGE_FLOW_STACKED_PARAMS_MAPPING: list[tuple[str, str, str]] = [
+    # (fused param name, checkpoint weight name, shard id)
+    (".to_qkv", ".to_q", "q"),
+    (".to_qkv", ".to_k", "k"),
+    (".to_qkv", ".to_v", "v"),
+    (".add_qkv_proj", ".add_q_proj", "q"),
+    (".add_qkv_proj", ".add_k_proj", "k"),
+    (".add_qkv_proj", ".add_v_proj", "v"),
+]
+
+
+def resolve_mage_flow_stacked_name(name: str) -> tuple[str, str | None]:
+    """Rewrite a checkpoint weight name onto its fused QKV parameter.
+
+    Returns ``(param_name, shard_id)``; ``shard_id`` is ``None`` for weights
+    that are not part of a fused projection and load unchanged.
+    """
+    for param_name, weight_name, shard_id in MAGE_FLOW_STACKED_PARAMS_MAPPING:
+        if weight_name in name and param_name not in name:
+            return name.replace(weight_name, param_name), shard_id
+    return name, None
 
 
 class MageFlowTransformer2DModel(nn.Module):
@@ -30,6 +64,28 @@ class MageFlowTransformer2DModel(nn.Module):
 
     _repeated_blocks = ["MageFlowDoubleStreamBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
+
+    # Sequence parallelism shards the image stream only. The text stream stays
+    # replicated and is spliced back in as joint tensors inside attention, the
+    # same split Qwen-Image uses for its dual-stream blocks. hidden_states and
+    # the RoPE table are emitted together so they shard in lockstep.
+    _sp_plan = {
+        "image_rope_prepare": {
+            0: SequenceParallelInput(
+                split_dim=1,
+                expected_dims=3,
+                split_output=True,
+                auto_pad=True,
+            ),
+            1: SequenceParallelInput(
+                split_dim=1,
+                expected_dims=3,
+                split_output=True,
+                auto_pad=True,
+            ),
+        },
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     def __init__(
         self,
@@ -133,6 +189,12 @@ class MageFlowTransformer2DModel(nn.Module):
         if hidden_size % num_heads:
             raise ValueError(f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
         head_dim = hidden_size // num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        if num_heads % tp_size:
+            raise ValueError(
+                f"Mage-Flow tensor parallelism shards whole attention heads, so num_heads "
+                f"({num_heads}) must be divisible by tensor_parallel_size ({tp_size})"
+            )
         if sum(axes_dim) != head_dim:
             raise ValueError(f"sum(axes_dim) ({sum(axes_dim)}) must equal head_dim ({head_dim})")
         if in_channels != out_channels:
@@ -198,6 +260,9 @@ class MageFlowTransformer2DModel(nn.Module):
                 for index in range(depth)
             ]
         )
+        # Registered after img_in/pos_embed so named_parameters() keeps
+        # reporting the checkpoint's own names for the shared submodules.
+        self.image_rope_prepare = MageFlowImageRopePrepare(self.img_in, self.pos_embed)
         self.norm_out = AdaLayerNormContinuous(
             hidden_size,
             hidden_size,
@@ -251,36 +316,6 @@ class MageFlowTransformer2DModel(nn.Module):
             )
         return [self._normalize_image_grids(grids) for grids in image_grid_hw]
 
-    def _prepare_batched_image_rope(
-        self,
-        grids_per_sample: list[list[tuple[int, int, int]]],
-        max_image_tokens: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        frequencies = []
-        for grids in grids_per_sample:
-            # RoPE owns a bounded device-aware LRU. Pass the execution device
-            # explicitly so cached GPU tensors cannot cross device boundaries.
-            sample_frequencies = self.pos_embed(grids, device=device)
-            padding = max_image_tokens - sample_frequencies.shape[0]
-            if padding < 0:
-                raise ValueError("Mage-Flow image grid exceeds the padded token length")
-            if padding:
-                sample_frequencies = torch.cat(
-                    [
-                        sample_frequencies,
-                        torch.ones(
-                            padding,
-                            sample_frequencies.shape[1],
-                            dtype=sample_frequencies.dtype,
-                            device=device,
-                        ),
-                    ],
-                    dim=0,
-                )
-            frequencies.append(sample_frequencies)
-        return torch.stack(frequencies)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -332,22 +367,39 @@ class MageFlowTransformer2DModel(nn.Module):
                 f"got {actual_tokens}, expected {expected_tokens}"
             )
 
-        image_rotary_emb = self._prepare_batched_image_rope(
-            grids_per_sample,
-            hidden_states.shape[1],
-            hidden_states.device,
-        )
-        hidden_states = _request_isolated_forward(
-            self.img_in,
+        hidden_states, image_rotary_emb = self.image_rope_prepare(
             hidden_states,
             image_attention_mask,
+            grids_per_sample,
+            hidden_states.shape[1],
         )
+        # The _sp_plan hook fires on image_rope_prepare's outputs, so the image
+        # stream is sharded from here on while the text stream stays whole.
+        sequence_parallel = _sequence_parallel_active()
+        if sequence_parallel and not (
+            bool(image_attention_mask.all()) and bool(encoder_attention_mask.all())
+        ):
+            # Sharding splits the padded sequence blindly, so a padded request
+            # would put real tokens and filler on different ranks with no mask
+            # to tell them apart. Requests of equal length shard cleanly.
+            raise ValueError(
+                "Mage-Flow sequence parallelism does not support padded token "
+                "sequences. Every request in the batch must share the same image "
+                "and text token counts; packed CFG pads the shorter prompt, so "
+                "pair --ulysses-degree with --cfg-parallel-size 2 instead of "
+                "letting one forward carry both guidance branches."
+            )
+
         encoder_hidden_states = _request_isolated_forward(
             self.txt_in,
             self.txt_norm(encoder_hidden_states),
             encoder_attention_mask,
         )
-        hidden_states = hidden_states * image_attention_mask[..., None]
+        if not sequence_parallel:
+            # Under SP the mask spans the full sequence while hidden_states holds
+            # only this rank's shard. The masks are all-valid there (checked
+            # above), so skipping these multiplies is a no-op, not a shortcut.
+            hidden_states = hidden_states * image_attention_mask[..., None]
         encoder_hidden_states = encoder_hidden_states * encoder_attention_mask[..., None]
         timestep = timestep.to(hidden_states.dtype)
         if timestep.shape != (batch_size,):
@@ -356,19 +408,26 @@ class MageFlowTransformer2DModel(nn.Module):
             )
         temb = self.time_text_embed(timestep, hidden_states)
 
+        # Every mask below is indexed against the full sequence, which no longer
+        # matches the sharded image stream. They are all-valid under SP, so the
+        # blocks run unmasked instead.
+        block_image_mask = None if sequence_parallel else image_attention_mask
+
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
-                image_attention_mask=image_attention_mask,
+                image_attention_mask=block_image_mask,
                 encoder_attention_mask=encoder_attention_mask,
             )
+        # proj_out carries the _sp_plan gather hook, so its output is whole
+        # again and the trailing mask applies to the full sequence.
         output = _request_isolated_forward(
             self.proj_out,
             self.norm_out(hidden_states, temb),
-            image_attention_mask,
+            block_image_mask,
         )
         output = output * image_attention_mask[..., None]
         return (output,)
@@ -377,4 +436,18 @@ class MageFlowTransformer2DModel(nn.Module):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
+        """Load transformer weights, fusing the unfused Q/K/V checkpoint tensors."""
+        params = dict(self.named_parameters())
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            lookup_name, shard_id = resolve_mage_flow_stacked_name(name)
+            param = params.get(lookup_name)
+            if param is None:
+                raise KeyError(f"Unexpected Mage-Flow transformer weight: {name}")
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if shard_id is None:
+                weight_loader(param, loaded_weight)
+            else:
+                weight_loader(param, loaded_weight, shard_id)
+            loaded.add(name)
+        return loaded
