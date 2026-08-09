@@ -263,6 +263,9 @@ class SanaWmPipeline(
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+    # 跳过启动 warmup：通用 dummy 请求只带一张空白图，没有相机位姿也没有动作串，
+    # 必然被 SANA-WM 的请求校验拒掉。首个真实请求负责预热。
+    dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
