@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Equivalence tests for the shared TensorParallelRMSNorm q/k fusion.
+"""Equivalence tests for SANA-WM's TensorParallelRMSNorm q/k fusion.
 
 `fused_qk_rms_norm` packs the q and k per-token sum-of-squares into one tensor
 and issues a single tensor-parallel all-reduce instead of two. These tests lock
@@ -19,15 +19,15 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.layers.norm import (
-    RMSNorm,
+from vllm_omni.diffusion.layers.norm import RMSNorm
+from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     TensorParallelRMSNorm,
     fused_qk_rms_norm,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_MODULE = "vllm_omni.diffusion.layers.norm"
+_MODULE = "vllm_omni.diffusion.models.sana_wm.sana_wm_transformer"
 
 
 def _make_norms(dim: int, tp_size: int) -> tuple[TensorParallelRMSNorm, TensorParallelRMSNorm]:

@@ -36,7 +36,7 @@ from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
-from vllm_omni.diffusion.layers.norm import RMSNorm, TensorParallelRMSNorm, fused_qk_rms_norm
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.ucpe import (
     SanaWmCamGeometry,
@@ -334,6 +334,85 @@ def reference_bidirectional_gated_delta_net(
         key=key.float(),
     )
     return (numerator / (denominator + eps)).to(dtype_orig)
+
+
+class TensorParallelRMSNorm(nn.Module):
+    """RMSNorm whose statistics span a tensor-parallel sharded last dimension.
+
+    Models that normalize q/k across *all* heads (``qk_norm="rms_norm_across_heads"``)
+    cannot use a plain RMSNorm once the q/k projections are column-parallel: each
+    rank would then compute the RMS over its local head shard only. This
+    all-reduces the squared sum so the denominator matches the global width,
+    while the affine weight stays local.
+
+    Model-local on purpose: LTX-2 and DreamZero carry their own near-identical
+    copies, and converging all three belongs in its own change rather than in
+    the SANA-WM port.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = True,
+        tp_size: int = 1,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.tp_size = max(int(tp_size), 1)
+        self.global_hidden_size = hidden_size * self.tp_size
+        self.eps = eps
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+        else:
+            self.register_parameter("weight", None)
+
+    def _local_sum_sq(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x_float = x.float()
+        return x_float, x_float.pow(2).sum(dim=-1, keepdim=True)
+
+    def _scale(self, x_float: torch.Tensor, global_sum_sq: torch.Tensor, input_dtype: torch.dtype) -> torch.Tensor:
+        out = x_float * torch.rsqrt(global_sum_sq / self.global_hidden_size + self.eps)
+        if self.weight is not None:
+            out = out * self.weight.float()
+        return out.to(dtype=input_dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_float, sum_sq = self._local_sum_sq(x)
+        if self.tp_size > 1:
+            sum_sq = tensor_model_parallel_all_reduce(sum_sq)
+        return self._scale(x_float, sum_sq, x.dtype)
+
+
+def fused_qk_rms_norm(
+    norm_q: nn.Module,
+    norm_k: nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply q/k :class:`TensorParallelRMSNorm` with a SINGLE fused all-reduce.
+
+    Self-attention normalizes q and k every step, and under TP each norm issues
+    its own tiny all-reduce of the per-token sum-of-squares. These collectives
+    are latency-bound, so packing both sums into one tensor halves the count
+    (2 collectives -> 1) for free.
+
+    Numerically identical to ``norm_q(q), norm_k(k)``: all-reduce is
+    elementwise, so packing along the last dim reduces each slice independently
+    with the same fp32 accumulation. Falls back to independent application when
+    either norm is not a :class:`TensorParallelRMSNorm` (e.g. ``nn.Identity``
+    when qk_norm is off, or plain ``RMSNorm`` at TP=1).
+    """
+    if not (isinstance(norm_q, TensorParallelRMSNorm) and isinstance(norm_k, TensorParallelRMSNorm)):
+        return norm_q(q), norm_k(k)
+    if norm_q.tp_size <= 1:
+        return norm_q(q), norm_k(k)
+
+    q_float, q_sum_sq = norm_q._local_sum_sq(q)
+    k_float, k_sum_sq = norm_k._local_sum_sq(k)
+    packed = tensor_model_parallel_all_reduce(torch.cat([q_sum_sq, k_sum_sq], dim=-1))
+    q_sum_sq, k_sum_sq = packed[..., 0:1], packed[..., 1:2]
+    return norm_q._scale(q_float, q_sum_sq, q.dtype), norm_k._scale(k_float, k_sum_sq, k.dtype)
 
 
 def _make_sharded_qk_rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
