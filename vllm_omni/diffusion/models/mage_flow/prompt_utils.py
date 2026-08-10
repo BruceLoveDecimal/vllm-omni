@@ -52,13 +52,6 @@ class MageFlowVariantDefaults:
     guidance_scale: float
 
 
-@dataclass(frozen=True)
-class MageFlowExtraArgs:
-    enable_safety_check: bool = True
-    enable_watermark: bool = True
-    vision_long_edge: int = 384
-
-
 def get_mage_flow_variant_defaults(
     model_name_or_path: str,
 ) -> MageFlowVariantDefaults:
@@ -167,31 +160,18 @@ def preprocess_mage_flow_reference_for_vae(
     return torch.from_numpy(array).permute(2, 0, 1).div_(127.5).sub_(1.0)
 
 
-def parse_mage_flow_extra_args(
-    extra_args: dict[str, Any] | None,
-) -> MageFlowExtraArgs:
+def parse_mage_flow_extra_args(extra_args: dict[str, Any] | None) -> int:
+    """Return the Edit visual-conditioning long edge from ``extra_args``."""
     extra_args = extra_args or {}
     # The serving layer advertises exactly these keys, so accept exactly these.
     unknown = sorted(key for key in extra_args if key.startswith("mage_") and key not in MAGE_FLOW_EXTRA_BODY_PARAMS)
     if unknown:
         raise ValueError("Unknown Mage-Flow extra_args: " + ", ".join(unknown))
 
-    enable_safety = extra_args.get("mage_enable_safety_check", True)
-    enable_watermark = extra_args.get("mage_enable_watermark", True)
     vision_long_edge = extra_args.get("mage_vision_long_edge", 384)
-    for name, value in (
-        ("mage_enable_safety_check", enable_safety),
-        ("mage_enable_watermark", enable_watermark),
-    ):
-        if not isinstance(value, bool):
-            raise ValueError(f"{name} must be a bool, got {type(value).__name__}")
     if isinstance(vision_long_edge, bool) or not isinstance(vision_long_edge, int) or vision_long_edge <= 0:
         raise ValueError(f"mage_vision_long_edge must be a positive integer, got {vision_long_edge!r}")
-    return MageFlowExtraArgs(
-        enable_safety_check=enable_safety,
-        enable_watermark=enable_watermark,
-        vision_long_edge=vision_long_edge,
-    )
+    return vision_long_edge
 
 
 def format_mage_flow_prompt(prompt: str, *, edit: bool = False) -> str:

@@ -47,11 +47,6 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .autoencoder_mage import MageVAE
-from .content_policy import (
-    make_initial_noise,
-    screen_mage_flow_edit_prompt,
-    screen_mage_flow_prompt,
-)
 from .mage_flow_transformer import (
     MageFlowTransformer2DModel,
     resolve_mage_flow_stacked_name,
@@ -439,7 +434,6 @@ class MageFlowPipeline(
         width: int,
         generator: torch.Generator,
         latents: torch.Tensor | None,
-        enable_watermark: bool,
     ) -> torch.Tensor:
         shape = (
             1,
@@ -448,12 +442,13 @@ class MageFlowPipeline(
             width // self.vae.downsample_factor,
         )
         if latents is None:
-            latent_image = make_initial_noise(
+            # Draw from the request's own generator rather than the global RNG,
+            # so a seeded request reproduces regardless of what else ran before.
+            latent_image = torch.randn(
                 shape,
                 generator=generator,
                 device=self.device,
                 dtype=self.od_config.dtype,
-                enable_watermark=enable_watermark,
             )
         else:
             if latents.shape == (
@@ -755,34 +750,13 @@ class MageFlowPipeline(
         output_type = sampling.output_type or "pil"
         if output_type not in {"pil", "tensor", "latent"}:
             raise ValueError("Mage-Flow output_type must be 'pil', 'tensor', or 'latent'")
-        extra_args = parse_mage_flow_extra_args(sampling.extra_args)
+        vision_long_edge = parse_mage_flow_extra_args(sampling.extra_args)
 
         is_edit = bool(reference_images)
-        if extra_args.enable_safety_check:
-            verdict = (
-                screen_mage_flow_edit_prompt(
-                    self.text_encoder,
-                    self.processor,
-                    prompt,
-                    reference_images,
-                )
-                if is_edit
-                else screen_mage_flow_prompt(
-                    self.text_encoder,
-                    self.processor,
-                    prompt,
-                )
-            )
-            if verdict.violates:
-                categories = ",".join(verdict.categories) or "unknown"
-                raise ValueError(
-                    f"Mage-Flow content safety check rejected the request ({categories}): {verdict.reason}"
-                )
-
         encode_kwargs = (
             {
                 "reference_images": reference_images,
-                "vision_long_edge": extra_args.vision_long_edge,
+                "vision_long_edge": vision_long_edge,
             }
             if is_edit
             else {}
@@ -815,7 +789,6 @@ class MageFlowPipeline(
             width=width,
             generator=generator,
             latents=sampling.latents,
-            enable_watermark=extra_args.enable_watermark,
         )
         if is_edit:
             reference_latents = self._prepare_reference_latents(

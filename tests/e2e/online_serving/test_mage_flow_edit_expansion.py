@@ -61,8 +61,6 @@ def test_mage_flow_three_different_reference_sizes(
             "num_inference_steps": 2,
             "guidance_scale": 1.0,
             "seed": 42,
-            "mage_enable_safety_check": False,
-            "mage_enable_watermark": False,
             "mage_vision_long_edge": 384,
         },
     }
@@ -91,8 +89,6 @@ def test_mage_flow_three_different_reference_sizes(
                 "num_inference_steps": 2,
                 "guidance_scale": 1.0,
                 "seed": 50 + index,
-                "mage_enable_safety_check": False,
-                "mage_enable_watermark": False,
                 "mage_vision_long_edge": 384,
             },
         }

@@ -27,8 +27,6 @@ def test_mage_flow_t2i(
         guidance_scale=1.0,
         seed=42,
         extra_args={
-            "mage_enable_safety_check": False,
-            "mage_enable_watermark": False,
         },
     )
     omni_runner_handler.send_diffusion_request(
