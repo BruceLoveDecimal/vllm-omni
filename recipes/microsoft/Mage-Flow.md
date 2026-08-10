@@ -79,9 +79,6 @@ curl -X POST http://localhost:8091/v1/images/generations \
 - BF16 only. Quantization and LoRA are not supported.
 - `Mage-Flow-Base` / `Mage-Flow` / `Mage-Flow-Turbo` default to 30 / 20 / 4
   denoising steps and CFG 5.0 / 5.0 / 1.0 when those values are omitted.
-- Safety checking and Gaussian-Shading watermarking are on by default. Review
-  your safety policy before exposing `mage_enable_safety_check` or
-  `mage_enable_watermark` to callers.
 - Raise `max_num_seqs` only after measuring activation-memory headroom.
 
 ### 2x GPU

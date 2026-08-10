@@ -21,8 +21,7 @@ The same batch may contain different reference counts; output resolution is
 part of the batch key, so requests that differ there are served separately.
 CFG positive and negative branches are packed into one transformer forward.
 
-Base/RL/Turbo default to 30/30/4 steps and CFG 5.0/5.0/1.0. Safety checking and
-Gaussian-Shading watermarking are enabled by default. Set
+Base/RL/Turbo default to 30/30/4 steps and CFG 5.0/5.0/1.0. Set
 `mage_vision_long_edge` in the request body to change the Qwen3-VL visual
 conditioning size (default 384).
 

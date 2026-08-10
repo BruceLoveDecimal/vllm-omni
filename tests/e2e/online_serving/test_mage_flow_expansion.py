@@ -53,8 +53,6 @@ def test_mage_flow_four_to_one_aspect_ratio(
             "num_inference_steps": 2,
             "guidance_scale": 1.0,
             "seed": 42,
-            "mage_enable_safety_check": False,
-            "mage_enable_watermark": False,
         },
     }
     openai_client.send_diffusion_request(request_config)
@@ -79,8 +77,6 @@ def test_mage_flow_four_to_one_aspect_ratio(
                 "num_inference_steps": 2,
                 "guidance_scale": 5.0,
                 "seed": 40 + index,
-                "mage_enable_safety_check": False,
-                "mage_enable_watermark": False,
             },
         }
         for index, prompt in enumerate(prompts)

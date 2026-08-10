@@ -23,11 +23,9 @@ CFG positive and negative branches are packed into one transformer forward.
 
 Use `microsoft/Mage-Flow-Edit-Base`, `microsoft/Mage-Flow-Edit`, or
 `microsoft/Mage-Flow-Edit-Turbo`. Their default denoising steps are 30, 30, and
-4; default CFG values are 5.0, 5.0, and 1.0. Safety checking and
-Gaussian-Shading watermarking are enabled by default. The
-`mage_vision_long_edge` request parameter defaults to 384 and affects only the
-Qwen3-VL semantic path; VAE reference conditioning keeps the requested output
-resolution.
+4; default CFG values are 5.0, 5.0, and 1.0. The `mage_vision_long_edge`
+request parameter defaults to 384 and affects only the Qwen3-VL semantic path;
+VAE reference conditioning keeps the requested output resolution.
 
 ## Start Server
 

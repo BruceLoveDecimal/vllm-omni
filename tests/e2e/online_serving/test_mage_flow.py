@@ -45,8 +45,6 @@ def test_mage_flow_t2i(
             "num_inference_steps": 2,
             "guidance_scale": 1.0,
             "seed": 42,
-            "mage_enable_safety_check": False,
-            "mage_enable_watermark": False,
         },
     }
     openai_client.send_diffusion_request(request_config)
