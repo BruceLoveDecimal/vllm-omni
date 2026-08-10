@@ -713,6 +713,8 @@ class MageFlowPipeline(
         self,
         prompt_data: Any,
         sampling: Any,
+        *,
+        is_dummy_warmup: bool = False,
     ) -> _MageFlowBatchItem:
         defaults = get_mage_flow_variant_defaults(self.od_config.model)
         if sampling.num_outputs_per_prompt != 1:
@@ -739,7 +741,12 @@ class MageFlowPipeline(
             raise ValueError("num_inference_steps must be positive")
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else defaults.guidance_scale
         if guidance_scale < 1.0:
-            raise ValueError("Mage-Flow guidance_scale must be at least 1.0")
+            if not is_dummy_warmup:
+                raise ValueError("Mage-Flow guidance_scale must be at least 1.0")
+            # The engine's warmup request pins guidance_scale=0.0 to keep CFG
+            # off. Mage-Flow spells that same intent as 1.0, so accept it here
+            # rather than failing startup, while real requests stay validated.
+            guidance_scale = 1.0
         output_type = sampling.output_type or "pil"
         if output_type not in {"pil", "tensor", "latent"}:
             raise ValueError("Mage-Flow output_type must be 'pil', 'tensor', or 'latent'")
@@ -840,8 +847,9 @@ class MageFlowPipeline(
         if not req.num_reqs:
             raise ValueError("Mage-Flow request batch must not be empty")
 
+        is_dummy_warmup = req.is_dummy_run()
         items = [
-            self._prepare_batch_item(prompt_data, sampling)
+            self._prepare_batch_item(prompt_data, sampling, is_dummy_warmup=is_dummy_warmup)
             for prompt_data, sampling in zip(
                 req.prompts,
                 req.sampling_params_list,
