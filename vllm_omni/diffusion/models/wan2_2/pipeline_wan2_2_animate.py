@@ -25,14 +25,12 @@ Ported from ``diffusers.pipelines.wan.pipeline_wan_animate``.
 
 from __future__ import annotations
 
-import html
 import logging
 import os
 from collections.abc import Iterable
 from typing import Any, ClassVar
 
 import PIL.Image
-import regex as re
 import torch
 import torch.nn.functional as F
 from diffusers.utils.torch_utils import randn_tensor
@@ -77,20 +75,11 @@ _DEFAULT_SEGMENT_FRAME_LENGTH = 77
 _DEFAULT_PREV_SEGMENT_COND_FRAMES = 1
 
 
-def _basic_clean(text: str) -> str:
-    import ftfy
-
-    text = ftfy.fix_text(text)
-    text = html.unescape(html.unescape(text))
-    return text.strip()
-
-
-def _whitespace_clean(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def _prompt_clean(text: str) -> str:
-    return _whitespace_clean(_basic_clean(text))
+    # Matches the other Wan pipelines here. Diffusers additionally runs ftfy over
+    # the prompt, but ftfy is not a vllm-omni dependency and only changes
+    # mojibake input, which the tokenizer handles the same way either way.
+    return " ".join(text.strip().split())
 
 
 def _load_video_frames(source: Any, name: str, mode: str = "RGB") -> list[PIL.Image.Image] | None:
@@ -335,8 +324,9 @@ class Wan22AnimatePipeline(
             from diffusers.pipelines.wan.image_processor import WanAnimateImageProcessor
         except ImportError as exc:  # pragma: no cover - depends on installed diffusers
             raise ImportError(
-                "Wan-Animate needs `WanAnimateImageProcessor` from diffusers "
-                "(diffusers.pipelines.wan.image_processor). Please upgrade diffusers."
+                "Wan-Animate needs `WanAnimateImageProcessor` from "
+                "`diffusers.pipelines.wan.image_processor`, which requires diffusers >= 0.38.0 "
+                "(the version pinned in requirements/common.txt)."
             ) from exc
 
         spatial_patch_size = tuple(self.transformer.config.patch_size[-2:])
