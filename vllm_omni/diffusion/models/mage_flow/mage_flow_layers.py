@@ -113,7 +113,11 @@ def get_timestep_embedding(
     scale: float = 1,
     max_period: int = 10000,
 ) -> torch.Tensor:
-    """Mage's timestep embedding, including its checkpoint-critical rounding."""
+    """Mage's timestep embedding, including its checkpoint-critical rounding.
+
+    The cast to ``timesteps.dtype`` below is load-bearing: under BF16 it diverges from
+    ``diffusers``' fp32 frequency table by ~1.13, so the two are not interchangeable.
+    """
     if timesteps.ndim != 1:
         raise ValueError("timesteps must be a 1-D tensor")
     half_dim = embedding_dim // 2
