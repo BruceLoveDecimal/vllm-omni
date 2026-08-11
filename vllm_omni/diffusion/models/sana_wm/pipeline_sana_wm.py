@@ -725,44 +725,35 @@ class SanaWmPipeline(
         scheduler.set_timesteps(params.num_inference_steps, device=device)
         timesteps = scheduler.timesteps
 
-        # A missing image means pure noise; a present but unusable one is an
-        # error, since falling back to noise would silently drop the
-        # conditioning and produce a plausible-looking but wrong video.
+        # ``normalize_sana_wm_payload`` guarantees the key is present but says
+        # nothing about its type. Falling back to pure noise on an unusable
+        # image would silently drop the conditioning and produce a
+        # plausible-looking but wrong video, so this raises instead.
         import numpy as _np
 
         first_frame_image = (prompt.get("multi_modal_data") or {}).get("image")
-        if first_frame_image is None:
-            _is_image = False
-        elif hasattr(first_frame_image, "convert") or isinstance(first_frame_image, (_np.ndarray, torch.Tensor)):
-            _is_image = True
-        else:
+        if not (hasattr(first_frame_image, "convert") or isinstance(first_frame_image, (_np.ndarray, torch.Tensor))):
             raise TypeError(
                 "Sana-WM first-frame image must be a PIL Image, numpy ndarray, or "
-                f"torch.Tensor; got {type(first_frame_image).__name__}. Silently "
-                "falling back to pure-noise initialisation drops the image "
-                "conditioning and corrupts video output."
+                f"torch.Tensor; got {type(first_frame_image).__name__}."
             )
         # Per-frame timestep contract matching NVlabs ``LTXFlowEuler.sample``:
         # frame 0 is the clean VAE-encoded conditioning latent and its timestep
         # is held at 0 while the sampling loop drives the other frames from
         # noise.
-        if _is_image:
-            first_latent = self._vae_encode_first_frame(
-                first_frame_image,
-                height=params.height,
-                width=params.width,
-                latent_height=latent_height,
-                latent_width=latent_width,
-                device=device,
-                dtype=dtype,
-            )
-            # Place the CLEAN VAE-encoded first frame at frame 0 and rely on
-            # per-frame timesteps + the `condition_mask` torch.where restore
-            # (below) to keep it invariant across denoising steps.
-            latents = torch.cat([first_latent, noise[:, :, 1:]], dim=2)
-        else:
-            first_latent = None
-            latents = noise
+        first_latent = self._vae_encode_first_frame(
+            first_frame_image,
+            height=params.height,
+            width=params.width,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            device=device,
+            dtype=dtype,
+        )
+        # Place the CLEAN VAE-encoded first frame at frame 0 and rely on
+        # per-frame timesteps + the `condition_mask` torch.where restore (below)
+        # to keep it invariant across denoising steps.
+        latents = torch.cat([first_latent, noise[:, :, 1:]], dim=2)
 
         prompt_embeds = self._native_prompt_embeds(
             prompt,
@@ -816,29 +807,17 @@ class SanaWmPipeline(
         # sampling sigma. We omit the legacy `add_noise_to_image_conditioning_latents`
         # motion-continuity term because the public SANA-WM config sets
         # ``condition_frame_info={0: 0.0}`` (image_cond_noise_scale=0).
-        use_per_frame_timestep = first_latent is not None
-        if use_per_frame_timestep:
-            cam_batch = latents.shape[0]
-            cam_frames = latents.shape[2]
-            condition_mask = torch.zeros(cam_batch, 1, cam_frames, 1, 1, device=latents.device, dtype=latents.dtype)
-            condition_mask[:, :, 0] = 1.0
-        else:
-            condition_mask = None
-            cam_batch = latents.shape[0]
-            cam_frames = latents.shape[2]
-        # The per-frame contract pairs with a per-token flow-matching Euler
-        # step that consumes per-token sigmas, matching NVlabs.
-        use_per_token_step = use_per_frame_timestep
+        cam_batch = latents.shape[0]
+        cam_frames = latents.shape[2]
+        condition_mask = torch.zeros(cam_batch, 1, cam_frames, 1, 1, device=latents.device, dtype=latents.dtype)
+        condition_mask[:, :, 0] = 1.0
 
-        for _step_idx, timestep in enumerate(timesteps):
-            if use_per_frame_timestep:
-                # (B, 1, F) per-frame timestep, frame 0 forced to 0. Stays fp32:
-                # casting through the bf16 latent dtype would quantise it before
-                # ``SanaWmTimestepEmbedder``'s sinusoidal embed.
-                model_timestep = timestep.float().expand(cam_batch, 1, cam_frames).clone()
-                model_timestep[:, :, 0] = 0.0
-            else:
-                model_timestep = timestep.expand(1)
+        for timestep in timesteps:
+            # (B, 1, F) per-frame timestep, frame 0 forced to 0. Stays fp32:
+            # casting through the bf16 latent dtype would quantise it before
+            # ``SanaWmTimestepEmbedder``'s sinusoidal embed.
+            model_timestep = timestep.float().expand(cam_batch, 1, cam_frames).clone()
+            model_timestep[:, :, 0] = 0.0
             positive_kwargs = {
                 "hidden_states": latents,
                 "timestep": model_timestep,
@@ -869,51 +848,46 @@ class SanaWmPipeline(
                 cfg_normalize=False,
             )
 
-            # Both branches end at ``prev = sample + dt * model_output``, but the
-            # scheduler defines dt with opposite signs: ``sigma - sigma_next``
-            # per-token, ``sigma_next - sigma`` standard. So the per-token call
-            # takes the sign-flipped prediction (matching NVlabs
-            # ``LTXFlowEuler.sample``) and the standard call takes it as-is.
-            # Passing the same sign to both would integrate one of them towards
-            # more noise.
-            if use_per_token_step:
-                # Broadcast the (B, 1, F) timestep to (B, 1, F, H, W) and flatten
-                # F*H*W; frame-0 conditioning tokens are already 0. The flatten
-                # order (F, H, W) matches ``pack_latents``.
-                pt_t = (
-                    model_timestep.unsqueeze(-1)
-                    .unsqueeze(-1)
-                    .expand(cam_batch, 1, cam_frames, latents.shape[3], latents.shape[4])
-                    .reshape(cam_batch, -1)
-                )
-                # The per-token branch consumes/returns the packed (B, N, C)
-                # layout and keeps its result in fp32; cast back so the latent
-                # dtype stays stable across steps.
-                stepped_packed = scheduler.step(
-                    -pack_latents(noise_pred),
-                    timestep,
-                    pack_latents(latents),
-                    per_token_timesteps=pt_t,
-                    return_dict=False,
-                )[0]
-                stepped = unpack_latents(
-                    stepped_packed.to(latents.dtype),
-                    cam_frames,
-                    latents.shape[3],
-                    latents.shape[4],
-                )
-            else:
-                stepped = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+            # The per-frame contract pairs with a per-token flow-matching Euler
+            # step. Both step branches end at ``prev = sample + dt *
+            # model_output``, but the scheduler defines dt as
+            # ``sigma - sigma_next`` per-token against ``sigma_next - sigma``
+            # standard, so the per-token call takes the sign-flipped prediction
+            # (matching NVlabs ``LTXFlowEuler.sample``); passing the standard
+            # sign here would integrate towards more noise.
+            #
+            # Broadcast the (B, 1, F) timestep to (B, 1, F, H, W) and flatten
+            # F*H*W; frame-0 conditioning tokens are already 0. The flatten
+            # order (F, H, W) matches ``pack_latents``.
+            pt_t = (
+                model_timestep.unsqueeze(-1)
+                .unsqueeze(-1)
+                .expand(cam_batch, 1, cam_frames, latents.shape[3], latents.shape[4])
+                .reshape(cam_batch, -1)
+            )
+            # The per-token branch consumes/returns the packed (B, N, C) layout
+            # and keeps its result in fp32; cast back so the latent dtype stays
+            # stable across steps.
+            stepped_packed = scheduler.step(
+                -pack_latents(noise_pred),
+                timestep,
+                pack_latents(latents),
+                per_token_timesteps=pt_t,
+                return_dict=False,
+            )[0]
+            stepped = unpack_latents(
+                stepped_packed.to(latents.dtype),
+                cam_frames,
+                latents.shape[3],
+                latents.shape[4],
+            )
 
-            if condition_mask is not None:
-                # Match NVlabs LTXFlowEuler exactly. This is stricter than a
-                # plain condition-frame restore: with bf16 latents, the
-                # `t=1000` comparison rounds `1 - 1e-6` to `1`, so the first
-                # full-noise step is discarded for generated tokens as well.
-                tokens_to_denoise_mask = timestep / float(SANA_WM_NUM_TRAIN_TIMESTEPS) - 1e-6 < (1.0 - condition_mask)
-                latents = torch.where(tokens_to_denoise_mask, stepped, latents)
-            else:
-                latents = stepped
+            # Match NVlabs LTXFlowEuler exactly. This is stricter than a plain
+            # condition-frame restore: with bf16 latents, the `t=1000`
+            # comparison rounds `1 - 1e-6` to `1`, so the first full-noise step
+            # is discarded for generated tokens as well.
+            tokens_to_denoise_mask = timestep / float(SANA_WM_NUM_TRAIN_TIMESTEPS) - 1e-6 < (1.0 - condition_mask)
+            latents = torch.where(tokens_to_denoise_mask, stepped, latents)
 
         output_type = getattr(sampling_params, "output_type", None) or "np"
         output = self._decode_native_latents(latents, output_type=output_type, device=device, dtype=dtype)
@@ -925,7 +899,6 @@ class SanaWmPipeline(
                     "backend": "native_gdn",
                     "output_space": output_type,
                     "chi_prompt_applied": bool(self.sana_wm_config.chi_prompt),
-                    "first_frame_encoded": _is_image,
                     "num_frames": params.num_frames,
                     "height": params.height,
                     "width": params.width,
