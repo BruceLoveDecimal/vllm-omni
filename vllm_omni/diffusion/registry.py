@@ -111,6 +111,11 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_s2v",
         "Wan22S2VPipeline",
     ),
+    "WanAnimatePipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_animate",
+        "Wan22AnimatePipeline",
+    ),
     "WanT2VDMD2Pipeline": (
         "wan2_2",
         "pipeline_wan2_2",
@@ -333,6 +338,9 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AudioXPipeline",
+    # Wan-Animate injects the face adapter between backbone blocks, so a generic
+    # block-level cache would skip the injection. Needs a dedicated adapter.
+    "WanAnimatePipeline",
 }
 
 
@@ -522,6 +530,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
+    "WanAnimatePipeline": "get_wan22_animate_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
@@ -580,6 +589,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
+    "WanAnimatePipeline": "get_wan22_animate_pre_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",

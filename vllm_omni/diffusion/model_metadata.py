@@ -56,6 +56,13 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "WanImageToVideoPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanVACEPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanS2VPipeline": DiffusionModelMetadata(attention_mask_free=True),
+    # Animation mode needs a reference character image *and* a pose video in
+    # the same request, so it has to opt into mixed image+video references --
+    # serving_video.py rejects that combination for every other video model.
+    "WanAnimatePipeline": DiffusionModelMetadata(
+        attention_mask_free=True,
+        supports_mixed_reference_inputs=True,
+    ),
 }
 
 

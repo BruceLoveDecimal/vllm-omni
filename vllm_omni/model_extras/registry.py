@@ -81,6 +81,10 @@ from vllm_omni.model_extras.vace import (
 from vllm_omni.model_extras.vace import (
     build_image_to_video_prompt as build_vace_image_to_video_prompt,
 )
+from vllm_omni.model_extras.wan_animate import (
+    WAN_ANIMATE_EXTRA_BODY_PARAMS,
+    WAN_ANIMATE_EXTRA_OUTPUT_PARAMS,
+)
 
 TextToImagePromptBuilder = Callable[
     [str, str | None, int | None, int | None],
@@ -246,6 +250,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
         "image_to_video_prompt_builder": build_vace_image_to_video_prompt,
+    },
+    "WanAnimatePipeline": {
+        "extra_body_params": WAN_ANIMATE_EXTRA_BODY_PARAMS,
+        "extra_output_params": WAN_ANIMATE_EXTRA_OUTPUT_PARAMS,
     },
     "MammothModa2DiTPipeline": {
         "extra_body_params": MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
