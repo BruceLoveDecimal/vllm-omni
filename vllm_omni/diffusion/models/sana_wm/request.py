@@ -19,9 +19,11 @@ constants impossible to share and so duplicated.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from vllm_omni.diffusion.models.sana_wm.camera_control import action_rollout_num_frames
 from vllm_omni.diffusion.models.sana_wm.config import (
     SANA_WM_VAE_SPATIAL_COMPRESSION,
     SANA_WM_VAE_TEMPORAL_COMPRESSION,
@@ -57,6 +59,22 @@ def _is_sequence(value: Any) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
 
 
+def _as_finite_float(value: Any, *, name: str) -> float:
+    """Parse a float and reject NaN/inf.
+
+    Non-finite geometry does not fail loudly downstream: it propagates through
+    the raymap into the Plucker maps and comes back as an all-NaN video with a
+    200 response.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Sana-WM {name} must be a number, got {value!r}.") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"Sana-WM {name} must be finite, got {parsed!r}.")
+    return parsed
+
+
 def _validate_numeric_matrix4x4(matrix: Any, *, name: str) -> None:
     if not _is_sequence(matrix) or len(matrix) != 4:
         raise ValueError(f"Sana-WM {name} must be a 4x4 matrix.")
@@ -64,10 +82,7 @@ def _validate_numeric_matrix4x4(matrix: Any, *, name: str) -> None:
         if not _is_sequence(row) or len(row) != 4:
             raise ValueError(f"Sana-WM {name}[{row_idx}] must contain 4 values.")
         for col_idx, value in enumerate(row):
-            try:
-                float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Sana-WM {name}[{row_idx}][{col_idx}] must be numeric.") from exc
+            _as_finite_float(value, name=f"{name}[{row_idx}][{col_idx}]")
 
 
 def _validate_camera_poses(poses: Any, *, num_frames: int | None = None) -> None:
@@ -92,10 +107,11 @@ def _validate_intrinsics(intrinsics: Any) -> None:
     if missing:
         raise ValueError(f"Sana-WM intrinsics mapping is missing keys: {missing}.")
     for key in required:
-        try:
-            float(intrinsics[key])
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Sana-WM intrinsics[{key!r}] must be numeric.") from exc
+        value = _as_finite_float(intrinsics[key], name=f"intrinsics[{key!r}]")
+        # ``compute_raymap`` divides by fx/fy. cx/cy stay unconstrained beyond
+        # finiteness — a principal point outside the frame is unusual, not wrong.
+        if key in ("fx", "fy") and value <= 0:
+            raise ValueError(f"Sana-WM intrinsics[{key!r}] must be positive, got {value}.")
 
 
 def _as_positive_int(value: Any, *, name: str) -> int:
@@ -109,10 +125,9 @@ def _as_positive_int(value: Any, *, name: str) -> int:
 
 
 def _as_positive_float(value: Any, *, name: str) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Sana-WM {name} must be a number, got {value!r}.") from exc
+    # Finiteness first: every comparison against NaN is False, so a bare
+    # ``parsed <= 0`` would accept it.
+    parsed = _as_finite_float(value, name=name)
     if parsed <= 0:
         raise ValueError(f"Sana-WM {name} must be positive, got {parsed}.")
     return parsed
@@ -187,8 +202,19 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any]) -> dict[str, Any]:
     camera = raw.get("camera")
     camera = _as_dict(camera, name="camera") if camera is not None else None
     action = raw.get("action")
-    if action is not None and (not isinstance(action, str) or not action.strip()):
-        raise ValueError("Sana-WM action must be a non-empty string when provided.")
+    if action is not None:
+        if not isinstance(action, str) or not action.strip():
+            raise ValueError("Sana-WM action must be a non-empty string when provided.")
+        # Rejected here rather than in the model: a mismatch used to shorten the
+        # camera tensor silently and then fail deep in the transformer on a
+        # camera/latent frame mismatch, and an unbounded duration used to be
+        # expanded one entry per frame before any of that.
+        rollout_frames = action_rollout_num_frames(action)
+        if rollout_frames != num_frames:
+            raise ValueError(
+                f"Sana-WM action rolls out {rollout_frames} frames but num_frames is {num_frames}. "
+                "Action segment durations must sum to num_frames - 1."
+            )
     if camera is not None and action is not None:
         raise ValueError("Sana-WM accepts exactly one of `camera` or `action`, not both.")
     if camera is None and action is None:
@@ -200,11 +226,22 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any]) -> dict[str, Any]:
         if poses is None:
             raise ValueError("Sana-WM camera payload requires `poses`.")
         _validate_camera_poses(poses, num_frames=num_frames)
-        canonical_camera = {
-            "format": camera.get("format", SANA_WM_DEFAULT_CAMERA_FORMAT),
-            "coordinate_system": camera.get("coordinate_system", SANA_WM_DEFAULT_COORDINATE_SYSTEM),
-            "poses": poses,
-        }
+        # Only the defaults are accepted: nothing downstream reads these two
+        # fields, so honouring another value would mean interpreting w2c poses
+        # as c2w and silently generating the wrong trajectory.
+        camera_format = camera.get("format", SANA_WM_DEFAULT_CAMERA_FORMAT)
+        if camera_format != SANA_WM_DEFAULT_CAMERA_FORMAT:
+            raise ValueError(
+                f"Sana-WM only accepts camera format {SANA_WM_DEFAULT_CAMERA_FORMAT!r}; "
+                f"convert the poses before sending, got {camera_format!r}."
+            )
+        coordinate_system = camera.get("coordinate_system", SANA_WM_DEFAULT_COORDINATE_SYSTEM)
+        if coordinate_system != SANA_WM_DEFAULT_COORDINATE_SYSTEM:
+            raise ValueError(
+                f"Sana-WM only accepts coordinate system {SANA_WM_DEFAULT_COORDINATE_SYSTEM!r}, "
+                f"got {coordinate_system!r}."
+            )
+        canonical_camera = {"poses": poses}
 
     intrinsics = raw.get("intrinsics")
     _validate_intrinsics(intrinsics)

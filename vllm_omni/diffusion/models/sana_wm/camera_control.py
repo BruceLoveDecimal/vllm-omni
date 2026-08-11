@@ -47,12 +47,19 @@ def _rot_y(angle_rad: float) -> np.ndarray:
     return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float64)
 
 
-def _parse_action_string(action: str) -> list[list[str]]:
+def _parse_action_segments(action: str) -> list[tuple[list[str], int]]:
+    """Parse an action string into ``(keys, duration)`` pairs without expanding it.
+
+    A single segment names an unbounded rollout (``"w-1000000000"`` is valid
+    syntax), so expanding here would allocate one list entry per frame before
+    anything checks the frame count. Callers total the durations and validate
+    against ``num_frames`` first; only :func:`_parse_action_string` expands.
+    """
     cleaned = "".join(action.replace("，", ",").split())
     if not cleaned:
         raise ValueError("Sana-WM action string is empty.")
 
-    per_frame: list[list[str]] = []
+    segments: list[tuple[list[str], int]] = []
     for segment in cleaned.split(","):
         if not segment or "-" not in segment:
             raise ValueError(f"Invalid Sana-WM action segment {segment!r}: expected '<keys>-<duration>'.")
@@ -68,7 +75,23 @@ def _parse_action_string(action: str) -> list[list[str]]:
                 allowed = "".join(sorted(SANA_WM_ALLOWED_ACTION_KEYS))
                 raise ValueError(f"Sana-WM action segment {segment!r} contains unknown keys {bad}; allowed: {allowed}.")
             keys = sorted(set(keys_lower))
-        per_frame.extend([keys] * int(duration))
+        segments.append((keys, int(duration)))
+    return segments
+
+
+def action_rollout_num_frames(action: str) -> int:
+    """Frames ``action`` rolls out: the identity start pose plus one per step.
+
+    Totals the durations arithmetically, so an oversized request is rejected
+    before anything allocates per-frame state.
+    """
+    return sum(duration for _, duration in _parse_action_segments(action)) + 1
+
+
+def _parse_action_string(action: str) -> list[list[str]]:
+    per_frame: list[list[str]] = []
+    for keys, duration in _parse_action_segments(action):
+        per_frame.extend([keys] * duration)
     return per_frame
 
 
