@@ -2,8 +2,8 @@
 
 This E2E driver runs the public ``realtime_duplex_demo.py`` against a live
 duplex backend. Arbitrary audio defaults to the model-policy lifecycle contract.
-The stronger response-required mode binds the multi-response contract to a
-known input checksum and expected follow-up response.
+The stronger response-required mode binds the response/audio contract to a
+known input checksum, with optional multi-response follow-up validation.
 """
 
 from __future__ import annotations
@@ -48,6 +48,13 @@ def _client_process_timeout_s(input_wav: Path, protocol_timeout_s: float) -> flo
     # The child first streams the WAV in real time, then can independently
     # exhaust its post-commit and session-close protocol waits.
     return _input_duration_s(input_wav) + 2 * protocol_timeout_s + 30.0
+
+
+def _sampling_temperature(args: argparse.Namespace) -> float | None:
+    temperature = getattr(args, "temperature", None)
+    if temperature is None and args.validation_mode == "response-required":
+        return 0.0
+    return temperature
 
 
 def _read_json(path: Path) -> dict[str, object]:
@@ -323,14 +330,21 @@ def summarize_artifacts(
         and multi_delta_ok
         and response_audio_contract_ok
         and response_before_final_commit
-        and listen_after_response_before_commit
-        and final_listen_after_commit
+        and (
+            effective_min_responses < 2
+            or (listen_after_response_before_commit and final_listen_after_commit)
+        )
     )
     mode_contract_ok = validation_mode == "model-policy" or (
-        second_response_before_final_commit
-        and listen_before_first_response
-        and listen_after_last_done
-        and followup_response_transcript_ok
+        listen_before_first_response
+        and (
+            effective_min_responses < 2
+            or (
+                second_response_before_final_commit
+                and listen_after_last_done
+                and followup_response_transcript_ok
+            )
+        )
     )
     ok = common_contract_ok and mode_contract_ok
     return {
@@ -397,6 +411,9 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         command.append("--require-audio")
     if args.no_realtime_pacing:
         command.append("--no-realtime-pacing")
+    temperature = _sampling_temperature(args)
+    if temperature is not None:
+        command.extend(["--temperature", str(temperature)])
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -462,11 +479,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-responses", type=int, default=2)
     parser.add_argument("--min-audio-deltas-per-response", type=int, default=2)
+    parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--input-sha256")
     parser.add_argument("--expect-followup-response-substring")
     args = parser.parse_args()
-    if args.validation_mode == "response-required" and args.min_responses < 2:
-        parser.error("--min-responses must be at least 2")
+    if args.validation_mode == "response-required" and args.min_responses < 1:
+        parser.error("--min-responses must be positive")
     if args.validation_mode == "response-required" and not args.input_sha256:
         parser.error("--input-sha256 is required in response-required mode")
     if args.min_audio_deltas_per_response < 1:

@@ -335,6 +335,22 @@ def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
     assert args.validation_mode == "model-policy"
 
 
+def test_realtime_duplex_soft_interrupt_response_required_uses_deterministic_sampling():
+    demo = _load_soft_interrupt_demo_module()
+
+    assert demo._sampling_temperature(
+        SimpleNamespace(validation_mode="response-required", temperature=None)
+    ) == 0.0
+
+
+def test_realtime_duplex_soft_interrupt_model_policy_preserves_default_sampling():
+    demo = _load_soft_interrupt_demo_module()
+
+    assert demo._sampling_temperature(
+        SimpleNamespace(validation_mode="model-policy", temperature=None)
+    ) is None
+
+
 def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(monkeypatch):
     demo = _load_soft_interrupt_demo_module()
     monkeypatch.setattr(
@@ -531,6 +547,42 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
 
     assert summary["ok"] is False
     assert summary["enough_responses"] is False
+
+
+def test_realtime_duplex_soft_interrupt_accepts_one_response_overlapping_final_commit(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "response_required_overlap"
+    output.mkdir()
+    response_id = "resp-only"
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.2},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
+        {"type": "response.done", "response_id": response_id, "_client_received_at_s": 4.0},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [response_id]}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="response-required",
+        min_responses=1,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring=None,
+    )
+
+    assert summary["ok"] is True
+    assert summary["response_before_final_commit"] is True
+    assert summary["listen_before_first_response"] is True
+    assert summary["second_response_before_final_commit"] is False
 
 
 def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(tmp_path):

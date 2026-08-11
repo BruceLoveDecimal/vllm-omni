@@ -157,6 +157,25 @@ def test_realtime_duplex_demo_accepts_explicit_ref_audio(monkeypatch):
     assert args.ref_audio == "ref.wav"
 
 
+def test_realtime_duplex_demo_accepts_explicit_temperature(monkeypatch):
+    demo = _load_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "realtime_duplex_demo.py",
+            "--input-wav",
+            "input.wav",
+            "--ref-audio",
+            "ref.wav",
+            "--temperature",
+            "0.0",
+        ],
+    )
+
+    assert demo.parse_args().temperature == 0.0
+
+
 def test_open_streaming_response_requires_post_commit_drain():
     demo = _load_demo_module()
 
