@@ -90,6 +90,12 @@ SANA_WM_NATIVE_MAX_TOKENS = (
     * (SANA_WM_OUTPUT_HEIGHT // SANA_WM_VAE_SPATIAL_COMPRESSION)
     * (SANA_WM_OUTPUT_WIDTH // SANA_WM_VAE_SPATIAL_COMPRESSION)
 )
+# The NVlabs production inference settings for this release. They belong in the
+# model rather than in a deploy YAML: single-stage diffusion models resolve
+# through ``create_default_diffusion``, which never reads a YAML's
+# ``default_sampling_params``, so a caller that omits either field lands here.
+SANA_WM_DEFAULT_NUM_INFERENCE_STEPS = 60
+SANA_WM_DEFAULT_GUIDANCE_SCALE = 5.0
 
 SANA_WM_STAGE1_PATTERNS = (
     SANA_WM_CONFIG_FILE,
@@ -125,10 +131,10 @@ class SanaWmNativeParams:
     num_frames: int
     num_inference_steps: int
     seed: int
-    # Defaults to 1.0 (single-branch, no CFG). A two-branch CFG forward runs
-    # only when the caller passes ``guidance_scale > 1.0`` together with
-    # ``guidance_scale_provided=True`` (NVlabs production uses cfg_scale=5.0).
-    cfg_scale: float = 1.0
+    # Defaults to the NVlabs production scale, so a caller that never mentions
+    # guidance still gets the two-branch CFG forward the model was tuned for.
+    # An explicit ``guidance_scale <= 1.0`` still selects the single-branch path.
+    cfg_scale: float = SANA_WM_DEFAULT_GUIDANCE_SCALE
 
 
 def build_sana_wm_download_patterns() -> tuple[str, ...]:
@@ -333,11 +339,15 @@ class SanaWmPipeline(
         height = int(getattr(sampling_params, "height", None) or payload["height"])
         width = int(getattr(sampling_params, "width", None) or payload["width"])
         num_frames = int(getattr(sampling_params, "num_frames", None) or payload["num_frames"])
-        steps = int(getattr(sampling_params, "num_inference_steps", None) or extra_args.get("num_inference_steps", 1))
+        steps = int(
+            getattr(sampling_params, "num_inference_steps", None)
+            or extra_args.get("num_inference_steps")
+            or SANA_WM_DEFAULT_NUM_INFERENCE_STEPS
+        )
         seed = int(getattr(sampling_params, "seed", None) or extra_args.get("seed", 0))
         if min(height, width, num_frames, steps) <= 0:
             raise ValueError("Sana-WM native height, width, num_frames, and steps must be positive.")
-        cfg_scale = 1.0
+        cfg_scale = SANA_WM_DEFAULT_GUIDANCE_SCALE
         if sampling_params is not None and getattr(sampling_params, "guidance_scale_provided", False):
             cfg_scale = float(getattr(sampling_params, "guidance_scale", 1.0) or 1.0)
         return SanaWmNativeParams(

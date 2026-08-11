@@ -4,9 +4,10 @@
 """
 Online serving smoke for SANA-WM image-to-video (first-frame I2V via ``/v1/videos``).
 
-Boots the server from the SANA-WM deploy config (``SanaWmPipeline`` +
-``skip_mm_profiling``), submits one async ``/v1/videos`` job with a first-frame
-reference image, and asserts the job completes and returns video bytes.
+Boots the server straight from the model id — the Stage-1 repo's
+``model_index.json`` names ``SanaWmPipeline``, so the class resolves on its own
+— submits one async ``/v1/videos`` job with a first-frame reference image, and
+asserts the job completes and returns video bytes.
 
 From ``tests/``::
 
@@ -31,7 +32,6 @@ from vllm_omni.diffusion.models.sana_wm import (
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = SANA_WM_MODEL_ID
-DEPLOY_CONFIG = "vllm_omni/deploy/sana_wm.yaml"
 PROMPT = "A slow forward camera move through a quiet city street."
 NEGATIVE_PROMPT = "blurry, low quality, distorted, watermark"
 
@@ -68,10 +68,10 @@ def _first_frame_data_url() -> str:
 
 
 def _get_diffusion_feature_cases(model: str):
-    """Single default server row that loads the SANA-WM deploy config."""
+    """Single default server row."""
     return [
         pytest.param(
-            OmniServerParams(model=model, stage_config_path=DEPLOY_CONFIG),
+            OmniServerParams(model=model),
             id="default",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),

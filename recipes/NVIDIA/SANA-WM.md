@@ -24,7 +24,6 @@ stage is not supported by this integration; it is a planned follow-up.
 ## References
 
 - Upstream model card: <https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional>
-- Deploy config: [`vllm_omni/deploy/sana_wm.yaml`](../../vllm_omni/deploy/sana_wm.yaml)
 - Video API: [`docs/serving/videos_api.md`](../../docs/serving/videos_api.md)
 
 ## Hardware Support
@@ -51,9 +50,11 @@ stage is not supported by this integration; it is a planned follow-up.
   eviction.
 - GPU sizing: the default 1280x704, 161-frame, 60-step serving profile peaks at
   22.6 GB of device memory and takes about 133 s to generate on one RTX PRO
-  6000 Blackwell. The peak lands in the VAE decode, so keep `vae_use_tiling`
-  on — without it the same request costs about 9 GB more. On smaller GPUs,
-  lower `width`, `height`, or `num_frames` before serving production requests.
+  6000 Blackwell. The peak lands in the VAE decode, which is why the pipeline
+  forces VAE tiling on regardless of `vae_use_tiling` — without it the same
+  request costs about 9 GB more, and a 321-frame one OOMs outright. On smaller
+  GPUs, lower `width`, `height`, or `num_frames` before serving production
+  requests.
 
 #### Environment
 
@@ -76,18 +77,17 @@ the pipeline class resolves on its own.
 CUDA_VISIBLE_DEVICES=0 \
 vllm serve BBBBruce/SANA-WM_bidirectional-stage1-diffusers \
   --omni \
-  --deploy-config vllm_omni/deploy/sana_wm.yaml \
   --host 0.0.0.0 \
   --port 8091
 ```
 
-Two things to know about `--deploy-config` here. Single-stage diffusion models
-are deliberately absent from `OMNI_PIPELINES`
-(`vllm_omni/config/pipeline_registry.py`), so stage resolution falls back to the
-default stage config and the YAML's stage settings — including
-`default_sampling_params` — are not applied. The path is still validated, so a
-bad one errors and a good one looks like it took effect. The request examples
-below therefore pass every generation field explicitly.
+No deploy config: single-stage diffusion models are deliberately absent from
+`OMNI_PIPELINES` (`vllm_omni/config/pipeline_registry.py`), so stage resolution
+falls back to the default stage config and a YAML's stage settings — including
+`default_sampling_params` — would not be applied. The production generation
+settings therefore live in the model (`num_inference_steps=60`,
+`guidance_scale=5.0`); a request that omits a field gets them. The examples
+below still pass every field explicitly so the numbers are visible.
 
 If you point this at the older two-stage repo
 (`BBBBruce/SANA-WM_bidirectional-diffusers`), startup fails with `Model class
