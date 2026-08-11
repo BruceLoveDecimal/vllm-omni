@@ -116,8 +116,9 @@ curl -sS -X POST http://localhost:8091/v1/videos/sync \
   -o sana_wm_smoke.mp4
 ```
 
-For a production-length request, use an action length that matches
-`num_frames - 1`:
+For a production-length request, note that the action durations must sum to
+`num_frames - 1` — the rollout includes the identity start pose — and a
+mismatch is rejected rather than padded or truncated:
 
 ```bash
 curl -sS -X POST http://localhost:8091/v1/videos/sync \
@@ -171,7 +172,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o sana_wm_output.
 - `sana_wm` must provide exactly one of `action` or `camera`.
 - Action strings use comma-separated `<keys>-<duration>` segments. Supported
   keys are `w`, `a`, `s`, `d` for translation and `i`, `j`, `k`, `l` for
-  pitch/yaw rotation.
+  pitch/yaw rotation. The durations must sum to `num_frames - 1`.
 - Explicit camera control (alternative to `action`): pass
   `"camera": {"poses": [...]}` where `poses` is a list of `num_frames`
   camera-to-world 4x4 matrices (row-major, OpenCV `+X right, +Y down, +Z forward`
@@ -182,6 +183,11 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o sana_wm_output.
 - Explicit `intrinsics` are recommended and take the mapping form
   `{"fx":640,"fy":640,"cx":640,"cy":352}` (for 1280x704). This `{fx,fy,cx,cy}`
   mapping is the only accepted intrinsics form; omit `intrinsics` to derive them
-  from the output resolution.
-- The video API returns decoded MP4 bytes by default. Pass the standard
-  `output_type: "latent"` sampling field when you want raw Stage-1 latents.
+  from the output resolution. All four values must be finite, and `fx`/`fy`
+  must be positive — the ray map divides by them.
+- The video API returns decoded MP4 bytes and has no `output_type` field, so
+  raw Stage-1 latents are reachable only from the offline API
+  (`OmniDiffusionSamplingParams(output_type="latent")`); see
+  [`tests/e2e/offline_inference/test_sana_wm.py`](../../tests/e2e/offline_inference/test_sana_wm.py).
+  Putting `output_type` in `extra_params` does not work: it lands in
+  `sampling_params.extra_args`, while the pipeline reads the top-level field.
