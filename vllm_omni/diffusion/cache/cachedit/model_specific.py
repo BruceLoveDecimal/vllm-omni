@@ -836,6 +836,27 @@ def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
+def enable_cache_for_wan22_animate(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
+    """Reject cache-dit for Wan-Animate instead of silently dropping conditioning.
+
+    Wan-Animate injects the face motion signal after every Nth transformer block
+    via ``WanAnimateTransformer3DModel.after_transformer_block``. The generic
+    block adapter would wrap the block loop without calling that hook, so cached
+    steps would silently lose the face conditioning -- wrong output rather than a
+    slow one. Registering this enabler makes the failure explicit.
+
+    Wiring it up properly means following the S2V path: a cached-blocks subclass
+    that calls ``after_transformer_block`` inside the cached loop (see
+    :class:`Wan22S2VCachedBlocks`), with the forward pattern verified against
+    Wan-Animate's block signature.
+    """
+    raise NotImplementedError(
+        "Cache-DiT is not supported for Wan-Animate yet. The face adapter injects conditioning between "
+        "transformer blocks, which the generic cache adapter would skip on cached steps. Run without "
+        "`--cache-backend cachedit` (or set `cache_backend=none`) for now."
+    )
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -850,6 +871,7 @@ def register_custom_dit_enablers() -> None:
             "Wan22TI2VPipeline": enable_cache_for_wan22,
             "Wan22VACEPipeline": enable_cache_for_wan22,
             "Wan22S2VPipeline": enable_cache_for_wan22_s2v,
+            "Wan22AnimatePipeline": enable_cache_for_wan22_animate,
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
