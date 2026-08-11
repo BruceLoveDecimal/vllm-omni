@@ -18,6 +18,7 @@ from vllm_omni.diffusion.model_metadata import (
     MAGE_FLOW_EXTRA_BODY_PARAMS,
     MAGE_FLOW_MAX_INPUT_IMAGES,
 )
+from vllm_omni.diffusion.utils.prompt_utils import validate_prompt_sequence_lengths
 
 MAGE_FLOW_PROMPT_TEMPLATE = (
     "<|im_start|>system\n"
@@ -54,12 +55,31 @@ class MageFlowVariantDefaults:
 
 def get_mage_flow_variant_defaults(
     model_name_or_path: str,
+    *,
+    model_index: dict[str, Any] | None = None,
 ) -> MageFlowVariantDefaults:
-    """Resolve defaults from checkpoint identity, never from requested steps."""
-    model_identity = model_name_or_path.rstrip("/").lower()
-    if "turbo" in model_identity:
+    """Resolve defaults from checkpoint identity, never from requested steps.
+
+    ``model_index.json`` records the repository a checkpoint was published as
+    whenever it carries ``_name_or_path``, so that wins when present. Otherwise
+    the identity is the *last path component that names a Mage-Flow checkpoint*,
+    which is neither the whole path nor simply the basename:
+
+    - ``/turbo-disk/Mage-Flow`` resolves on ``Mage-Flow``, so an unrelated
+      parent directory cannot pass the checkpoint off as the Turbo variant.
+    - ``.../models/microsoft--Mage-Flow-Turbo/snapshots/master`` resolves on
+      ``microsoft--Mage-Flow-Turbo``, because Hub and ModelScope caches both
+      end in a revision component that names nothing.
+    """
+    identity = model_index.get("_name_or_path") if model_index is not None else None
+    if not isinstance(identity, str) or not identity:
+        identity = model_name_or_path
+    parts = [part for part in identity.replace("\\", "/").lower().split("/") if part]
+    named = [part for part in parts if "mage-flow" in part or "mage_flow" in part]
+    identity = named[-1] if named else (parts[-1] if parts else "")
+    if "turbo" in identity:
         return MageFlowVariantDefaults(4, 1.0)
-    if "mage-flow" in model_identity and "edit" not in model_identity and "base" not in model_identity:
+    if "mage-flow" in identity and "edit" not in identity and "base" not in identity:
         return MageFlowVariantDefaults(20, 5.0)
     return MageFlowVariantDefaults(30, 5.0)
 
@@ -206,6 +226,7 @@ def encode_mage_flow_prompt(
         formatted = format_mage_flow_edit_prompt(prompt, len(reference_images))
         start_index = MAGE_FLOW_EDIT_PROMPT_START_INDEX
         vision_keys = {"pixel_values", "image_grid_thw", "mm_token_type_ids"}
+        error_context = "for Mage-Flow Edit (the count includes reference-image tokens)"
         processor_kwargs = {
             "images": [resize_mage_flow_reference_for_vision(image, vision_long_edge) for image in reference_images],
         }
@@ -213,10 +234,8 @@ def encode_mage_flow_prompt(
         formatted = format_mage_flow_prompt(prompt)
         start_index = MAGE_FLOW_PROMPT_START_INDEX
         vision_keys = set()
-        processor_kwargs = {
-            "truncation": True,
-            "max_length": max_length + MAGE_FLOW_PROMPT_START_INDEX,
-        }
+        error_context = "for Mage-Flow"
+        processor_kwargs = {}
 
     inputs = processor(
         text=[formatted],
@@ -225,6 +244,20 @@ def encode_mage_flow_prompt(
         **processor_kwargs,
     )
     inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is not None:
+        # Bound the conditioning before it reaches the encoder rather than after.
+        # The T2I path used to ask the processor to truncate, which quietly cut
+        # the tail off an over-long prompt, and the Edit path had no bound at
+        # all -- an unbounded instruction went straight into Qwen3-VL.
+        validate_prompt_sequence_lengths(
+            attention_mask,
+            max_sequence_length=max_length,
+            supported_max_sequence_length=max_length,
+            prompt_name="prompt",
+            length_offset=start_index,
+            error_context=error_context,
+        )
     model_inputs = {
         key: value
         for key, value in inputs.items()
@@ -236,7 +269,6 @@ def encode_mage_flow_prompt(
         return_dict=True,
     )
     hidden_states = outputs.last_hidden_state
-    attention_mask = inputs.get("attention_mask")
     valid_length = int(attention_mask[0].sum().item()) if attention_mask is not None else hidden_states.shape[1]
     if valid_length <= start_index:
         raise ValueError("Mage-Flow prompt produced no conditioning tokens")

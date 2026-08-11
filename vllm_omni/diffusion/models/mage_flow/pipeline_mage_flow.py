@@ -10,6 +10,7 @@
 import copy
 import os
 import posixpath
+import random
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -21,7 +22,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_exists
 
@@ -47,11 +48,9 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .autoencoder_mage import MageVAE
-from .mage_flow_transformer import (
-    MageFlowTransformer2DModel,
-    resolve_mage_flow_stacked_name,
-)
+from .mage_flow_transformer import MageFlowTransformer2DModel
 from .prompt_utils import (
+    MageFlowVariantDefaults,
     encode_mage_flow_prompt,
     get_mage_flow_variant_defaults,
     normalize_mage_flow_reference_images,
@@ -59,6 +58,18 @@ from .prompt_utils import (
     preprocess_mage_flow_reference_for_vae,
     validate_mage_flow_size,
 )
+
+
+@dataclass(frozen=True)
+class _MageFlowCheckpoint:
+    """Component layout and variant defaults resolved from ``model_index.json``."""
+
+    text_encoder_subfolder: str
+    vae_subfolder: str
+    vae_filename: str
+    vae_config: dict[str, Any]
+    transformer_config: dict[str, Any]
+    variant_defaults: MageFlowVariantDefaults
 
 
 @dataclass
@@ -93,27 +104,19 @@ def make_mage_flow_request_scheduler(
     return request_scheduler
 
 
-def map_mage_flow_weight_name(name: str) -> str | None:
-    """Map official MageVAE training prefixes to the inference module tree."""
-    ignored_prefixes = (
-        "vae.pipeline.y_embedder.encoder.",
-        "vae.pipeline.y_embedder.bottleneck.",
-    )
-    if name.startswith(ignored_prefixes):
-        return None
-    if name.startswith("vae.student.dconv_encoder."):
-        return name.replace(
-            "vae.student.dconv_encoder.",
-            "vae.dconv_encoder.",
-            1,
-        )
-    if name.startswith("vae.pipeline."):
-        return name.replace(
-            "vae.pipeline.",
-            "vae.decoder_model.",
-            1,
-        )
-    return name
+MAGE_FLOW_WEIGHTS_MAPPER = WeightsMapper(
+    orig_to_new_prefix={
+        # ``y_embedder``'s encoder and bottleneck belong to the training
+        # pipeline alone and have no inference counterpart. Order matters:
+        # ``orig_to_new_prefix`` is applied in insertion order, so the dropped
+        # prefixes must precede the broader ``vae.pipeline.`` rewrite that
+        # would otherwise claim them first.
+        "vae.pipeline.y_embedder.encoder.": None,
+        "vae.pipeline.y_embedder.bottleneck.": None,
+        "vae.student.dconv_encoder.": "vae.dconv_encoder.",
+        "vae.pipeline.": "vae.decoder_model.",
+    }
+)
 
 
 def get_mage_flow_pre_process_func(
@@ -189,9 +192,12 @@ class MageFlowPipeline(
 
         model = od_config.model
         local_files_only = os.path.isdir(model)
-        text_encoder_subfolder, vae_subfolder, vae_filename, vae_config, transformer_config = (
-            self._load_checkpoint_metadata()
-        )
+        checkpoint = self._load_checkpoint_metadata()
+        text_encoder_subfolder = checkpoint.text_encoder_subfolder
+        vae_subfolder = checkpoint.vae_subfolder
+        # Resolved once from the checkpoint's own identity, so no request has to
+        # re-derive it and no request can steer it.
+        self.variant_defaults = checkpoint.variant_defaults
         component_subfolders = [
             "scheduler",
             text_encoder_subfolder,
@@ -217,7 +223,7 @@ class MageFlowPipeline(
                 revision=od_config.revision,
                 prefix="vae.",
                 fall_back_to_pt=False,
-                allow_patterns_overrides=[vae_filename],
+                allow_patterns_overrides=[checkpoint.vae_filename],
             ),
         ]
 
@@ -248,15 +254,15 @@ class MageFlowPipeline(
         )
         self.transformer = MageFlowTransformer2DModel(
             od_config=od_config,
-            **transformer_config,
+            **checkpoint.transformer_config,
         )
         # ``sample_posterior`` is not forwarded: _load_checkpoint_metadata
         # already rejects any value but False, so the VAE only ever needs the
         # posterior mode.
         self.vae = MageVAE(
             od_config=od_config,
-            latent_channels=int(vae_config["latent_channels"]),
-            downsample_factor=int(vae_config["downsample_factor"]),
+            latent_channels=int(checkpoint.vae_config["latent_channels"]),
+            downsample_factor=int(checkpoint.vae_config["downsample_factor"]),
         )
         if self.transformer.in_channels != self.vae.latent_channels:
             raise ValueError(
@@ -276,6 +282,8 @@ class MageFlowPipeline(
         )
 
     def _validate_runtime_config(self) -> None:
+        if self.device.type != "cuda":
+            raise ValueError(f"Mage-Flow currently supports only CUDA execution, got {self.device.type}")
         if self.od_config.dtype != torch.bfloat16:
             raise ValueError(f"Mage-Flow currently supports only BF16, got {self.od_config.dtype}")
         if self.od_config.quantization_config is not None:
@@ -324,9 +332,7 @@ class MageFlowPipeline(
         if parallel.use_hsdp:
             raise ValueError("Mage-Flow does not yet support HSDP")
 
-    def _load_checkpoint_metadata(
-        self,
-    ) -> tuple[str, str, str, dict[str, Any], dict[str, Any]]:
+    def _load_checkpoint_metadata(self) -> _MageFlowCheckpoint:
         model_index = get_hf_file_to_dict(
             "model_index.json",
             self.od_config.model,
@@ -387,12 +393,16 @@ class MageFlowPipeline(
         )
         if transformer_config is None:
             raise ValueError("Mage-Flow Transformer config not found at transformer/config.json")
-        return (
-            text_encoder_subfolder,
-            vae_subfolder,
-            vae_filename,
-            vae_config,
-            transformer_config,
+        return _MageFlowCheckpoint(
+            text_encoder_subfolder=text_encoder_subfolder,
+            vae_subfolder=vae_subfolder,
+            vae_filename=vae_filename,
+            vae_config=vae_config,
+            transformer_config=transformer_config,
+            variant_defaults=get_mage_flow_variant_defaults(
+                self.od_config.model,
+                model_index=model_index,
+            ),
         )
 
     def _validate_component_path(self, key: str, value: object) -> str:
@@ -424,7 +434,12 @@ class MageFlowPipeline(
                 return local_generator
             return generator
         local_generator = torch.Generator(device=self.device)
-        local_generator.manual_seed(42 if seed is None else seed)
+        # OmniDiffusionRequest assigns a random seed when the caller supplies
+        # neither a seed nor a generator, so a real request always arrives with
+        # one. Draw the same way it does for the paths that do not go through
+        # it (the engine's warmup request), rather than pinning a constant that
+        # would make every such run produce the identical image.
+        local_generator.manual_seed(random.randint(0, 2**31 - 1) if seed is None else seed)
         return local_generator
 
     def _prepare_latents(
@@ -716,7 +731,7 @@ class MageFlowPipeline(
         *,
         is_dummy_warmup: bool = False,
     ) -> _MageFlowBatchItem:
-        defaults = get_mage_flow_variant_defaults(self.od_config.model)
+        defaults = self.variant_defaults
         if sampling.num_outputs_per_prompt != 1:
             raise ValueError("Mage-Flow currently supports num_outputs_per_prompt=1")
         reference_images = []
@@ -842,8 +857,6 @@ class MageFlowPipeline(
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        if self.device.type != "cuda":
-            raise ValueError(f"Mage-Flow currently supports only CUDA execution, got {self.device.type}")
         if not req.num_reqs:
             raise ValueError("Mage-Flow request batch must not be empty")
 
@@ -919,31 +932,12 @@ class MageFlowPipeline(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        """Map official MageVAE prefixes and reject unexplained weights."""
-        params = dict(self.named_parameters())
-        loaded: set[str] = set()
-        for name, loaded_weight in weights:
-            name = map_mage_flow_weight_name(name)
-            if name is None:
-                continue
-            # Only the transformer fuses Q/K/V; the VAE's own ``.q``/``.k``/
-            # ``.v`` convolutions must never be rewritten.
-            if name.startswith("transformer."):
-                lookup_name, shard_id = resolve_mage_flow_stacked_name(name)
-            else:
-                lookup_name, shard_id = name, None
-            param = params.get(lookup_name)
-            if param is None:
-                raise KeyError(f"Unexpected Mage-Flow checkpoint weight: {name}")
-            weight_loader = getattr(
-                param,
-                "weight_loader",
-                default_weight_loader,
-            )
-            if shard_id is None:
-                weight_loader(param, loaded_weight)
-            else:
-                weight_loader(param, loaded_weight, shard_id)
-            loaded.add(name)
-            loaded.add(lookup_name)
-        return loaded
+        """Rewrite the checkpoint's MageVAE prefixes and load each component.
+
+        ``AutoWeightsLoader`` walks to the owning submodule and hands off to its
+        own ``load_weights``, which is what keeps Q/K/V fusion confined to the
+        transformer: the VAE's ``.q``/``.k``/``.v`` convolutions live under a
+        module that knows nothing about the fused projections and so can never
+        be rewritten by them.
+        """
+        return AutoWeightsLoader(self).load_weights(weights, mapper=MAGE_FLOW_WEIGHTS_MAPPER)

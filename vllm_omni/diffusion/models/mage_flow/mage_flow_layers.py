@@ -582,13 +582,16 @@ class MageJointAttention(nn.Module):
             # varlen attention and repads with zeros.
             #
             # Two absent masks stay absent rather than being materialised into
-            # an all-ones mask. Passing a mask is not free even when nothing is
-            # padded: FLASH_ATTN and FlashInfer short-circuit an all-valid mask
-            # back to the dense kernel, but CUDNN_ATTN -- the platform default
-            # on sm_120 -- forwards it to SDPA unconditionally, which selects a
-            # different kernel and shifts the output (measured: SSIM 0.9977 on
-            # an unpadded single request that is bit-identical under
-            # FLASH_ATTN).
+            # an all-ones mask, which saves building it and the multiplies that
+            # consume it.
+            #
+            # An earlier version of this comment justified that numerically,
+            # claiming an all-valid mask shifts the output because CUDNN_ATTN
+            # forwards it to SDPA rather than short-circuiting to the dense
+            # kernel (citing SSIM 0.9977). Comparing mask against no-mask on
+            # that backend (sm_120, cuDNN 9.19) instead produced bit-identical
+            # images, so treat this as a work reduction only, and re-measure on
+            # your own backend before relying on the stronger claim.
             image_mask = image_attention_mask
             encoder_mask = encoder_attention_mask
             attn_metadata = None

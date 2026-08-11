@@ -517,5 +517,10 @@ class MageVAE(nn.Module):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        """Load already-mapped native MageVAE component weights."""
+        """Load already-mapped native MageVAE component weights.
+
+        The pipeline's own ``AutoWeightsLoader`` delegates here for everything
+        under ``vae.``, having first rewritten the checkpoint's training-time
+        prefixes onto this module tree.
+        """
         return AutoWeightsLoader(self).load_weights(weights)
