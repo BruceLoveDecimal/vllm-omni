@@ -396,7 +396,21 @@ class StageEngineCoreClientBase(StageClientBase):
         """
         if self.custom_process_input_func is not None:
             signature = inspect.signature(self.custom_process_input_func)
-            if len(signature.parameters) >= 4:
+            parameters = signature.parameters
+            accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+            extra_kwargs: dict[str, Any] = {}
+            if accepts_kwargs or "streaming_context" in parameters:
+                extra_kwargs["streaming_context"] = streaming_context
+            if accepts_kwargs or "stage_client" in parameters:
+                extra_kwargs["stage_client"] = self
+            if extra_kwargs:
+                return self.custom_process_input_func(
+                    source_outputs,
+                    prompt,
+                    self.requires_multimodal_data,
+                    **extra_kwargs,
+                )
+            if len(parameters) >= 4:
                 return self.custom_process_input_func(
                     source_outputs,
                     prompt,
