@@ -655,6 +655,13 @@ class MageFlowPipeline(
         )
         do_cfg = guidance_scale > 1.0
         cfg_parallel = get_classifier_free_guidance_world_size() > 1
+        # Packed CFG pads the shorter guidance branch, and sequence parallelism
+        # cannot shard a padded sequence -- the transformer refuses one. Run the
+        # branches as two separate unpadded forwards instead, which shard
+        # cleanly. Pairing SP with --cfg-parallel-size 2 is faster because it
+        # splits the branches across ranks, but SP alone has to stay correct
+        # rather than failing once the first guided request arrives.
+        sequence_parallel = self.od_config.parallel_config.sequence_parallel_size > 1
 
         with self.progress_bar(total=len(scheduler.timesteps)) as progress:
             for step_index, timestep in enumerate(scheduler.timesteps):
@@ -693,10 +700,12 @@ class MageFlowPipeline(
                     if do_cfg
                     else None
                 )
-                if cfg_parallel:
-                    # One branch per rank. Packing both branches into the batch
-                    # dimension would defeat the split, so the mixin's
-                    # rank-partitioned path replaces it here.
+                if cfg_parallel or (do_cfg and sequence_parallel):
+                    # One branch per rank under CFG parallelism; two sequential
+                    # unpadded forwards under sequence parallelism. Packing both
+                    # branches into the batch dimension would defeat the split
+                    # in the first case and pad the shard in the second, so the
+                    # mixin's own path replaces it here.
                     full_noise_prediction = self.predict_noise_maybe_with_cfg(
                         do_true_cfg=do_cfg,
                         true_cfg_scale=guidance_scale,

@@ -340,10 +340,12 @@ class MageFlowTransformer2DModel(nn.Module):
             # Requests of equal length shard cleanly.
             raise ValueError(
                 "Mage-Flow sequence parallelism does not support padded token "
-                "sequences. Every request in the batch must share the same image "
-                "and text token counts; packed CFG pads the shorter prompt, so "
-                "pair --ulysses-degree with --cfg-parallel-size 2 instead of "
-                "letting one forward carry both guidance branches."
+                "sequences: sharding would put real tokens and filler on "
+                "different ranks with no mask to tell them apart. The pipeline "
+                "already refuses --max-num-seqs > 1 under SP at startup and "
+                "routes guided requests through sequential CFG rather than the "
+                "packed path, so reaching this point means a caller built a "
+                "padded batch directly."
             )
         if sequence_parallel:
             _warn_on_unmasked_sp_padding()

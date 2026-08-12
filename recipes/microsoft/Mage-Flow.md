@@ -164,13 +164,18 @@ settings would conflate the guidance change with the parallelism effect.
 
 - **Sequence parallelism cannot shard a padded batch.** Sharding splits the
   padded sequence blindly, leaving real tokens and filler on different ranks
-  with no mask to separate them. Packed CFG pads the shorter of the two
-  prompts, which is why `--usp` is paired with `--cfg-parallel-size 2` rather
-  than left to run against packed CFG. Serving hits the same rule: `--usp`
-  requires `--max-num-seqs 1`, which is the default. Raising it is refused at
-  startup, because prompt length is not part of the request-batch key: any two
-  concurrent requests could then land in one batch with differing token counts
-  and fail mid-generation.
+  with no mask to separate them. Serving therefore requires `--max-num-seqs 1`
+  under `--usp`, which is the default; raising it is refused at startup,
+  because prompt length is not part of the request-batch key, so any two
+  concurrent requests could land in one batch with differing token counts.
+- **`--usp` alone is correct, but pairing it with `--cfg-parallel-size 2` is
+  faster.** Packed CFG pads the shorter of the two guidance branches, which SP
+  cannot shard, so under `--usp` a guided request runs its positive and
+  negative branches as two sequential forwards per step instead. That is
+  correct but does no guidance work in parallel. `--cfg-parallel-size 2` puts
+  one branch on each rank and is the configuration measured above. The
+  distinction only matters at guidance > 1: `Mage-Flow-Turbo` runs at guidance
+  1.0 and has no negative branch either way.
 - Combining dimensions beats the product of the parts (SP2 x CFG2 reaches
   7.12x). Attention is quadratic in sequence length, so sharding the sequence
   pays off super-linearly.
@@ -192,6 +197,51 @@ settings would conflate the guidance change with the parallelism effect.
 Unsupported multi-GPU modes (pipeline parallelism, VAE patch parallelism,
 HSDP) fail at startup with an explicit error rather than degrading silently, as
 does sequence parallelism combined with `--max-num-seqs > 1`.
+
+## Known limitations
+
+### Content safety and provenance
+
+The upstream reference implementation ships two governance mechanisms that this
+integration does **not** provide:
+
+- **Prompt and reference-image screening.** Upstream runs a fail-closed
+  content-policy classifier on the same Qwen3-VL weights that produce the
+  diffusion conditioning, covering sexual, hate, self-harm, violence,
+  copyright, and public-figure categories; the editing path also inspects the
+  reference images, where recognizing a real person or a copyrighted character
+  is itself a violation. Upstream marks that gate mandatory with no opt-out and
+  returns a blank refusal image when it fires. vLLM-Omni does not implement it:
+  every prompt and reference image reaches the model.
+- **Gaussian-Shading provenance watermark.** Upstream unconditionally replaces
+  the initial noise with a distribution-preserving watermarked sample and ships
+  a flow-ODE inversion detector for it. vLLM-Omni draws plain Gaussian noise,
+  so outputs carry no provenance mark and upstream's detector will not identify
+  them as Mage-Flow output.
+
+Deployments are responsible for their own content moderation, and for their own
+provenance or synthetic-content marking where that is required. This follows
+upstream's own guidance that "downstream users are responsible for applying
+additional safeguards" before broader use, alongside its statement that the
+checkpoints are released for research rather than for product or service
+deployment.
+
+The weight repositories are gated. Accept the access terms on the model page
+and set `HF_TOKEN` before running, and confirm there which license governs the
+weights: the MIT license in the upstream GitHub repository covers the source
+code, and the gate may present separate terms.
+
+One practical consequence: because the watermark replaces the initial noise
+rather than being applied to the finished image, a seeded vLLM-Omni run does
+not reproduce the upstream image for the same seed. Compare the two
+implementations by injecting an identical initial latent through `latents`
+rather than by matching seeds.
+
+### Other constraints
+
+See the per-configuration **Notes** above for BF16-only operation, unsupported
+quantization and LoRA, the `--max-num-seqs 1` requirement under sequence
+parallelism, and the untested SP+TP and ring-attention combinations.
 
 ## A note on output differences
 

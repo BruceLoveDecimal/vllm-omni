@@ -106,8 +106,14 @@ resolutions; Edit accepts one to three PIL, NumPy, or Tensor reference images. M
 tensor parallelism, CFG parallelism (degree 2), and Ulysses sequence
 parallelism; see the [Mage-Flow recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/microsoft/Mage-Flow.md)
 for tested configurations. Sequence parallelism requires uniform token counts
-across the batch, so pair it with `--cfg-parallel-size 2` rather than packed
-CFG. Quantization, LoRA, pipeline parallelism, HSDP, VAE parallel, step
-execution, and diffusion cache are not yet supported. The upstream checkpoints
-are released for research purposes and are not intended for product or service
-deployment.
+across the batch, so it is refused at startup unless `--max-num-seqs 1`; under
+it a guided request runs the two guidance branches as sequential forwards, and
+`--cfg-parallel-size 2` is the faster pairing because it splits them by rank. Quantization, LoRA, pipeline parallelism, HSDP, VAE parallel, step
+execution, and diffusion cache are not yet supported. The upstream reference
+implementation additionally runs a mandatory, fail-closed content-policy gate
+on its text encoder and embeds a Gaussian-Shading provenance watermark in the
+initial noise; this integration provides neither, so deployments are
+responsible for their own content moderation and provenance marking. The
+upstream checkpoints are released for research purposes and are not intended
+for product or service deployment; the weight repositories are gated, so accept
+their access terms before serving.
