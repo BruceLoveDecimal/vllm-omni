@@ -15,11 +15,8 @@ from vllm.inputs import TextPrompt
 
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
-    DEFAULT_MAX_TEXT_LENGTH,
+    resolve_ming_prefill_text,
     resolve_ming_prompt_fields,
-)
-from vllm_omni.model_executor.models.ming_flash_omni.text_processing import (
-    segment_and_normalize,
 )
 
 logger = logging.getLogger(__name__)
@@ -162,11 +159,6 @@ def _infer_spk_emb_count(spk_emb: Any, *, use_zero_spk_emb: bool) -> int:
     return 1
 
 
-def _first_tts_segment(text: str, max_text_length: int) -> str:
-    segments = segment_and_normalize(text, max_length=max_text_length)
-    return segments[0] if segments else text
-
-
 def build_ming_talker_prompt_token_ids_for_info(
     *,
     text: str,
@@ -184,8 +176,9 @@ def build_ming_talker_prompt_token_ids_for_info(
     # and the prefill embeddings can never drift apart.
     _, prompt, instruction, use_zero_spk_emb = resolve_ming_prompt_fields(additional_info)
 
-    max_text_length = int(additional_info.get("max_text_length", DEFAULT_MAX_TEXT_LENGTH))
-    segment = _first_tts_segment(str(text or ""), max_text_length)
+    # Shared with the talker's _resolve_prefill_text: slots must cover the whole
+    # request, which the talker synthesizes in this single prefill.
+    prefill_text = resolve_ming_prefill_text(str(text or ""))
     from vllm_omni.model_executor.models.ming_flash_omni.talker_module import (
         build_tts_prompt_token_ids,
     )
@@ -202,7 +195,7 @@ def build_ming_talker_prompt_token_ids_for_info(
 
     return build_tts_prompt_token_ids(
         tokenizer=tokenizer,
-        text=segment,
+        text=prefill_text,
         prompt=prompt,
         spk_emb_count=spk_emb_count,
         instruction=instruction,
@@ -712,7 +705,6 @@ def _build_talker_inputs(
             "prompt_text": additional_info.get("prompt_text", None),
             "prompt_wav_lat": additional_info.get("prompt_wav_lat", None),
             "prompt_wav_emb": additional_info.get("prompt_wav_emb", None),
-            "max_text_length": additional_info.get("max_text_length", DEFAULT_MAX_TEXT_LENGTH),
         }
 
         stamp_ming_talker_voice_meta(talker_info, stage_client=stage_client)

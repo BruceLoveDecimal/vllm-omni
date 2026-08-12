@@ -36,7 +36,7 @@ from vllm_omni.transformers_utils.configs.ming_flash_omni import (
     resolve_ming_talker_config,
 )
 
-from .prompt_utils import DEFAULT_MAX_TEXT_LENGTH, resolve_ming_prompt_fields
+from .prompt_utils import resolve_ming_prefill_text, resolve_ming_prompt_fields
 from .talker_module import (
     CFM,
     Aggregator,
@@ -49,7 +49,6 @@ from .talker_request_state import (
     MingTalkerRequestState,
     MingTalkerStateManager,
 )
-from .text_processing import segment_and_normalize
 from .voice_presets import VoicePresetRegistry
 
 logger = init_logger(__name__)
@@ -68,7 +67,6 @@ class _GenerationParams:
     max_steps: int
     seed: int | None
     use_zero_spk_emb: bool
-    max_text_length: int
     stream_decode: bool
 
 
@@ -426,6 +424,26 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             self.state_manager.evict(req_id)
         self._commit_pending_step()
 
+    def _reject_recompute_after_decode(self, req_id: str, prompt_len: int) -> None:
+        """Refuse a re-prefill for a request that has already generated audio.
+
+        vLLM recovers a preempted request by recomputing it from token 0. The
+        talker cannot follow: positions past the prompt were driven by CFM
+        aggregator embeddings, which are not reconstructible from prompt token
+        ids, so the rebuilt KV would be padding while the audio state silently
+        restarts mid-utterance. Fail loudly instead of emitting corrupt audio.
+        """
+        state = self.state_manager.get(req_id)
+        if state.step <= 0:
+            return
+        raise RuntimeError(
+            "Ming native talker cannot recompute a preempted request after decode has started: "
+            f"request_id={req_id!r}, completed_audio_steps={state.step}, prompt_len={prompt_len}. "
+            "Generated positions are conditioned on CFM aggregator embeddings that a prompt-token "
+            "re-prefill cannot rebuild. Give the talker stage enough KV cache to avoid preemption "
+            "(raise gpu_memory_utilization or lower max_num_seqs / max_decode_steps)."
+        )
+
     def _record_pending_prefill_done_update(self, state: MingTalkerRequestState) -> None:
         self._pending_prefill_done_updates.setdefault(state.req_id, bool(state.prefill_done))
 
@@ -502,15 +520,15 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             if is_prefill:
                 params = self._resolve_generation_params(info_dict)
                 voice = self._resolve_voice(info_dict)
-                text, segments = self._resolve_prefill_segments(info_dict, params)
-                max_steps = self._native_prefill_max_steps(text, segments, params)
+                text = self._resolve_prefill_text(info_dict)
+                max_steps = self._native_prefill_max_steps(text, params)
                 embeds = self._build_native_prefill_embeds(
                     input_ids=input_ids,
                     input_embeds=input_embeds,
                     info_dict=info_dict,
                     params=params,
                     voice=voice,
-                    segments=segments,
+                    text=text,
                 )
                 if req_id in self.state_manager and num_computed_tokens > 0:
                     # Later chunk of a chunked prefill: keep the existing state.
@@ -519,6 +537,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 else:
                     # First prefill chunk (or a restarted request): start fresh.
                     if req_id in self.state_manager:
+                        self._reject_recompute_after_decode(req_id, prompt_len)
                         self.state_manager.evict(req_id)
                     state = self._prefill_request(
                         req_id,
@@ -666,6 +685,19 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         for req_id in finished:
             self._pending_prefill_done_updates.pop(req_id, None)
         self._results_queue = [item for item in self._results_queue if item[0] not in finished]
+        # Audio still queued for a request the engine has already retired can no
+        # longer be routed: the runner maps sparse audio payloads onto the
+        # current batch's request ids. Outside an abort that means the sampling
+        # budget left no room for the stop-token step that ships the waveform,
+        # so name the invariant instead of returning an empty response.
+        dropped = [req_id for req_id, payload in self._audio_queue if req_id in finished and payload]
+        if dropped:
+            logger.error(
+                "Ming native talker discarded finalized audio for request_ids=%s: the request finished "
+                "before the stop-token step could ship it. Give the stage a sampling budget of at least "
+                "max_decode_steps + 1 tokens.",
+                dropped,
+            )
         self._audio_queue = [item for item in self._audio_queue if item[0] not in finished]
 
     def _build_native_prefill_embeds(
@@ -676,7 +708,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         info_dict: dict[str, Any],
         params: _GenerationParams,
         voice: _VoiceContext,
-        segments: list[str],
+        text: str,
     ) -> torch.Tensor:
         provided = info_dict.get("prefill_embeds", info_dict.get("inputs_embeds"))
         if isinstance(provided, torch.Tensor):
@@ -688,14 +720,14 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 prompt_len=int(info_dict.get("_omni_prompt_len", input_ids.reshape(-1).shape[0]) or 0),
             )
 
-        if segments:
+        if text:
             spk_emb = self._project_spk_emb(voice.spk_emb, voice.already_projected, params.use_zero_spk_emb)
             built, _ = build_tts_input(
                 tokenizer=self.tokenizer,
                 embed_tokens=self._input_embedder(),
                 device=input_ids.device,
                 dtype=torch.bfloat16,
-                text=segments[0],
+                text=text,
                 prompt=params.prompt,
                 spk_emb=spk_emb,
                 instruction=params.instruction,
@@ -747,30 +779,47 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             return embeds[:span_len].contiguous()
 
         pad_rows = span_len - int(embeds.shape[0])
+        if provided is not None:
+            # Padding a short prefill span repeats the last prompt row into
+            # positions the scheduler reserved, which is indistinguishable from
+            # real conditioning downstream. Reaching here means the reserved
+            # prompt slots and the embeddings built from the same text drifted,
+            # so surface it rather than synthesizing from padding.
+            raise ValueError(
+                "native Ming talker prefill embeddings are shorter than the scheduled span: "
+                f"embed_len={int(embeds.shape[0])}, span_len={span_len}, missing={pad_rows}. "
+                "The reserved prompt slots and the talker-built embeddings disagree; both sides "
+                "must resolve the request with resolve_ming_prefill_text and resolve_ming_prompt_fields."
+            )
         if embeds.shape[0] > 0:
             pad = embeds[-1:].expand(pad_rows, -1)
         else:
             pad = torch.zeros(pad_rows, self.hidden_size, device=input_ids.device, dtype=self.dtype)
         return torch.cat([embeds, pad], dim=0).contiguous()
 
-    def _resolve_prefill_segments(self, info_dict: dict[str, Any], params: _GenerationParams) -> tuple[str, list[str]]:
-        """Segment a prefill row's text once, for both the embeds and the step cap.
+    def _resolve_prefill_text(self, info_dict: dict[str, Any]) -> str:
+        """Normalize a prefill row's text once, for both the embeds and the step cap.
 
-        Segmenting separately in each consumer would let the prefill length and
-        the duration cap drift apart on any change to the segmenter.
+        Normalizing separately in each consumer would let the prefill length and
+        the duration cap drift apart on any change to the text pipeline. The
+        stage input processor sizes prompt-KV slots with the same helper, so the
+        whole request is synthesized in this single prefill.
         """
         text = str(info_dict.get("text", "") or "")
         if not text:
-            return "", []
-        return text, segment_and_normalize(text, max_length=params.max_text_length)
+            return ""
+        return resolve_ming_prefill_text(text)
 
-    def _native_prefill_max_steps(self, text: str, segments: list[str], params: _GenerationParams) -> int:
-        """Apply Ming's duration cap to the native-paged request state."""
+    def _native_prefill_max_steps(self, text: str, params: _GenerationParams) -> int:
+        """Apply Ming's duration cap to the native-paged request state.
+
+        The cap scales with the full request text, so a long utterance gets the
+        decode steps it needs instead of a fragment's worth.
+        """
         if not text:
             return params.max_steps
 
-        segment = segments[0] if segments else text
-        return int(self.audio_generator.duration_capped_steps(len(segment), params.max_steps))
+        return int(self.audio_generator.duration_capped_steps(len(text), params.max_steps))
 
     def _prefill_request(
         self,
@@ -902,7 +951,6 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                     additional_info.get("request_seed", additional_info.get("seed")),
                 )
             ),
-            max_text_length=int(additional_info.get("max_text_length", DEFAULT_MAX_TEXT_LENGTH)),
             stream_decode=bool(additional_info.get("stream_decode", True)),
         )
 

@@ -24,6 +24,8 @@ import copy
 import json
 from typing import Any
 
+from .text_processing import segment_and_normalize
+
 # ============================================================
 # Image-gen query-token block (thinker stage)
 # ============================================================
@@ -85,10 +87,29 @@ def maybe_expand_image_gen_prompt(
 
 DEFAULT_PROMPT = "Please generate speech based on the following description.\n"
 
-# Max characters per TTS segment. The stage input processor and the talker must
-# segment identically — the processor sizes prompt-KV slots from the first
-# segment that the talker will then synthesize — so both read this constant.
-DEFAULT_MAX_TEXT_LENGTH = 50
+# A length no real TTS request reaches, so ``cut_text_by_semantic_length`` takes
+# its "already fits" branch and hands back the text as a single fragment.
+_NATIVE_MAX_SEMANTIC_LENGTH = 1 << 30
+
+
+def resolve_ming_prefill_text(text: str) -> str:
+    """Normalize a talker request's text into one native-paged prefill fragment.
+
+    A paged request has exactly one prefill, so the text must not be cut by
+    length: the talker synthesizes what this returns and nothing else. The
+    voxcpm2 and qwen3-tts talkers do not cut text either; length cutting
+    belonged to the pre-paged loop, which ran a fresh ``StaticCache`` per
+    fragment and concatenated the latents, and on the paged path it would
+    silently drop every fragment after the first.
+
+    Number expansion and the leading-comma trim still run, so this returns
+    exactly what ``segment_and_normalize`` does for text that already fits in
+    one fragment. Like :func:`resolve_ming_prompt_fields`, both the stage input
+    processor (which sizes prompt-KV slots) and the talker (which builds the
+    prefill embeddings) must call this, or the two drift apart.
+    """
+    segments = segment_and_normalize(text, max_length=_NATIVE_MAX_SEMANTIC_LENGTH)
+    return segments[0] if segments else text.strip()
 
 
 def resolve_ming_prompt_fields(additional_info: dict[str, Any]) -> tuple[bool, str, str | None, bool]:
@@ -161,7 +182,7 @@ __all__ = [
     "DEFAULT_NUM_QUERY_TOKENS",
     "maybe_expand_image_gen_prompt",
     "DEFAULT_PROMPT",
-    "DEFAULT_MAX_TEXT_LENGTH",
+    "resolve_ming_prefill_text",
     "resolve_ming_prompt_fields",
     "BASE_CAPTION_TEMPLATE",
     "create_instruction",

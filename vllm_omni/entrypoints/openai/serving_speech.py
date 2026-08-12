@@ -3349,11 +3349,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
-            max_tokens = request.max_new_tokens or getattr(sampling_params_list[0], "max_tokens", None)
-            max_tokens = int(max_tokens or _TTS_MAX_NEW_TOKENS_MAX)
-            sampling_params_list[0].max_tokens = max_tokens
+            decode_steps = request.max_new_tokens
+            if decode_steps is None:
+                # A configured stage budget already covers the stop-token step,
+                # so recover the decode budget from it rather than re-adding one.
+                stage_budget = getattr(sampling_params_list[0], "max_tokens", None)
+                decode_steps = int(stage_budget) - 1 if stage_budget else None
+            decode_steps = max(1, int(decode_steps or _TTS_MAX_NEW_TOKENS_MAX))
+            # The talker finalizes audio inside ``compute_logits`` of its last
+            # decode step, but that step's ``make_omni_output`` has already run,
+            # so the waveform can only ship with the following stop-token step.
+            # Budget one token beyond the decode budget: a request that
+            # length-finishes exactly at ``decode_steps`` drops its audio.
+            sampling_params_list[0].max_tokens = decode_steps + 1
             if isinstance(prompt, dict):
-                prompt.setdefault("additional_information", {})["max_decode_steps"] = max_tokens
+                prompt.setdefault("additional_information", {})["max_decode_steps"] = decode_steps
             stop_token_ids = set(getattr(sampling_params_list[0], "stop_token_ids", None) or [])
             stop_token_ids.add(1)
             sampling_params_list[0].stop_token_ids = sorted(stop_token_ids)

@@ -232,7 +232,10 @@ Override the default text per case with `--text`, write to a custom path with `-
 - Talker-only deployment — for the multimodal Ming-flash-omni example, see [`examples/offline_inference/ming_flash_omni/`](../../ming_flash_omni/).
 - Deploy config: `vllm_omni/deploy/ming_flash_omni_tts.yaml` (single-GPU native paged talker,
   `enforce_eager: false`, `max_num_seqs: 4`).
-- Decode defaults from the Ming cookbook: `max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`, `use_zero_spk_emb=True`.
+- Decode defaults from the Ming cookbook: `cfg=2.0`, `sigma=0.25`, `temperature=0.0`, `use_zero_spk_emb=True`.
+- The whole request is synthesized in one prefill, so `--max-decode-steps` (default 4096) is only a ceiling:
+  the talker caps each request with Ming's text-duration heuristic. The stage's sampling budget must stay at
+  `max_decode_steps + 1` — the final waveform ships on the stop-token step that follows the last decode step.
 
 ---
 

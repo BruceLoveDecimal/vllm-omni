@@ -3758,6 +3758,33 @@ class TestMingFlashOmniTTSServing:
         asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
         ming_flash_omni_tts_server._build_ming_flash_omni_prompt.assert_called_once()
 
+    @pytest.mark.parametrize("max_new_tokens", [None, 64])
+    def test_ming_flash_omni_tts_budget_exceeds_decode_steps_by_one(
+        self, ming_flash_omni_tts_server, mocker: MockerFixture, max_new_tokens
+    ):
+        """The sampler must outlive the decode budget by the stop-token step.
+
+        The talker finalizes audio inside ``compute_logits`` of its last decode
+        step, after that step's output payload was assembled, so a budget equal
+        to ``max_decode_steps`` length-finishes the request and drops the
+        waveform.
+        """
+        prompt = {
+            "prompt_token_ids": [1, 2, 3],
+            "additional_information": {"voice": ["test"]},
+        }
+        ming_flash_omni_tts_server._build_ming_flash_omni_prompt = mocker.MagicMock(return_value=prompt)
+        request = OpenAICreateSpeechRequest(input="Hello", voice="test", max_new_tokens=max_new_tokens)
+
+        asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
+
+        sent = ming_flash_omni_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
+        decode_steps = prompt["additional_information"]["max_decode_steps"]
+        if max_new_tokens is not None:
+            assert decode_steps == max_new_tokens
+        assert sent[0].max_tokens == decode_steps + 1
+        assert 1 in sent[0].stop_token_ids
+
 
 class TestTTSAsyncOffloading:
     """Tests for event-loop-safe offloading of blocking TTS operations."""

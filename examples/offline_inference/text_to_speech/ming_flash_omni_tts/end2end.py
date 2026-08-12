@@ -5,6 +5,7 @@ from typing import Any
 
 import soundfile as sf
 import torch
+from vllm import SamplingParams
 
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
@@ -90,7 +91,12 @@ def parse_args():
     parser.add_argument("--text", type=str, default=None, help="Override default text for the selected case.")
     parser.add_argument("--output", type=str, default=None, help="Output wav path.")
     parser.add_argument("--seed", type=int, default=None, help="Optional deterministic Ming talker seed.")
-    parser.add_argument("--max-decode-steps", type=int, default=200, help="Maximum talker decode steps.")
+    parser.add_argument(
+        "--max-decode-steps",
+        type=int,
+        default=4096,
+        help="Decode-step ceiling. The talker bounds itself per request with Ming's text-duration heuristic.",
+    )
     parser.add_argument("--min-new-token", type=int, default=None, help="Minimum talker decode steps before stop.")
     parser.add_argument("--no-stream-decode", action="store_true", help="Decode the final latent sequence in one pass.")
     parser.add_argument("--log-stats", action="store_true", default=False, help="Enable stats logging.")
@@ -137,7 +143,17 @@ def main():
         additional_information=additional_information,
     )
 
-    outputs = omni.generate(req)
+    # The talker finalizes audio in compute_logits of its last decode step, but
+    # that step's output payload is already assembled, so the waveform ships with
+    # the following stop-token step. Budget one token beyond max_decode_steps or
+    # a request that runs the budget out returns no audio.
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=args.max_decode_steps + 1,
+        stop_token_ids=[1],
+    )
+
+    outputs = omni.generate(req, [sampling_params])
     mm = outputs[0].outputs[0].multimodal_output
 
     output_path = args.output or f"output_{args.case}.wav"

@@ -53,7 +53,16 @@ stages:
       cudagraph_mode: PIECEWISE
     default_sampling_params:
       temperature: 0.0
-      max_tokens: 200
+      # Decode-step ceiling (4096, as for the voxcpm2 talker) plus one: the
+      # talker synthesizes the whole request in a single prefill and bounds
+      # itself per request with Ming's text-duration heuristic, so this only
+      # has to stay above what the longest supported utterance needs. The +1
+      # covers the stop-token step: audio is finalized in compute_logits of the
+      # last decode step and can only ship with the step after it, so a budget
+      # equal to the decode budget would length-finish the request and drop the
+      # waveform. Keep this at max_decode_steps + 1. (stop_token_ids is pinned
+      # by the pipeline's sampling_constraints, not here.)
+      max_tokens: 4097
 
 # Ming-flash-omni-2.0 has only been verified on CUDA devices,
 # left empty intentionally. Add per-platform overrides here

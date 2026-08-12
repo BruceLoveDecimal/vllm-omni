@@ -336,6 +336,124 @@ def test_audio_finalize_delays_stop_until_next_scheduler_step():
     assert float(stop_logits[0, 1]) == 0.0
 
 
+_MULTI_SEGMENT_TEXT = (
+    "我们当迎着阳光辛勤耕作，去摘取，去制作，去品尝，去馈赠。"
+    "这款产品的名字，叫变态坑爹牛肉丸。"
+    "我会一直在这里陪着你，直到你慢慢地沉入那个最温柔的梦里。"
+)
+
+
+def test_prefill_text_keeps_the_whole_request():
+    """A paged request has one prefill, so no text may be cut away from it.
+
+    The pre-paged loop ran one AR pass per ~50-char fragment and concatenated
+    the latents; on the native path everything past the first fragment would
+    never be synthesized.
+    """
+    from vllm_omni.model_executor.models.ming_flash_omni.text_processing import segment_and_normalize
+
+    # The old segmenter really does split this text, so the bug is reachable.
+    assert len(segment_and_normalize(_MULTI_SEGMENT_TEXT, max_length=50)) > 1
+
+    talker = MingFlashOmniTalkerForConditionalGeneration.__new__(MingFlashOmniTalkerForConditionalGeneration)
+    resolved = talker._resolve_prefill_text({"text": _MULTI_SEGMENT_TEXT})
+
+    assert resolved.endswith("最温柔的梦里。")
+    assert len(resolved) == len(_MULTI_SEGMENT_TEXT)
+    assert talker._resolve_prefill_text({"text": ""}) == ""
+
+
+def test_prompt_slots_and_prefill_text_stay_in_lockstep():
+    """Both sides must resolve the same string or the prefill length drifts."""
+    tokenizer = _TinyTokenizer()
+    talker = MingFlashOmniTalkerForConditionalGeneration.__new__(MingFlashOmniTalkerForConditionalGeneration)
+
+    ids = build_ming_talker_prompt_token_ids_for_info(
+        text=_MULTI_SEGMENT_TEXT,
+        additional_info={"ming_task": "instruct", "prompt": "system prompt"},
+        tokenizer=tokenizer,
+    )
+
+    assert ids is not None
+    # The slots must encode the very string the talker will synthesize.
+    assert tokenizer.encode(talker._resolve_prefill_text({"text": _MULTI_SEGMENT_TEXT}))[0] in ids
+
+
+def test_duration_cap_scales_with_the_full_text_not_a_fragment():
+    """The step budget must cover the whole utterance the prefill encodes."""
+    talker = MingFlashOmniTalkerForConditionalGeneration.__new__(MingFlashOmniTalkerForConditionalGeneration)
+    seen: list[int] = []
+
+    def fake_duration_capped_steps(text_len, requested_max_steps):
+        seen.append(text_len)
+        # Mirrors the real heuristic's shape: proportional to text, then capped.
+        return min(requested_max_steps, max(1, text_len * 6))
+
+    talker.audio_generator = SimpleNamespace(duration_capped_steps=fake_duration_capped_steps)
+    params = SimpleNamespace(max_steps=4096)
+
+    text = talker._resolve_prefill_text({"text": _MULTI_SEGMENT_TEXT})
+    steps = talker._native_prefill_max_steps(text, params)
+
+    assert seen == [len(text)]
+    assert steps == len(text) * 6
+    # A ~50-char first fragment would have bought far fewer steps.
+    assert steps > 50 * 6
+
+
+def test_recompute_after_decode_is_rejected_instead_of_restarting_audio():
+    """A preempted request must not silently re-prefill mid-utterance.
+
+    vLLM recovers a preempted request by recomputing from token 0. Generated
+    positions were conditioned on CFM aggregator embeddings, so a prompt-token
+    re-prefill would pad their KV while the audio state restarts.
+    """
+    talker = MingFlashOmniTalkerForConditionalGeneration.__new__(MingFlashOmniTalkerForConditionalGeneration)
+    talker.state_manager = MingTalkerStateManager()
+
+    state = talker.state_manager.create("req-a", his_lat=torch.zeros(1, 2, 3), seed=5)
+
+    # Still inside the first prefill (no audio step yet): restarting is fine.
+    talker._reject_recompute_after_decode("req-a", prompt_len=12)
+
+    state.step = 7
+    with pytest.raises(RuntimeError, match="recompute a preempted request after decode has started"):
+        talker._reject_recompute_after_decode("req-a", prompt_len=12)
+
+
+def test_short_prefill_embeds_raise_instead_of_padding_with_the_last_prompt_row(monkeypatch):
+    """Slot/embedding drift must surface, not become repeated-row conditioning."""
+    talker = MingFlashOmniTalkerForConditionalGeneration.__new__(MingFlashOmniTalkerForConditionalGeneration)
+    talker.hidden_size = 4
+    # ``dtype`` is a read-only property derived from the loaded backbone, so it
+    # has to be stubbed on the class for an instance built without __init__.
+    monkeypatch.setattr(MingFlashOmniTalkerForConditionalGeneration, "dtype", torch.float32, raising=False)
+
+    with pytest.raises(ValueError, match="shorter than the scheduled span"):
+        talker._coerce_scheduled_embeds(
+            input_ids=torch.zeros(6, dtype=torch.long),
+            input_embeds=None,
+            provided=torch.zeros(4, 4),
+        )
+
+
+def test_finished_request_with_undelivered_audio_is_reported(caplog):
+    """Dropping finalized audio must name the budget invariant, not go quiet."""
+    talker = MingFlashOmniTalkerForConditionalGeneration.__new__(MingFlashOmniTalkerForConditionalGeneration)
+    talker.state_manager = MingTalkerStateManager()
+    talker._pending_requests = []
+    talker._pending_state_creations = set()
+    talker._pending_prefill_done_updates = {}
+    talker._results_queue = []
+    talker._audio_queue = [("req-a", {"audio": torch.zeros(4)})]
+
+    with caplog.at_level("ERROR"):
+        talker.on_requests_finished({"req-a"})
+
+    assert not talker._audio_queue
+    assert "max_decode_steps + 1" in caplog.text
+
+
 def test_finished_mask_matches_original_zero_based_min_new_token_boundary():
     should_stop = MingFlashOmniTalkerForConditionalGeneration._request_should_stop
 
