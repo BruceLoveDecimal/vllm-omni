@@ -71,6 +71,11 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
+from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
+    build_ming_talker_prompt_token_ids_for_info,
+    get_ming_talker_tokenizer,
+    stamp_ming_talker_voice_meta,
+)
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
@@ -465,6 +470,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.supported_languages = self._load_supported_languages()
 
         self._tts_tokenizer = None
+        self._ming_talker_tokenizer = None
         self._voxcpm2_tokenizer = None
         self._audex_tokenizer = None
         self._audex_tta_rvq = None
@@ -3076,7 +3082,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if has_spk_emb:
             # Passed as plain float list
             additional_information["spk_emb"] = list(request.speaker_embedding)
-        prompt = tokens_input(prompt_token_ids=[0])
+        if request.seed is not None:
+            additional_information["seed"] = int(request.seed)
+        stamp_ming_talker_voice_meta(additional_information, stage_client=self)
+        prompt_token_ids = [0]
+        native_prompt_ids = build_ming_talker_prompt_token_ids_for_info(
+            text=request.input,
+            additional_info=additional_information,
+            tokenizer=get_ming_talker_tokenizer(self),
+        )
+        if native_prompt_ids is not None:
+            prompt_token_ids = native_prompt_ids
+        else:
+            logger.warning("Ming talker exact prompt slots could not be built; using one dummy token")
+        prompt = tokens_input(prompt_token_ids=prompt_token_ids)
         prompt["additional_information"] = additional_information
         return prompt
 
@@ -3322,6 +3341,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Ming emits TEXT_EOS after the latent decode budget is exhausted, so
                 # Stage-0 needs one extra token beyond ming_max_decode_steps.
                 sampling_params_list[0].max_tokens = int(request.max_new_tokens) + 1
+        elif self._tts_model_type == "ming_flash_omni_tts" and sampling_params_list:
+            # Ming talker: the paged Qwen2 backbone runs one AR step
+            # per audio frame, so Stage-0 max_tokens must cover the full decode
+            # budget (mirrored into ``max_decode_steps`` on the prompt) and stop
+            # on the talker EOS (token id 1).
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            max_tokens = request.max_new_tokens or getattr(sampling_params_list[0], "max_tokens", None)
+            max_tokens = int(max_tokens or _TTS_MAX_NEW_TOKENS_MAX)
+            sampling_params_list[0].max_tokens = max_tokens
+            if isinstance(prompt, dict):
+                prompt.setdefault("additional_information", {})["max_decode_steps"] = max_tokens
+            stop_token_ids = set(getattr(sampling_params_list[0], "stop_token_ids", None) or [])
+            stop_token_ids.add(1)
+            sampling_params_list[0].stop_token_ids = sorted(stop_token_ids)
 
         if request.seed is not None and sampling_params_list:
             import copy
