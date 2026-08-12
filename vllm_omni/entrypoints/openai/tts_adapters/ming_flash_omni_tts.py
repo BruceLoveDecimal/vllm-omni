@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """MingFlashOmniTTS serving adapter."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 logger = init_logger(__name__)
+
+_TTS_MAX_NEW_TOKENS_MAX = 4096
 
 
 @register_tts_adapter
@@ -64,6 +66,37 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
         server = self.ctx.server
         prompt = server._build_ming_flash_omni_prompt(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        """Give Stage 0 a decode budget that covers the whole waveform.
+
+        The talker's paged Qwen2 backbone runs one AR step per audio frame, so
+        ``max_tokens`` bounds the audio length rather than a text length. The
+        same budget is mirrored onto the prompt as ``max_decode_steps`` for the
+        talker itself, and the talker's EOS (stop-token id 1) is added so the
+        request ends when the model stops rather than at the budget.
+        """
+        import copy
+
+        if not sampling_params_list:
+            return sampling_params_list
+
+        sampling_params_list = copy.deepcopy(sampling_params_list)
+        max_tokens = request.max_new_tokens or getattr(sampling_params_list[0], "max_tokens", None)
+        max_tokens = int(max_tokens or _TTS_MAX_NEW_TOKENS_MAX)
+        sampling_params_list[0].max_tokens = max_tokens
+        if isinstance(prompt, dict):
+            prompt.setdefault("additional_information", {})["max_decode_steps"] = max_tokens
+        stop_token_ids = set(getattr(sampling_params_list[0], "stop_token_ids", None) or [])
+        stop_token_ids.add(1)
+        sampling_params_list[0].stop_token_ids = sorted(stop_token_ids)
+        return sampling_params_list
 
     def _load_supported_speakers(self) -> set[str]:
         # Speaker selection is driven by caption JSON rather than a static table.
