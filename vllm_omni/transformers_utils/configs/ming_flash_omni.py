@@ -19,7 +19,7 @@
 import os
 from typing import Any, ClassVar
 
-from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast, Qwen2Config
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -358,7 +358,7 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         # during PretrainedConfig.__init__, before llm_config is assigned
         llm_config = getattr(self, "llm_config", None)
         if isinstance(llm_config, dict):
-            return PretrainedConfig.from_dict(llm_config)
+            return Qwen2Config(**llm_config)
 
         return llm_config
 

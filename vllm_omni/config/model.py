@@ -1,3 +1,4 @@
+import os
 from dataclasses import MISSING, field
 from typing import Any
 
@@ -216,6 +217,11 @@ class OmniModelConfig(ModelConfig):
         # transformers' get_text_config method is used to get the text config from thinker_config.
         # to handle the case that each model stage has their own text config,
         # we need to draw the text config from the corresponding model stage.
+        if self.model_arch == "MingFlashOmniTalkerForConditionalGeneration" and self.hf_config_name == "talker_config":
+            ming_talker_text_config = self._draw_ming_talker_text_config()
+            if ming_talker_text_config is not None:
+                return ming_talker_text_config
+
         if self.hf_config_name is None:
             return get_hf_text_config(self.hf_config)
         try:
@@ -229,6 +235,66 @@ class OmniModelConfig(ModelConfig):
                 "falling back to default get_hf_text_config"
             )
             return get_hf_text_config(self.hf_config)
+
+    def _draw_ming_talker_text_config(self):
+        """Resolve the Ming talker Qwen2 config before model construction."""
+        try:
+            from transformers import Qwen2Config
+
+            from vllm_omni.transformers_utils.configs.ming_flash_omni import (
+                MingFlashOmniTalkerConfig,
+            )
+        except Exception:
+            return None
+
+        stage_config = getattr(self.hf_config, "talker_config", None)
+        if isinstance(stage_config, dict):
+            stage_config = MingFlashOmniTalkerConfig(**stage_config)
+        if isinstance(stage_config, MingFlashOmniTalkerConfig):
+            text_config = stage_config.get_text_config()
+            if text_config is not None:
+                return text_config
+
+        model_path = getattr(self, "model", None)
+        if not isinstance(model_path, str) or not model_path:
+            return None
+
+        if os.path.isdir(model_path):
+            talker_dir = os.path.join(model_path, "talker")
+            if not os.path.isdir(talker_dir):
+                talker_dir = model_path
+
+            if os.path.isdir(talker_dir):
+                try:
+                    talker_config = MingFlashOmniTalkerConfig.from_pretrained(talker_dir)
+                except Exception:
+                    talker_config = None
+                if isinstance(talker_config, MingFlashOmniTalkerConfig):
+                    text_config = talker_config.get_text_config()
+                    if text_config is not None:
+                        return text_config
+
+                llm_dir = os.path.join(talker_dir, "llm")
+                if os.path.isdir(llm_dir):
+                    try:
+                        return Qwen2Config.from_pretrained(llm_dir)
+                    except Exception:
+                        return None
+            return None
+
+        for loader, subfolder in (
+            (MingFlashOmniTalkerConfig, "talker"),
+            (Qwen2Config, "talker/llm"),
+        ):
+            try:
+                cfg = loader.from_pretrained(model_path, subfolder=subfolder)
+            except Exception:
+                continue
+            text_config = cfg.get_text_config() if isinstance(cfg, MingFlashOmniTalkerConfig) else cfg
+            if text_config is not None:
+                return text_config
+
+        return None
 
     def _validate_startup_task_type(self) -> None:
         """Validate startup-only task selectors owned by an AR model."""
