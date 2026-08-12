@@ -85,6 +85,11 @@ def maybe_expand_image_gen_prompt(
 
 DEFAULT_PROMPT = "Please generate speech based on the following description.\n"
 
+# Max characters per TTS segment. The stage input processor and the talker must
+# segment identically — the processor sizes prompt-KV slots from the first
+# segment that the talker will then synthesize — so both read this constant.
+DEFAULT_MAX_TEXT_LENGTH = 50
+
 BASE_CAPTION_TEMPLATE: dict[str, Any] = {
     "audio_sequence": [
         {
