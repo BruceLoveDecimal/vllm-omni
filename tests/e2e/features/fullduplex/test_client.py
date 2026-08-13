@@ -77,6 +77,7 @@ async def test_realtime_client_configure_omits_ref_audio_by_default():
 
     session = client.sent[0]["session"]
     assert "ref_audio" not in session
+    assert "temperature" not in session
 
 
 @pytest.mark.asyncio
@@ -100,6 +101,28 @@ async def test_realtime_client_configure_sends_explicit_ref_audio():
 
     session = client.sent[0]["session"]
     assert session["ref_audio"] == "data:audio/wav;base64,AAAA"
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_configure_preserves_zero_temperature():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add({"type": "session.created"})
+
+    client = Client()
+
+    await client.configure(
+        "openbmb/MiniCPM-o-4_5",
+        temperature=0.0,
+        timeout_s=1,
+    )
+
+    assert client.sent[0]["session"]["temperature"] == 0.0
 
 
 @pytest.mark.asyncio

@@ -520,6 +520,7 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
     assert summary["second_response_before_final_commit"] is True
     assert summary["final_listen_after_commit"] is True
     assert summary["response_audio_contract_ok"] is True
+    assert summary["response_required_contract_ok"] is True
     assert summary["response_summaries"][0]["audio_delta_count"] == 2
     assert summary["response_summaries"][1]["transcript"] == "一加一等于二。"
 
@@ -551,16 +552,120 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
     summary = demo.summarize_artifacts(
         output_dir=output,
         validation_mode="model-policy",
-        min_responses=2,
+        min_responses=0,
         min_audio_deltas_per_response=2,
         expect_followup_response_substring=None,
     )
 
     assert summary["ok"] is True
     assert summary["validation_mode"] == "model-policy"
+    assert summary["effective_min_responses"] == 0
     assert summary["enough_responses"] is True
     assert summary["response_before_final_commit"] is True
     assert summary["listen_after_response_before_commit"] is True
+
+
+def test_realtime_duplex_soft_interrupt_model_policy_accepts_listen_only(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "model_policy_listen_only"
+    output.mkdir()
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 2.0},
+        {"type": "response.listen", "_client_received_at_s": 2.1},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": []}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="model-policy",
+        min_responses=0,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring=None,
+    )
+
+    assert summary["ok"] is True
+    assert summary["policy_decision_observed"] is True
+    assert summary["response_count"] == 0
+    assert summary["response_lifecycle_ok"] is True
+    assert summary["response_audio_contract_ok"] is True
+
+
+def test_realtime_duplex_soft_interrupt_model_policy_accepts_response_after_commit(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "model_policy_response_after_commit"
+    output.mkdir()
+    response_id = "resp-after-commit"
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 2.0},
+        {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 3.0},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 3.1},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 3.2},
+        {"type": "response.done", "response_id": response_id, "_client_received_at_s": 3.3},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [response_id]}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="model-policy",
+        min_responses=0,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring=None,
+    )
+
+    assert summary["ok"] is True
+    assert summary["response_before_final_commit"] is False
+    assert summary["response_lifecycle_ok"] is True
+    assert summary["response_audio_contract_ok"] is True
+
+
+def test_realtime_duplex_soft_interrupt_model_policy_rejects_incomplete_response(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "model_policy_incomplete_response"
+    output.mkdir()
+    response_id = "resp-incomplete"
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.2},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [response_id]}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="model-policy",
+        min_responses=0,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring=None,
+    )
+
+    assert summary["ok"] is False
+    assert summary["policy_decision_observed"] is True
+    assert summary["response_lifecycle_ok"] is False
 
 
 def test_realtime_duplex_soft_interrupt_model_policy_accepts_commit_during_speak(tmp_path):
@@ -589,7 +694,7 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_commit_during_speak
     summary = demo.summarize_artifacts(
         output_dir=output,
         validation_mode="model-policy",
-        min_responses=1,
+        min_responses=0,
         min_audio_deltas_per_response=2,
         expect_followup_response_substring=None,
     )
@@ -634,6 +739,7 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
 
     assert summary["ok"] is False
     assert summary["enough_responses"] is False
+    assert summary["response_required_contract_ok"] is False
 
 
 def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(tmp_path):

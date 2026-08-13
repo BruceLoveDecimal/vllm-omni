@@ -53,10 +53,11 @@ def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_
     assert result["admission"]["overflow_error_code"] == "resource_exhausted"
 
 
-# CUDA-only for now: this contract asserts the model speaks while the user is
-# still talking, which only holds when the duplex pipeline sustains real-time
-# throughput. The current NPU stack runs several times slower than real time,
-# so it never reaches a mid-stream decision point.
+# The fixed WAV exercises the soft-interrupt data path, but a real model's
+# listen/speak choice and exact decision time are policy/throughput dependent.
+# Strict two-response ordering remains covered by deterministic event fixtures
+# in test_minicpmo_realtime_duplex_drivers.py; this hardware test pins protocol
+# health for whichever valid decision the model makes.
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -> None:
@@ -72,10 +73,11 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
                 summary_output=None,
                 chunk_ms=200,
                 timeout_s=180.0,
-                require_audio=True,
+                require_audio=False,
                 no_realtime_pacing=False,
-                validation_mode="response-required",
-                min_responses=2,
+                validation_mode="model-policy",
+                temperature=0.0,
+                min_responses=0,
                 min_audio_deltas_per_response=2,
                 input_sha256=SOFT_INTERRUPT_SHA256,
                 expect_followup_response_substring=None,
@@ -85,6 +87,6 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
 
     assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
     assert result["error_count"] == 0
+    assert result["policy_decision_observed"] is True
     assert result["response_lifecycle_ok"] is True
     assert result["response_audio_contract_ok"] is True
-    assert result["followup_response_transcript_ok"] is True

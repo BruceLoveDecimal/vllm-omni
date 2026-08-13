@@ -140,18 +140,24 @@ def test_minicpmo_extension_owns_stage_sampling_overrides():
         SamplingParams(max_tokens=4),
         SamplingParams(max_tokens=8),
     )
+    default_stage0_temperature = defaults[0].temperature
 
     configured = MiniCPMO45DuplexRuntimeExtension().configure_sampling_params(
         runtime_config={
             "duplex_stage_max_tokens": {"0": 20},
-            "duplex_stage_sampling_params": {"1": {"stop_token_ids": [151645]}},
+            "duplex_stage_sampling_params": {
+                "0": {"temperature": 0.0},
+                "1": {"stop_token_ids": [151645]},
+            },
         },
         defaults=defaults,
     )
 
     assert configured[0].max_tokens == 20
+    assert configured[0].temperature == 0.0
     assert configured[1].stop_token_ids == [151645]
     assert defaults[0].max_tokens == 4
+    assert defaults[0].temperature == default_stage0_temperature
     assert 151645 not in (defaults[1].stop_token_ids or [])
 
 

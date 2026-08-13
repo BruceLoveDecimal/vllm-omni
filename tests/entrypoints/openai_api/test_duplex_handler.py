@@ -934,6 +934,27 @@ async def test_native_session_update_rebuilds_server_runtime_policy():
 
 
 @pytest.mark.asyncio
+async def test_native_realtime_initial_zero_temperature_reaches_stage0_runtime():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    event = _native_realtime_session_update("sid-runtime-temperature-zero")
+    event["session"]["temperature"] = 0.0
+    ws = TimedWebSocket()
+    ws.put(event)
+    ws.put({"type": "session.close"})
+
+    await handler.handle_realtime_session(ws)
+
+    assert engine.opened_configs[0]["temperature"] == 0.0
+    runtime_config = engine.opened_runtime_configs[0]
+    assert runtime_config["duplex_stage_sampling_params"]["0"]["temperature"] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_native_session_update_rejects_client_runtime_config():
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(

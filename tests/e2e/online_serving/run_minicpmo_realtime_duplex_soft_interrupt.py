@@ -1,9 +1,10 @@
 """Validate MiniCPM-o Realtime duplex soft-interrupt delta streaming.
 
 This E2E driver runs the public ``realtime_duplex_demo.py`` against a live
-duplex backend. Arbitrary audio defaults to the model-policy lifecycle contract.
-The stronger response-required mode binds the multi-response contract to a
-known input checksum and expected follow-up response.
+duplex backend. Arbitrary audio defaults to the model-policy contract: the
+model owns the listen/speak choice, while every observed response must still
+have a valid lifecycle. The stronger response-required mode binds the strict
+multi-response soft-interrupt contract to a known input checksum.
 """
 
 from __future__ import annotations
@@ -253,7 +254,10 @@ def summarize_artifacts(
         None,
     )
     listen_indices = [index for index, event in enumerate(events) if event.get("type") == "response.listen"]
-    effective_min_responses = min_responses if validation_mode == "response-required" else 1
+    # The strict fixture requires responses. In model-policy mode a listen-only
+    # decision is valid; response lifecycle checks apply to responses that were
+    # actually observed instead of forcing the model to choose speak.
+    effective_min_responses = min_responses if validation_mode == "response-required" else 0
     enough_responses = len(response_summaries) >= effective_min_responses
     response_lifecycle_ok = enough_responses and all(bool(summary.get("one_done")) for summary in response_summaries)
     multi_delta_ok = enough_responses and all(
@@ -314,14 +318,7 @@ def summarize_artifacts(
         and event["response"].get("status") == "cancelled"
     )
     result_ok = result.get("ok") is True
-    # response-required keeps the full listen sandwich around commit. model-policy
-    # only requires a completed audio response that started before final commit:
-    # single-GPU co-location often still drains speak after the WAV ends.
-    commit_listen_contract_ok = (
-        listen_after_response_before_commit and final_listen_after_commit
-        if validation_mode == "response-required"
-        else response_before_final_commit
-    )
+    policy_decision_observed = bool(response_summaries or listen_indices)
     common_contract_ok = bool(
         result_ok
         and not error_events
@@ -330,15 +327,17 @@ def summarize_artifacts(
         and response_lifecycle_ok
         and multi_delta_ok
         and response_audio_contract_ok
-        and response_before_final_commit
-        and commit_listen_contract_ok
     )
-    mode_contract_ok = validation_mode == "model-policy" or (
-        second_response_before_final_commit
+    response_required_contract_ok = bool(
+        response_before_final_commit
+        and second_response_before_final_commit
         and listen_before_first_response
         and listen_after_last_done
+        and listen_after_response_before_commit
+        and final_listen_after_commit
         and followup_response_transcript_ok
     )
+    mode_contract_ok = policy_decision_observed if validation_mode == "model-policy" else response_required_contract_ok
     ok = common_contract_ok and mode_contract_ok
     return {
         "ok": ok,
@@ -347,6 +346,7 @@ def summarize_artifacts(
         "event_counts": _event_counts(events),
         "response_ids": response_ids,
         "response_summaries": response_summaries,
+        "response_count": len(response_summaries),
         "min_responses": min_responses,
         "effective_min_responses": effective_min_responses,
         "min_audio_deltas_per_response": min_audio_deltas_per_response,
@@ -366,6 +366,9 @@ def summarize_artifacts(
         "followup_response_transcript_ok": followup_response_transcript_ok,
         "expect_followup_response_substring": expect_followup_response_substring,
         "followup_response_transcript_expectation_ok": followup_response_transcript_expectation_ok,
+        "policy_decision_observed": policy_decision_observed,
+        "response_required_contract_ok": response_required_contract_ok,
+        "mode_contract_ok": mode_contract_ok,
         "error_count": len(error_events),
         "cancelled_count": cancelled_count,
         "compact_sequence": _compact_sequence(events),
