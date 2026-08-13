@@ -21,6 +21,29 @@ either an action DSL string or explicit camera poses. vLLM-Omni serves the
 SANA-WM Stage-1 DiT, decoded through the SANA VAE. The optional LTX-2 refiner
 stage is not supported by this integration; it is a planned follow-up.
 
+### Which SANA-WM this is
+
+Upstream ships three single-GPU inference variants, each as its own checkpoint.
+**Only the first is integrated here.**
+
+| Variant | Checkpoint | Status |
+|---------|------------|--------|
+| Bidirectional generator (offline, highest quality) | `Efficient-Large-Model/SANA-WM_bidirectional` | Supported — this recipe |
+| Chunk-causal autoregressive generator (sequential rollout) | `Efficient-Large-Model/SANA-WM_chunk_causal` | Not integrated |
+| Few-step distilled autoregressive generator (streaming) | `Efficient-Large-Model/SANA-WM_streaming` | Not integrated |
+
+These are separate sets of weights, not a runtime switch: the bidirectional
+model's recurrence runs a backward pass over future frames, so it cannot be
+driven autoregressively without the causally-trained checkpoints. Pointing this
+recipe at either autoregressive repo will not work.
+
+`SANA-WM_chunk_causal` is published by upstream as a research checkpoint for
+reproducing the chunk-causal Stage-1 training path, and as the teacher for
+distillation. `SANA-WM_streaming` is the deployable autoregressive path, and is
+a whole pipeline rather than a drop-in DiT — a 4-step distilled Stage 1 plus a
+chunk-causal refiner and a causal VAE decoder, overlapped across CUDA streams.
+Supporting either is a separate piece of work.
+
 ## References
 
 - Upstream model card: <https://huggingface.co/Efficient-Large-Model/SANA-WM_bidirectional>
