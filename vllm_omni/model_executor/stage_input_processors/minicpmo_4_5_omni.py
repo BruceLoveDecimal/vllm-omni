@@ -10,6 +10,7 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.errors import StageInputProcessingError
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
@@ -773,7 +774,7 @@ def llm2tts(
             tts_bos_id = 151703
             tts_end_ids = set(tts_end_ids) | {151704, 151645}
         if thinker_hidden_states is None and not is_native_duplex_handoff:
-            raise ValueError("No latent or hidden_states found in thinker output")
+            raise StageInputProcessingError("No latent or hidden_states found in thinker output")
 
         tts_bos_idx = None
         # For native duplex the resumable prompt folds every earlier unit, so
@@ -903,7 +904,7 @@ def llm2tts(
             # skip them before treating missing hidden states as an error.
             continue
         if thinker_hidden_states is None:
-            raise ValueError("No latent or hidden_states found in thinker output")
+            raise StageInputProcessingError("No latent or hidden_states found in thinker output")
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(
                 handoff_ids,

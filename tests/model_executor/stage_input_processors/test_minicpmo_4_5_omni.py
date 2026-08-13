@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.errors import StageInputProcessingError
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
     llm2tts,
@@ -175,7 +176,20 @@ def test_native_duplex_no_speech_without_hidden_states_is_skipped(output_ids: li
     )
 
 
-def test_native_duplex_speech_without_hidden_states_still_raises() -> None:
+def test_non_duplex_output_without_hidden_states_raises_stage_input_error() -> None:
+    source = _output(
+        prompt_ids=[101],
+        output_ids=[21],
+    )
+
+    with pytest.raises(StageInputProcessingError, match="No latent or hidden_states"):
+        llm2tts(
+            [source],
+            prompt=[{}],
+        )
+
+
+def test_native_duplex_speech_without_hidden_states_raises_stage_input_error() -> None:
     source = _output(
         prompt_ids=[101],
         output_ids=[9304, 21, 9308],
@@ -193,7 +207,7 @@ def test_native_duplex_speech_without_hidden_states_still_raises() -> None:
         },
     )
 
-    with pytest.raises(ValueError, match="No latent or hidden_states"):
+    with pytest.raises(StageInputProcessingError, match="No latent or hidden_states"):
         llm2tts(
             [source],
             prompt=[{}],
