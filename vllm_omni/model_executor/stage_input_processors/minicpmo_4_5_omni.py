@@ -750,11 +750,12 @@ def llm2tts(
         latent = mm_output.get("latent", None)
         if latent is None:
             latent = output.hidden_states if hasattr(output, "hidden_states") else None
-            if latent is None:
-                raise ValueError("No latent or hidden_states found in thinker output")
-
-        thinker_hidden_states = latent.detach()
-        if thinker_hidden_states.ndim == 3 and thinker_hidden_states.shape[0] == 1:
+        thinker_hidden_states = latent.detach() if latent is not None else None
+        if (
+            thinker_hidden_states is not None
+            and thinker_hidden_states.ndim == 3
+            and thinker_hidden_states.shape[0] == 1
+        ):
             thinker_hidden_states = thinker_hidden_states.squeeze(0)
 
         # Build full token sequence and extract TTS region
@@ -771,6 +772,8 @@ def llm2tts(
         if tts_bos_id is None and not is_native_duplex_handoff:
             tts_bos_id = 151703
             tts_end_ids = set(tts_end_ids) | {151704, 151645}
+        if thinker_hidden_states is None and not is_native_duplex_handoff:
+            raise ValueError("No latent or hidden_states found in thinker output")
 
         tts_bos_idx = None
         # For native duplex the resumable prompt folds every earlier unit, so
@@ -797,8 +800,12 @@ def llm2tts(
 
         tts_token_ids_slice = tts_hidden_slice = None
         native_segment_end = False
-        if tts_bos_idx is not None and thinker_hidden_states.shape[0] > tts_bos_idx:
-            end_idx = tts_eos_idx if tts_eos_idx is not None else thinker_hidden_states.shape[0]
+        if tts_bos_idx is not None and (thinker_hidden_states is None or thinker_hidden_states.shape[0] > tts_bos_idx):
+            end_idx = (
+                tts_eos_idx
+                if tts_eos_idx is not None
+                else (thinker_hidden_states.shape[0] if thinker_hidden_states is not None else len(full_token_ids))
+            )
             if is_native_duplex_handoff and tts_eos_idx is not None:
                 boundary_token = full_token_ids[tts_eos_idx]
                 native_segment_end = boundary_token in {
@@ -806,7 +813,8 @@ def llm2tts(
                     special_token_ids.get("chunk_tts_eos_token_id"),
                 }
             tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
-            tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+            if thinker_hidden_states is not None:
+                tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
             # Official MiniCPM-o duplex does not prefill an assistant
             # <|tts_bos|> boundary before generation. A segment delta can
@@ -846,14 +854,17 @@ def llm2tts(
                 # segments), so prompt_len + delta over-counts them and
                 # front-aligned indexing truncates the slice. The hidden
                 # tensor's last len(out_ids) rows are the delta's rows.
-                hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids)
-                if hidden_base >= 0 and out_end > out_start:
+                hidden_base = (
+                    int(thinker_hidden_states.shape[0]) - len(out_ids) if thinker_hidden_states is not None else None
+                )
+                if out_end > out_start and (hidden_base is None or hidden_base >= 0):
                     tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
-                    tts_hidden_slice = (
-                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
-                        .to(torch.float32)
-                        .contiguous()
-                    )
+                    if thinker_hidden_states is not None:
+                        tts_hidden_slice = (
+                            thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
+                            .to(torch.float32)
+                            .contiguous()
+                        )
             elif j < len(out_ids) and out_ids[j] not in tts_end_ids:
                 # HF streaming_generate does not require an explicit <|speak|>
                 # marker. If a unit starts directly with text, the first token
@@ -874,15 +885,25 @@ def llm2tts(
                             special_token_ids.get("chunk_tts_eos_token_id"),
                         }
                         break
-                hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids)
-                if hidden_base >= 0 and out_end > out_start:
+                hidden_base = (
+                    int(thinker_hidden_states.shape[0]) - len(out_ids) if thinker_hidden_states is not None else None
+                )
+                if out_end > out_start and (hidden_base is None or hidden_base >= 0):
                     tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
-                    tts_hidden_slice = (
-                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
-                        .to(torch.float32)
-                        .contiguous()
-                    )
+                    if thinker_hidden_states is not None:
+                        tts_hidden_slice = (
+                            thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
+                            .to(torch.float32)
+                            .contiguous()
+                        )
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
+        if is_native_duplex_handoff and not handoff_ids:
+            # Listen/control/terminal outputs intentionally carry no Talker
+            # conditioning. They may also omit latent/hidden states entirely;
+            # skip them before treating missing hidden states as an error.
+            continue
+        if thinker_hidden_states is None:
+            raise ValueError("No latent or hidden_states found in thinker output")
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(
                 handoff_ids,
@@ -936,8 +957,6 @@ def llm2tts(
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
-            if not handoff_ids:
-                continue
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
         if native_turn_end_handoff:
             model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True

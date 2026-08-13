@@ -15,12 +15,13 @@ def _output(
     *,
     prompt_ids: list[int],
     output_ids: list[int],
-    latent: torch.Tensor,
+    latent: torch.Tensor | None = None,
     multimodal_output: dict | None = None,
     token_list: list[int] | None = None,
 ):
     mm_output = dict(multimodal_output or {})
-    mm_output["latent"] = latent
+    if latent is not None:
+        mm_output["latent"] = latent
     completion = SimpleNamespace(
         token_ids=output_ids if token_list is None else token_list,
         text="hello",
@@ -135,6 +136,68 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     assert info["meta"]["segment_end"] is True
     assert info["duplex"]["epoch"] == 3
     assert info["duplex"]["turn_id"] == 7
+
+
+@pytest.mark.parametrize(
+    "output_ids",
+    (
+        [],
+        [9303],
+        [9303, 9303],
+        [9308],
+        [9303, 9308],
+    ),
+)
+def test_native_duplex_no_speech_without_hidden_states_is_skipped(output_ids: list[int]) -> None:
+    source = _output(
+        prompt_ids=[101],
+        output_ids=output_ids,
+        multimodal_output={
+            "duplex_prompt_token_ids": [101],
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308,
+                "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+
+    assert (
+        llm2tts(
+            [source],
+            prompt=[{}],
+        )
+        == []
+    )
+
+
+def test_native_duplex_speech_without_hidden_states_still_raises() -> None:
+    source = _output(
+        prompt_ids=[101],
+        output_ids=[9304, 21, 9308],
+        multimodal_output={
+            "duplex_prompt_token_ids": [101],
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308,
+                "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="No latent or hidden_states"):
+        llm2tts(
+            [source],
+            prompt=[{}],
+        )
 
 
 def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
