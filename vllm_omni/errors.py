@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Request-scoped client error types shared across vLLM-Omni entrypoints."""
+"""Request-scoped error types shared across vLLM-Omni components."""
 
 from __future__ import annotations
 
@@ -10,6 +10,14 @@ from http import HTTPStatus
 from typing import NoReturn
 
 DEFAULT_CLIENT_ERROR_TYPE = "BadRequestError"
+
+
+class StageInputProcessingError(RuntimeError):
+    """A stage bridge rejected data belonging to one request.
+
+    The orchestrator converts this error into a request-scoped ``ErrorMessage``
+    while allowing unexpected processor exceptions to remain engine-fatal.
+    """
 
 
 class OmniClientError(ValueError):

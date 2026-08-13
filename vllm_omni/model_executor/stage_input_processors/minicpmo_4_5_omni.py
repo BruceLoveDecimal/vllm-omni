@@ -10,6 +10,7 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.errors import StageInputProcessingError
 from vllm_omni.experimental.fullduplex.engine.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
@@ -751,7 +752,7 @@ def llm2tts(
         if latent is None:
             latent = output.hidden_states if hasattr(output, "hidden_states") else None
             if latent is None:
-                raise ValueError("No latent or hidden_states found in thinker output")
+                raise StageInputProcessingError("No latent or hidden_states found in thinker output")
 
         thinker_hidden_states = latent.detach()
         if thinker_hidden_states.ndim == 3 and thinker_hidden_states.shape[0] == 1:

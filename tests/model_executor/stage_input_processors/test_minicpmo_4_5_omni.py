@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.errors import StageInputProcessingError
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
     llm2tts,
@@ -15,12 +16,13 @@ def _output(
     *,
     prompt_ids: list[int],
     output_ids: list[int],
-    latent: torch.Tensor,
+    latent: torch.Tensor | None = None,
     multimodal_output: dict | None = None,
     token_list: list[int] | None = None,
 ):
     mm_output = dict(multimodal_output or {})
-    mm_output["latent"] = latent
+    if latent is not None:
+        mm_output["latent"] = latent
     completion = SimpleNamespace(
         token_ids=output_ids if token_list is None else token_list,
         text="hello",
@@ -135,6 +137,44 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     assert info["meta"]["segment_end"] is True
     assert info["duplex"]["epoch"] == 3
     assert info["duplex"]["turn_id"] == 7
+
+
+def test_non_duplex_output_without_hidden_states_raises_stage_input_error() -> None:
+    source = _output(
+        prompt_ids=[101],
+        output_ids=[21],
+    )
+
+    with pytest.raises(StageInputProcessingError, match="No latent or hidden_states"):
+        llm2tts(
+            [source],
+            prompt=[{}],
+        )
+
+
+def test_native_duplex_speech_without_hidden_states_raises_stage_input_error() -> None:
+    source = _output(
+        prompt_ids=[101],
+        output_ids=[9304, 21, 9308],
+        multimodal_output={
+            "duplex_prompt_token_ids": [101],
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308,
+                "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+
+    with pytest.raises(StageInputProcessingError, match="No latent or hidden_states"):
+        llm2tts(
+            [source],
+            prompt=[{}],
+        )
 
 
 def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
