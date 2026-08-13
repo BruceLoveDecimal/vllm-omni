@@ -51,18 +51,6 @@ def test_replace_hf_config_prefers_vllm_helper_and_sets_text_config():
     assert replaced.model_config.hf_text_config == "talker-qwen2"
 
 
-def test_replace_hf_config_shallow_fallback_sets_model_config():
-    vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config="root", hf_text_config="root-text"))
-
-    replaced = _replace_hf_config(vllm_config, "talker-qwen2")
-
-    assert replaced is not vllm_config
-    assert replaced.model_config is not vllm_config.model_config
-    assert replaced.model_config.hf_config == "talker-qwen2"
-    assert replaced.model_config.hf_text_config == "talker-qwen2"
-    assert vllm_config.model_config.hf_config == "root"
-
-
 def test_strip_model_prefix_only_strips_backbone_weights():
     weights = [
         ("model.layers.0.weight", torch.empty(1)),
@@ -301,33 +289,6 @@ def test_resolve_voice_injects_preset_only_when_slots_were_reserved():
     assert with_slots.already_projected is True
 
 
-@pytest.mark.parametrize(
-    ("info", "message"),
-    [
-        (
-            {"native_talker_prompt_wav_len": 3},
-            "reserved 3 prompt-wav slots but the registered preset has 4",
-        ),
-        (
-            {"native_talker_prompt_wav_len": 4, "native_talker_spk_emb_count": 2},
-            "reserved 2 speaker-embedding slots but the registered preset has 1",
-        ),
-    ],
-)
-def test_resolve_voice_fails_fast_on_reserved_slot_mismatch(info, message):
-    talker = MingFlashOmniTalkerForConditionalGeneration.__new__(MingFlashOmniTalkerForConditionalGeneration)
-    talker.voice_presets = {
-        "DB30": {
-            "prompt_wav_lat": torch.ones(1, 2, 3),
-            "prompt_wav_emb": torch.ones(1, 4, 5),
-            "spk_emb": [torch.ones(1, 6)],
-        }
-    }
-
-    with pytest.raises(ValueError, match=message):
-        talker._resolve_voice({"voice_name": "DB30", **info})
-
-
 def test_audio_finalize_delays_stop_until_next_scheduler_step():
     talker = MingFlashOmniTalkerForConditionalGeneration.__new__(MingFlashOmniTalkerForConditionalGeneration)
     talker.hidden_size = 4
@@ -337,7 +298,6 @@ def test_audio_finalize_delays_stop_until_next_scheduler_step():
     talker._pending_prefill_done_updates = {}
     talker._results_queue = []
     talker._audio_queue = []
-    talker._deferred_cleanup_ids = set()
 
     state = talker.state_manager.create("req-a", his_lat=torch.zeros(1, 2, 3), seed=11)
 

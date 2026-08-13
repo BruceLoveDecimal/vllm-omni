@@ -18,12 +18,12 @@ from vllm.logger import init_logger
 
 from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
 from vllm_omni.model_executor.models.common.ming.spk_embedding import SpkembExtractor
+from vllm_omni.transformers_utils.configs.ming_flash_omni import resolve_ming_talker_config
 
 from .talker_module import (
     ming_prompt_wav_len,
     resample,
     resolve_audio_vae_config,
-    resolve_ming_talker_config,
 )
 
 if TYPE_CHECKING:
@@ -94,8 +94,7 @@ def _resolve_prompt_wav_geometry(talker_dir: str, model_path: str) -> tuple[int,
     Uses the talker's own config resolvers so both processes read the same
     files; no weights are loaded. The talker prefers an in-memory talker config
     when the root config wraps one, which this cannot see — a divergence there
-    is caught by ``_verify_derived_meta`` at init and by the slot check in
-    ``_resolve_voice`` per request.
+    is caught by ``_verify_derived_meta`` at init.
     """
     talker_config = resolve_ming_talker_config(None, talker_dir, model_path)
     if talker_config is None:

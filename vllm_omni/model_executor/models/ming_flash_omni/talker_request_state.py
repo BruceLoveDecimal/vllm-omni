@@ -97,9 +97,6 @@ class MingTalkerStateManager:
         """Drop state when the request finishes (free his_lat / latents)."""
         self._states.pop(req_id, None)
 
-    def active_request_ids(self) -> list[str]:
-        return list(self._states)
-
     def __contains__(self, req_id: str) -> bool:
         return req_id in self._states
 

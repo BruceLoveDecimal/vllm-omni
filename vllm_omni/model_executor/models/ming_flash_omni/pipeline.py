@@ -59,6 +59,10 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             tokenizer_subdir="talker/llm",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
+            # The native-paged talker signals EOS via stop-token id 1
+            # (see compute_logits); declare it here so deploy configs
+            # cannot silently drop it.
+            sampling_constraints={"stop_token_ids": [1]},
         ),
     ),
 )
@@ -81,6 +85,10 @@ MING_FLASH_OMNI_TTS_PIPELINE = PipelineConfig(
             hf_config_name="talker_config",
             engine_output_type="audio",
             tokenizer_subdir="talker/llm",
+            # The native-paged talker signals EOS via stop-token id 1
+            # (see compute_logits); declare it here so deploy configs
+            # cannot silently drop it.
+            sampling_constraints={"stop_token_ids": [1]},
         ),
     ),
 )
