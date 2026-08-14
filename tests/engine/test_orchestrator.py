@@ -2406,7 +2406,11 @@ async def test_request_cleanup_failure_is_deferred_to_control_plane():
             self.finalized: list[str] = []
 
         def close_sessions_for_request_ids(self, request_ids: list[str], **kwargs):
-            assert kwargs == {"abort": True, "cleanup_in_progress": True}
+            assert kwargs == {
+                "abort": True,
+                "cleanup_in_progress": True,
+                "reason": "request_cleanup",
+            }
             return {"sid-cleanup": ["req-a"]}
 
         def defer_request_cleanups(self, session_ids: list[str]) -> None:
@@ -2434,3 +2438,66 @@ async def test_request_cleanup_failure_is_deferred_to_control_plane():
 
     assert orchestrator.duplex_control_plane.deferred == ["sid-cleanup"]
     assert orchestrator.duplex_control_plane.finalized == []
+
+
+@pytest.mark.asyncio
+async def test_session_close_reports_requests_the_caller_never_failed():
+    """Closing a duplex session drags in the session's other requests. The
+    caller only reported the one request it was failing, so the rest would be
+    aborted without their consumers ever being told (they would block until
+    their own timeout). They are reported here instead."""
+
+    class _Pool:
+        async def abort_requests(self, request_ids: list[str]) -> None:
+            pass
+
+        def release_bindings(self, request_ids: list[str]) -> None:
+            pass
+
+    class _Plane:
+        def __init__(self) -> None:
+            self.reasons: list[str] = []
+            self.finalized: list[str] = []
+
+        def close_sessions_for_request_ids(self, request_ids: list[str], **kwargs):
+            self.reasons.append(kwargs["reason"])
+            # The session holds the failing request plus two siblings.
+            return {"sid-1": ["req-failed", "req-sibling-a", "req-sibling-b"]}
+
+        def defer_request_cleanups(self, session_ids: list[str]) -> None:
+            pass
+
+        def finalize_closed_sessions(self, session_ids: list[str]) -> None:
+            self.finalized.extend(session_ids)
+
+    from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [_Pool()]
+    orchestrator.duplex_control_plane = _Plane()
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator._pd_kv_params = {}
+    orchestrator.request_states = {}
+    orchestrator._running_counter = None
+    orchestrator._cfg_tracker = CfgCompanionTracker()
+
+    await orchestrator._cleanup_request_ids(
+        ["req-failed"],
+        abort=True,
+        close_duplex_sessions=True,
+        session_close_reason="stage-1 rejected the handoff",
+    )
+
+    errors = []
+    while not orchestrator.output_async_queue.empty():
+        errors.append(orchestrator.output_async_queue.get_nowait())
+
+    # Exactly the two siblings, never the request the caller already failed.
+    assert [error.request_id for error in errors] == ["req-sibling-a", "req-sibling-b"]
+    assert all(isinstance(error, ErrorMessage) and not error.fatal for error in errors)
+    assert all("sid-1" in error.error for error in errors)
+    assert all("stage-1 rejected the handoff" in error.error for error in errors)
+    # The reason reaches the control plane too, so the session's own lifecycle
+    # event carries it rather than a generic "request_cleanup".
+    assert orchestrator.duplex_control_plane.reasons == ["stage-1 rejected the handoff"]
+    assert orchestrator.duplex_control_plane.finalized == ["sid-1"]

@@ -1055,6 +1055,7 @@ class Orchestrator:
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
             close_duplex_sessions=True,
+            session_close_reason=f"stage-{stage_id} failed request {parent_id}",
         )
 
     async def _handle_dead_replica(self, stage_id: int, replica_id: int, error: EngineDeadError) -> None:
@@ -1202,6 +1203,7 @@ class Orchestrator:
         *,
         abort: bool = False,
         close_duplex_sessions: bool = False,
+        session_close_reason: str = "request_cleanup",
     ) -> None:
         """Release pool bindings and logical request state for the given ids.
 
@@ -1211,6 +1213,14 @@ class Orchestrator:
         can never complete). Every teardown path (stage error, abort, replica
         loss, membership unregister) funnels through here, so tracker state
         cannot outlive its requests.
+
+        Closing a duplex session drags in every other request that session still
+        holds. Those requests were never told anything by the caller — it only
+        knows about the failure it is cleaning up — so they are reported here.
+        The notification is derived (ids the session pulled in, minus the ids
+        already in the batch) rather than passed in, so a caller cannot forget
+        it and leave those requests hanging until their own timeout.
+        ``session_close_reason`` only sharpens the message.
         """
         if not request_ids:
             return
@@ -1240,10 +1250,16 @@ class Orchestrator:
                     cleanup_ids.append(cid)
         closing_session_ids: list[str] = []
         if close_duplex_sessions and self.duplex_control_plane is not None:
+            # Ids the caller is already accounting for: the request it failed,
+            # its CFG relatives (never client-visible on their own), and any
+            # orphaned parent reported above. Only what the session close adds
+            # on top of this needs a report of its own.
+            reported_ids = set(cleanup_ids)
             closed_sessions = self.duplex_control_plane.close_sessions_for_request_ids(
                 cleanup_ids,
                 abort=abort,
                 cleanup_in_progress=True,
+                reason=session_close_reason,
             )
             closing_session_ids.extend(closed_sessions)
             for session_id, stale_request_ids in closed_sessions.items():
@@ -1252,6 +1268,16 @@ class Orchestrator:
                     session_id,
                     stale_request_ids,
                 )
+                for stale_id in stale_request_ids:
+                    if stale_id in reported_ids:
+                        continue
+                    reported_ids.add(stale_id)
+                    await self.output_async_queue.put(
+                        ErrorMessage(
+                            request_id=stale_id,
+                            error=f"Duplex session {session_id} was closed ({session_close_reason})",
+                        )
+                    )
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
 
@@ -2165,6 +2191,7 @@ class Orchestrator:
                 [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
                 abort=True,
                 close_duplex_sessions=True,
+                session_close_reason=f"{bridge} input processing failed for request {req_id}",
             )
             return
         finally:

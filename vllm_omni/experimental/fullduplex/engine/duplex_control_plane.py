@@ -83,6 +83,7 @@ class _PendingRequestCleanup:
     lease_generation: int
     request_ids: tuple[str, ...]
     abort: bool
+    reason: str = "request_cleanup"
 
 
 class DuplexResultSink(Protocol):
@@ -747,18 +748,15 @@ class DuplexControlPlane:
                     await self._stage_port.cleanup(list(item.submitted_request_ids), abort=True)
                 if item.reserved_request_ids:
                     await self._stage_port.cleanup(list(item.reserved_request_ids))
-                if self._lifecycle_sink is not None:
-                    await self._lifecycle_sink.put(
-                        DuplexSessionLifecycleMessage(
-                            fence=item.fence,
-                            session_id=item.session_id,
-                            event="expired",
-                            reason=item.reason,
-                            lease_generation=item.lease_generation,
-                            submitted_request_ids=list(item.submitted_request_ids),
-                            reserved_request_ids=list(item.reserved_request_ids),
-                        )
-                    )
+                await self._notify_session_terminated(
+                    session_id=item.session_id,
+                    fence=item.fence,
+                    event="expired",
+                    reason=item.reason,
+                    lease_generation=item.lease_generation,
+                    submitted_request_ids=item.submitted_request_ids,
+                    reserved_request_ids=item.reserved_request_ids,
+                )
             except Exception as exc:
                 logger.warning(
                     "duplex expiry cleanup remains pending for session %s: %s",
@@ -794,6 +792,45 @@ class DuplexControlPlane:
 
             task.add_done_callback(discard)
         await asyncio.shield(task)
+
+    async def _notify_session_terminated(
+        self,
+        *,
+        session_id: str,
+        fence: DuplexFence,
+        event: str,
+        reason: str,
+        lease_generation: int,
+        submitted_request_ids: Iterable[str] = (),
+        reserved_request_ids: Iterable[str] = (),
+    ) -> None:
+        """Tell the frontend a session died without it having asked.
+
+        Only unsolicited teardown needs this. Expiry and request-cleanup are
+        decided by the engine, so a client that is not told simply waits on a
+        session that no longer exists. ``close`` and ``open_rollback`` are the
+        client's own control operations and are answered by their own result
+        (see ``put_result(operation="close")`` and the ``open_duplex_session``
+        failure path), so they deliberately do NOT route through here.
+
+        Callers must emit BEFORE finalizing the close: a sink failure then
+        leaves the cleanup pending and the next tick retries the whole step, so
+        a duplicate event is possible but a dropped one is not. The consumer
+        ignores events for sessions it has already torn down.
+        """
+        if self._lifecycle_sink is None:
+            return
+        await self._lifecycle_sink.put(
+            DuplexSessionLifecycleMessage(
+                fence=fence,
+                session_id=session_id,
+                event=event,
+                reason=reason,
+                lease_generation=lease_generation,
+                submitted_request_ids=list(submitted_request_ids),
+                reserved_request_ids=list(reserved_request_ids),
+            )
+        )
 
     async def _run_submission_cleanup(self, pending: _PendingSubmissionCleanup) -> None:
         await self._stage_port.cleanup(list(pending.request_ids), abort=True)
@@ -838,6 +875,19 @@ class DuplexControlPlane:
             and session.fence.incarnation == pending.fence.incarnation
             and session.lease.generation == pending.lease_generation
         ):
+            # Before finalize_close_session: it drops the session, so a sink
+            # failure after it would leave the retry unable to re-enter this
+            # branch and the frontend never learns the session is gone.
+            submitted = set(session.resource_request_ids(submitted=True))
+            await self._notify_session_terminated(
+                session_id=pending.session_id,
+                fence=pending.fence,
+                event="closed",
+                reason=pending.reason,
+                lease_generation=pending.lease_generation,
+                submitted_request_ids=[rid for rid in pending.request_ids if rid in submitted],
+                reserved_request_ids=[rid for rid in pending.request_ids if rid not in submitted],
+            )
             self.sessions.finalize_close_session(session)
         if self._pending_request_cleanups.get(key) is pending:
             self._pending_request_cleanups.pop(key, None)
@@ -1008,8 +1058,9 @@ class DuplexControlPlane:
         *,
         abort: bool = False,
         cleanup_in_progress: bool = False,
+        reason: str = "request_cleanup",
     ) -> dict[str, list[str]]:
-        closed = self._sessions.close_sessions_for_request_ids(request_ids)
+        closed = self._sessions.close_sessions_for_request_ids(request_ids, reason=reason)
         for session_id, stale_request_ids in closed.items():
             session = self._sessions.get(session_id)
             if session is None:
@@ -1030,6 +1081,10 @@ class DuplexControlPlane:
                 lease_generation=session.lease.generation,
                 request_ids=merged_request_ids,
                 abort=abort or (existing.abort if existing is not None else False),
+                # mark_terminal keeps the first reason, so a session already
+                # closing keeps the reason it actually died of rather than the
+                # one this (no-op) close would have given it.
+                reason=session.lease.terminal_reason or reason,
             )
             if cleanup_in_progress:
                 self._request_cleanups_in_progress.add(key)

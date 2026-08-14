@@ -656,6 +656,109 @@ async def test_failed_request_cleanup_retries_before_releasing_admission() -> No
 
 
 @pytest.mark.asyncio
+async def test_request_cleanup_close_publishes_lifecycle_with_its_reason() -> None:
+    """A session closed because one of its requests failed is torn down by the
+    engine, not by the client. Without a lifecycle event the frontend keeps a
+    session that no longer exists, so the close must be published like an
+    expiry — carrying the reason the caller gave."""
+    stage_port = _TypedStagePort()
+    result_sink: asyncio.Queue = asyncio.Queue()
+    lifecycle_sink: asyncio.Queue = asyncio.Queue()
+    plane = DuplexControlPlane(
+        extension=None,
+        stage_port=stage_port,
+        result_sink=result_sink,
+        lifecycle_sink=lifecycle_sink,
+    )
+    fence = DuplexFence("sid-close-notify")
+    await plane.handle(
+        OpenDuplexSessionMessage(
+            control_id="open-close-notify",
+            fence=fence,
+            session_id=fence.session_id,
+            capabilities={},
+        )
+    )
+    assert (await result_sink.get()).ok is True
+    session = plane.sessions.require(fence.session_id)
+    session.bind_stage_request(0, "req-failed", fence=fence)
+    session.bind_stage_request(1, "req-sibling", fence=fence)
+
+    closed = plane.close_sessions_for_request_ids(
+        ["req-failed"],
+        abort=True,
+        reason="stage-0->stage-1 input processing failed for request req-failed",
+    )
+    assert set(closed[fence.session_id]) == {"req-failed", "req-sibling"}
+
+    assert await plane.reap_expired() == 1
+    assert plane.sessions.get(fence.session_id) is None
+
+    lifecycle = await lifecycle_sink.get()
+    assert isinstance(lifecycle, DuplexSessionLifecycleMessage)
+    assert lifecycle.session_id == fence.session_id
+    assert lifecycle.event == "closed"
+    assert lifecycle.reason == "stage-0->stage-1 input processing failed for request req-failed"
+    # Every request the close dragged in is named, not just the failing one.
+    assert set(lifecycle.submitted_request_ids) == {"req-failed", "req-sibling"}
+    assert lifecycle_sink.empty()
+
+
+@pytest.mark.asyncio
+async def test_request_cleanup_lifecycle_is_at_least_once() -> None:
+    """The event is published BEFORE the session is finalized: finalizing drops
+    the session, and the retry can only re-enter that branch while it is still
+    there. A sink that fails must therefore cost a duplicate event (harmless —
+    the consumer ignores events for sessions it already tore down), never a
+    dropped one."""
+
+    class _FailOnceQueue(asyncio.Queue):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failures_remaining = 1
+
+        async def put(self, item: object) -> None:
+            if self.failures_remaining:
+                self.failures_remaining -= 1
+                raise RuntimeError("transient lifecycle sink failure")
+            await super().put(item)
+
+    stage_port = _TypedStagePort()
+    result_sink: asyncio.Queue = asyncio.Queue()
+    lifecycle_sink = _FailOnceQueue()
+    plane = DuplexControlPlane(
+        extension=None,
+        stage_port=stage_port,
+        result_sink=result_sink,
+        lifecycle_sink=lifecycle_sink,
+    )
+    fence = DuplexFence("sid-close-retry")
+    await plane.handle(
+        OpenDuplexSessionMessage(
+            control_id="open-close-retry",
+            fence=fence,
+            session_id=fence.session_id,
+            capabilities={},
+        )
+    )
+    assert (await result_sink.get()).ok is True
+    plane.sessions.require(fence.session_id).bind_stage_request(0, "req-retry", fence=fence)
+
+    plane.close_sessions_for_request_ids(["req-retry"], abort=True, reason="handoff_rejected")
+
+    # First tick: the sink raises, so the session stays and the cleanup is retried.
+    assert await plane.reap_expired() == 0
+    assert plane.sessions.get(fence.session_id) is not None
+    assert lifecycle_sink.empty()
+
+    assert await plane.reap_expired() == 1
+    assert plane.sessions.get(fence.session_id) is None
+    lifecycle = await lifecycle_sink.get()
+    assert lifecycle.session_id == fence.session_id
+    assert lifecycle.reason == "handoff_rejected"
+
+
+@pytest.mark.asyncio
 async def test_stale_request_cleanup_does_not_finalize_reopened_incarnation() -> None:
     stage_port = _TypedStagePort()
     result_sink: asyncio.Queue = asyncio.Queue()

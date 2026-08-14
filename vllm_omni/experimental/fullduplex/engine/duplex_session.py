@@ -498,14 +498,19 @@ class DuplexSessionRuntimeManager:
             )
         return expired
 
-    def close_sessions_for_request_ids(self, request_ids: list[str]) -> dict[str, list[str]]:
+    def close_sessions_for_request_ids(
+        self,
+        request_ids: list[str],
+        *,
+        reason: str = "request_cleanup",
+    ) -> dict[str, list[str]]:
         request_id_set = set(request_ids)
         closed: dict[str, list[str]] = {}
         for session_id, session in list(self._sessions.items()):
             stale = session.resource_request_ids()
             if request_id_set.isdisjoint(stale):
                 continue
-            if not session.begin_close(session.fence, reason="request_cleanup"):
+            if not session.begin_close(session.fence, reason=reason):
                 continue
             closed[session_id] = stale
         return closed

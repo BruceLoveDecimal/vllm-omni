@@ -182,7 +182,14 @@ class DuplexControlPlanePort(Protocol):
 
     async def shutdown(self) -> None: ...
 
-    def close_sessions_for_request_ids(self, request_ids: list[str]) -> dict[str, list[str]]: ...
+    def close_sessions_for_request_ids(
+        self,
+        request_ids: list[str],
+        *,
+        abort: bool = False,
+        cleanup_in_progress: bool = False,
+        reason: str = "request_cleanup",
+    ) -> dict[str, list[str]]: ...
 
     def finalize_closed_sessions(self, session_ids: Iterable[str]) -> None: ...
 
