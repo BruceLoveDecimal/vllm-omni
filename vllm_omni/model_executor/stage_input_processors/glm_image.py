@@ -11,6 +11,7 @@ import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
+from vllm_omni.errors import StageInputProcessingError
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
@@ -179,7 +180,7 @@ def _parse_generated_tokens(
                 actual_tokens,
                 large_image_tokens,
             )
-            raise ValueError(
+            raise StageInputProcessingError(
                 f"i2i token parse failed: actual_tokens={actual_tokens} < expected_large_tokens={large_image_tokens}"
             )
     elif actual_tokens >= small_image_tokens + large_image_tokens:
@@ -195,7 +196,9 @@ def _parse_generated_tokens(
             actual_tokens,
             small_image_tokens + large_image_tokens,
         )
-        raise ValueError("t2i token parse failed: missing small-preview tokens; refusing low-quality fallback")
+        raise StageInputProcessingError(
+            "t2i token parse failed: missing small-preview tokens; refusing low-quality fallback"
+        )
     else:
         logger.warning(
             "[_parse_generated_tokens] token parse failed: insufficient tokens "
@@ -204,7 +207,9 @@ def _parse_generated_tokens(
             large_image_tokens if is_i2i else (small_image_tokens + large_image_tokens),
             "i2i" if is_i2i else "t2i",
         )
-        raise ValueError(f"token parse failed: actual_tokens={actual_tokens}, mode={'i2i' if is_i2i else 't2i'}")
+        raise StageInputProcessingError(
+            f"token parse failed: actual_tokens={actual_tokens}, mode={'i2i' if is_i2i else 't2i'}"
+        )
 
     # Upsample from 32x to 16x
     prior_token_ids = _upsample_token_ids(prior_token_ids_d32, actual_h, actual_w)

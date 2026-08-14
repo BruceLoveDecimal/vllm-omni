@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.errors import StageInputProcessingError
 from vllm_omni.model_executor.stage_input_processors.glm_image import (
     _first_source_image,
     _has_source_image,
@@ -249,13 +250,15 @@ class TestParseGeneratedTokens:
         assert w == 1024
 
     def test_i2i_too_few_tokens_raises(self):
-        with pytest.raises(ValueError, match="i2i token parse failed"):
+        # Typed so the orchestrator reports the parser's own reason instead of
+        # dressing it up as an internal error.
+        with pytest.raises(StageInputProcessingError, match="i2i token parse failed"):
             _parse_generated_tokens([1, 2, 3], 1024, 1024, is_i2i=True)
 
     def test_t2i_too_few_tokens_raises(self):
         # Only large tokens, no small preview
         large_tokens = list(range(1024))
-        with pytest.raises(ValueError, match="t2i token parse failed"):
+        with pytest.raises(StageInputProcessingError, match="t2i token parse failed"):
             _parse_generated_tokens(large_tokens, 1024, 1024, is_i2i=False)
 
     def test_i2i_t2i_style_layout_fallback(self):

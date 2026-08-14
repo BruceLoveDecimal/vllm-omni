@@ -5,6 +5,7 @@ from typing import Any
 
 from vllm.inputs import TextPrompt
 
+from vllm_omni.errors import StageInputProcessingError
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 
@@ -75,7 +76,7 @@ def ar2dit(
 
         mm_output = getattr(completion_output, "multimodal_output", None)
         if not isinstance(mm_output, Mapping) or "latent" not in mm_output:
-            raise ValueError(
+            raise StageInputProcessingError(
                 "AR stage output missing latent multimodal output. "
                 f"request_id={getattr(ar_output, 'request_id', None)}, "
                 f"completion_has_mm={hasattr(completion_output, 'multimodal_output')}"
