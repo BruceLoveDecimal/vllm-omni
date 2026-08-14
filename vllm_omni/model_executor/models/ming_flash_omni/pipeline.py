@@ -6,8 +6,9 @@ Stage 0: Thinker — multimodal understanding + text generation.
 Stage 1: Talker  — scheduler-driven native-paged Qwen2 -> CFM -> AudioVAE.
 
 The thinker -> talker bridge passes the detokenized text rather than
-hidden states; the talker has a self-contained Qwen2 LLM that retokenizes
-the string itself.
+hidden states. The talker has a self-contained Qwen2 LLM, and the bridge
+builds its prompt token ids so the scheduler can allocate paged KV for the
+exact prompt the talker will embed.
 """
 
 from vllm_omni.config.stage_config import (

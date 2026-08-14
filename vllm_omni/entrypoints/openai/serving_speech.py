@@ -72,9 +72,7 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
 )
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
-    build_ming_talker_prompt_token_ids_for_info,
-    get_ming_talker_tokenizer,
-    stamp_ming_talker_voice_meta,
+    prepare_ming_talker_prompt,
 )
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import (
@@ -3084,17 +3082,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             additional_information["spk_emb"] = list(request.speaker_embedding)
         if request.seed is not None:
             additional_information["seed"] = int(request.seed)
-        stamp_ming_talker_voice_meta(additional_information, stage_client=self)
-        prompt_token_ids = [0]
-        native_prompt_ids = build_ming_talker_prompt_token_ids_for_info(
+        prompt_token_ids = prepare_ming_talker_prompt(
+            additional_information,
             text=request.input,
-            additional_info=additional_information,
-            tokenizer=get_ming_talker_tokenizer(self),
+            stage_client=self,
         )
-        if native_prompt_ids is not None:
-            prompt_token_ids = native_prompt_ids
-        else:
-            logger.warning("Ming talker exact prompt slots could not be built; using one dummy token")
         prompt = tokens_input(prompt_token_ids=prompt_token_ids)
         prompt["additional_information"] = additional_information
         return prompt

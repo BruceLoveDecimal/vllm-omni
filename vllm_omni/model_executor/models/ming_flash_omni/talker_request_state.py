@@ -38,6 +38,16 @@ class MingTalkerRequestState:
     prefill_done: bool = False
     finished: bool = False
 
+    # Voice-slot bookkeeping. The prompt reserves one placeholder token per
+    # speaker embedding and per reference-wav frame, and the model overwrites
+    # those positions during prefill. A chunked prefill sees them a span at a
+    # time, so the running counts live here and are checked against the
+    # reserved totals once the last prompt chunk lands.
+    spk_slots_filled: int = 0
+    wav_slots_filled: int = 0
+    reserved_spk_slots: int | None = None
+    reserved_wav_slots: int | None = None
+
     # Sampling knobs resolved once at prefill (cfg / sigma / temperature).
     cfg: float = 2.0
     sigma: float = 0.25

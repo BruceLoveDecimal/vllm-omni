@@ -21,6 +21,7 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 import os
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -34,6 +35,13 @@ from vllm_omni.model_executor.models.common.ming.dit import CondEmbedder, DiTBlo
 from vllm_omni.model_executor.models.common.ming.fm import apply_sway_sampling, integrate_cfm_steps
 
 logger = init_logger(__name__)
+
+# Placeholder tokens the talker prompt reserves for conditioning features that
+# have no token form: one per speaker embedding and one per reference-wav frame.
+# ``build_tts_prompt`` emits them and ``inject_prompt_slot_embeddings`` fills
+# them, so they are declared once here rather than spelled out on both sides.
+SPK_SLOT_TOKEN = "<|vision_pad|>"
+WAV_SLOT_TOKEN = "<audioPatch>"
 
 
 class DiT(nn.Module):
@@ -379,69 +387,24 @@ def _looks_like_music_prompt(text: str) -> bool:
     return all(tag in text for tag in _MUSIC_TAGS)
 
 
-def build_tts_input(
-    *,
-    tokenizer: PreTrainedTokenizerBase,
-    embed_tokens: torch.nn.Module,
-    device: torch.device,
-    dtype: torch.dtype,
-    text: str,
-    prompt: str,
-    spk_emb: list[torch.Tensor] | None = None,
-    instruction: str | None = None,
-    prompt_text: str | None = None,
-    prompt_wav_emb: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build (inputs_embeds, input_ids) for one TTS segment.
+@dataclass(frozen=True, slots=True)
+class MingTalkerPrompt:
+    """A built talker prefill prompt plus the voice slots it reserves.
 
-    Args:
-        tokenizer: HF tokenizer
-        embed_tokens: The LLM's input-embedding module
-        device: Device to place the returned tensors on.
-        dtype: dtype for the returned `inputs_embeds`.
-        text: Text to synthesize.
-        prompt: System-level instruction prompt prepended to the user turn.
-        spk_emb: Optional list of speaker embeddings already projected into
-            LLM hidden dim; each is injected at a `<|vision_start|>` slot.
-        instruction: Optional free-form instruction
-        prompt_text: Reference text for zero-shot voice cloning.
-        prompt_wav_emb: Reference-wav embeddings to inject.
+    ``token_ids`` is what the scheduler allocates paged-KV for; ``spk_slots``
+    and ``wav_slots`` say how many of those tokens are placeholders that the
+    model must overwrite with real conditioning features
+    (:func:`inject_prompt_slot_embeddings`). Returning the counts alongside the
+    ids keeps the reserving side and the injecting side reading one answer
+    instead of each re-deriving it from the request metadata.
     """
-    input_part = build_tts_prompt_token_ids(
-        tokenizer=tokenizer,
-        text=text,
-        prompt=prompt,
-        spk_emb_count=(len(spk_emb) if spk_emb is not None else 0),
-        instruction=instruction,
-        prompt_text=prompt_text,
-        prompt_wav_len=(int(prompt_wav_emb.size(1)) if prompt_wav_emb is not None else 0),
-    )
 
-    input_ids = torch.tensor(input_part, dtype=torch.long, device=device).unsqueeze(0)
-    inputs_embeds = embed_tokens(input_ids).to(device=device, dtype=dtype)
-
-    # inject speaker embeddings
-    if spk_emb is not None:
-        spk_token_id = tokenizer.encode("<|vision_start|>")
-        assert len(spk_token_id) == 1, "<|vision_start|> must tokenize to a single id"
-        spk_indices = torch.where(input_ids[0] == spk_token_id[0])[0]
-        assert len(spk_indices) > 0, "expected at least one <|vision_start|> slot"
-        for i, se in enumerate(spk_emb):
-            inputs_embeds[0, spk_indices[i] + 1] = se
-
-    # inject prompt-wav embeddings after <audio>
-    if prompt_wav_emb is not None and prompt_text is not None:
-        audio_token_id = tokenizer.encode("<audio>")
-        assert len(audio_token_id) == 1, "<audio> must tokenize to a single id"
-        audio_indices = torch.where(input_ids[0] == audio_token_id[0])[0]
-        assert len(audio_indices) > 0, "expected at least one <audio> slot"
-        start = audio_indices[0] + 1
-        inputs_embeds[0, start : start + prompt_wav_emb.size(1), :] = prompt_wav_emb[0]
-
-    return inputs_embeds, input_ids
+    token_ids: list[int]
+    spk_slots: int
+    wav_slots: int
 
 
-def build_tts_prompt_token_ids(
+def build_tts_prompt(
     *,
     tokenizer: PreTrainedTokenizerBase,
     text: str,
@@ -450,20 +413,22 @@ def build_tts_prompt_token_ids(
     instruction: str | None = None,
     prompt_text: str | None = None,
     prompt_wav_len: int = 0,
-) -> list[int]:
-    """Build token IDs for the Ming talker prefill prompt.
+) -> MingTalkerPrompt:
+    """Build the Ming talker prefill prompt without touching model weights.
 
-    This mirrors ``build_tts_input`` exactly, but does not require model
-    weights. Native vLLM scheduling needs the prompt length before model
-    ``preprocess()`` builds embeddings, so stage input processors use this
-    helper to allocate the correct number of paged-KV slots.
+    Native vLLM scheduling needs the prompt length before the model's
+    ``preprocess()`` runs, so stage input processors call this to allocate the
+    right number of paged-KV slots. Speaker embeddings and reference-wav frames
+    get one placeholder token each (``<|vision_pad|>`` / ``<audioPatch>``); the
+    model fills those positions in later.
     """
+    spk_emb_count = max(0, int(spk_emb_count))
     spk_emb_prompt: list[int] = []
-    for i in range(max(0, int(spk_emb_count))):
+    for i in range(spk_emb_count):
         spk_emb_prompt.extend(
             tokenizer.encode(f"  speaker_{i + 1}:")
             + tokenizer.encode("<|vision_start|>")
-            + tokenizer.encode("<|vision_pad|>")
+            + tokenizer.encode(SPK_SLOT_TOKEN)
             + tokenizer.encode("<|vision_end|>\n")
         )
 
@@ -473,13 +438,17 @@ def build_tts_prompt_token_ids(
 
     prompt_text_token: list[int] = []
     prompt_latent_token: list[int] = []
+    wav_slots = 0
     if prompt_wav_len > 0 and prompt_text is not None:
+        # Reference audio only conditions the talker when it is paired with its
+        # transcript, so both are emitted together or not at all.
+        wav_slots = int(prompt_wav_len)
         prompt_text_token = tokenizer.encode(prompt_text)
-        prompt_latent_token = tokenizer.encode("<audioPatch>") * int(prompt_wav_len)
+        prompt_latent_token = tokenizer.encode(WAV_SLOT_TOKEN) * wav_slots
 
     prompt2 = [] if _looks_like_music_prompt(text) else tokenizer.encode(" Text input:\n")
 
-    return (
+    token_ids = (
         tokenizer.encode("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n")
         + tokenizer.encode("<|im_start|>user\n")
         + tokenizer.encode(prompt)
@@ -493,6 +462,82 @@ def build_tts_prompt_token_ids(
         + tokenizer.encode("<audio>")
         + prompt_latent_token
     )
+    return MingTalkerPrompt(token_ids=token_ids, spk_slots=spk_emb_count, wav_slots=wav_slots)
+
+
+def resolve_slot_token_id(tokenizer: PreTrainedTokenizerBase, token: str) -> int:
+    """Return the single id ``token`` encodes to, or raise."""
+    encoded = tokenizer.encode(token)
+    if len(encoded) != 1:
+        raise ValueError(
+            f"Ming talker slot marker {token!r} must tokenize to exactly one id, got {len(encoded)}. "
+            "The talker tokenizer does not match the checkpoint that built the prompt."
+        )
+    return int(encoded[0])
+
+
+def inject_prompt_slot_embeddings(
+    *,
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    spk_slot_token_id: int,
+    wav_slot_token_id: int,
+    spk_emb: list[torch.Tensor] | None = None,
+    prompt_wav_emb: torch.Tensor | None = None,
+    spk_slots_filled: int = 0,
+    wav_slots_filled: int = 0,
+) -> tuple[int, int]:
+    """Overwrite the reserved voice slots inside one scheduled prefill span.
+
+    ``build_tts_prompt`` reserves one placeholder token per speaker embedding
+    and per reference-wav frame. Those tokens carry no meaning of their own —
+    they exist so the scheduler can size paged KV — so the real conditioning
+    features are written over their embeddings here, the same way the thinker
+    substitutes vision features at ``<imagePatch>`` positions.
+
+    A span may cover only part of the prompt under chunked prefill, so the
+    caller threads the running per-request fill counts in and gets the updated
+    counts back. Returns ``(spk_slots_filled, wav_slots_filled)``.
+    """
+    flat = input_ids.reshape(-1)
+    spk_source = (
+        torch.cat([emb.reshape(1, -1) for emb in spk_emb], dim=0)
+        if spk_emb
+        else torch.empty(0, inputs_embeds.shape[-1], device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+    )
+    wav_source = (
+        prompt_wav_emb.reshape(-1, prompt_wav_emb.shape[-1])
+        if prompt_wav_emb is not None
+        else torch.empty(0, inputs_embeds.shape[-1], device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+    )
+    return (
+        _fill_prompt_slots(inputs_embeds, flat, spk_slot_token_id, spk_source, spk_slots_filled, "speaker-embedding"),
+        _fill_prompt_slots(inputs_embeds, flat, wav_slot_token_id, wav_source, wav_slots_filled, "reference-wav"),
+    )
+
+
+def _fill_prompt_slots(
+    inputs_embeds: torch.Tensor,
+    flat_input_ids: torch.Tensor,
+    slot_token_id: int,
+    source: torch.Tensor,
+    filled: int,
+    what: str,
+) -> int:
+    positions = (flat_input_ids == slot_token_id).nonzero(as_tuple=False).reshape(-1)
+    num_slots = int(positions.numel())
+    if num_slots == 0:
+        return filled
+
+    end = filled + num_slots
+    if end > int(source.shape[0]):
+        raise ValueError(
+            f"Ming talker {what} slots outnumber the available features: the prompt reserves "
+            f"at least {end} slot(s) but only {int(source.shape[0])} feature row(s) were resolved. "
+            "The prompt was built for a different voice than the one the talker resolved."
+        )
+    inputs_embeds[positions] = source[filled:end].to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+    return end
 
 
 def ming_prompt_wav_len(
