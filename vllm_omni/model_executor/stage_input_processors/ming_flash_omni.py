@@ -162,53 +162,81 @@ def _infer_spk_emb_count(spk_emb: Any, *, use_zero_spk_emb: bool) -> int:
     return 1
 
 
-def _first_tts_segment(text: str, max_text_length: int) -> str:
-    segments = segment_and_normalize(text, max_length=max_text_length)
-    return segments[0] if segments else text
-
-
-def build_ming_talker_prompt_token_ids_for_info(
+def prepare_ming_talker_prompt(
+    request_info: dict[str, Any],
     *,
     text: str,
-    additional_info: dict[str, Any],
-    tokenizer: Any | None,
-) -> list[int] | None:
-    """Build exact Ming talker prompt slots from request metadata.
+    stage_client: Any | None = None,
+    tokenizer: Any | None = None,
+) -> list[int]:
+    """Build a talker prompt and stamp what the talker needs to fill it in.
 
-    Returns ``None`` when no tokenizer is available.
+    Prompt construction lives here alone. The scheduler allocates paged KV for
+    exactly the token ids returned here, and the talker embeds those same ids
+    rather than re-deriving the prompt from the request metadata, so there is
+    one prompt geometry instead of two that have to agree.
+
+    Two things the ids alone do not carry are stamped onto ``request_info``:
+    the voice slots the prompt reserves, so the talker can verify it filled
+    exactly those, and the length of the segment actually built into the
+    prompt, so the decode duration cap covers the text being synthesized.
+
+    Mutates ``request_info`` in place and returns the prompt token ids.
     """
     if tokenizer is None:
-        return None
+        tokenizer = get_ming_talker_tokenizer(stage_client)
+    stamp_ming_talker_voice_meta(request_info, stage_client=stage_client)
 
-    # Shared with the talker's _resolve_generation_params so the slot count
-    # and the prefill embeddings can never drift apart.
-    _, prompt, instruction, use_zero_spk_emb = resolve_ming_prompt_fields(additional_info)
+    # Shared with the talker's _resolve_generation_params so both sides agree
+    # on which task's defaults apply.
+    _, prompt, instruction, use_zero_spk_emb = resolve_ming_prompt_fields(request_info)
 
-    max_text_length = int(additional_info.get("max_text_length", DEFAULT_MAX_TEXT_LENGTH))
-    segment = _first_tts_segment(str(text or ""), max_text_length)
-    from vllm_omni.model_executor.models.ming_flash_omni.talker_module import (
-        build_tts_prompt_token_ids,
-    )
+    max_text_length = int(request_info.get("max_text_length", DEFAULT_MAX_TEXT_LENGTH))
+    raw_text = str(text or "")
+    segments = segment_and_normalize(raw_text, max_length=max_text_length) if raw_text else []
+    segment = segments[0] if segments else raw_text
+    if len(segments) > 1:
+        # One engine request carries one prompt, so a request whose text spans
+        # several segments synthesizes only the first. Fanning the remaining
+        # segments out into their own requests is not wired up yet; say so
+        # rather than silently returning a truncated waveform.
+        logger.warning(
+            "Ming talker synthesizes only the first of %d text segments (%d of %d characters); "
+            "split the request or raise max_text_length to synthesize the rest",
+            len(segments),
+            len(segment),
+            len(raw_text),
+        )
+    request_info["native_talker_segment_len"] = len(segment)
+
+    if tokenizer is None:
+        logger.warning("Ming talker could not build exact prompt slots; falling back to one dummy token")
+        return [0]
+
+    from vllm_omni.model_executor.models.ming_flash_omni.talker_module import build_tts_prompt
 
     # Preset metadata (see stamp_ming_talker_voice_meta) overrides the request
     # fields so the slot count includes the preset's prompt_wav frames.
-    native_prompt_text = additional_info.get("native_talker_prompt_text")
-    prompt_text = native_prompt_text if native_prompt_text is not None else additional_info.get("prompt_text", None)
-    native_spk_count = additional_info.get("native_talker_spk_emb_count")
+    native_prompt_text = request_info.get("native_talker_prompt_text")
+    prompt_text = native_prompt_text if native_prompt_text is not None else request_info.get("prompt_text", None)
+    native_spk_count = request_info.get("native_talker_spk_emb_count")
     if native_spk_count is not None:
         spk_emb_count = max(0, int(native_spk_count))
     else:
-        spk_emb_count = _infer_spk_emb_count(additional_info.get("spk_emb", None), use_zero_spk_emb=use_zero_spk_emb)
+        spk_emb_count = _infer_spk_emb_count(request_info.get("spk_emb", None), use_zero_spk_emb=use_zero_spk_emb)
 
-    return build_tts_prompt_token_ids(
+    built = build_tts_prompt(
         tokenizer=tokenizer,
         text=segment,
         prompt=prompt,
         spk_emb_count=spk_emb_count,
         instruction=instruction,
         prompt_text=prompt_text,
-        prompt_wav_len=_infer_prompt_wav_len(additional_info),
+        prompt_wav_len=_infer_prompt_wav_len(request_info),
     )
+    request_info["native_talker_reserved_spk_slots"] = built.spk_slots
+    request_info["native_talker_reserved_wav_slots"] = built.wav_slots
+    return built.token_ids
 
 
 def stamp_ming_talker_voice_meta(request_info: dict[str, Any], *, stage_client: Any | None) -> None:
@@ -240,23 +268,6 @@ def stamp_ming_talker_voice_meta(request_info: dict[str, Any], *, stage_client: 
     request_info["native_talker_spk_emb_count"] = int(meta.get("spk_emb_count", 0))
     if request_info.get("prompt_text") is None and meta.get("prompt_text"):
         request_info["native_talker_prompt_text"] = meta["prompt_text"]
-
-
-def _resolve_ming_talker_prompt_token_ids(
-    *,
-    text: str,
-    additional_info: dict[str, Any],
-    stage_client: Any | None,
-) -> list[int]:
-    prompt_ids = build_ming_talker_prompt_token_ids_for_info(
-        text=text,
-        additional_info=additional_info,
-        tokenizer=get_ming_talker_tokenizer(stage_client),
-    )
-    if prompt_ids is None:
-        logger.warning("Ming talker could not build exact prompt slots; falling back to one dummy token")
-        return [0]
-    return prompt_ids
 
 
 def _check_single_quotes(s: str) -> bool:
@@ -715,10 +726,12 @@ def _build_talker_inputs(
             "max_text_length": additional_info.get("max_text_length", DEFAULT_MAX_TEXT_LENGTH),
         }
 
-        stamp_ming_talker_voice_meta(talker_info, stage_client=stage_client)
-        prompt_token_ids = _resolve_ming_talker_prompt_token_ids(
+        # Build the prompt from the dict that ships to the talker: sizing the
+        # prompt off any field the talker will not see is what lets the two
+        # sides drift.
+        prompt_token_ids = prepare_ming_talker_prompt(
+            talker_info,
             text=generated_text,
-            additional_info={**additional_info, **talker_info},
             stage_client=stage_client,
         )
         talker_inputs.append(
@@ -755,7 +768,7 @@ __all__ = [
     "expand_cfg_prompts",
     "thinker2imagegen",
     "thinker2talker_token_only",
-    "build_ming_talker_prompt_token_ids_for_info",
+    "prepare_ming_talker_prompt",
     "get_ming_talker_tokenizer",
     "stamp_ming_talker_voice_meta",
 ]

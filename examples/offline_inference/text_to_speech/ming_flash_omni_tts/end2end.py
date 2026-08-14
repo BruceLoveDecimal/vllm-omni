@@ -17,8 +17,8 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction,
 )
 from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
-    build_ming_talker_prompt_token_ids_for_info,
     get_ming_talker_tokenizer,
+    prepare_ming_talker_prompt,
 )
 
 MODEL_NAME = "Jonathan1909/Ming-flash-omni-2.0"
@@ -121,16 +121,18 @@ def main():
     if args.no_stream_decode:
         decode_args["stream_decode"] = False
     additional_information = {**messages, **decode_args}
-    tokenizer = get_ming_talker_tokenizer(getattr(omni, "engine", None))
+    engine = getattr(omni, "engine", None)
+    tokenizer = get_ming_talker_tokenizer(engine)
     if tokenizer is None:
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(args.model, subfolder="talker/llm", trust_remote_code=True)
-    prompt_token_ids = build_ming_talker_prompt_token_ids_for_info(
+    prompt_token_ids = prepare_ming_talker_prompt(
+        additional_information,
         text=messages["text"],
-        additional_info=additional_information,
+        stage_client=engine,
         tokenizer=tokenizer,
-    ) or [0]
+    )
 
     req = OmniTokensPrompt(
         prompt_token_ids=prompt_token_ids,

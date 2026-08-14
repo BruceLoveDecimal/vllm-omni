@@ -36,20 +36,22 @@ from vllm_omni.transformers_utils.configs.ming_flash_omni import (
     resolve_ming_talker_config,
 )
 
-from .prompt_utils import DEFAULT_MAX_TEXT_LENGTH, resolve_ming_prompt_fields
+from .prompt_utils import resolve_ming_prompt_fields
 from .talker_module import (
     CFM,
+    SPK_SLOT_TOKEN,
+    WAV_SLOT_TOKEN,
     Aggregator,
     DiT,
     MingAudioGenerator,
-    build_tts_input,
+    inject_prompt_slot_embeddings,
     resolve_audio_vae_config,
+    resolve_slot_token_id,
 )
 from .talker_request_state import (
     MingTalkerRequestState,
     MingTalkerStateManager,
 )
-from .text_processing import segment_and_normalize
 from .voice_presets import VoicePresetRegistry
 
 logger = init_logger(__name__)
@@ -57,10 +59,8 @@ logger = init_logger(__name__)
 
 @dataclass(slots=True)
 class _GenerationParams:
-    """Resolved sampling / decoding parameters for one forward call."""
+    """Resolved sampling / decoding parameters for one prefill row."""
 
-    prompt: str
-    instruction: str | None
     cfg: float
     sigma: float
     temperature: float
@@ -68,19 +68,28 @@ class _GenerationParams:
     max_steps: int
     seed: int | None
     use_zero_spk_emb: bool
-    max_text_length: int
     stream_decode: bool
+    # Length of the text this prompt synthesizes, used for Ming's duration cap.
+    # Stamped by the stage input processor, which segments the request text once
+    # while sizing prompt slots, so the cap covers exactly the synthesized span.
+    text_len: int
+    # Voice slots the prompt reserves, stamped alongside the token ids. ``None``
+    # when the prompt was built without them (hand-built token ids).
+    reserved_spk_slots: int | None
+    reserved_wav_slots: int | None
 
 
 @dataclass(slots=True)
 class _VoiceContext:
-    """Voice cloning inputs resolved from request info + presets."""
+    """Voice-cloning features resolved from request info + presets.
 
-    spk_emb: Any  # list[Tensor] | Tensor | list[float] | None
-    prompt_text: str | None
+    ``spk_emb`` is already projected into the LLM hidden dim, so both fields are
+    ready to be written straight into their reserved prompt slots.
+    """
+
+    spk_emb: list[torch.Tensor] | None
     prompt_wav_lat: torch.Tensor | None
     prompt_wav_emb: torch.Tensor | None
-    already_projected: bool
 
 
 class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin):
@@ -168,7 +177,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         )
         self._pending_requests: list[tuple[str, bool, int]] = []
         self._pending_state_creations: set[str] = set()
-        self._pending_prefill_done_updates: dict[str, bool] = {}
+        self._pending_state_snapshots: dict[str, tuple[bool, int, int]] = {}
         self._results_queue: list[tuple[str, torch.Tensor | None]] = []
         self._audio_queue: list[tuple[str, dict[str, Any] | None]] = []
 
@@ -415,19 +424,24 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         """Drop per-step scheduler-row tracking once the step outcome is settled."""
         self._pending_requests.clear()
         self._pending_state_creations.clear()
-        self._pending_prefill_done_updates.clear()
+        self._pending_state_snapshots.clear()
 
     def _abort_pending_preprocess_batch(self) -> None:
         """Roll back request state prepared for a model step that failed."""
-        for req_id, prefill_done in self._pending_prefill_done_updates.items():
+        for req_id, snapshot in self._pending_state_snapshots.items():
             if req_id in self.state_manager:
-                self.state_manager.get(req_id).prefill_done = prefill_done
+                state = self.state_manager.get(req_id)
+                state.prefill_done, state.spk_slots_filled, state.wav_slots_filled = snapshot
         for req_id in self._pending_state_creations:
             self.state_manager.evict(req_id)
         self._commit_pending_step()
 
-    def _record_pending_prefill_done_update(self, state: MingTalkerRequestState) -> None:
-        self._pending_prefill_done_updates.setdefault(state.req_id, bool(state.prefill_done))
+    def _record_pending_state_snapshot(self, state: MingTalkerRequestState) -> None:
+        """Remember the prefill bookkeeping a failed step would have to undo."""
+        self._pending_state_snapshots.setdefault(
+            state.req_id,
+            (bool(state.prefill_done), int(state.spk_slots_filled), int(state.wav_slots_filled)),
+        )
 
     def _validate_native_hidden_states(self, hidden_states: torch.Tensor) -> None:
         if not isinstance(hidden_states, torch.Tensor):
@@ -501,34 +515,29 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         try:
             if is_prefill:
                 params = self._resolve_generation_params(info_dict)
-                voice = self._resolve_voice(info_dict)
-                text, segments = self._resolve_prefill_segments(info_dict, params)
-                max_steps = self._native_prefill_max_steps(text, segments, params)
-                embeds = self._build_native_prefill_embeds(
-                    input_ids=input_ids,
-                    input_embeds=input_embeds,
-                    info_dict=info_dict,
-                    params=params,
-                    voice=voice,
-                    segments=segments,
-                )
+                voice = self._resolve_voice(info_dict, params)
                 if req_id in self.state_manager and num_computed_tokens > 0:
                     # Later chunk of a chunked prefill: keep the existing state.
                     state = self.state_manager.get(req_id)
-                    self._record_pending_prefill_done_update(state)
+                    self._record_pending_state_snapshot(state)
                 else:
                     # First prefill chunk (or a restarted request): start fresh.
+                    if num_computed_tokens > 0:
+                        raise RuntimeError(
+                            "Ming native talker prefill starts mid-prompt without request state: "
+                            f"request_id={req_id!r}, num_computed_tokens={num_computed_tokens}. "
+                            "The talker reserves prompt slots that it must fill itself, so the "
+                            "prompt tokens cannot be served from a shared prefix cache; run the "
+                            "talker stage with enable_prefix_caching=false."
+                        )
                     if req_id in self.state_manager:
                         self.state_manager.evict(req_id)
-                    state = self._prefill_request(
-                        req_id,
-                        embeds.reshape(1, span_len, -1),
-                        params,
-                        voice,
-                        max_steps=max_steps,
-                    )
+                    state = self._prefill_request(req_id, input_ids.device, params, voice)
                     self._pending_state_creations.add(req_id)
+                embeds = self._build_prefill_embeds(input_ids, state, voice)
                 state.prefill_done = is_final_prefill
+                if is_final_prefill:
+                    self._verify_voice_slots_filled(state)
             else:
                 try:
                     state = self.state_manager.get(req_id)
@@ -543,19 +552,16 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 if state.next_inputs_embed is not None:
                     embeds = state.next_inputs_embed.reshape(1, -1).to(device=input_ids.device, dtype=self.dtype)
                 else:
-                    embeds = self._coerce_scheduled_embeds(
-                        input_ids=input_ids,
-                        input_embeds=input_embeds,
-                        provided=None,
-                    )
+                    embeds = self.embed_input_ids(input_ids.reshape(-1).to(torch.long)).to(dtype=self.dtype)
         except Exception:
             self._abort_pending_preprocess_batch()
             raise
 
-        input_ids_out = input_ids.reshape(-1).clone()
-        input_ids_out[:] = 0
         self._pending_requests.append((req_id, (not is_prefill) or is_final_prefill, span_len))
-        return input_ids_out, embeds.reshape(span_len, -1), {}
+        # The scheduled ids pass through untouched: the backbone reads the
+        # embeddings, and leaving the runner's id buffer holding the real prompt
+        # is what lets a decode step re-derive an embedding from it.
+        return input_ids, embeds.reshape(span_len, -1), {}
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata=None) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
@@ -664,136 +670,86 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         self._pending_requests = [item for item in self._pending_requests if item[0] not in finished]
         self._pending_state_creations.difference_update(finished)
         for req_id in finished:
-            self._pending_prefill_done_updates.pop(req_id, None)
+            self._pending_state_snapshots.pop(req_id, None)
         self._results_queue = [item for item in self._results_queue if item[0] not in finished]
         self._audio_queue = [item for item in self._audio_queue if item[0] not in finished]
 
-    def _build_native_prefill_embeds(
+    def _build_prefill_embeds(
         self,
-        *,
         input_ids: torch.Tensor,
-        input_embeds: torch.Tensor | None,
-        info_dict: dict[str, Any],
-        params: _GenerationParams,
+        state: MingTalkerRequestState,
         voice: _VoiceContext,
-        segments: list[str],
     ) -> torch.Tensor:
-        provided = info_dict.get("prefill_embeds", info_dict.get("inputs_embeds"))
-        if isinstance(provided, torch.Tensor):
-            return self._coerce_scheduled_embeds(
-                input_ids=input_ids,
-                input_embeds=input_embeds,
-                provided=provided,
-                offset=int(info_dict.get("_omni_num_computed_tokens", 0) or 0),
-                prompt_len=int(info_dict.get("_omni_prompt_len", input_ids.reshape(-1).shape[0]) or 0),
-            )
+        """Embed one scheduled prompt span and fill its reserved voice slots.
 
-        if segments:
-            spk_emb = self._project_spk_emb(voice.spk_emb, voice.already_projected, params.use_zero_spk_emb)
-            built, _ = build_tts_input(
-                tokenizer=self.tokenizer,
-                embed_tokens=self._input_embedder(),
-                device=input_ids.device,
-                dtype=torch.bfloat16,
-                text=segments[0],
-                prompt=params.prompt,
-                spk_emb=spk_emb,
-                instruction=params.instruction,
-                prompt_text=voice.prompt_text,
-                prompt_wav_emb=voice.prompt_wav_emb,
-            )
-            return self._coerce_scheduled_embeds(
-                input_ids=input_ids,
-                input_embeds=input_embeds,
-                provided=built,
-                offset=int(info_dict.get("_omni_num_computed_tokens", 0) or 0),
-                prompt_len=int(info_dict.get("_omni_prompt_len", input_ids.reshape(-1).shape[0]) or 0),
-            )
-
-        return self._coerce_scheduled_embeds(input_ids=input_ids, input_embeds=input_embeds, provided=None)
-
-    def _coerce_scheduled_embeds(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        input_embeds: torch.Tensor | None,
-        provided: torch.Tensor | None,
-        offset: int = 0,
-        prompt_len: int | None = None,
-    ) -> torch.Tensor:
-        span_len = int(input_ids.reshape(-1).shape[0])
-        if provided is not None:
-            embeds = provided
-            if embeds.ndim == 3:
-                embeds = embeds.reshape(-1, embeds.shape[-1])
-            elif embeds.ndim != 2:
-                raise ValueError(f"prefill embeds must be 2D or 3D, got shape={tuple(embeds.shape)}")
-            embeds = embeds.to(device=input_ids.device, dtype=self.dtype)
-            if prompt_len is not None and prompt_len > 0 and embeds.shape[0] > prompt_len:
-                raise ValueError(
-                    "native Ming talker prompt slots are shorter than the generated TTS "
-                    f"prefill embeddings: prompt_len={prompt_len}, embed_len={embeds.shape[0]}. "
-                    "Build prompt_token_ids with build_tts_prompt_token_ids before scheduling."
-                )
-            if embeds.shape[0] > span_len:
-                start = max(0, min(int(offset), int(embeds.shape[0])))
-                embeds = embeds[start : start + span_len]
-        else:
-            embeds = self.embed_input_ids(input_ids.reshape(-1).to(torch.long)).to(dtype=self.dtype)
-
-        if embeds.shape[0] == span_len:
-            return embeds
-        if embeds.shape[0] > span_len:
-            return embeds[:span_len].contiguous()
-
-        pad_rows = span_len - int(embeds.shape[0])
-        if embeds.shape[0] > 0:
-            pad = embeds[-1:].expand(pad_rows, -1)
-        else:
-            pad = torch.zeros(pad_rows, self.hidden_size, device=input_ids.device, dtype=self.dtype)
-        return torch.cat([embeds, pad], dim=0).contiguous()
-
-    def _resolve_prefill_segments(self, info_dict: dict[str, Any], params: _GenerationParams) -> tuple[str, list[str]]:
-        """Segment a prefill row's text once, for both the embeds and the step cap.
-
-        Segmenting separately in each consumer would let the prefill length and
-        the duration cap drift apart on any change to the segmenter.
+        The scheduled token ids are the single source of truth for the prompt:
+        the stage input processor built them with ``build_tts_prompt`` and the
+        scheduler allocated paged KV for exactly those positions, so the model
+        embeds what it was handed instead of re-tokenizing the request. Only the
+        conditioning features that have no token form — speaker embeddings and
+        reference-wav frames — are written over their placeholder positions.
         """
-        text = str(info_dict.get("text", "") or "")
-        if not text:
-            return "", []
-        return text, segment_and_normalize(text, max_length=params.max_text_length)
+        flat_ids = input_ids.reshape(-1).to(torch.long)
+        embeds = self.embed_input_ids(flat_ids).to(dtype=self.dtype).clone()
+        spk_slot_id, wav_slot_id = self._voice_slot_token_ids
+        state.spk_slots_filled, state.wav_slots_filled = inject_prompt_slot_embeddings(
+            input_ids=flat_ids,
+            inputs_embeds=embeds,
+            spk_slot_token_id=spk_slot_id,
+            wav_slot_token_id=wav_slot_id,
+            spk_emb=voice.spk_emb,
+            prompt_wav_emb=voice.prompt_wav_emb,
+            spk_slots_filled=state.spk_slots_filled,
+            wav_slots_filled=state.wav_slots_filled,
+        )
+        return embeds
 
-    def _native_prefill_max_steps(self, text: str, segments: list[str], params: _GenerationParams) -> int:
-        """Apply Ming's duration cap to the native-paged request state."""
-        if not text:
-            return params.max_steps
+    def _verify_voice_slots_filled(self, state: MingTalkerRequestState) -> None:
+        """Check the finished prompt filled exactly the slots it reserved.
 
-        segment = segments[0] if segments else text
-        return int(self.audio_generator.duration_capped_steps(len(segment), params.max_steps))
+        ``inject_prompt_slot_embeddings`` already fails when a span holds more
+        placeholders than there are features. The opposite drift — features the
+        prompt never reserved a slot for — is silent otherwise, and would ship
+        audio in the wrong voice, so it is caught here once the last prompt
+        chunk lands. Requests whose prompt was built without the reserved-slot
+        stamps (hand-built token ids) skip the check.
+        """
+        for reserved, filled, what in (
+            (state.reserved_spk_slots, state.spk_slots_filled, "speaker-embedding"),
+            (state.reserved_wav_slots, state.wav_slots_filled, "reference-wav"),
+        ):
+            if reserved is not None and int(reserved) != int(filled):
+                raise RuntimeError(
+                    f"Ming native talker {what} slot mismatch for request {state.req_id!r}: "
+                    f"the prompt reserved {int(reserved)} slot(s) but {int(filled)} were filled. "
+                    "The prompt token ids and the resolved voice describe different requests."
+                )
 
     def _prefill_request(
         self,
         req_id: str,
-        inputs_embeds: torch.Tensor,
+        device: torch.device,
         params: _GenerationParams,
         voice: _VoiceContext,
-        *,
-        max_steps: int | None = None,
     ) -> MingTalkerRequestState:
         """Initialize per-request audio state at the prefill step.
 
         Builds his_lat (from prompt_wav_lat or zeros), seeds the RNG, resolves
         cfg/sigma/temperature/max_steps, registers state in the manager.
         """
-        device = inputs_embeds.device
-        dtype = inputs_embeds.dtype
-        his_lat = self.audio_generator._init_his_lat(voice.prompt_wav_lat, device, dtype)
+        his_lat = self.audio_generator._init_his_lat(voice.prompt_wav_lat, device, self.dtype)
+        # An empty prompt text carries no duration to cap against, so the
+        # request keeps its full decode budget.
+        max_steps = (
+            int(self.audio_generator.duration_capped_steps(params.text_len, params.max_steps))
+            if params.text_len > 0
+            else params.max_steps
+        )
         return self.state_manager.create(
             req_id,
             his_lat=his_lat,
             min_steps=params.min_steps,
-            max_steps=params.max_steps if max_steps is None else int(max_steps),
+            max_steps=max_steps,
             seed=params.seed,
             prefill_done=True,
             cfg=params.cfg,
@@ -801,6 +757,8 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             temperature=params.temperature,
             stream_decode=params.stream_decode,
             generator_device=device,
+            reserved_spk_slots=params.reserved_spk_slots,
+            reserved_wav_slots=params.reserved_wav_slots,
         )
 
     def _talker_audio_step(
@@ -868,11 +826,11 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         return {}
 
     def _resolve_generation_params(self, additional_info: dict[str, Any]) -> _GenerationParams:
-        # prompt/instruction/spk-emb fields are shared with the stage input
-        # processor (slot sizing); the sampling knobs below are talker-only.
+        # The prompt text itself is resolved by the stage input processor, which
+        # owns prompt construction; only the sampling knobs are talker-side.
         # "omni"    : thinker -> talker hand-off with hardcoded defaults
         # "instruct": standalone TTS with caller-supplied sampling knobs
-        is_omni, prompt, instruction, use_zero_spk_emb = resolve_ming_prompt_fields(additional_info)
+        is_omni, _prompt, _instruction, use_zero_spk_emb = resolve_ming_prompt_fields(additional_info)
 
         if is_omni:
             cfg = 2.0
@@ -887,9 +845,13 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             min_steps = int(additional_info.get("min_new_token", additional_info.get("min_steps", 10)))
             max_steps = int(additional_info.get("max_steps", additional_info.get("max_decode_steps", 200)))
 
+        # The processor stamps the length of the segment it actually built a
+        # prompt for; without the stamp fall back to the raw request text.
+        text_len = additional_info.get("native_talker_segment_len")
+        if text_len is None:
+            text_len = len(str(additional_info.get("text", "") or ""))
+
         return _GenerationParams(
-            prompt=prompt,
-            instruction=instruction,
             cfg=cfg,
             sigma=sigma,
             temperature=temperature,
@@ -902,47 +864,52 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                     additional_info.get("request_seed", additional_info.get("seed")),
                 )
             ),
-            max_text_length=int(additional_info.get("max_text_length", DEFAULT_MAX_TEXT_LENGTH)),
             stream_decode=bool(additional_info.get("stream_decode", True)),
+            text_len=int(text_len),
+            reserved_spk_slots=_optional_int(additional_info.get("native_talker_reserved_spk_slots")),
+            reserved_wav_slots=_optional_int(additional_info.get("native_talker_reserved_wav_slots")),
         )
 
-    def _resolve_voice(self, additional_info: dict[str, Any]) -> _VoiceContext:
+    def _resolve_voice(self, additional_info: dict[str, Any], params: _GenerationParams) -> _VoiceContext:
         spk_emb = additional_info.get("spk_emb", None)
-        prompt_text = additional_info.get("prompt_text", None)
         prompt_wav_lat = additional_info.get("prompt_wav_lat", None)
         prompt_wav_emb = additional_info.get("prompt_wav_emb", None)
         already_projected = False
 
         voice_name = additional_info.get("voice_name", None)
-        # Native-paged scheduling reserves prompt-KV slots before preprocess
-        # runs, so the prefill embeds must not exceed them. Inject the preset
-        # only when the input processor signalled that it sized the slots for
-        # one (non-native always injects); otherwise fall back to no preset.
-        native_slots_reserved = additional_info.get("native_talker_prompt_wav_len") is not None
+        # Use the preset only when the input processor resolved the same one
+        # while sizing the prompt; otherwise it reserved slots for a zero
+        # speaker embedding and no reference wav, and the talker must match.
         # Preset geometry is cross-checked against the processor-side derived
         # metadata once at load time (VoicePresetRegistry._verify_derived_meta),
-        # so the stamped slot counts are trusted here.
+        # and any residual disagreement with the prompt the processor actually
+        # built is caught per request by _verify_voice_slots_filled.
+        native_slots_reserved = additional_info.get("native_talker_prompt_wav_len") is not None
         if voice_name and spk_emb is None and voice_name in self.voice_presets and native_slots_reserved:
             preset = self.voice_presets.get(voice_name) or {}
             prompt_wav_lat = preset.get("prompt_wav_lat")
             prompt_wav_emb = preset.get("prompt_wav_emb")
             spk_emb = preset.get("spk_emb")
             already_projected = True
-            if prompt_text is None:
-                prompt_text = preset.get("prompt_text")
 
         return _VoiceContext(
-            spk_emb=spk_emb,
-            prompt_text=prompt_text,
+            spk_emb=self._project_spk_emb(spk_emb, already_projected, params.use_zero_spk_emb),
             prompt_wav_lat=prompt_wav_lat,
             prompt_wav_emb=prompt_wav_emb,
-            already_projected=already_projected,
         )
 
     def _input_embedder(self):
         if hasattr(self.model, "get_input_embeddings"):
             return self.model.get_input_embeddings()
         return self.model.embed_input_ids
+
+    @cached_property
+    def _voice_slot_token_ids(self) -> tuple[int, int]:
+        """Ids of the placeholder tokens the prompt reserves for voice features."""
+        return (
+            resolve_slot_token_id(self.tokenizer, SPK_SLOT_TOKEN),
+            resolve_slot_token_id(self.tokenizer, WAV_SLOT_TOKEN),
+        )
 
     def _project_spk_emb(
         self, spk_emb: Any, already_projected: bool, use_zero_spk_emb: bool
