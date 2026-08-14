@@ -107,6 +107,7 @@ _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
     "indextts2_5",
     "audex",
     "audex_tta",
+    "ming_flash_omni_tts",
 }
 # Audex contract: zero-codec / invalid generations arrive as empty terminal
 # payloads and must fail the request, never serialize as a successful empty
@@ -135,7 +136,6 @@ _HIGGS_V3_REF_CODE_CACHE_MAX_ENTRIES = 256
 _HIGGS_V3_REF_CODE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _QWEN3_TTS_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
-_TTS_MAX_NEW_TOKENS_MAX = 4096
 _MING_DEFAULT_PROMPT = MING_DEFAULT_PROMPT
 
 
@@ -3078,7 +3078,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "instruction": ming_create_instruction(caption_fields),
             "voice_name": request.voice or None,
             "use_zero_spk_emb": not has_spk_emb,
-            "max_decode_steps": request.max_new_tokens or _TTS_MAX_NEW_TOKENS_MAX,
             "cfg": 2.0,
             "sigma": 0.25,
             "temperature": 0.0,
@@ -3086,6 +3085,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if has_spk_emb:
             # Passed as plain float list
             additional_information["spk_emb"] = list(request.speaker_embedding)
+        if request.max_new_tokens is not None:
+            # Only stamp a caller-named budget here;
+            # _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES carries the same number to
+            # SamplingParams.max_tokens so the two agree. When the caller names
+            # none, the adapter fills it from the stage's own max_tokens.
+            additional_information["max_decode_steps"] = int(request.max_new_tokens)
         if request.seed is not None:
             additional_information["seed"] = int(request.seed)
         prompt_token_ids = prepare_ming_talker_prompt(
@@ -3339,22 +3344,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Ming emits TEXT_EOS after the latent decode budget is exhausted, so
                 # Stage-0 needs one extra token beyond ming_max_decode_steps.
                 sampling_params_list[0].max_tokens = int(request.max_new_tokens) + 1
-        elif self._tts_model_type == "ming_flash_omni_tts" and sampling_params_list:
-            # Ming talker: the paged Qwen2 backbone runs one AR step
-            # per audio frame, so Stage-0 max_tokens must cover the full decode
-            # budget (mirrored into ``max_decode_steps`` on the prompt) and stop
-            # on the talker EOS (token id 1).
-            import copy
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            max_tokens = request.max_new_tokens or getattr(sampling_params_list[0], "max_tokens", None)
-            max_tokens = int(max_tokens or _TTS_MAX_NEW_TOKENS_MAX)
-            sampling_params_list[0].max_tokens = max_tokens
-            if isinstance(prompt, dict):
-                prompt.setdefault("additional_information", {})["max_decode_steps"] = max_tokens
-            stop_token_ids = set(getattr(sampling_params_list[0], "stop_token_ids", None) or [])
-            stop_token_ids.add(1)
-            sampling_params_list[0].stop_token_ids = sorted(stop_token_ids)
 
         if request.seed is not None and sampling_params_list:
             import copy

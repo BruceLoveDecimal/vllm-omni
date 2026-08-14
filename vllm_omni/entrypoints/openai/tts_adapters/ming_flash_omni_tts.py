@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """MingFlashOmniTTS serving adapter."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -60,4 +60,24 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
     ) -> PreparedRequest:
         server = self.ctx.server
         prompt = server._build_ming_flash_omni_prompt(request)
+        self._align_decode_budget(prompt, sampling_params_list)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
+
+    @staticmethod
+    def _align_decode_budget(prompt: dict[str, Any], sampling_params_list: list) -> None:
+        """Make the talker's decode budget match what the stage will enforce.
+
+        The talker spends one AR step per audio frame and only emits audio once
+        it decides to stop, so if ``SamplingParams.max_tokens`` runs out first the
+        request ends with no audio at all. The prompt builder stamps
+        ``max_decode_steps`` when the caller named a budget; otherwise the budget
+        is whatever the deploy config gave the stage, which is what gets copied
+        here. Read-only on ``sampling_params_list`` — the stage defaults are
+        shared across requests.
+        """
+        info = prompt.get("additional_information")
+        if not isinstance(info, dict) or "max_decode_steps" in info or not sampling_params_list:
+            return
+        stage_budget = getattr(sampling_params_list[0], "max_tokens", None)
+        if stage_budget:
+            info["max_decode_steps"] = int(stage_budget)
