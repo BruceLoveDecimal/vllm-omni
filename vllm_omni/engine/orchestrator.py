@@ -1296,7 +1296,7 @@ class Orchestrator:
                 self.duplex_control_plane.defer_request_cleanups(closing_session_ids)
             raise
         if closing_session_ids and self.duplex_control_plane is not None:
-            self.duplex_control_plane.finalize_closed_sessions(closing_session_ids)
+            await self.duplex_control_plane.finalize_closed_sessions(closing_session_ids)
 
     async def _apply_raw_terminal_stage_finish(
         self,

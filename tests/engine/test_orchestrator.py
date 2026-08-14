@@ -2416,7 +2416,7 @@ async def test_request_cleanup_failure_is_deferred_to_control_plane():
         def defer_request_cleanups(self, session_ids: list[str]) -> None:
             self.deferred.extend(session_ids)
 
-        def finalize_closed_sessions(self, session_ids: list[str]) -> None:
+        async def finalize_closed_sessions(self, session_ids: list[str]) -> None:
             self.finalized.extend(session_ids)
 
     from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -2467,7 +2467,7 @@ async def test_session_close_reports_requests_the_caller_never_failed():
         def defer_request_cleanups(self, session_ids: list[str]) -> None:
             pass
 
-        def finalize_closed_sessions(self, session_ids: list[str]) -> None:
+        async def finalize_closed_sessions(self, session_ids: list[str]) -> None:
             self.finalized.extend(session_ids)
 
     from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker

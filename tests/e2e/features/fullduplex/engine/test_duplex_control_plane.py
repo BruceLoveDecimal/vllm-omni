@@ -705,6 +705,55 @@ async def test_request_cleanup_close_publishes_lifecycle_with_its_reason() -> No
 
 
 @pytest.mark.asyncio
+async def test_caller_finalized_close_publishes_lifecycle_without_the_reaper() -> None:
+    """The healthy close never reaches the reaper: the caller aborts the
+    requests itself and calls finalize_closed_sessions, which drops the pending
+    cleanup. Announcing the close only from _run_request_cleanup would leave
+    every normal teardown silent."""
+    stage_port = _TypedStagePort()
+    result_sink: asyncio.Queue = asyncio.Queue()
+    lifecycle_sink: asyncio.Queue = asyncio.Queue()
+    plane = DuplexControlPlane(
+        extension=None,
+        stage_port=stage_port,
+        result_sink=result_sink,
+        lifecycle_sink=lifecycle_sink,
+    )
+    fence = DuplexFence("sid-caller-finalized")
+    await plane.handle(
+        OpenDuplexSessionMessage(
+            control_id="open-caller-finalized",
+            fence=fence,
+            session_id=fence.session_id,
+            capabilities={},
+        )
+    )
+    assert (await result_sink.get()).ok is True
+    session = plane.sessions.require(fence.session_id)
+    session.bind_stage_request(0, "req-failed", fence=fence)
+    session.reserve_stage_request(1, "req-reserved", fence=fence)
+
+    plane.close_sessions_for_request_ids(
+        ["req-failed"],
+        abort=True,
+        cleanup_in_progress=True,
+        reason="handoff_rejected",
+    )
+    await plane.finalize_closed_sessions([fence.session_id])
+
+    assert plane.sessions.get(fence.session_id) is None
+    lifecycle = await lifecycle_sink.get()
+    assert lifecycle.session_id == fence.session_id
+    assert lifecycle.event == "closed"
+    assert lifecycle.reason == "handoff_rejected"
+    assert lifecycle.submitted_request_ids == ["req-failed"]
+    assert lifecycle.reserved_request_ids == ["req-reserved"]
+    # The reaper has nothing left to do, and does not publish a second event.
+    assert await plane.reap_expired() == 0
+    assert lifecycle_sink.empty()
+
+
+@pytest.mark.asyncio
 async def test_request_cleanup_lifecycle_is_at_least_once() -> None:
     """The event is published BEFORE the session is finalized: finalizing drops
     the session, and the retry can only re-enter that branch while it is still

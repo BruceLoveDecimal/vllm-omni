@@ -1095,13 +1095,48 @@ class DuplexControlPlane:
         active_keys = {key for key in self._request_cleanups_in_progress if key[0] in session_id_set}
         self._request_cleanups_in_progress.difference_update(active_keys)
 
-    def finalize_closed_sessions(self, session_ids: Iterable[str]) -> None:
+    async def finalize_closed_sessions(self, session_ids: Iterable[str]) -> None:
+        """Finalize sessions whose cleanup the caller already carried out.
+
+        This is the path a healthy close takes: the caller aborts the requests
+        itself and finalizes here, so ``_run_request_cleanup`` never runs and
+        cannot be the only place the close is announced.
+
+        Unlike the retry path, nothing will run again if the sink fails — the
+        caller has already released the requests — so a sink failure is logged
+        and the session is still finalized rather than left dangling.
+        """
         session_id_set = set(session_ids)
+        pending_by_session: dict[str, _PendingRequestCleanup] = {}
         for key in list(self._pending_request_cleanups):
             if key[0] not in session_id_set:
                 continue
-            self._pending_request_cleanups.pop(key, None)
+            pending = self._pending_request_cleanups.pop(key)
             self._request_cleanups_in_progress.discard(key)
+            pending_by_session.setdefault(key[0], pending)
+        for session_id in dict.fromkeys(session_ids):
+            session = self._sessions.get(session_id)
+            if session is None or session.lease.terminal_reason is None:
+                continue
+            pending = pending_by_session.get(session_id)
+            request_ids = pending.request_ids if pending is not None else tuple(session.resource_request_ids())
+            submitted = set(session.resource_request_ids(submitted=True))
+            try:
+                await self._notify_session_terminated(
+                    session_id=session_id,
+                    fence=session.fence,
+                    event="closed",
+                    reason=pending.reason if pending is not None else session.lease.terminal_reason,
+                    lease_generation=session.lease.generation,
+                    submitted_request_ids=[rid for rid in request_ids if rid in submitted],
+                    reserved_request_ids=[rid for rid in request_ids if rid not in submitted],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "duplex session %s closed without notifying the frontend: %s",
+                    session_id,
+                    exc,
+                )
         self._sessions.finalize_closed_sessions(session_ids)
 
 
