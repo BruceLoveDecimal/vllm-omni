@@ -6,14 +6,12 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 logger = init_logger(__name__)
-
-_TTS_MAX_NEW_TOKENS_MAX = 4096
 
 
 @register_tts_adapter
@@ -65,6 +63,7 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
     ) -> PreparedRequest:
         server = self.ctx.server
         prompt = server._build_ming_flash_omni_prompt(request)
+        self._align_decode_budget(prompt, sampling_params_list)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
 
     def apply_sampling_overrides(
@@ -74,29 +73,26 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
         prompt: dict[str, Any] | None = None,
         request_id: str | None = None,
     ) -> list:
-        """Give Stage 0 a decode budget that covers the whole waveform.
+        return apply_max_new_tokens(sampling_params_list, request)
 
-        The talker's paged Qwen2 backbone runs one AR step per audio frame, so
-        ``max_tokens`` bounds the audio length rather than a text length. The
-        same budget is mirrored onto the prompt as ``max_decode_steps`` for the
-        talker itself, and the talker's EOS (stop-token id 1) is added so the
-        request ends when the model stops rather than at the budget.
+    @staticmethod
+    def _align_decode_budget(prompt: dict[str, Any], sampling_params_list: list) -> None:
+        """Make the talker's decode budget match what the stage will enforce.
+
+        The talker spends one AR step per audio frame and only emits audio once
+        it decides to stop, so if ``SamplingParams.max_tokens`` runs out first the
+        request ends with no audio at all. The prompt builder stamps
+        ``max_decode_steps`` when the caller named a budget; otherwise the budget
+        is whatever the deploy config gave the stage, which is what gets copied
+        here. Read-only on ``sampling_params_list`` — the stage defaults are
+        shared across requests.
         """
-        import copy
-
-        if not sampling_params_list:
-            return sampling_params_list
-
-        sampling_params_list = copy.deepcopy(sampling_params_list)
-        max_tokens = request.max_new_tokens or getattr(sampling_params_list[0], "max_tokens", None)
-        max_tokens = int(max_tokens or _TTS_MAX_NEW_TOKENS_MAX)
-        sampling_params_list[0].max_tokens = max_tokens
-        if isinstance(prompt, dict):
-            prompt.setdefault("additional_information", {})["max_decode_steps"] = max_tokens
-        stop_token_ids = set(getattr(sampling_params_list[0], "stop_token_ids", None) or [])
-        stop_token_ids.add(1)
-        sampling_params_list[0].stop_token_ids = sorted(stop_token_ids)
-        return sampling_params_list
+        info = prompt.get("additional_information")
+        if not isinstance(info, dict) or "max_decode_steps" in info or not sampling_params_list:
+            return
+        stage_budget = getattr(sampling_params_list[0], "max_tokens", None)
+        if stage_budget:
+            info["max_decode_steps"] = int(stage_budget)
 
     def _load_supported_speakers(self) -> set[str]:
         # Speaker selection is driven by caption JSON rather than a static table.

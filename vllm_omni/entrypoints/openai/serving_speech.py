@@ -103,7 +103,6 @@ _SPEECH_USAGE_INPUT_AUDIO_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-AUDIO-TOKENS"
 # reference (issue #4644). Matches the offline example/test and upstream demo.
 _COSYVOICE3_PROMPT_DELIMITER = "<|endofprompt|>"
 _COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DELIMITER}"
-
 # Audex contract: zero-codec / invalid generations arrive as empty terminal
 # payloads and must fail the request, never serialize as a successful empty
 # WAV. Covers both the TTS ("audex") and TTA ("audex_tta") pipelines.
@@ -118,7 +117,6 @@ _HIGGS_V3_REF_CODE_CACHE_MAX_ENTRIES = 256
 _HIGGS_V3_REF_CODE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _QWEN3_TTS_REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
-_TTS_MAX_NEW_TOKENS_MAX = 4096
 _MING_DEFAULT_PROMPT = MING_DEFAULT_PROMPT
 _DEFAULT_VOICE_NAME = "default"
 
@@ -2947,7 +2945,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "instruction": ming_create_instruction(caption_fields),
             "voice_name": request.voice or None,
             "use_zero_spk_emb": not has_spk_emb,
-            "max_decode_steps": request.max_new_tokens or _TTS_MAX_NEW_TOKENS_MAX,
             "cfg": 2.0,
             "sigma": 0.25,
             "temperature": 0.0,
@@ -2955,6 +2952,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if has_spk_emb:
             # Passed as plain float list
             additional_information["spk_emb"] = list(request.speaker_embedding)
+        if request.max_new_tokens is not None:
+            # Only stamp a caller-named budget here; the adapter's
+            # apply_sampling_overrides carries the same number to
+            # SamplingParams.max_tokens so the two agree. When the caller names
+            # none, the adapter fills it from the stage's own max_tokens.
+            additional_information["max_decode_steps"] = int(request.max_new_tokens)
         if request.seed is not None:
             additional_information["seed"] = int(request.seed)
         stamp_ming_talker_voice_meta(additional_information, stage_client=self)
