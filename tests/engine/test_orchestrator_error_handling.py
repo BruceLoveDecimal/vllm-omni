@@ -402,6 +402,55 @@ async def test_stage_input_processor_client_error_keeps_4xx_metadata(orchestrato
 
 
 @pytest.mark.asyncio
+async def test_diffusion_bridge_rejection_fails_request_not_server(orchestrator_factory) -> None:
+    """An AR -> diffusion stage does not go through process_engine_inputs: it
+    calls custom_process_input_func directly. That call site must obey the same
+    rule, or every ar2diffusion processor (glm_image, hunyuan_image3,
+    ming_flash_omni, ...) stays engine-fatal while the shared bridge is safe.
+    """
+
+    def _reject(source_outputs, prompt, requires_multimodal_data):
+        raise StageInputProcessingError("thinker produced no image conditioning")
+
+    stage0 = FakeStageClient(stage_type="llm", final_output=False, next_inputs=[{"prompt_token_ids": [7, 8]}])
+    stage1 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    stage1.custom_process_input_func = _reject
+    proc0 = FakeOutputProcessor(request_outputs=[_build_request_output("req-diffusion", token_ids=[3], finished=True)])
+    stage_pools = _build_stage_pools([[stage0], [stage1]], output_processors=[proc0, FakeOutputProcessor()])
+    fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id="req-diffusion",
+            prompt=SimpleNamespace(request_id="req-diffusion", prompt_token_ids=[1, 2]),
+            original_prompt={"prompt": "a cat"},
+            sampling_params_list=[_sampling_params(), OmniDiffusionSamplingParams()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+        stage0.push_engine_core_outputs(_engine_core_outputs("s0-raw", 1.0))
+        error_msg = await _wait_for_error_message(fixture, request_id="req-diffusion")
+
+        assert error_msg.fatal is False
+        assert error_msg.stage_id == 1
+        assert "stage-0->stage-1" in error_msg.error
+        assert "thinker produced no image conditioning" in error_msg.error
+        assert "Internal error" not in error_msg.error
+
+        # Scoped to the request: the server keeps running and the diffusion
+        # stage was never handed the payload it rejected.
+        assert fixture.thread.is_alive()
+        await _wait_for(lambda: "req-diffusion" not in fixture.orchestrator.request_states)
+        assert stage1.add_request_calls == []
+    finally:
+        if fixture.thread.is_alive():
+            fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_factory) -> None:
     """A new request entering a stage that already lost all replicas fails that
     request instead of raising out of the request handler and tearing the server
