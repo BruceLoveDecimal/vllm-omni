@@ -51,6 +51,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.errors import OmniClientError, StageInputProcessingError, client_error_metadata
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
@@ -2122,13 +2123,50 @@ class Orchestrator:
                 req_state.prompt,
                 streaming_context=req_state.streaming,
             )
-        except Exception:
-            logger.exception(
-                "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
-                req_id,
-                next_logical,
+        except Exception as exc:
+            # A stage bridge rejects ONE request's payload; that says nothing
+            # about engine health. There is no per-request guard above this
+            # frame — _handle_processed_outputs runs outside the stage-poll
+            # try/except — so re-raising would unwind into Orchestrator.run()
+            # and tear down every stage. Fail just this request (#4285).
+            #
+            # Every failure here is request-scoped, but they are not equally
+            # expected: StageInputProcessingError (and OmniClientError) mark a
+            # payload the processor knowingly rejects, while anything else is a
+            # processor bug that must keep its traceback and must not be
+            # reported to the caller as if their input were at fault.
+            bridge = f"stage-{src_stage_id}->stage-{next_logical}"
+            if isinstance(exc, (StageInputProcessingError, OmniClientError)):
+                logger.warning(
+                    "[Orchestrator] req=%s %s input processor rejected the payload: %s",
+                    req_id,
+                    bridge,
+                    exc,
+                )
+                error = f"Stage input processing failed for {bridge}: {exc}"
+            else:
+                logger.exception(
+                    "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
+                    req_id,
+                    next_logical,
+                )
+                error = f"Internal error in {bridge} input processor: {type(exc).__name__}: {exc}"
+            status_code, error_type = client_error_metadata(exc)
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=req_id,
+                    stage_id=next_logical,
+                    error=error,
+                    status_code=status_code,
+                    error_type=error_type,
+                )
             )
-            raise
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                abort=True,
+                close_duplex_sessions=True,
+            )
+            return
         finally:
             req_state.streaming.source_token_decoder = previous_decoder
 

@@ -5,6 +5,7 @@
 Covers:
 - EngineDeadError from an LLM stage poll → fatal error broadcast + replica eviction
 - Diffusion stage error output (OmniRequestOutput.from_error) → routed correctly
+- Stage input processor failure on the inter-stage bridge → request-scoped error
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import time
+from http import HTTPStatus
 from types import SimpleNamespace
 
 import janus
@@ -27,6 +29,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError, StageInputProcessingError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -289,6 +292,113 @@ async def test_forward_to_dead_downstream_stage_fails_request_not_server(orchest
         if orchestrator_fixture.thread.is_alive():
             orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
             orchestrator_fixture.thread.join(timeout=5)
+
+
+class _FailingInputProcessorStageClient(FakeStageClient):
+    """LLM stage replica whose inter-stage input processor rejects the payload."""
+
+    def __init__(self, *args, exc: Exception, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.exc = exc
+
+    def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+        raise self.exc
+
+
+async def _run_failing_bridge(
+    orchestrator_factory,
+    *,
+    request_id: str,
+    exc: Exception,
+) -> tuple[ErrorMessage, OrchestratorFixture, FakeStageClient]:
+    """Drive a two-stage pipeline whose stage-0 -> stage-1 bridge raises ``exc``."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=False, next_inputs=[{"prompt_token_ids": [7, 8]}])
+    stage1 = _FailingInputProcessorStageClient(stage_type="llm", final_output=True, exc=exc)
+    proc0 = FakeOutputProcessor(request_outputs=[_build_request_output(request_id, token_ids=[3], finished=True)])
+    stage_pools = _build_stage_pools([[stage0], [stage1]], output_processors=[proc0, FakeOutputProcessor()])
+    fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    await _enqueue_add_request(
+        fixture,
+        request_id=request_id,
+        prompt=SimpleNamespace(request_id=request_id, prompt_token_ids=[1, 2]),
+        original_prompt={"prompt": "hello"},
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+    )
+    await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+    # Completing stage 0 triggers the stage-0 -> stage-1 bridge, which raises.
+    stage0.push_engine_core_outputs(_engine_core_outputs("s0-raw", 1.0))
+    error_msg = await _wait_for_error_message(fixture, request_id=request_id)
+    return error_msg, fixture, stage1
+
+
+@pytest.mark.asyncio
+async def test_stage_input_processor_rejection_fails_request_not_server(orchestrator_factory) -> None:
+    """A stage bridge that rejects one request's payload must fail only that
+    request. ``process_engine_inputs`` runs inline in the orchestration loop with
+    no per-request guard above it, so an escaping exception would unwind into
+    ``Orchestrator.run()`` and shut every stage down (#6099).
+    """
+    error_msg, fixture, stage1 = await _run_failing_bridge(
+        orchestrator_factory,
+        request_id="req-bad-handoff",
+        exc=StageInputProcessingError("No latent or hidden_states found in thinker output"),
+    )
+
+    assert error_msg.fatal is False
+    assert error_msg.stage_id == 1
+    assert error_msg.error == (
+        "Stage input processing failed for stage-0->stage-1: No latent or hidden_states found in thinker output"
+    )
+    # An anticipated rejection carries no client-error metadata, so the frontend
+    # surfaces it as a 500 rather than a 4xx.
+    assert error_msg.status_code is None
+    assert error_msg.error_type is None
+
+    # The failure is scoped to the request: the orchestrator keeps running, the
+    # request state is released, and nothing was submitted downstream.
+    assert fixture.thread.is_alive()
+    await _wait_for(lambda: "req-bad-handoff" not in fixture.orchestrator.request_states)
+    assert stage1.add_request_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unexpected_stage_input_processor_bug_is_still_request_scoped(orchestrator_factory) -> None:
+    """An unanticipated processor bug must not tear the server down either, but it
+    is reported as an internal error rather than blamed on the request's input."""
+    error_msg, fixture, _ = await _run_failing_bridge(
+        orchestrator_factory,
+        request_id="req-processor-bug",
+        exc=AttributeError("'NoneType' object has no attribute 'shape'"),
+    )
+
+    assert error_msg.fatal is False
+    assert error_msg.stage_id == 1
+    assert error_msg.error == (
+        "Internal error in stage-0->stage-1 input processor: AttributeError: 'NoneType' object has no attribute 'shape'"
+    )
+    assert error_msg.status_code is None
+    assert fixture.thread.is_alive()
+    await _wait_for(lambda: "req-processor-bug" not in fixture.orchestrator.request_states)
+
+
+@pytest.mark.asyncio
+async def test_stage_input_processor_client_error_keeps_4xx_metadata(orchestrator_factory) -> None:
+    """An ``OmniClientError`` raised by a stage bridge keeps its 4xx status so the
+    frontend reports a client error instead of a generic 500."""
+    error_msg, fixture, _ = await _run_failing_bridge(
+        orchestrator_factory,
+        request_id="req-bad-input",
+        exc=OmniClientError("reference audio is malformed"),
+    )
+
+    assert error_msg.fatal is False
+    assert error_msg.status_code == HTTPStatus.BAD_REQUEST.value
+    assert error_msg.error_type == DEFAULT_CLIENT_ERROR_TYPE
+    assert "reference audio is malformed" in error_msg.error
+    assert fixture.thread.is_alive()
 
 
 @pytest.mark.asyncio

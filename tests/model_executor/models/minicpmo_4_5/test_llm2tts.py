@@ -25,6 +25,7 @@ import torch
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
+from vllm_omni.errors import StageInputProcessingError
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import llm2tts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -132,7 +133,7 @@ class TestInputValidation:
             prompt_token_ids=[10, 11],
             output_token_ids=[20],
         )
-        with pytest.raises(ValueError, match="No latent or hidden_states"):
+        with pytest.raises(StageInputProcessingError, match="No latent or hidden_states"):
             llm2tts([bad], prompt=None)
 
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Request-scoped client error types shared across vLLM-Omni entrypoints."""
+"""Request-scoped error types shared across vLLM-Omni components."""
 
 from __future__ import annotations
 
@@ -10,6 +10,18 @@ from http import HTTPStatus
 from typing import NoReturn
 
 DEFAULT_CLIENT_ERROR_TYPE = "BadRequestError"
+
+
+class StageInputProcessingError(RuntimeError):
+    """A stage bridge knowingly rejected the payload of one request.
+
+    Every exception escaping a stage input processor is request-scoped — the
+    orchestrator never lets one bad payload tear down the engine. This type
+    marks the rejections a processor *anticipates* (a malformed handoff, an
+    unusable intermediate tensor) so they are reported as such, while an
+    unexpected processor bug keeps its traceback and is surfaced as an internal
+    error instead of being blamed on the request.
+    """
 
 
 class OmniClientError(ValueError):
