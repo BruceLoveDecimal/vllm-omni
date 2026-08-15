@@ -3,7 +3,11 @@
 This E2E driver runs the public ``realtime_duplex_demo.py`` against a live
 duplex backend. Arbitrary audio defaults to the model-policy lifecycle contract.
 The stronger response-required mode binds the multi-response contract to a
-known input checksum and expected follow-up response.
+known input checksum and expected follow-up response. In that mode the client
+holds the input stream open with bounded trailing silence (a live microphone
+never stops at a WAV boundary) until the model completes the required
+responses, so the contract binds model turn ordering around the final commit
+instead of wall-clock pipeline throughput.
 """
 
 from __future__ import annotations
@@ -44,10 +48,11 @@ def _input_duration_s(path: Path) -> float:
         return wav_file.getnframes() / wav_file.getframerate()
 
 
-def _client_process_timeout_s(input_wav: Path, protocol_timeout_s: float) -> float:
-    # The child first streams the WAV in real time, then can independently
+def _client_process_timeout_s(input_wav: Path, protocol_timeout_s: float, *, trailing_silence_ms: int = 0) -> float:
+    # The child first streams the WAV in real time, may hold the stream open
+    # with up to trailing_silence_ms of runway silence, then can independently
     # exhaust its post-commit and session-close protocol waits.
-    return _input_duration_s(input_wav) + 2 * protocol_timeout_s + 30.0
+    return _input_duration_s(input_wav) + trailing_silence_ms / 1000.0 + 2 * protocol_timeout_s + 30.0
 
 
 def _read_json(path: Path) -> dict[str, object]:
@@ -344,6 +349,7 @@ def summarize_artifacts(
         "ok": ok,
         "result_ok": result_ok,
         "validation_mode": validation_mode,
+        "trailing_silence": result.get("trailing_silence"),
         "event_counts": _event_counts(events),
         "response_ids": response_ids,
         "response_summaries": response_summaries,
@@ -405,6 +411,25 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         temperature = 0.0
     if temperature is not None:
         command.extend(["--temperature", str(temperature)])
+    # The strict multi-response contract owns commit placement: the client keeps
+    # the stream open with bounded silence until the model finishes the required
+    # responses, so slower-than-realtime pipelines are measured on the same
+    # unit stream instead of on wall-clock throughput.
+    await_responses = getattr(args, "await_responses", None)
+    if await_responses is None:
+        await_responses = args.min_responses if args.validation_mode == "response-required" else 0
+    max_trailing_silence_ms = getattr(args, "max_trailing_silence_ms", None)
+    if max_trailing_silence_ms is None:
+        max_trailing_silence_ms = 120_000
+    if await_responses > 0:
+        command.extend(
+            [
+                "--await-responses",
+                str(await_responses),
+                "--max-trailing-silence-ms",
+                str(max_trailing_silence_ms),
+            ]
+        )
     if args.require_audio:
         command.append("--require-audio")
     if args.no_realtime_pacing:
@@ -419,7 +444,11 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             process.communicate(),
-            timeout=_client_process_timeout_s(input_wav, args.timeout_s),
+            timeout=_client_process_timeout_s(
+                input_wav,
+                args.timeout_s,
+                trailing_silence_ms=max_trailing_silence_ms if await_responses > 0 else 0,
+            ),
         )
     except TimeoutError:
         process.kill()
@@ -480,6 +509,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-responses", type=int, default=2)
     parser.add_argument("--min-audio-deltas-per-response", type=int, default=2)
+    parser.add_argument(
+        "--await-responses",
+        type=int,
+        default=None,
+        help=(
+            "Trailing-silence runway: keep the stream open until this many responses "
+            "completed before the final commit. Defaults to --min-responses in "
+            "response-required mode and 0 (disabled) in model-policy mode."
+        ),
+    )
+    parser.add_argument(
+        "--max-trailing-silence-ms",
+        type=int,
+        default=None,
+        help="Upper bound on the trailing-silence runway (default 120000).",
+    )
     parser.add_argument("--input-sha256")
     parser.add_argument("--expect-followup-response-substring")
     args = parser.parse_args()
@@ -489,6 +534,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--input-sha256 is required in response-required mode")
     if args.min_audio_deltas_per_response < 1:
         parser.error("--min-audio-deltas-per-response must be positive")
+    if args.await_responses is not None and args.await_responses < 0:
+        parser.error("--await-responses must be non-negative")
+    if args.max_trailing_silence_ms is not None and args.max_trailing_silence_ms < 0:
+        parser.error("--max-trailing-silence-ms must be non-negative")
     return args
 
 

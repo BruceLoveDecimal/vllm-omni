@@ -401,6 +401,117 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
     assert result["ok"] is True
 
 
+def _capture_soft_interrupt_command(tmp_path, monkeypatch, **arg_overrides):
+    demo = _load_soft_interrupt_demo_module()
+    input_wav = tmp_path / "input.wav"
+    with wave.open(str(input_wav), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(b"\x00\x00" * 320)
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"ref")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir(exist_ok=True)
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b'{"ok": true}', b""
+
+        def kill(self):
+            return None
+
+    async def _fake_exec(*command, **kwargs):
+        captured["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(demo.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(demo, "summarize_artifacts", lambda **kwargs: {"ok": True, "returncode": 0})
+    args = SimpleNamespace(
+        url="ws://127.0.0.1:8099/v1/realtime?duplex=1",
+        model="openbmb/MiniCPM-o-4_5",
+        input_wav=str(input_wav),
+        ref_audio=str(ref_audio),
+        output_dir=str(output_dir),
+        summary_output=None,
+        chunk_ms=200,
+        timeout_s=5.0,
+        require_audio=True,
+        no_realtime_pacing=False,
+        validation_mode="response-required",
+        temperature=None,
+        min_responses=2,
+        min_audio_deltas_per_response=2,
+        input_sha256=None,
+        expect_followup_response_substring=None,
+    )
+    for name, value in arg_overrides.items():
+        setattr(args, name, value)
+    asyncio.run(demo.run_soft_interrupt(args))
+    command = captured["command"]
+    assert isinstance(command, list)
+    return command
+
+
+def test_realtime_duplex_soft_interrupt_response_required_defaults_silence_runway(tmp_path, monkeypatch):
+    """response-required awaits the responses it asserts, bounded by the runway cap."""
+    command = _capture_soft_interrupt_command(tmp_path, monkeypatch)
+
+    assert command[command.index("--await-responses") + 1] == "2"
+    assert command[command.index("--max-trailing-silence-ms") + 1] == "120000"
+
+
+def test_realtime_duplex_soft_interrupt_model_policy_omits_silence_runway(tmp_path, monkeypatch):
+    """model-policy keeps the fixed-length capture: commit right after the WAV."""
+    command = _capture_soft_interrupt_command(
+        tmp_path,
+        monkeypatch,
+        validation_mode="model-policy",
+        temperature=0.0,
+        min_responses=1,
+    )
+
+    assert "--await-responses" not in command
+    assert "--max-trailing-silence-ms" not in command
+
+
+def test_realtime_duplex_soft_interrupt_explicit_runway_overrides_default(tmp_path, monkeypatch):
+    command = _capture_soft_interrupt_command(
+        tmp_path,
+        monkeypatch,
+        await_responses=3,
+        max_trailing_silence_ms=5_000,
+    )
+
+    assert command[command.index("--await-responses") + 1] == "3"
+    assert command[command.index("--max-trailing-silence-ms") + 1] == "5000"
+
+
+def test_realtime_duplex_soft_interrupt_rejects_negative_runway(monkeypatch):
+    demo = _load_soft_interrupt_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "soft.py",
+            "--input-wav",
+            "input.wav",
+            "--output-dir",
+            "out",
+            "--ref-audio",
+            "ref.wav",
+            "--await-responses",
+            "-1",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        demo.parse_args()
+
+
 def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(monkeypatch):
     demo = _load_soft_interrupt_demo_module()
     monkeypatch.setattr(
