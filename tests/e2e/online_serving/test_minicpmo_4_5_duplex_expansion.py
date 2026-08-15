@@ -53,10 +53,13 @@ def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_
     assert result["admission"]["overflow_error_code"] == "resource_exhausted"
 
 
-# CUDA-only for now: this contract asserts the model speaks while the user is
-# still talking, which only holds when the duplex pipeline sustains real-time
-# throughput. The current NPU stack runs several times slower than real time,
-# so it never reaches a mid-stream decision point.
+# The two-response contract is asserted in stream space: with temperature 0 the
+# model's listen/speak decisions are a function of the audio-unit stream alone,
+# so the client keeps the stream open with bounded trailing silence (as a live
+# microphone would) until the model finishes the interrupted turn and the
+# follow-up turn, then commits. Single-GPU co-location stretches wall clock but
+# sees the same unit stream. CUDA-only until the NPU pipeline fits the runway
+# and test-time budget.
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -> None:
@@ -77,6 +80,8 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
                 validation_mode="response-required",
                 min_responses=2,
                 min_audio_deltas_per_response=2,
+                await_responses=2,
+                max_trailing_silence_ms=120_000,
                 input_sha256=SOFT_INTERRUPT_SHA256,
                 expect_followup_response_substring=None,
             )
@@ -85,6 +90,8 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
 
     assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
     assert result["error_count"] == 0
+    assert result["cancelled_count"] == 0
     assert result["response_lifecycle_ok"] is True
     assert result["response_audio_contract_ok"] is True
+    assert result["second_response_before_final_commit"] is True
     assert result["followup_response_transcript_ok"] is True

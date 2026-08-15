@@ -1,8 +1,10 @@
+import asyncio
 import base64
 import importlib.util
 import sys
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -155,6 +157,115 @@ def test_realtime_duplex_demo_accepts_explicit_ref_audio(monkeypatch):
     args = demo.parse_args()
 
     assert args.ref_audio == "ref.wav"
+    assert args.await_responses == 0
+    assert args.max_trailing_silence_ms == 30_000
+
+
+def test_realtime_duplex_demo_rejects_negative_await_responses(monkeypatch):
+    demo = _load_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "realtime_duplex_demo.py",
+            "--input-wav",
+            "input.wav",
+            "--ref-audio",
+            "ref.wav",
+            "--await-responses",
+            "-1",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        demo.parse_args()
+
+
+def test_realtime_duplex_demo_handoff_completion_requires_done_and_trailing_listen():
+    demo = _load_demo_module()
+    listen = {"type": "response.listen"}
+    created_a = {"type": "response.created", "response": {"id": "resp-a"}}
+    done_a = {"type": "response.done", "response_id": "resp-a"}
+    created_b = {"type": "response.created", "response": {"id": "resp-b"}}
+    done_b = {"type": "response.done", "response_id": "resp-b"}
+
+    assert not demo._handoff_complete([listen, created_a, done_a, listen], 2)
+    assert not demo._handoff_complete([created_a, done_a, listen, created_b], 2)
+    assert not demo._handoff_complete([listen, created_a, done_a, listen, created_b, done_b], 2)
+    assert demo._handoff_complete([created_a, done_a, listen, created_b, done_b, listen], 2)
+
+
+def test_realtime_duplex_demo_trailing_silence_runway_paces_until_handoff(monkeypatch):
+    demo = _load_demo_module()
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.events = SimpleNamespace(events=[])
+            self.sent: list[dict[str, object]] = []
+
+        async def send(self, event: dict[str, object]) -> None:
+            self.sent.append(event)
+            if len(self.sent) == 2:
+                self.events.events = [
+                    {"type": "response.created", "response": {"id": "resp-a"}},
+                    {"type": "response.done", "response_id": "resp-a"},
+                    {"type": "response.created", "response": {"id": "resp-b"}},
+                    {"type": "response.done", "response_id": "resp-b"},
+                    {"type": "response.listen"},
+                ]
+
+    async def _instant_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(demo.asyncio, "sleep", _instant_sleep)
+    client = _FakeClient()
+
+    trailing, error = asyncio.run(
+        demo._stream_trailing_silence_until_handoff(
+            client,
+            input_audio_end_ms=25_600,
+            min_responses=2,
+            chunk_ms=200,
+            max_trailing_silence_ms=1_000,
+        )
+    )
+
+    assert error is None
+    assert trailing == {"sent_ms": 400, "max_ms": 1_000, "handoff_complete": True}
+    assert all(event["type"] == "input_audio_buffer.append" for event in client.sent)
+    assert [event["audio_end_ms"] for event in client.sent] == [25_800, 26_000]
+
+
+def test_realtime_duplex_demo_trailing_silence_runway_caps_out(monkeypatch):
+    demo = _load_demo_module()
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.events = SimpleNamespace(events=[])
+            self.sent: list[dict[str, object]] = []
+
+        async def send(self, event: dict[str, object]) -> None:
+            self.sent.append(event)
+
+    async def _instant_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(demo.asyncio, "sleep", _instant_sleep)
+    client = _FakeClient()
+
+    trailing, error = asyncio.run(
+        demo._stream_trailing_silence_until_handoff(
+            client,
+            input_audio_end_ms=0,
+            min_responses=2,
+            chunk_ms=200,
+            max_trailing_silence_ms=600,
+        )
+    )
+
+    assert error is not None and "handoff incomplete" in error
+    assert trailing == {"sent_ms": 600, "max_ms": 600, "handoff_complete": False}
+    assert len(client.sent) == 3
 
 
 def test_open_streaming_response_requires_post_commit_drain():

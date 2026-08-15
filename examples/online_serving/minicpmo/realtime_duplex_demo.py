@@ -175,6 +175,81 @@ def _ref_audio_data_url(path: str | None) -> str | None:
     return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
 
 
+def _handoff_complete(events: list[dict[str, object]], min_responses: int) -> bool:
+    """True once ``min_responses`` responses exist and the model closed the last one.
+
+    Closed means the newest response's ``response.done`` arrived and a
+    ``response.listen`` followed it, so a final commit sent now cannot truncate
+    the handoff mid-response.
+    """
+    created_ids: list[str] = []
+    for event in events:
+        if event.get("type") != "response.created":
+            continue
+        response_id = RealtimeEventCollector.response_id(event)
+        if response_id and response_id not in created_ids:
+            created_ids.append(response_id)
+    if len(created_ids) < max(min_responses, 1):
+        return False
+    last_response_id = created_ids[-1]
+    done_index = next(
+        (
+            index
+            for index, event in enumerate(events)
+            if event.get("type") == "response.done" and RealtimeEventCollector.response_id(event) == last_response_id
+        ),
+        None,
+    )
+    if done_index is None:
+        return False
+    return any(event.get("type") == "response.listen" for event in events[done_index + 1 :])
+
+
+async def _stream_trailing_silence_until_handoff(
+    client: RealtimeDuplexClient,
+    *,
+    input_audio_end_ms: int,
+    min_responses: int,
+    chunk_ms: int,
+    max_trailing_silence_ms: int,
+) -> tuple[dict[str, object], str | None]:
+    """Hold the input stream open with silence until the handoff completes.
+
+    A live microphone keeps delivering silence after the user stops talking; a
+    fixed-length WAV cannot. Bounded trailing silence keeps the final commit
+    behind the model's own turn decisions, so multi-response contracts bind the
+    model handoff instead of wall-clock pipeline throughput. The recorded
+    speech the model hears is unchanged, and the runway is always paced in
+    real time so slower pipelines see the same bounded silence stream.
+    """
+    chunk_bytes = max(PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000, PCM16_BYTES_PER_SAMPLE)
+    duration_ms = chunk_bytes * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+    silence_chunk = base64.b64encode(bytes(chunk_bytes)).decode("ascii")
+    sent_ms = 0
+    while not _handoff_complete(client.events.events, min_responses):
+        if sent_ms + duration_ms > max_trailing_silence_ms:
+            return (
+                {"sent_ms": sent_ms, "max_ms": max_trailing_silence_ms, "handoff_complete": False},
+                (
+                    f"model handoff incomplete after {sent_ms} ms of trailing silence: expected "
+                    f"{min_responses} completed response(s) and a trailing listen before the final commit"
+                ),
+            )
+        sent_ms += duration_ms
+        await client.send(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": silence_chunk,
+                "input_audio_format": "pcm16",
+                "sample_rate_hz": PCM16_SAMPLE_RATE,
+                "duration_ms": duration_ms,
+                "audio_end_ms": input_audio_end_ms + sent_ms,
+            }
+        )
+        await asyncio.sleep(duration_ms / 1000)
+    return {"sent_ms": sent_ms, "max_ms": max_trailing_silence_ms, "handoff_complete": True}, None
+
+
 async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     input_pcm16 = read_pcm16_wav(Path(args.input_wav))
     if not input_pcm16:
@@ -205,6 +280,17 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             chunk_ms=args.chunk_ms,
             realtime=not args.no_realtime_pacing,
         )
+        trailing_silence: dict[str, object] | None = None
+        handoff_error: str | None = None
+        if args.await_responses > 0:
+            input_audio_end_ms = len(input_pcm16) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+            trailing_silence, handoff_error = await _stream_trailing_silence_until_handoff(
+                client,
+                input_audio_end_ms=input_audio_end_ms,
+                min_responses=args.await_responses,
+                chunk_ms=args.chunk_ms,
+                max_trailing_silence_ms=args.max_trailing_silence_ms,
+            )
         commit_event_cursor = len(client.events.events)
         stream_decision = _latest_model_decision(client.events.events, stream_event_cursor)
         input_has_residual_model_unit = _has_residual_model_unit(
@@ -225,8 +311,12 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             )
             committed_index = _input_committed_index(client.events.events, commit_event_cursor)
             stream_decision = _latest_model_decision(client.events.events[: committed_index + 1], stream_event_cursor)
-            wait_for_post_commit_decision = input_has_residual_model_unit or _response_in_progress(
-                client.events.events[: committed_index + 1]
+            # A trailing-silence runway ends on a listen; still wait out the
+            # post-commit decision so the final listen is recorded before close.
+            wait_for_post_commit_decision = (
+                input_has_residual_model_unit
+                or args.await_responses > 0
+                or _response_in_progress(client.events.events[: committed_index + 1])
             )
             if wait_for_post_commit_decision:
                 await wait_for(
@@ -284,6 +374,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             response_id=response_id,
         )
         errors = client.events.errors()
+        if handoff_error:
+            errors.append({"type": "client.handoff", "message": handoff_error})
         if wait_error:
             errors.append({"type": "client.timeout", "message": wait_error})
         if close_error:
@@ -310,6 +402,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 and (bool(audio) or not args.require_audio)
             ),
             "model_decision": model_decision,
+            "trailing_silence": trailing_silence,
             "post_commit": {
                 "input_committed_event_index": committed_index,
                 "decision": post_commit_decision,
@@ -392,7 +485,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-realtime-pacing", action="store_true")
     parser.add_argument("--require-audio", action="store_true")
-    return parser.parse_args()
+    parser.add_argument(
+        "--await-responses",
+        type=int,
+        default=0,
+        help=(
+            "Keep streaming silence after the input WAV until this many responses have "
+            "completed (done plus a trailing listen), then send the final commit. "
+            "0 commits right after the WAV, matching a fixed-length capture."
+        ),
+    )
+    parser.add_argument(
+        "--max-trailing-silence-ms",
+        type=int,
+        default=30_000,
+        help="Upper bound on the --await-responses trailing-silence runway.",
+    )
+    args = parser.parse_args()
+    if args.await_responses < 0:
+        parser.error("--await-responses must be non-negative")
+    if args.max_trailing_silence_ms < 0:
+        parser.error("--max-trailing-silence-ms must be non-negative")
+    return args
 
 
 def main() -> None:
