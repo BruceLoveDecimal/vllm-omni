@@ -2434,3 +2434,56 @@ async def test_request_cleanup_failure_is_deferred_to_control_plane():
 
     assert orchestrator.duplex_control_plane.deferred == ["sid-cleanup"]
     assert orchestrator.duplex_control_plane.finalized == []
+
+
+@pytest.mark.asyncio
+async def test_streaming_terminal_update_is_skipped_once_the_forward_failed():
+    """A finished streaming request forwards twice: the segment update, then the
+    terminal (resumable=False) one. If the first forward already failed and
+    cleaned up the request, the second re-runs the same doomed bridge and
+    reports the same failure again."""
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [
+        SimpleNamespace(final_output=False),
+        SimpleNamespace(final_output=True),
+    ]
+    orchestrator.duplex_control_plane = None
+    orchestrator.async_chunk = False
+    orchestrator._pd_pair = None
+    orchestrator.output_async_queue = asyncio.Queue()
+    orchestrator.request_states = {}
+    orchestrator._cfg_tracker = CfgCompanionTracker()
+
+    req_state = OrchestratorRequestState(
+        request_id="req-streaming",
+        prompt={"prompt": "hello"},
+        sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
+        final_stage_id=1,
+    )
+    req_state.streaming.enabled = True
+    orchestrator.request_states["req-streaming"] = req_state
+
+    forwards: list[bool] = []
+
+    async def _fake_forward(req_id, stage_id, output, state, **kwargs):
+        forwards.append(kwargs.get("is_final_update", False))
+        # Stand in for a failed forward: the request is failed and cleaned up.
+        orchestrator.request_states.pop(req_id, None)
+
+    orchestrator._forward_to_next_stage = _fake_forward
+
+    await orchestrator._route_output(
+        0,
+        0,
+        SimpleNamespace(request_id="req-streaming", finished=True),
+        req_state,
+        None,
+    )
+
+    assert forwards == [False]
+
+
