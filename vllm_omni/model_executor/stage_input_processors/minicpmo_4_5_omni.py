@@ -516,7 +516,7 @@ def _has_native_duplex_prompt_metadata(mm_output):
 
 def _require_native_tts_boundary_metadata(special_token_ids):
     if special_token_ids.get("tts_bos_token_id") is None:
-        raise ValueError(
+        raise StageInputProcessingError(
             "MiniCPM-o native duplex TTS handoff requires tokenizer-derived "
             "<|tts_bos|> metadata; refusing to infer special token ids."
         )
@@ -669,7 +669,7 @@ def _build_tts_scheduler_prompt_token_ids(
         return llm_output_ids
     if prompt_token_ids:
         return prompt_token_ids[-1:]
-    raise ValueError("MiniCPM-o TTS stage requires at least one scheduler prompt token")
+    raise StageInputProcessingError("MiniCPM-o TTS stage requires at least one scheduler prompt token")
 
 
 def llm2tts(

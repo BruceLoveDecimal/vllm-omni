@@ -349,9 +349,12 @@ async def test_stage_input_processor_rejection_fails_request_not_server(orchestr
 
     assert error_msg.fatal is False
     assert error_msg.stage_id == 1
-    assert error_msg.error == (
-        "Stage input processing failed for stage-0->stage-1: No latent or hidden_states found in thinker output"
-    )
+    # Assert the classification and the payload, not the exact sentence: the
+    # bridge is named, the processor's own message survives, and the report is
+    # NOT dressed up as an internal error.
+    assert "stage-0->stage-1" in error_msg.error
+    assert "No latent or hidden_states found in thinker output" in error_msg.error
+    assert "Internal error" not in error_msg.error
     # An anticipated rejection carries no client-error metadata, so the frontend
     # surfaces it as a 500 rather than a 4xx.
     assert error_msg.status_code is None
@@ -376,9 +379,12 @@ async def test_unexpected_stage_input_processor_bug_is_still_request_scoped(orch
 
     assert error_msg.fatal is False
     assert error_msg.stage_id == 1
-    assert error_msg.error == (
-        "Internal error in stage-0->stage-1 input processor: AttributeError: 'NoneType' object has no attribute 'shape'"
-    )
+    # Same three properties as the rejection case, with the classification
+    # inverted: this one IS flagged as internal and names the exception type.
+    assert "stage-0->stage-1" in error_msg.error
+    assert "'NoneType' object has no attribute 'shape'" in error_msg.error
+    assert "Internal error" in error_msg.error
+    assert "AttributeError" in error_msg.error
     assert error_msg.status_code is None
     assert fixture.thread.is_alive()
     await _wait_for(lambda: "req-processor-bug" not in fixture.orchestrator.request_states)

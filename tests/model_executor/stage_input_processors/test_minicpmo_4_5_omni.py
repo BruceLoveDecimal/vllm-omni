@@ -333,7 +333,7 @@ def test_native_duplex_requires_tokenizer_boundary_metadata() -> None:
         multimodal_output={"duplex_prompt_token_ids": [101]},
     )
 
-    with pytest.raises(ValueError, match="tokenizer-derived.*metadata"):
+    with pytest.raises(StageInputProcessingError, match="tokenizer-derived.*metadata"):
         llm2tts([source], prompt=[{}], _streaming_context=SimpleNamespace(bridge_states={}))
 
 
