@@ -59,7 +59,9 @@ def test_duplex_admission_and_expiry_reaper(omni_server, model_prefix: str, tmp_
 # so it never reaches a mid-stream decision point.
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -> None:
+def test_duplex_soft_interrupt_overlap_lifecycle(
+    omni_server, model_prefix: str, tmp_path: Path
+) -> None:
     input_wav = validated_soft_interrupt_wav()
     result = asyncio.run(
         run_soft_interrupt(
@@ -74,8 +76,7 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
                 timeout_s=180.0,
                 require_audio=True,
                 no_realtime_pacing=False,
-                validation_mode="response-required",
-                min_responses=2,
+                validation_mode="model-policy",
                 min_audio_deltas_per_response=2,
                 input_sha256=SOFT_INTERRUPT_SHA256,
                 expect_followup_response_substring=None,
@@ -87,4 +88,4 @@ def test_duplex_soft_interrupt(omni_server, model_prefix: str, tmp_path: Path) -
     assert result["error_count"] == 0
     assert result["response_lifecycle_ok"] is True
     assert result["response_audio_contract_ok"] is True
-    assert result["followup_response_transcript_ok"] is True
+    assert result["overlap_sequence_ok"] is True

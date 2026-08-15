@@ -386,7 +386,6 @@ def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(t
                 no_realtime_pacing=False,
                 validation_mode="response-required",
                 temperature=None,
-                min_responses=2,
                 min_audio_deltas_per_response=2,
                 input_sha256=None,
                 expect_followup_response_substring=None,
@@ -466,7 +465,8 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
             "delta": "是造纸术。",
             "_client_received_at_s": 2.6,
         },
-        {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 3.0},
+        {"type": "response.listen", "_client_received_at_s": 3.0},
+        {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 3.5},
         {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 4.0},
         {"type": "response.speak", "response_id": second_response_id, "_client_received_at_s": 4.0},
         {
@@ -510,18 +510,63 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
     summary = demo.summarize_artifacts(
         output_dir=output,
         validation_mode="response-required",
-        min_responses=2,
         min_audio_deltas_per_response=2,
         expect_followup_response_substring="一加一等于二",
     )
 
     assert summary["ok"] is True
-    assert summary["listen_between_responses"] is False
+    assert summary["handoff_sequence_ok"] is True
     assert summary["second_response_before_final_commit"] is True
     assert summary["final_listen_after_commit"] is True
     assert summary["response_audio_contract_ok"] is True
     assert summary["response_summaries"][0]["audio_delta_count"] == 2
     assert summary["response_summaries"][1]["transcript"] == "一加一等于二。"
+
+
+def test_realtime_duplex_soft_interrupt_rejects_two_responses_without_listen_transition(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "missing_listen_transition"
+    output.mkdir()
+    first_response_id = "resp-first"
+    second_response_id = "resp-second"
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "response.created", "response": {"id": first_response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.audio.delta", "response_id": first_response_id, "delta": "AAAA"},
+        {"type": "response.audio.delta", "response_id": first_response_id, "delta": "AAAA"},
+        {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 3.0},
+        {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 4.0},
+        {"type": "response.audio.delta", "response_id": second_response_id, "delta": "AAAA"},
+        {"type": "response.audio.delta", "response_id": second_response_id, "delta": "AAAA"},
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": second_response_id,
+            "delta": "第二次回答",
+        },
+        {"type": "response.done", "response_id": second_response_id, "_client_received_at_s": 5.0},
+        {"type": "response.listen", "_client_received_at_s": 5.2},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 6.0},
+        {"type": "response.listen", "_client_received_at_s": 6.1},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [first_response_id, second_response_id]}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="response-required",
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring=None,
+    )
+
+    assert summary["has_response"] is True
+    assert summary["handoff_sequence_ok"] is False
+    assert summary["ok"] is False
 
 
 def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp_path):
@@ -532,12 +577,11 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
     events = [
         {"type": "response.listen", "_client_received_at_s": 1.0},
         {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.speak", "response_id": response_id, "_client_received_at_s": 2.05},
         {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
         {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.15},
-        {"type": "response.done", "response_id": response_id, "_client_received_at_s": 2.2},
-        {"type": "response.listen", "_client_received_at_s": 2.3},
-        {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
-        {"type": "response.listen", "_client_received_at_s": 3.1},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 2.2},
+        {"type": "response.done", "response_id": response_id, "_client_received_at_s": 2.3},
     ]
     (output / "events.jsonl").write_text(
         "".join(demo.json.dumps(event) + "\n" for event in events),
@@ -551,16 +595,14 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
     summary = demo.summarize_artifacts(
         output_dir=output,
         validation_mode="model-policy",
-        min_responses=2,
         min_audio_deltas_per_response=2,
         expect_followup_response_substring=None,
     )
 
     assert summary["ok"] is True
     assert summary["validation_mode"] == "model-policy"
-    assert summary["enough_responses"] is True
-    assert summary["response_before_final_commit"] is True
-    assert summary["listen_after_response_before_commit"] is True
+    assert summary["has_response"] is True
+    assert summary["overlap_sequence_ok"] is True
 
 
 def test_realtime_duplex_soft_interrupt_model_policy_accepts_commit_during_speak(tmp_path):
@@ -571,6 +613,7 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_commit_during_speak
     events = [
         {"type": "response.listen", "_client_received_at_s": 1.0},
         {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.speak", "response_id": response_id, "_client_received_at_s": 2.05},
         {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
         {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.2},
         {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
@@ -589,12 +632,12 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_commit_during_speak
     summary = demo.summarize_artifacts(
         output_dir=output,
         validation_mode="model-policy",
-        min_responses=1,
         min_audio_deltas_per_response=2,
         expect_followup_response_substring=None,
     )
 
     assert summary["ok"] is True
+    assert summary["overlap_sequence_ok"] is True
     assert summary["response_before_final_commit"] is True
     assert summary["listen_after_response_before_commit"] is False
     assert summary["final_listen_after_commit"] is False
@@ -627,13 +670,13 @@ def test_realtime_duplex_soft_interrupt_response_required_rejects_single_respons
     summary = demo.summarize_artifacts(
         output_dir=output,
         validation_mode="response-required",
-        min_responses=2,
         min_audio_deltas_per_response=2,
         expect_followup_response_substring="一加一等于二",
     )
 
     assert summary["ok"] is False
-    assert summary["enough_responses"] is False
+    assert summary["has_response"] is True
+    assert summary["handoff_sequence_ok"] is False
 
 
 def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(tmp_path):
@@ -663,8 +706,8 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
             "delta": "一加一等于二",
             "_client_received_at_s": 2.2,
         },
-        {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 2.3},
-        {"type": "response.listen", "_client_received_at_s": 2.4},
+        {"type": "response.listen", "_client_received_at_s": 2.3},
+        {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 2.4},
         {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 3.0},
         {
             "type": "response.audio.delta",
@@ -701,7 +744,6 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
     summary = demo.summarize_artifacts(
         output_dir=output,
         validation_mode="response-required",
-        min_responses=2,
         min_audio_deltas_per_response=2,
         expect_followup_response_substring="一加一等于二",
     )
@@ -722,12 +764,11 @@ def test_realtime_duplex_soft_interrupt_reports_text_expectation_without_gating(
     missing_transcript_summary = demo.summarize_artifacts(
         output_dir=output,
         validation_mode="response-required",
-        min_responses=2,
         min_audio_deltas_per_response=2,
         expect_followup_response_substring="一加一等于二",
     )
 
-    assert missing_transcript_summary["ok"] is False
+    assert missing_transcript_summary["ok"] is True
     assert missing_transcript_summary["followup_response_transcript_ok"] is False
 
 

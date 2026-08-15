@@ -1,9 +1,9 @@
-"""Validate MiniCPM-o Realtime duplex soft-interrupt delta streaming.
+"""Validate MiniCPM-o Realtime duplex lifecycle and delta streaming.
 
 This E2E driver runs the public ``realtime_duplex_demo.py`` against a live
 duplex backend. Arbitrary audio defaults to the model-policy lifecycle contract.
-The stronger response-required mode binds the multi-response contract to a
-known input checksum and expected follow-up response.
+The deterministic response-required mode validates the complete handoff event
+order against a known input checksum. Response cardinality is diagnostic only.
 """
 
 from __future__ import annotations
@@ -92,6 +92,113 @@ def _first_event_index(events: list[dict[str, object]], event_type: str) -> int 
         if event.get("type") == event_type:
             return index
     return None
+
+
+def _first_response_event_index(
+    events: list[dict[str, object]],
+    event_types: str | set[str],
+    response_id: str,
+) -> int | None:
+    accepted_types = {event_types} if isinstance(event_types, str) else event_types
+    for index, event in enumerate(events):
+        if event.get("type") in accepted_types and _event_response_id(event) == response_id:
+            return index
+    return None
+
+
+def _overlap_event_sequence(
+    events: list[dict[str, object]],
+    response_ids: list[str],
+    commit_index: int | None,
+) -> tuple[bool, list[dict[str, int | str | None]]]:
+    """Describe one response overlapping the final input commit."""
+    response_id = response_ids[0] if response_ids else None
+
+    def response_index(event_types: str | set[str]) -> int | None:
+        if response_id is None:
+            return None
+        return _first_response_event_index(events, event_types, response_id)
+
+    sequence: list[dict[str, int | str | None]] = [
+        {
+            "event": "response_created",
+            "index": response_index("response.created"),
+            "response_id": response_id,
+        },
+        {
+            "event": "response_speak",
+            "index": response_index("response.speak"),
+            "response_id": response_id,
+        },
+        {
+            "event": "first_response_audio",
+            "index": response_index(AUDIO_DELTA_EVENTS),
+            "response_id": response_id,
+        },
+        {"event": "input_audio_buffer_committed", "index": commit_index},
+        {
+            "event": "response_done",
+            "index": response_index("response.done"),
+            "response_id": response_id,
+        },
+    ]
+    indices = [item["index"] for item in sequence]
+    sequence_ok = all(isinstance(index, int) for index in indices) and all(
+        left < right for left, right in zip(indices, indices[1:])
+    )
+    return sequence_ok, sequence
+
+
+def _handoff_event_sequence(
+    events: list[dict[str, object]],
+    response_ids: list[str],
+) -> tuple[bool, list[dict[str, int | str | None]]]:
+    """Describe a deterministic speak/listen/speak handoff.
+
+    A response count is only a proxy for soft interrupt: two response IDs can
+    be emitted back-to-back without the model returning to listen. Record the
+    causal event order instead. The runtime emits the interrupting model-listen
+    decision before it terminates the first response.
+    """
+    first_response_id = response_ids[0] if response_ids else None
+    second_response_id = response_ids[1] if len(response_ids) > 1 else None
+
+    def response_index(event_types: str | set[str], response_id: str | None) -> int | None:
+        if response_id is None:
+            return None
+        return _first_response_event_index(events, event_types, response_id)
+
+    first_created = response_index("response.created", first_response_id)
+    first_audio = response_index(AUDIO_DELTA_EVENTS, first_response_id)
+    first_done = response_index("response.done", first_response_id)
+    second_created = response_index("response.created", second_response_id)
+    second_audio = response_index(AUDIO_DELTA_EVENTS, second_response_id)
+    second_done = response_index("response.done", second_response_id)
+    interrupt_listen = next(
+        (
+            index
+            for index, event in enumerate(events)
+            if event.get("type") == "response.listen"
+            and first_audio is not None
+            and first_done is not None
+            and first_audio < index < first_done
+        ),
+        None,
+    )
+    sequence: list[dict[str, int | str | None]] = [
+        {"event": "first_response_created", "index": first_created, "response_id": first_response_id},
+        {"event": "first_response_audio", "index": first_audio, "response_id": first_response_id},
+        {"event": "interrupt_listen", "index": interrupt_listen},
+        {"event": "first_response_done", "index": first_done, "response_id": first_response_id},
+        {"event": "second_response_created", "index": second_created, "response_id": second_response_id},
+        {"event": "second_response_audio", "index": second_audio, "response_id": second_response_id},
+        {"event": "second_response_done", "index": second_done, "response_id": second_response_id},
+    ]
+    indices = [item["index"] for item in sequence]
+    sequence_ok = all(isinstance(index, int) for index in indices) and all(
+        left < right for left, right in zip(indices, indices[1:])
+    )
+    return sequence_ok, sequence
 
 
 def _event_counts(events: list[dict[str, object]]) -> dict[str, int]:
@@ -189,8 +296,17 @@ def _response_summary(
         for index, event in enumerate(events)
         if event.get("type") in TRANSCRIPT_DELTA_EVENTS and _event_response_id(event) == response_id
     ]
-    done_index = done_indices[0] if done_indices else None
-    audio_before_done_ok = done_index is not None and all(index < done_index for index in audio_indices)
+    created_index = created_indices[0] if len(created_indices) == 1 else None
+    done_index = done_indices[0] if len(done_indices) == 1 else None
+    terminal_lifecycle_ok = (
+        created_index is not None and done_index is not None and created_index < done_index
+    )
+    audio_before_done_ok = done_index is not None and all(
+        index < done_index for index in audio_indices
+    )
+    audio_within_lifecycle_ok = terminal_lifecycle_ok and all(
+        created_index < index < done_index for index in audio_indices
+    )
     stale_audio_count = sum(index > done_index for index in audio_indices) if done_index is not None else 0
 
     def offset_ms(index: int) -> float | None:
@@ -201,7 +317,7 @@ def _response_summary(
 
     return {
         "response_id": response_id,
-        "created_index": created_indices[0] if created_indices else None,
+        "created_index": created_index,
         "done_indices": done_indices,
         "created_offset_ms": offset_ms(created_indices[0]) if created_indices else None,
         "done_offset_ms": offset_ms(done_indices[0]) if done_indices else None,
@@ -211,7 +327,9 @@ def _response_summary(
         "audio_duration_ms": [_audio_delta_duration_ms(events[index]) for index in audio_indices],
         "transcript": "".join(str(events[index].get("delta") or "") for index in transcript_indices),
         "one_done": len(done_indices) == 1,
+        "terminal_lifecycle_ok": terminal_lifecycle_ok,
         "audio_before_done_ok": audio_before_done_ok,
+        "audio_within_lifecycle_ok": audio_within_lifecycle_ok,
         "stale_audio_count": stale_audio_count,
     }
 
@@ -220,7 +338,6 @@ def summarize_artifacts(
     *,
     output_dir: Path,
     validation_mode: str,
-    min_responses: int,
     min_audio_deltas_per_response: int,
     expect_followup_response_substring: str | None,
 ) -> dict[str, object]:
@@ -253,14 +370,19 @@ def summarize_artifacts(
         None,
     )
     listen_indices = [index for index, event in enumerate(events) if event.get("type") == "response.listen"]
-    effective_min_responses = min_responses if validation_mode == "response-required" else 1
-    enough_responses = len(response_summaries) >= effective_min_responses
-    response_lifecycle_ok = enough_responses and all(bool(summary.get("one_done")) for summary in response_summaries)
-    multi_delta_ok = enough_responses and all(
+    # Response cardinality is model policy, not a protocol guarantee. Require a
+    # visible response for the shared lifecycle contract; deterministic handoff
+    # coverage is expressed by the event state machine below.
+    has_response = bool(response_summaries)
+    response_lifecycle_ok = has_response and all(
+        summary.get("terminal_lifecycle_ok") is True for summary in response_summaries
+    )
+    multi_delta_ok = has_response and all(
         int(summary.get("audio_delta_count", 0)) >= min_audio_deltas_per_response for summary in response_summaries
     )
-    response_audio_contract_ok = enough_responses and all(
-        summary.get("audio_before_done_ok") is True and int(summary.get("stale_audio_count", 0)) == 0
+    response_audio_contract_ok = has_response and all(
+        summary.get("audio_within_lifecycle_ok") is True
+        and int(summary.get("stale_audio_count", 0)) == 0
         for summary in response_summaries
     )
     response_before_final_commit = (
@@ -284,6 +406,12 @@ def summarize_artifacts(
         and any(last_done_index < index < commit_index for index in listen_indices)
     )
     final_listen_after_commit = commit_index is not None and any(index > commit_index for index in listen_indices)
+    overlap_sequence_ok, overlap_sequence = _overlap_event_sequence(
+        events,
+        response_ids,
+        commit_index,
+    )
+    handoff_sequence_ok, handoff_sequence = _handoff_event_sequence(events, response_ids)
     transcript = "".join(str(summary.get("transcript") or "") for summary in response_summaries)
     followup_response_transcripts = [
         str(summary.get("transcript") or "")
@@ -314,31 +442,16 @@ def summarize_artifacts(
         and event["response"].get("status") == "cancelled"
     )
     result_ok = result.get("ok") is True
-    # response-required keeps the full listen sandwich around commit. model-policy
-    # only requires a completed audio response that started before final commit:
-    # single-GPU co-location often still drains speak after the WAV ends.
-    commit_listen_contract_ok = (
-        listen_after_response_before_commit and final_listen_after_commit
-        if validation_mode == "response-required"
-        else response_before_final_commit
-    )
     common_contract_ok = bool(
         result_ok
         and not error_events
         and cancelled_count == 0
-        and enough_responses
+        and has_response
         and response_lifecycle_ok
         and multi_delta_ok
         and response_audio_contract_ok
-        and response_before_final_commit
-        and commit_listen_contract_ok
     )
-    mode_contract_ok = validation_mode == "model-policy" or (
-        second_response_before_final_commit
-        and listen_before_first_response
-        and listen_after_last_done
-        and followup_response_transcript_ok
-    )
+    mode_contract_ok = overlap_sequence_ok if validation_mode == "model-policy" else handoff_sequence_ok
     ok = common_contract_ok and mode_contract_ok
     return {
         "ok": ok,
@@ -347,10 +460,8 @@ def summarize_artifacts(
         "event_counts": _event_counts(events),
         "response_ids": response_ids,
         "response_summaries": response_summaries,
-        "min_responses": min_responses,
-        "effective_min_responses": effective_min_responses,
         "min_audio_deltas_per_response": min_audio_deltas_per_response,
-        "enough_responses": enough_responses,
+        "has_response": has_response,
         "response_lifecycle_ok": response_lifecycle_ok,
         "multi_delta_ok": multi_delta_ok,
         "response_audio_contract_ok": response_audio_contract_ok,
@@ -361,6 +472,10 @@ def summarize_artifacts(
         "listen_after_last_done": listen_after_last_done,
         "listen_after_response_before_commit": listen_after_response_before_commit,
         "final_listen_after_commit": final_listen_after_commit,
+        "overlap_sequence_ok": overlap_sequence_ok,
+        "overlap_sequence": overlap_sequence,
+        "handoff_sequence_ok": handoff_sequence_ok,
+        "handoff_sequence": handoff_sequence,
         "transcript": transcript,
         "followup_response_transcripts": followup_response_transcripts,
         "followup_response_transcript_ok": followup_response_transcript_ok,
@@ -435,7 +550,6 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
     summary = summarize_artifacts(
         output_dir=output_dir,
         validation_mode=args.validation_mode,
-        min_responses=args.min_responses,
         min_audio_deltas_per_response=args.min_audio_deltas_per_response,
         expect_followup_response_substring=args.expect_followup_response_substring,
     )
@@ -478,13 +592,10 @@ def parse_args() -> argparse.Namespace:
         choices=("model-policy", "response-required"),
         default="model-policy",
     )
-    parser.add_argument("--min-responses", type=int, default=2)
     parser.add_argument("--min-audio-deltas-per-response", type=int, default=2)
     parser.add_argument("--input-sha256")
     parser.add_argument("--expect-followup-response-substring")
     args = parser.parse_args()
-    if args.validation_mode == "response-required" and args.min_responses < 2:
-        parser.error("--min-responses must be at least 2")
     if args.validation_mode == "response-required" and not args.input_sha256:
         parser.error("--input-sha256 is required in response-required mode")
     if args.min_audio_deltas_per_response < 1:
