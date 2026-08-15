@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections.abc import Iterable
 from contextlib import suppress
 from functools import cached_property
@@ -47,6 +48,25 @@ from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+# Opt-in per-unit trace of the native duplex listen/speak decision. A soft
+# interrupt requires the model to leave a turn mid-answer, which only turn_eos
+# does: a mid-turn listen is rewritten to tts_bos so the turn keeps speaking.
+# Without this trace a missing handoff cannot be attributed to the model's own
+# decision versus that rewrite.
+MINICPMO45_DUPLEX_TRACE_ENV = "VLLM_OMNI_MINICPMO45_DUPLEX_TRACE"
+
+
+def minicpmo45_duplex_trace_enabled() -> bool:
+    return os.environ.get(MINICPMO45_DUPLEX_TRACE_ENV, "").strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def minicpmo45_duplex_decision_name(token_id: int, token_ids: dict[str, int]) -> str:
+    """Name the sampled duplex decision, or ``text:<id>`` for ordinary tokens."""
+    for name, value in token_ids.items():
+        if value == token_id:
+            return name.removesuffix("_token_id")
+    return f"text:{int(token_id)}"
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -891,8 +911,45 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             and not getattr(state, "current_turn_ended", True)
             and not force_listen
         ):
+            if minicpmo45_duplex_trace_enabled():
+                self._minicpmo45_duplex_listen_rewrites()[row_idx] = True
             return int(tts_bos_id)
         return int(sampled)
+
+    def _minicpmo45_duplex_listen_rewrites(self) -> dict[int, bool]:
+        rewrites = getattr(self, "_minicpmo45_duplex_listen_rewrite_rows", None)
+        if not isinstance(rewrites, dict):
+            rewrites = {}
+            self._minicpmo45_duplex_listen_rewrite_rows = rewrites
+        return rewrites
+
+    def _trace_minicpmo45_duplex_decision(
+        self,
+        row_idx: int,
+        sampled: int,
+        token_ids: dict[str, int],
+        *,
+        state: Any,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        """Record one unit's decision, including a listen->tts_bos rewrite.
+
+        ``unit`` is the count of audio units appended to this session so far,
+        so a decision lines up with a position in the input stream.
+        """
+        rewritten = bool(self._minicpmo45_duplex_listen_rewrites().pop(row_idx, False))
+        logger.info(
+            "[minicpmo45-duplex-trace] row=%s session=%s unit=%s decision=%s "
+            "rewritten_from_listen=%s turn_ended=%s is_speech=%s force_listen=%s",
+            row_idx,
+            getattr(state, "session_id", None),
+            getattr(state, "audio_chunk_idx", None),
+            minicpmo45_duplex_decision_name(sampled, token_ids),
+            rewritten,
+            getattr(state, "current_turn_ended", None),
+            (payload or {}).get("is_speech"),
+            (payload or {}).get("force_listen"),
+        )
 
     def _record_minicpmo45_duplex_generation_token(self, row_idx: int, sampled: int) -> None:
         """Track tokens returned by the model-policy decoder.
@@ -928,6 +985,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if state is None:
             return
         payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        if minicpmo45_duplex_trace_enabled():
+            self._trace_minicpmo45_duplex_decision(row_idx, sampled, token_ids, state=state, payload=payload)
         force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
         listen_id = token_ids.get("listen_token_id", -1)
         tts_bos_id = token_ids.get("tts_bos_token_id", -1)
