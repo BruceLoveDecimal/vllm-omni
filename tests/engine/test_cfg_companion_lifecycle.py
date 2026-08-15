@@ -233,8 +233,13 @@ async def test_companion_abort_after_completion_does_not_fail_parent():
     assert orch._cfg_tracker.get_companion_outputs("p") == [{"o": 1}]  # bundle intact
 
 
-class _CapturedDispatchError(Exception):
-    """Sentinel raised by the capture hook to stop the forward after bundling."""
+class _CapturedDispatchError(BaseException):
+    """Sentinel raised by the capture hook to stop the forward after bundling.
+
+    Deliberately a BaseException: the orchestrator scopes every *Exception* a
+    stage bridge raises to the request (reporting it and cleaning up), so an
+    Exception sentinel would be swallowed and the capture loop would see a
+    torn-down request instead of a second bundle."""
 
 
 @pytest.mark.asyncio

@@ -1129,6 +1129,64 @@ class Orchestrator:
             abort=True,
         )
 
+    async def _fail_request_bridge_error(
+        self,
+        exc: BaseException,
+        *,
+        req_id: str,
+        src_stage_id: int,
+        next_logical: int,
+    ) -> None:
+        """Fail one request whose inter-stage bridge raised.
+
+        A stage bridge rejects ONE request's payload; that says nothing about
+        engine health. There is no per-request guard above this frame —
+        _handle_processed_outputs runs outside the stage-poll try/except — so
+        re-raising would unwind into Orchestrator.run() and tear down every
+        stage. Fail just this request (#4285).
+
+        Every failure here is request-scoped, but they are not equally
+        expected: StageInputProcessingError (and OmniClientError) mark a payload
+        the processor knowingly rejects, while anything else is a processor bug
+        that must keep its traceback and must not be reported to the caller as
+        if their input were at fault.
+
+        This handles the shared ``process_engine_inputs`` bridge used by the
+        MiniCPM-o Thinker-to-Talker handoff.
+        """
+        bridge = f"stage-{src_stage_id}->stage-{next_logical}"
+        if isinstance(exc, StageInputProcessingError | OmniClientError):
+            logger.warning(
+                "[Orchestrator] req=%s %s input processor rejected the payload: %s",
+                req_id,
+                bridge,
+                exc,
+            )
+            error = f"Stage input processing failed for {bridge}: {exc}"
+        else:
+            logger.exception(
+                "[Orchestrator] req=%s input processing FAILED for %s",
+                req_id,
+                bridge,
+                exc_info=exc,
+            )
+            error = f"Internal error in {bridge} input processor: {type(exc).__name__}: {exc}"
+        status_code, error_type = client_error_metadata(exc)
+        await self.output_async_queue.put(
+            ErrorMessage(
+                request_id=req_id,
+                stage_id=next_logical,
+                error=error,
+                status_code=status_code,
+                error_type=error_type,
+            )
+        )
+        await self._cleanup_request_ids(
+            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            abort=True,
+            close_duplex_sessions=True,
+        )
+
     async def _dispatch_or_fail_request(
         self,
         dispatch: Callable[[], Awaitable[Any]],
@@ -2124,47 +2182,11 @@ class Orchestrator:
                 streaming_context=req_state.streaming,
             )
         except Exception as exc:
-            # A stage bridge rejects ONE request's payload; that says nothing
-            # about engine health. There is no per-request guard above this
-            # frame — _handle_processed_outputs runs outside the stage-poll
-            # try/except — so re-raising would unwind into Orchestrator.run()
-            # and tear down every stage. Fail just this request (#4285).
-            #
-            # Every failure here is request-scoped, but they are not equally
-            # expected: StageInputProcessingError (and OmniClientError) mark a
-            # payload the processor knowingly rejects, while anything else is a
-            # processor bug that must keep its traceback and must not be
-            # reported to the caller as if their input were at fault.
-            bridge = f"stage-{src_stage_id}->stage-{next_logical}"
-            if isinstance(exc, (StageInputProcessingError, OmniClientError)):
-                logger.warning(
-                    "[Orchestrator] req=%s %s input processor rejected the payload: %s",
-                    req_id,
-                    bridge,
-                    exc,
-                )
-                error = f"Stage input processing failed for {bridge}: {exc}"
-            else:
-                logger.exception(
-                    "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
-                    req_id,
-                    next_logical,
-                )
-                error = f"Internal error in {bridge} input processor: {type(exc).__name__}: {exc}"
-            status_code, error_type = client_error_metadata(exc)
-            await self.output_async_queue.put(
-                ErrorMessage(
-                    request_id=req_id,
-                    stage_id=next_logical,
-                    error=error,
-                    status_code=status_code,
-                    error_type=error_type,
-                )
-            )
-            await self._cleanup_request_ids(
-                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-                abort=True,
-                close_duplex_sessions=True,
+            await self._fail_request_bridge_error(
+                exc,
+                req_id=req_id,
+                src_stage_id=src_stage_id,
+                next_logical=next_logical,
             )
             return
         finally:
