@@ -1521,6 +1521,11 @@ class Orchestrator:
                     and finished
                     and not final_only_finished
                     and not self._is_duplex_session_request(req_state)
+                    # The forward above can fail the request (a rejected bridge
+                    # payload, a dead downstream stage) and clean it up. Sending
+                    # the terminal update anyway re-runs the same doomed bridge
+                    # and reports the same failure a second time.
+                    and req_id in self.request_states
                 ):
                     # For streaming sessions, send the terminal (resumable=False) update only on a finish
                     await self._forward_to_next_stage(
