@@ -28,6 +28,10 @@ class MiniCPMO45ServingSessionState:
     pending_silence_task: asyncio.Task[bool] | None = None
     pending_silence_owner_id: str | None = None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
+    # Set when listen_only forced a listen over assistant audio. The model's
+    # resulting listen ends the turn, so it must close the response instead of
+    # being folded into it as an ordinary mid-turn pause.
+    pending_soft_interrupt: bool = False
 
     def retain_committed_audio(
         self,

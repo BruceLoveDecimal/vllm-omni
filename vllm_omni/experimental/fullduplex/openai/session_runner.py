@@ -1377,6 +1377,15 @@ class DuplexSessionRunnerMixin:
                             # than letting the same stream start another assistant
                             # segment. Speech/barge-in chunks remain model-owned.
                             payload["force_listen"] = True
+                        elif native_response_in_progress() and self._should_soft_interrupt_for_auto_response_overlap(
+                            session, event, payload
+                        ):
+                            # listen_only: the user talking over the assistant takes
+                            # the turn back. Forcing the listen both hands the model
+                            # the turn boundary and marks the resulting listen as
+                            # terminal, so the response closes without a cancel.
+                            payload["force_listen"] = True
+                            native.pending_soft_interrupt = True
                         if not buffer_overlap_audio:
                             continue
                         session.mark_user_input_activity()

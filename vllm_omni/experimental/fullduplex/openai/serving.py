@@ -776,6 +776,45 @@ class OmniDuplexSessionHandler(
         return event.get("force_listen") is True or payload.get("force_listen") is True
 
     @staticmethod
+    def _session_soft_interrupts_on_overlap(session: DuplexSession) -> bool:
+        """Opt-in: enforce ``overlap_policy`` for speech overlap in full duplex.
+
+        Auto-response deliberately leaves speech overlap model-owned, so the
+        assistant stops only when the model itself ends the turn. A model that
+        does not yield mid-answer therefore cannot be interrupted at all, and
+        the session's ``overlap_policy`` has no effect on speech. Clients that
+        need the negotiated policy enforced set
+        ``extra_body.soft_interrupt_on_overlap``; the default keeps the
+        model-owned behaviour.
+        """
+        extra = getattr(session.config, "extra_body", None)
+        return isinstance(extra, dict) and extra.get("soft_interrupt_on_overlap") is True
+
+    def _should_soft_interrupt_for_auto_response_overlap(
+        self,
+        session: DuplexSession,
+        event: dict[str, object],
+        payload: dict[str, object],
+    ) -> bool:
+        """Whether ``listen_only`` should end the assistant turn for this append.
+
+        Turn mode routes overlapping user speech through ``_overlap_decision``,
+        where ``listen_only`` forces a listen that closes the assistant turn.
+        This restores that contract for opted-in full-duplex sessions, for
+        speech overlap only -- silence must keep reaching the model untouched,
+        which is how it starts speaking after a question.
+        """
+        if not self._session_auto_responds(session):
+            return False
+        if not self._session_soft_interrupts_on_overlap(session):
+            return False
+        if session.config.overlap_policy != DuplexOverlapPolicy.LISTEN_ONLY.value:
+            return False
+        if event.get("force_barge_in") is True or self._event_requests_barge_in(event):
+            return False
+        return self._input_looks_like_speech(event, payload, session=session)
+
+    @staticmethod
     def _assistant_playback_active(session: DuplexSession) -> bool:
         return (
             session.config.playback_commit_policy == DuplexPlaybackCommitPolicy.ACK_ONLY.value

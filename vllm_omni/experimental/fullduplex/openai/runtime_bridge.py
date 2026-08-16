@@ -861,11 +861,21 @@ class NativeRuntimeBridgeMixin:
                 and not session.active_response_accepts_model_turn(model_turn_id)
             ):
                 return close_reason, emitted_response
+            # A listen the overlap policy forced over assistant audio is the
+            # turn boundary itself: the model-side latch already ended the turn,
+            # but a forced listen never reaches the TTS handoff that would carry
+            # turn_end metadata, so it arrives indistinguishable from a mid-turn
+            # pause. Consume the marker here and treat this listen as terminal.
+            native_state = self._runtime_session_state(session)
+            soft_interrupt = bool(getattr(native_state, "pending_soft_interrupt", False))
+            if soft_interrupt:
+                native_state.pending_soft_interrupt = False
             non_terminal_auto_listen = (
                 self._session_auto_responds(session)
                 and session.active_response_id is not None
                 and session.active_request_id is not None
                 and native_result.get("end_of_turn") is not True
+                and not soft_interrupt
             )
             if non_terminal_auto_listen:
                 await self._maybe_continue_native_response(
@@ -1106,6 +1116,9 @@ class NativeRuntimeBridgeMixin:
                 if not self._session_auto_responds(session):
                     self._serving_runtime_adapter.data_plane.mark_terminal(data_plane_request_id)
             should_commit = self._should_commit_response_to_history(session, response_id)
+            # The model reached turn_eos on its own, so any overlap marker for
+            # this response is spent and must not close the next one early.
+            self._runtime_session_state(session).pending_soft_interrupt = False
             committed_message = session.end_response(
                 commit_text=should_commit,
                 preserve_request=self._session_auto_responds(session),

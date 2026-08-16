@@ -52,6 +52,7 @@ class PersonaPlexServingSessionState:
     pending_silence_task: asyncio.Task[bool] | None = None
     pending_silence_owner_id: str | None = None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
+    pending_soft_interrupt: bool = False
 
     def retain_committed_audio(
         self,

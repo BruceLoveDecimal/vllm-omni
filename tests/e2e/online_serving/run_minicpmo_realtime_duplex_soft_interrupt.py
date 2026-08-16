@@ -405,6 +405,13 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         temperature = 0.0
     if temperature is not None:
         command.extend(["--temperature", str(temperature)])
+    # The multi-response contract needs the user's overlapping speech to take
+    # the turn back. Full duplex leaves that model-owned unless the session
+    # opts in, so the strict mode asks for the negotiated overlap policy.
+    if getattr(args, "soft_interrupt_on_overlap", None) is True or (
+        getattr(args, "soft_interrupt_on_overlap", None) is None and args.validation_mode == "response-required"
+    ):
+        command.append("--soft-interrupt-on-overlap")
     if args.require_audio:
         command.append("--require-audio")
     if args.no_realtime_pacing:
@@ -480,6 +487,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-responses", type=int, default=2)
     parser.add_argument("--min-audio-deltas-per-response", type=int, default=2)
+    parser.add_argument(
+        "--soft-interrupt-on-overlap",
+        action="store_true",
+        default=None,
+        help="Enforce the overlap policy while the assistant speaks (default: on in response-required mode).",
+    )
     parser.add_argument("--input-sha256")
     parser.add_argument("--expect-followup-response-substring")
     args = parser.parse_args()

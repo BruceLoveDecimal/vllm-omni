@@ -197,6 +197,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
             ref_audio=_ref_audio_data_url(args.ref_audio),
             session_id=args.session_id,
             temperature=args.temperature,
+            soft_interrupt_on_overlap=args.soft_interrupt_on_overlap,
             timeout_s=args.timeout_s,
         )
         stream_event_cursor = len(client.events.events)
@@ -392,6 +393,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-realtime-pacing", action="store_true")
     parser.add_argument("--require-audio", action="store_true")
+    parser.add_argument(
+        "--soft-interrupt-on-overlap",
+        action="store_true",
+        help=(
+            "Enforce the session overlap policy while the assistant speaks. "
+            "Full duplex otherwise leaves speech overlap model-owned, so the "
+            "model alone decides whether speaking over it takes the turn."
+        ),
+    )
     return parser.parse_args()
 
 

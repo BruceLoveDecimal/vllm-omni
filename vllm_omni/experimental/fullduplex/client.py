@@ -415,6 +415,7 @@ class RealtimeDuplexClient:
         initial_user_text: str | None = None,
         native_duplex: bool = True,
         auto_response: bool = True,
+        soft_interrupt_on_overlap: bool = False,
         temperature: float | None = None,
         extra_body: dict[str, object] | None = None,
         session_id: str | None = None,
@@ -429,6 +430,11 @@ class RealtimeDuplexClient:
                     "force_listen_count": 0,
                 }
             )
+            if soft_interrupt_on_overlap:
+                # Enforce overlap_policy while the assistant speaks. Without it
+                # full duplex leaves speech overlap model-owned, so the model
+                # alone decides whether a user talking over it takes the turn.
+                session_extra_body["soft_interrupt_on_overlap"] = True
         else:
             session_extra_body["minicpmo45_native_duplex"] = False
         session: dict[str, object] = {

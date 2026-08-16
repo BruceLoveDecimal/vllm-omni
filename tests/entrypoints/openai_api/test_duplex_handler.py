@@ -1384,6 +1384,13 @@ def _auto_response_context(
     return handler, session
 
 
+def _soft_interrupt_context(session_id: str) -> tuple[OmniDuplexSessionHandler, DuplexSession]:
+    """Full duplex with the overlap policy opted in."""
+    handler, session = _auto_response_context(session_id)
+    session.config.extra_body["soft_interrupt_on_overlap"] = True
+    return handler, session
+
+
 def _install_direct_silence_scheduler(
     handler: OmniDuplexSessionHandler,
     session: DuplexSession,
@@ -1523,6 +1530,68 @@ def test_auto_response_playback_overlap_keeps_model_owned_listen_speak_decision(
 
     session.acknowledge_playback(played_ms=1000, committed_ms=1000)
     assert handler._should_force_listen_for_auto_response_overlap(session, {}, speech_payload) is False
+
+
+def test_auto_response_speech_overlap_stays_model_owned_by_default():
+    """The documented full-duplex default: only the model ends its own turn."""
+    handler, session = _auto_response_context("sid-auto-overlap-default")
+
+    assert (
+        handler._should_soft_interrupt_for_auto_response_overlap(session, {}, _native_audio_payload(is_speech=None))
+        is False
+    )
+
+
+def test_opted_in_listen_only_hands_the_turn_back_on_overlapping_speech():
+    """With the opt-in, listen_only reaches full duplex.
+
+    Without it a user talking over the assistant can never take the turn back:
+    the model is under no obligation to yield, and in auto-response mode
+    nothing else can end its turn.
+    """
+    handler, session = _soft_interrupt_context("sid-auto-listen-only")
+    speech_payload = _native_audio_payload(is_speech=None)
+    silent_payload = _native_audio_payload(value=0.0, is_speech=None)
+
+    assert handler._should_soft_interrupt_for_auto_response_overlap(session, {}, speech_payload) is True
+    # Silence still reaches the model untouched: that is how it starts speaking
+    # after a question, so it must never read as the user taking the turn.
+    assert handler._should_soft_interrupt_for_auto_response_overlap(session, {}, silent_payload) is False
+    # An explicit barge-in is a hard cancel, a different contract.
+    assert (
+        handler._should_soft_interrupt_for_auto_response_overlap(session, {"force_barge_in": True}, speech_payload)
+        is False
+    )
+
+
+def test_soft_interrupt_is_scoped_to_the_listen_only_policy():
+    handler, session = _soft_interrupt_context("sid-auto-policy-scope")
+    speech_payload = _native_audio_payload(is_speech=None)
+
+    session.config.overlap_policy = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    assert handler._should_soft_interrupt_for_auto_response_overlap(session, {}, speech_payload) is False
+
+    session.config.overlap_policy = DuplexOverlapPolicy.AUTO.value
+    assert handler._should_soft_interrupt_for_auto_response_overlap(session, {}, speech_payload) is False
+
+    session.config.overlap_policy = DuplexOverlapPolicy.LISTEN_ONLY.value
+    assert handler._should_soft_interrupt_for_auto_response_overlap(session, {}, speech_payload) is True
+
+
+def test_turn_mode_overlap_stays_on_the_decision_path():
+    """Turn mode already routes overlap through ``_overlap_decision``; the
+    auto-response shortcut must not double-apply there."""
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-turn-mode",
+        config=DuplexSessionConfig(extra_body={"soft_interrupt_on_overlap": True}),
+    )
+
+    assert handler._should_soft_interrupt_for_auto_response_overlap(session, {}, _native_audio_payload()) is False
 
 
 def test_auto_response_overlap_silence_advances_model_unit_and_preserves_realtime_input():
