@@ -3776,6 +3776,77 @@ class TestMingFlashOmniTTSServing:
         ming_flash_omni_tts_server._build_ming_flash_omni_prompt.assert_called_once()
 
 
+@pytest.fixture
+def dots_tts_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(
+        model="dots-studio/dots.tts-soar",
+    )
+    mock_engine_client.default_sampling_params_list = [
+        SimpleNamespace(max_tokens=2048, min_tokens=None, extra_args=None)
+    ]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="latent_generator", model_arch="DotsTTSForConditionalGeneration"),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.tts_adapters.dots_tts.AutoTokenizer.from_pretrained",
+        return_value=mocker.MagicMock(),
+    )
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestDotsTTSServing:
+    def test_dots_tts_prompt_validation(self, dots_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "ref_text" in error
+
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "ref_audio" in error
+
+        request = OpenAICreateSpeechRequest(input="Hello", voice="test")
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "voice" in error
+
+        request = OpenAICreateSpeechRequest(input="Hello", speaker_embedding=[1, 2, 3])
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "speaker_embedding" in error
+
+        request = OpenAICreateSpeechRequest(input="Hello", x_vector_only_mode=True)
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "x_vector_only_mode" in error
+
+    def test_dots_tts_adapter_builds_prompt(self, dots_tts_server, mocker: MockerFixture):
+        mocker.patch.object(dots_tts_server._adapter, "build", return_value=PreparedRequest(prompt="Hello"))
+        request = OpenAICreateSpeechRequest(input="Hello")
+        asyncio.run(dots_tts_server._prepare_speech_generation(request))
+        dots_tts_server._adapter.build.assert_called_once()
+
+
 class TestTTSAsyncOffloading:
     """Tests for event-loop-safe offloading of blocking TTS operations."""
 
