@@ -2485,5 +2485,3 @@ async def test_streaming_terminal_update_is_skipped_once_the_forward_failed():
     )
 
     assert forwards == [False]
-
-

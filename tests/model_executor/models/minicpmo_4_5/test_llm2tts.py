@@ -22,10 +22,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.errors import StageInputProcessingError
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
-from vllm_omni.errors import StageInputProcessingError
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import llm2tts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
