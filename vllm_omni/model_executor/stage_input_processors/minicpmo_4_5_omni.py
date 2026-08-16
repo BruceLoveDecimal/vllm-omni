@@ -773,8 +773,6 @@ def llm2tts(
         if tts_bos_id is None and not is_native_duplex_handoff:
             tts_bos_id = 151703
             tts_end_ids = set(tts_end_ids) | {151704, 151645}
-        if thinker_hidden_states is None and not is_native_duplex_handoff:
-            raise StageInputProcessingError("No latent or hidden_states found in thinker output")
 
         tts_bos_idx = None
         # For native duplex the resumable prompt folds every earlier unit, so

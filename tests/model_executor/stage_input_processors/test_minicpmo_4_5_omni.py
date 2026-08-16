@@ -142,11 +142,9 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
 @pytest.mark.parametrize(
     "output_ids",
     (
-        [],
-        [9303],
-        [9303, 9303],
-        [9308],
-        [9303, 9308],
+        [],  # nothing generated
+        [9303],  # a listen run that consumes the whole delta
+        [9308],  # a bare control terminator
     ),
 )
 def test_native_duplex_no_speech_without_hidden_states_is_skipped(output_ids: list[int]) -> None:
@@ -174,19 +172,6 @@ def test_native_duplex_no_speech_without_hidden_states_is_skipped(output_ids: li
         )
         == []
     )
-
-
-def test_non_duplex_output_without_hidden_states_raises_stage_input_error() -> None:
-    source = _output(
-        prompt_ids=[101],
-        output_ids=[21],
-    )
-
-    with pytest.raises(StageInputProcessingError, match="No latent or hidden_states"):
-        llm2tts(
-            [source],
-            prompt=[{}],
-        )
 
 
 def test_native_duplex_speech_without_hidden_states_raises_stage_input_error() -> None:

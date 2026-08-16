@@ -294,17 +294,6 @@ async def test_forward_to_dead_downstream_stage_fails_request_not_server(orchest
             orchestrator_fixture.thread.join(timeout=5)
 
 
-class _FailingInputProcessorStageClient(FakeStageClient):
-    """LLM stage replica whose inter-stage input processor rejects the payload."""
-
-    def __init__(self, *args, exc: Exception, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.exc = exc
-
-    def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
-        raise self.exc
-
-
 async def _run_failing_bridge(
     orchestrator_factory,
     *,
@@ -312,8 +301,13 @@ async def _run_failing_bridge(
     exc: Exception,
 ) -> tuple[ErrorMessage, OrchestratorFixture, FakeStageClient]:
     """Drive a two-stage pipeline whose stage-0 -> stage-1 bridge raises ``exc``."""
+
+    def _reject(source_outputs, prompt=None, streaming_context=None):
+        raise exc
+
     stage0 = FakeStageClient(stage_type="llm", final_output=False, next_inputs=[{"prompt_token_ids": [7, 8]}])
-    stage1 = _FailingInputProcessorStageClient(stage_type="llm", final_output=True, exc=exc)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    stage1.process_engine_inputs = _reject
     proc0 = FakeOutputProcessor(request_outputs=[_build_request_output(request_id, token_ids=[3], finished=True)])
     stage_pools = _build_stage_pools([[stage0], [stage1]], output_processors=[proc0, FakeOutputProcessor()])
     fixture = orchestrator_factory([], stage_pools=stage_pools)
