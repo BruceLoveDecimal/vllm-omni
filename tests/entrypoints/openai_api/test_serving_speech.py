@@ -3953,6 +3953,13 @@ class TestDotsTTSServing:
         asyncio.run(dots_tts_server._prepare_speech_generation(request))
         dots_tts_server._adapter.build.assert_called_once()
 
+    def test_dots_tts_adapter_apply_sampling_overrides(self, dots_tts_server, mocker: MockerFixture):
+        mocker.patch.object(dots_tts_server._adapter, "build", return_value=PreparedRequest(prompt="Hello"))
+        request = OpenAICreateSpeechRequest(input="Hello", max_new_tokens=10)
+        asyncio.run(dots_tts_server._prepare_speech_generation(request))
+        sampling_params_list = dots_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
+        assert sampling_params_list[0].max_tokens == 10
+
 
 class TestTTSAsyncOffloading:
     """Tests for event-loop-safe offloading of blocking TTS operations."""

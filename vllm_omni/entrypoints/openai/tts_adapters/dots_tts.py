@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from transformers import AutoTokenizer
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -58,3 +58,12 @@ class DotsTTSAdapter(ARTTSAdapter):
 
         prompt = build_dots_tts_prompt(self.tokenizer, request.input)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="dots_tts")
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)
