@@ -53,7 +53,10 @@ stages:
       cudagraph_mode: PIECEWISE
     default_sampling_params:
       temperature: 0.0
-      max_tokens: 200
+      # One token beyond the talker's 200-step decode budget: audio finalized
+      # in compute_logits only ships with the following step's output, so the
+      # stop token needs a token of its own past the budget.
+      max_tokens: 201
 
 # Ming-flash-omni-2.0 has only been verified on CUDA devices,
 # left empty intentionally. Add per-platform overrides here

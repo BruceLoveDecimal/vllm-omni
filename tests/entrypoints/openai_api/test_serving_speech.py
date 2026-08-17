@@ -1879,6 +1879,32 @@ class TestTTSMethods:
         assert additional["voice_name"] == "alice"
         assert additional["voice_created_at"] == 0
 
+    def test_ming_flash_omni_max_new_tokens_buys_a_token_for_the_delayed_stop(self, speech_server, mocker):
+        """The talker's stop token must not compete with its own decode budget.
+
+        Audio is finalized in ``compute_logits`` and can only ship with the next
+        step's output, so a request whose last decode step is also its last
+        budgeted token would be finished by the engine with the audio still
+        queued. ``ming_tts`` buys the same slack.
+        """
+        speech_server._tts_model_type = "ming_flash_omni_tts"
+        speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=201)]
+        speech_server.engine_client.generate = mocker.MagicMock(return_value=iter(()))
+        speech_server._build_ming_flash_omni_prompt = mocker.MagicMock(
+            return_value={
+                "prompt_token_ids": [1],
+                "additional_information": {"max_decode_steps": 20},
+            }
+        )
+
+        asyncio.run(
+            speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", max_new_tokens=20))
+        )
+
+        kwargs = speech_server.engine_client.generate.call_args.kwargs
+        assert kwargs["sampling_params_list"][0].max_tokens == 21
+        assert kwargs["prompt"]["additional_information"]["max_decode_steps"] == 20
+
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""
         req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan", language="English")

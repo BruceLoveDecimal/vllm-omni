@@ -330,6 +330,34 @@ def test_indextts25_build_uses_configured_tokenizer_file(
     assert captured["tokenizer_file"] == expected_tokenizer_file
 
 
+def test_ming_flash_omni_decode_budget_stays_below_the_stage_max_tokens():
+    """The talker's delayed stop token needs a token of its own past the budget.
+
+    Audio finalized in ``compute_logits`` only ships with the NEXT step's
+    ``make_omni_output``; if the budget-exhausting decode step is also the last
+    token the engine grants, the request finishes first and the finalized audio
+    is dropped in ``on_requests_finished``.
+    """
+    from vllm_omni.entrypoints.openai.tts_adapters.ming_flash_omni_tts import MingFlashOmniTTSAdapter
+
+    align = MingFlashOmniTTSAdapter._align_decode_budget
+
+    prompt: dict = {"additional_information": {}}
+    align(prompt, [SimpleNamespace(max_tokens=201)])
+    assert prompt["additional_information"]["max_decode_steps"] == 200
+
+    # A caller-named budget is left alone: serving_speech buys the extra token
+    # on the SamplingParams side instead.
+    named: dict = {"additional_information": {"max_decode_steps": 64}}
+    align(named, [SimpleNamespace(max_tokens=65)])
+    assert named["additional_information"]["max_decode_steps"] == 64
+
+    # Degenerate stage budgets still leave at least one decode step.
+    tiny: dict = {"additional_information": {}}
+    align(tiny, [SimpleNamespace(max_tokens=1)])
+    assert tiny["additional_information"]["max_decode_steps"] == 1
+
+
 def test_diffusion_adapter_extra_body_params_fallback():
     class _DiffAdapter(DiffusionTTSAdapter):
         name = "diff_probe"

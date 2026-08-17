@@ -670,6 +670,19 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         for req_id in finished:
             self._pending_prefill_done_updates.pop(req_id, None)
         self._results_queue = [item for item in self._results_queue if item[0] not in finished]
+        dropped = [req_id for req_id, payload in self._audio_queue if req_id in finished and payload]
+        if dropped:
+            # Normally unreachable: the stop token costs one token beyond the
+            # decode budget (deploy max_tokens = max_decode_steps + 1), so the
+            # engine cannot finish a request between finalize and the next
+            # make_omni_output. If it does, the caller silently gets no audio,
+            # so say why.
+            logger.warning(
+                "Ming native talker dropped finalized audio for finished requests %s; "
+                "the stage's SamplingParams.max_tokens must exceed max_decode_steps by "
+                "at least one token so the delayed stop step can ship the audio.",
+                sorted(dropped),
+            )
         self._audio_queue = [item for item in self._audio_queue if item[0] not in finished]
 
     def _build_native_prefill_embeds(
@@ -934,7 +947,6 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             already_projected = True
             if prompt_text is None:
                 prompt_text = preset.get("prompt_text")
-
         return _VoiceContext(
             spk_emb=spk_emb,
             prompt_text=prompt_text,

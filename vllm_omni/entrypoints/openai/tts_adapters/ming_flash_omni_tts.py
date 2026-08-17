@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -73,26 +73,52 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
         prompt: dict[str, Any] | None = None,
         request_id: str | None = None,
     ) -> list:
-        return apply_max_new_tokens(sampling_params_list, request)
+        """Buy the talker's delayed stop token a budget slot of its own.
+
+        The talker emits its stop token one step after it finalizes audio (see
+        ``_align_decode_budget``), so a caller-named decode budget needs one
+        token beyond it. At ``max_tokens == max_new_tokens`` the engine finishes
+        the request on its last decode step and the finalized audio is dropped
+        before it can ship, leaving the caller with no audio at all.
+        ``ming_tts`` buys the same slack.
+        """
+        if request.max_new_tokens is None:
+            return sampling_params_list
+
+        import copy
+
+        sampling_params_list = copy.deepcopy(sampling_params_list)
+        sampling_params_list[0].max_tokens = int(request.max_new_tokens) + 1
+        return sampling_params_list
 
     @staticmethod
     def _align_decode_budget(prompt: dict[str, Any], sampling_params_list: list) -> None:
-        """Make the talker's decode budget match what the stage will enforce.
+        """Derive the talker's decode budget from what the stage will enforce.
 
         The talker spends one AR step per audio frame and only emits audio once
         it decides to stop, so if ``SamplingParams.max_tokens`` runs out first the
         request ends with no audio at all. The prompt builder stamps
         ``max_decode_steps`` when the caller named a budget; otherwise the budget
-        is whatever the deploy config gave the stage, which is what gets copied
-        here. Read-only on ``sampling_params_list`` — the stage defaults are
-        shared across requests.
+        comes from the deploy config's stage ``max_tokens``, which is what gets
+        derived here.
+
+        The talker finalizes audio inside ``compute_logits`` but only emits the
+        stop token on the FOLLOWING step (``make_omni_output`` is assembled
+        before ``compute_logits`` within a runner step), so the decode budget
+        must stay one token below ``max_tokens``: a request whose last decode
+        step is also its last budgeted token is finished by the engine before
+        the queued audio can ship, and ``on_requests_finished`` then drops it.
+        ``ming_tts`` buys the same slack in ``serving_speech.py``.
+
+        Read-only on ``sampling_params_list`` — the stage defaults are shared
+        across requests.
         """
         info = prompt.get("additional_information")
         if not isinstance(info, dict) or "max_decode_steps" in info or not sampling_params_list:
             return
         stage_budget = getattr(sampling_params_list[0], "max_tokens", None)
         if stage_budget:
-            info["max_decode_steps"] = int(stage_budget)
+            info["max_decode_steps"] = max(1, int(stage_budget) - 1)
 
     def _load_supported_speakers(self) -> set[str]:
         # Speaker selection is driven by caption JSON rather than a static table.
