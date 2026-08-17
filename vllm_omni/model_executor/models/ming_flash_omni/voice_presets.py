@@ -221,6 +221,10 @@ class VoicePresetRegistry:
         self._patch_size = patch_size
 
         self.registered: dict[str, dict[str, Any]] = {}
+        # Voices the manifest lists (so the input processor sizes prompt-KV
+        # slots for them) but that failed to register. Requests naming one fall
+        # back to the default voice; tracked so the fallback can say why.
+        self.unavailable: dict[str, str] = {}
 
     def __contains__(self, voice_name: str) -> bool:
         return voice_name in self.registered
@@ -325,9 +329,15 @@ class VoicePresetRegistry:
     def _verify_derived_meta(self) -> None:
         """Cross-check registrations against ``resolve_voice_preset_meta``.
 
-        Every voice that sizes prompt-KV slots must be registered with exactly
-        the derived geometry, so a mismatch fails here instead of resurfacing as
-        a prefill length error on the first request naming that voice.
+        A voice that registered must match the derived geometry exactly, so a
+        mismatch fails here instead of resurfacing as a prefill length error on
+        the first request naming that voice.
+
+        A voice that did not register at all is a weaker failure: the manifest
+        and the wav header agreed enough to derive metadata, but the audio
+        itself (or the extractor) did not survive registration. That costs one
+        voice, not the engine, so it is recorded and warned about here and the
+        request path falls back to the default voice.
         """
         if self._audio_vae is None:
             logger.warning("AudioVAE unavailable; skipping voice preset geometry cross-check")
@@ -336,10 +346,13 @@ class VoicePresetRegistry:
         for name, expected in resolve_voice_preset_meta(self._model_path, self._download_dir).items():
             info = self.registered.get(name)
             if info is None:
-                raise RuntimeError(
-                    f"Voice preset '{name}' is listed in voice_name.json but failed to register; "
-                    "the stage input processor would still reserve prompt-KV slots for it"
+                self.unavailable[name] = "listed in voice_name.json but failed to register"
+                logger.warning(
+                    "Voice preset '%s' is listed in voice_name.json but failed to register; "
+                    "requests naming it fall back to the default voice",
+                    name,
                 )
+                continue
             emb = info.get("prompt_wav_emb")
             actual_len = int(emb.size(1)) if emb is not None else 0
             spk = info.get("spk_emb")

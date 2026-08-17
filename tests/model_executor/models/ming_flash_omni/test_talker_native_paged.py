@@ -336,6 +336,46 @@ def test_audio_finalize_delays_stop_until_next_scheduler_step():
     assert float(stop_logits[0, 1]) == 0.0
 
 
+def test_listed_but_unregistered_preset_warns_while_geometry_mismatch_still_fails(monkeypatch):
+    """One bad wav costs its voice; a real geometry mismatch still fails fast."""
+    from vllm_omni.model_executor.models.ming_flash_omni import voice_presets
+
+    registry = voice_presets.VoicePresetRegistry.__new__(voice_presets.VoicePresetRegistry)
+    registry._audio_vae = SimpleNamespace()
+    registry._model_path = "model"
+    registry._download_dir = None
+    registry.unavailable = {}
+    registry.registered = {"good": {"prompt_wav_emb": torch.ones(1, 5, 3), "spk_emb": [torch.ones(1, 2)]}}
+
+    derived = {
+        "good": {"prompt_wav_len": 5, "spk_emb_count": 1},
+        "broken": {"prompt_wav_len": 7, "spk_emb_count": 1},
+    }
+    monkeypatch.setattr(voice_presets, "resolve_voice_preset_meta", lambda *_: derived)
+
+    registry._verify_derived_meta()
+
+    assert "broken" in registry.unavailable
+    assert "good" not in registry.unavailable
+
+    registry.registered["good"]["prompt_wav_emb"] = torch.ones(1, 6, 3)
+    with pytest.raises(RuntimeError, match="geometry mismatch"):
+        registry._verify_derived_meta()
+
+
+def test_unregistered_preset_falls_back_instead_of_failing_the_request():
+    """A listed-but-unregistered voice costs that voice, not the request."""
+    talker = MingFlashOmniTalkerForConditionalGeneration.__new__(MingFlashOmniTalkerForConditionalGeneration)
+    talker.voice_presets = {}
+
+    voice = talker._resolve_voice({"voice_name": "DB30", "native_talker_prompt_wav_len": 4})
+
+    assert voice.spk_emb is None
+    assert voice.prompt_wav_lat is None
+    assert voice.prompt_wav_emb is None
+    assert voice.already_projected is False
+
+
 def test_finished_mask_matches_original_zero_based_min_new_token_boundary():
     should_stop = MingFlashOmniTalkerForConditionalGeneration._request_should_stop
 

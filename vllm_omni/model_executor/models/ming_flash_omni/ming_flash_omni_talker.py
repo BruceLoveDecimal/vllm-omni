@@ -947,6 +947,17 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             already_projected = True
             if prompt_text is None:
                 prompt_text = preset.get("prompt_text")
+        elif voice_name and spk_emb is None and native_slots_reserved and voice_name not in self.voice_presets:
+            # The processor sized slots from the manifest, but the voice never
+            # registered (see VoicePresetRegistry._verify_derived_meta). The
+            # reserved prompt-wav slots are padded and the request renders in
+            # the default voice rather than failing.
+            logger.warning(
+                "Ming talker voice preset %r is unavailable (%s); rendering in the default voice",
+                voice_name,
+                getattr(self.voice_presets, "unavailable", {}).get(voice_name, "not registered"),
+            )
+
         return _VoiceContext(
             spk_emb=spk_emb,
             prompt_text=prompt_text,
