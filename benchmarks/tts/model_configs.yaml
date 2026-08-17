@@ -132,3 +132,23 @@ models:
     endpoint: /v1/audio/speech
     task_extra_body:
       voice_design: {}
+
+  # Ming-flash-omni-2.0 standalone talker. Unlike the other entries this one
+  # does NOT use the auto-loaded deploy YAML: the default (ming_flash_omni.yaml)
+  # brings up thinker + talker, so the server must be launched with
+  # `--deploy-config vllm_omni/deploy/ming_flash_omni_tts.yaml` for a talker-only
+  # benchmark.
+  # Per-request cloning from raw audio is rejected by the TTS adapter (speaker
+  # features are extracted model-side at engine init), so voice_clone is NOT
+  # supported: use a preset `voice` from the checkpoint's talker/voice_name.json
+  # or pass `speaker_embedding` directly. `language` / `task_type` are also
+  # rejected — the talker infers language from the input text.
+  Jonathan1909/Ming-flash-omni-2.0:
+    supported_tasks: [default_voice]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      default_voice:
+        # talker/data/voice_name.json ships two presets: DB30 and lingguang.
+        voice: DB30
