@@ -247,6 +247,39 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     return runner
 
 
+def _prepare_runner_for_kwargs_extra(runner):
+    runner.model_config = SimpleNamespace(has_sampling_extra_args=True)
+    runner._omni_num_scheduled_tokens_np = None
+    runner._omni_query_start_loc_model_kwarg = False
+    runner._sync_local_stage_payloads = lambda: None
+    runner._gather_runtime_additional_information = lambda: {}
+    runner.requests["r1"].sampling_params = SimpleNamespace(extra_args={"tts_local_seed": 11})
+    runner.requests["r2"].sampling_params = SimpleNamespace(extra_args=None)
+    return runner
+
+
+def test_build_model_kwargs_extra_forwards_req_ids_when_model_opts_in():
+    runner = _prepare_runner_for_kwargs_extra(_make_runner(req_ids=("r1", "r2")))
+    runner.model.accepts_sampling_req_ids = True
+
+    extra = OmniGPUModelRunner._build_model_kwargs_extra(runner)
+
+    assert extra["req_ids"] == ["r1", "r2"]
+    assert extra["active_req_ids"] == ["r1", "r2"]
+    assert extra["sampling_extra_args"][0]["tts_local_seed"] == 11
+    assert extra["sampling_extra_args"][1] == {}
+
+
+def test_build_model_kwargs_extra_omits_req_ids_without_opt_in():
+    runner = _prepare_runner_for_kwargs_extra(_make_runner(req_ids=("r1", "r2")))
+
+    extra = OmniGPUModelRunner._build_model_kwargs_extra(runner)
+
+    assert "req_ids" not in extra
+    assert "active_req_ids" not in extra
+    assert extra["sampling_extra_args"][0]["tts_local_seed"] == 11
+
+
 def _make_runner_for_mimo(req_id="r_mimo"):
     """Create a minimal runner with MiMoAudio-like model and request state."""
     runner = object.__new__(OmniGPUModelRunner)

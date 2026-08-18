@@ -13,6 +13,7 @@ from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from vllm_omni.model_executor.models.voxtral_tts.flow_matching_seed import fill_flow_matching_noise
 from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
     AudioSpecialTokens,
 )
@@ -232,6 +233,7 @@ class CUDAGraphAcousticTransformerWrapper:
         self,
         hidden_states: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        generators: list[torch.Generator | None] | None = None,
     ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]] | None]:
         """
         Drop-in replacement for model.compute_mm_logits().
@@ -243,15 +245,15 @@ class CUDAGraphAcousticTransformerWrapper:
         actual_size = hidden_states.shape[0]
 
         if not self.enabled or not self._warmed_up:
-            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
+            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, generators=generators)
 
         # Inner graph replay is illegal during an outer stream capture.
         if torch.cuda.is_current_stream_capturing():
-            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
+            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, generators=generators)
 
         padded_size = self._get_padded_size(actual_size)
         if padded_size is None or padded_size not in self.graphs:
-            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
+            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, generators=generators)
 
         # Zero static input, then copy actual data
         self.static_inputs[padded_size].zero_()
@@ -261,9 +263,11 @@ class CUDAGraphAcousticTransformerWrapper:
         self.static_cfg_alpha[padded_size].fill_(1.2)
         self.static_cfg_alpha[padded_size][:actual_size, 0] = cfg_alpha
 
-        # Fill noise buffer with fresh random values before replay so the
-        # flow-matching ODE starts from different initial noise each time.
-        self.static_noise[padded_size].normal_()
+        fill_flow_matching_noise(
+            self.static_noise[padded_size],
+            generators,
+            actual_size=actual_size,
+        )
 
         # Replay captured graph
         self.graphs[padded_size].replay()
