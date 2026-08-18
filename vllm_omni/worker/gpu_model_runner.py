@@ -1398,8 +1398,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 sp = req.sampling_params if req else None
                 extra_args_list.append(sp.extra_args if sp and sp.extra_args else {})
             model_kwargs_extra["sampling_extra_args"] = extra_args_list
-            model_kwargs_extra["req_ids"] = list(self.input_batch.req_ids)
-            model_kwargs_extra["active_req_ids"] = list(self.requests.keys())
 
         return model_kwargs_extra
 

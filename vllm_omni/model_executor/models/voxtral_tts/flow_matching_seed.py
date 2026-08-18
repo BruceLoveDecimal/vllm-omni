@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Seeded flow-matching noise helpers for Voxtral TTS."""
+"""Seeded flow-matching noise helpers for Voxtral TTS.
+
+Reuses the existing speech-API ``tts_local_seed`` extra_arg written by
+``serving_speech`` (same field Qwen3-TTS consumes). Each frame builds a
+fresh ``torch.Generator`` from that seed so the ODE initial noise is
+reproducible without a runner-side request-id cache.
+"""
 
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -8,49 +14,27 @@ from typing import Any
 import torch
 
 
-def resolve_tts_local_seeds(
+def generators_from_tts_local_seed(
     batch_size: int,
     sampling_extra_args: Sequence[Any] | None,
-) -> list[int | None]:
-    """Read per-request ``tts_local_seed`` values aligned to the current batch."""
+    *,
+    device: torch.device,
+) -> list[torch.Generator | None] | None:
+    """Build per-row generators from Qwen3's ``tts_local_seed`` extra_arg."""
     extras = list(sampling_extra_args) if sampling_extra_args is not None else []
-    seeds: list[int | None] = []
+    generators: list[torch.Generator | None] = []
+    any_seeded = False
     for index in range(batch_size):
         extra = extras[index] if index < len(extras) else None
         seed = extra.get("tts_local_seed") if isinstance(extra, Mapping) else None
-        seeds.append(int(seed) if seed is not None else None)
-    return seeds
-
-
-def resolve_flow_matching_generators(
-    seeds: Sequence[int | None],
-    req_ids: Sequence[str] | None,
-    *,
-    device: torch.device,
-    cache: dict[str, tuple[int, torch.Generator]],
-    active_req_ids: Sequence[str] | None = None,
-) -> list[torch.Generator | None] | None:
-    """Return per-row generators that persist across decode steps of a request."""
-    if all(seed is None for seed in seeds):
-        return None
-    if active_req_ids is not None:
-        live = set(active_req_ids)
-        for stale_id in [req_id for req_id in cache if req_id not in live]:
-            del cache[stale_id]
-
-    generators: list[torch.Generator | None] = []
-    for index, seed in enumerate(seeds):
         if seed is None:
             generators.append(None)
             continue
-        req_id = req_ids[index] if req_ids is not None and index < len(req_ids) else f"__seed_{seed}_{index}"
-        cached = cache.get(req_id)
-        if cached is None or cached[0] != seed or cached[1].device != device:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(int(seed))
-            cache[req_id] = (int(seed), generator)
-        generators.append(cache[req_id][1])
-    return generators
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+        generators.append(generator)
+        any_seeded = True
+    return generators if any_seeded else None
 
 
 def sample_flow_matching_noise(
