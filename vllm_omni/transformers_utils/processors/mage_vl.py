@@ -109,11 +109,33 @@ class MageVLProcessor(Qwen2VLProcessor):
     def spatial_merge_size(self) -> int:
         return int(self.image_processor.merge_size)
 
-    def __call__(self, images=None, text=None, videos=None, **kwargs):
+    def __call__(
+        self,
+        images=None,
+        text=None,
+        videos=None,
+        video_backend: str = "frames",
+        codec_config=None,
+        **kwargs,
+    ):
+        """Image / frame-sampled path by default; ``video_backend="codec"`` for canvases.
+
+        Frame sampling keeps video in the image tensors (one block per frame), which is
+        what the reference serves online, so ``videos=`` is not a separate tensor path
+        here. Codec sampling is different in kind -- it tiles patches from many frames
+        onto shared canvases and rewrites the prompt with per-frame timestamps -- so it
+        gets its own branch.
+        """
+        if video_backend == "codec":
+            return self._call_codec(text=text, videos=videos, codec_config=codec_config)
+        if video_backend != "frames":
+            raise ValueError(
+                f"unknown video_backend {video_backend!r} (use 'frames' or 'codec')"
+            )
         if videos is not None:
             raise ValueError(
-                "Mage-VL has no video processor: frames are sampled or codec-decoded "
-                "upstream and enter through the image tensors. Pass them as `images`."
+                "Mage-VL has no video processor: with video_backend='frames' the caller "
+                "samples frames upstream and passes them as `images`."
             )
 
         outputs = super().__call__(images=images, text=text, **kwargs)
@@ -123,6 +145,64 @@ class MageVLProcessor(Qwen2VLProcessor):
                 spatial_merge_size=self.spatial_merge_size,
             )
         return outputs
+
+    def _call_codec(self, text, videos, codec_config):
+        """Build model inputs from codec canvases.
+
+        The canvases carry patches from several source frames each, so unlike the frame
+        path the prompt cannot keep a single placeholder: it is rewritten into one
+        timestamped ``<|image_pad|>`` run per source frame.
+        """
+        from transformers import BatchFeature
+
+        from vllm_omni.transformers_utils.processors.mage_vl_codec import (
+            CodecConfig,
+            codec_image_processor_outputs,
+            codec_positions_for_processor,
+            drop_padding_canvases,
+            load_codec_result,
+            process_codec_video,
+            rewrite_text_with_codec_positions,
+        )
+
+        if text is None:
+            raise ValueError("`text` is required")
+        prompts = [text] if isinstance(text, str) else list(text)
+        if len(prompts) != 1:
+            raise ValueError("the codec path handles one prompt at a time")
+
+        settings = dict(codec_config or {})
+        asset_dir = settings.pop("asset_dir", None)
+        cfg = CodecConfig(**settings)
+
+        # An asset directory is a codec run someone already did; without one we would
+        # have to run an engine, and process_codec_video says which tool is missing.
+        result = load_codec_result(asset_dir) if asset_dir else process_codec_video(videos, cfg)
+
+        images, src_positions, _ = drop_padding_canvases(result["images"], result["src_positions"])
+        if not images:
+            raise ValueError("every codec canvas was padding; nothing to encode")
+
+        image_outputs = codec_image_processor_outputs(
+            self.image_processor, images, max_pixels=cfg.max_pixels
+        )
+        patch_positions = codec_positions_for_processor(
+            src_positions, image_outputs["image_grid_thw"]
+        )
+        prompt = rewrite_text_with_codec_positions(
+            prompts[0], patch_positions, fps=result["fps"], decimals=result["decimals"]
+        )
+
+        text_inputs = self.tokenizer([prompt], return_tensors="pt")
+        return BatchFeature(
+            data={
+                **text_inputs,
+                "pixel_values": image_outputs["pixel_values"],
+                "image_grid_thw": image_outputs["image_grid_thw"],
+                "patch_positions": patch_positions,
+            },
+            tensor_type="pt",
+        )
 
     @property
     def model_input_names(self):
