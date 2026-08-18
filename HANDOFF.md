@@ -39,7 +39,7 @@ below can be verified without it. Once it boots, run §5 in order.
 
 | Commit | Risk | State |
 |---|---|---|
-| `8ca45ea8` deploy config `stage_id`/`pipeline` | high | **Still unrun.** The invocation is `-m vllm_omni.entrypoints.cli.main serve <model> --omni --deploy-config vllm_omni/deploy/mage_vl.yaml`, and **`--deploy-config` is only accepted together with `--omni`** (without it: `unrecognized arguments`). The box died during this launch when the balance ran out, so there is no evidence either way. |
+| `8ca45ea8` deploy config `stage_id`/`pipeline` | high | **Verified**: `-m vllm_omni.entrypoints.cli.main serve <model> --omni --deploy-config vllm_omni/deploy/mage_vl.yaml` starts (KV cache 16.45 GiB / 119,760 tokens) and answers 3/3 token-identical. Note **`--deploy-config` is only accepted together with `--omni`** (without it: `unrecognized arguments`). |
 | `9128219e` `keep_on_cpu` + `temporal_patch_size` | low | **Verified** -- exercised by every run below, and `temporal_patch_size` is what the reused `_get_vision_info` reads. |
 | `e4a1606f` reuse Qwen2-VL merger + MLP | **highest** | **Verified numerically**: fp32 `rel_l2` 4.1865e-06 / cos 1.0000000000, identical to the pre-reuse figure. |
 | `a5994c5c` `__init__` exports | none | Verified by import. |
@@ -134,9 +134,18 @@ Measured **2026-08-19, with the processor/processing-info reuse in place**:
 | Video (frame-sampled multi-image) | token-identical; 4 concurrent requests → 1 distinct output |
 | CPU tests | 15/15 on transformers 5.8.0 (Mac) and 5.8.1 (box) |
 
-**Still never verified:** TP > 1 (single-GPU box), `trust_remote_code=False` *serving*
-(the processor loads without it, but no engine run has dropped the flag), the
-`vllm-omni serve` deploy-config path, and the profiling comparison in §5.
+Also verified in the same session:
+
+| Check | Result |
+|---|---|
+| `vllm-omni serve --omni --deploy-config` | starts; 3/3 token-identical + streaming |
+| Serving with **no** `--trust-remote-code` | starts (`trust_remote_code=False` in the engine config) and answers 3/3 token-identical |
+| Profiling at 0.85 / `image: 8` / 32768 | encoder cache budget 3906 tokens profiled with **1** max-size image; KV 16.67 GiB / 121,408 tokens. With `--mm-processor-kwargs '{"max_pixels":150000}'`: budget 2048, KV 16.97 GiB. The 0.3 GiB delta is why the checkpoint default stays -- and it proves `mm_processor_kwargs` passthrough works |
+| Online e2e suite (`tests/e2e/online_serving/test_mage_vl.py`) | L2 1/1, L3 3/3 |
+| Perf smoke (1 image, 64 tokens, greedy) | TTFT median 76 ms, decode 161.7 tok/s; 4 concurrent: 422.3 tok/s aggregate, TTFT median 124 ms |
+
+**Still never verified: `tp > 1`.** It needs a second GPU, which this box does not have.
+Everything else in the M1/M2 acceptance list has been run.
 
 ---
 
