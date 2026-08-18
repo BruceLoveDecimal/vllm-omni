@@ -151,6 +151,31 @@ Lower it when you want more KV cache and your inputs are small:
 vllm serve microsoft/Mage-VL --mm-processor-kwargs '{"max_pixels": 150000}'
 ```
 
+### Codec-native video
+
+Long video can go through the checkpoint's codec sampler instead of uniform frames: it
+groups frames by how much new information each carries and tiles the selected patches
+onto a small number of square canvases, so a 256-frame clip costs far fewer visual tokens
+than 256 images would. vllm-omni ports the preprocessing that turns those canvases into
+model inputs — position table, padding-canvas removal, and the prompt rewrite that
+replaces the video placeholder with one timestamped `<|image_pad|>` run per source frame:
+
+```python
+processor(
+    text=prompt,
+    video_backend="codec",
+    codec_config={"asset_dir": "/path/to/codec/assets"},
+)
+```
+
+**Running the codec itself is not included.** `engine="hevc"` (the checkpoint default)
+shells out to an external `cv-preinfer` binary that neither the checkpoint nor vllm-omni
+ships, and `engine="dcvc-rt"` needs the checkpoint's bundled `neural_codec` package with
+its compiled CUDA extensions. Asking for either raises `NotImplementedError` naming the
+missing tool rather than failing later on a shape mismatch. Until that tooling is
+available, point `codec_config={"asset_dir": ...}` at an asset directory produced by the
+reference pipeline (`canvas_*.jpg` + `src_patch_position.npy` + `meta.json`).
+
 ## Limitations
 
 Untested support is reported as unknown, not as supported:
@@ -159,9 +184,10 @@ Untested support is reported as unknown, not as supported:
   linear layers so weights-TP should work, but no multi-GPU run has been made. The model
   leaves `supports_encoder_tp_data` at `False`, so vLLM downgrades encoder "data"
   parallelism to weights-TP on its own rather than running with incomplete state.
-- **Codec-native video is not wired up.** The checkpoint ships a codec preprocessing path
-  for long video; this port takes frames through the image tensors, which is what the
-  reference serves online.
+- **Codec-native video is preprocessing-only.** The canvas → model-input half is ported
+  and checked elementwise against the reference; neither codec *engine* runs here (see
+  [Codec-native video](#codec-native-video)), so end-to-end codec parity on a real video
+  is unmeasured.
 - **The StreamMind cognition gate is not wired up.** `streammind_gate.safetensors` is
   present in the checkpoint but proactive streaming is a later milestone.
 - **Checkpoint revision:** validation ran against a local snapshot; pin an explicit

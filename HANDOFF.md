@@ -263,6 +263,49 @@ Registration happens in three places, all required: `models/registry.py` (`_OMNI
 
 ---
 
+## 7b. Milestone status (2026-08-19)
+
+**M1/M2 complete except `tp > 1`**, which needs a second GPU this box does not have.
+Landed in this session: model listing row, `recipes/Microsoft/Mage-VL.md` with measured
+accuracy *and* perf numbers, `tests/e2e/online_serving/test_mage_vl.py` (L2 1/1, L3 3/3 on
+the box), a CI deploy overlay (`_CI_OVERLAYS["mage_vl"]`), buildkite wiring in
+test-ready/test-merge, and CPU guards for the modality declaration and the parallel-axis
+fail-fast.
+
+Two traps found while writing those tests, both worth remembering:
+
+- `send_omni_request` forwards only a fixed set of top-level keys. A top-level
+  `temperature` is **dropped silently**, so the server sampled with the checkpoint's
+  generation_config defaults and every "output is stable" assertion failed for the wrong
+  reason. Sampling params must ride in `extra_body`.
+- `--deploy-config` is only accepted alongside `--omni`.
+
+**M3 is half done.** The canvas → model-input half is ported into
+`vllm_omni/transformers_utils/processors/mage_vl_codec.py` and reachable through
+`processor(video_backend="codec", codec_config={"asset_dir": ...})`. Every piece was
+compared elementwise against the checkpoint's own `codec_video_processing_mage_vl.py` over
+randomized inputs on CPU (positions, padding drop, prompt rewrite, pixel-budget clamp,
+config coercion -- all identical), and pinned by 13 CPU tests.
+
+What M3 still needs, and why it stopped here: **neither codec engine can run.**
+`engine="hevc"` (the checkpoint default) shells out to an external `cv-preinfer` binary
+that is not bundled with the checkpoint or available here, and `engine="dcvc-rt"` needs
+the checkpoint's `neural_codec/` package with compiled CUDA extensions (255 MB of it is in
+the checkpoint, unbuilt). Both raise `NotImplementedError` naming the missing tool. So
+M3's acceptance #1 (parity against the HF codec path on a real video) is **not
+measurable** until one of those is installed on the box -- that is the next decision, not
+more code.
+
+**M4 needs the box.** The gate (`streammind_gate.py`) is built on
+`mamba_ssm.models.mixer_seq_simple.create_block`, which is CUDA-only: it cannot be
+cross-checked on the dev Mac at all, and `mamba_ssm` is not installed on the box either.
+The reuse-first port would go through vLLM's own Mamba layers, but every parity number for
+it has to come from a GPU run.
+
+The reference implementation's sources are cached at
+`<scratchpad>/mage_ref_src/` (checkpoint `.py` + `.json`, no weights) so this reading does
+not need the box powered on.
+
 ## 8. Reuse done, and what it now needs from the box
 
 Both items the audit left open are **implemented** (the transformers-runtime blockers were
