@@ -58,6 +58,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.tokenizers.mistral import MistralTokenizer
 
+from vllm_omni.model_executor.models.voxtral_tts.flow_matching_seed import sample_flow_matching_noise
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 weight_norm = torch.nn.utils.parametrizations.weight_norm
@@ -510,6 +511,7 @@ class FlowMatchingAudioTransformer(nn.Module):
         semantic_code: torch.Tensor,
         llm_hidden: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        generators: Sequence[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         B = semantic_code.shape[0]
 
@@ -517,7 +519,13 @@ class FlowMatchingAudioTransformer(nn.Module):
         should_decode = semantic_code != self._end_audio_token_id
 
         # acoustic_codes starts from x_0; generate directly on device to skip H2D.
-        x_0 = torch.randn(B, self.model_args.n_acoustic_codebook, dtype=llm_hidden.dtype, device=llm_hidden.device)
+        x_0 = sample_flow_matching_noise(
+            B,
+            self.model_args.n_acoustic_codebook,
+            device=llm_hidden.device,
+            dtype=llm_hidden.dtype,
+            generators=generators,
+        )
         x_0 = self._noise_scale * x_0
 
         # Build the schedule constants once per dtype and reuse them every frame.
@@ -598,6 +606,7 @@ class FlowMatchingAudioTransformer(nn.Module):
         self,
         llm_hidden: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        generators: Sequence[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         # llm_hidden: BxD
         semantic_logit = self.semantic_codebook_output(llm_hidden).float()
@@ -611,6 +620,7 @@ class FlowMatchingAudioTransformer(nn.Module):
             semantic_code.squeeze(1),
             llm_hidden,
             cfg_alpha=cfg_alpha,
+            generators=generators,
         )
 
         audio_codes = torch.concatenate(
@@ -1061,10 +1071,12 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
         self,
         hidden_states: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        generators: Sequence[torch.Generator | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         audio_codes = self.acoustic_transformer(
             llm_hidden=hidden_states,
             cfg_alpha=cfg_alpha,
+            generators=generators,
         )
         # Cache device-resident 1.0/0.0 scalars to avoid a per-call H2D transfer.
         consts = self._fake_eos_consts.get(audio_codes.device)

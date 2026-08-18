@@ -23,6 +23,10 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.voxtral_tts.cuda_graph_acoustic_transformer_wrapper import (
     CUDAGraphAcousticTransformerWrapper,
 )
+from vllm_omni.model_executor.models.voxtral_tts.flow_matching_seed import (
+    resolve_flow_matching_generators,
+    resolve_tts_local_seeds,
+)
 from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
     VoxtralTTSDummyInputsBuilder,
     VoxtralTTSMultiModalProcessor,
@@ -125,6 +129,7 @@ class VoxtralTTSForConditionalGeneration(
             self.model = self.audio_generation
             self.audio_tokenizer = None
             self._cudagraph_acoustic_transformer = None
+            self._tts_noise_generators: dict[str, tuple[int, torch.Generator]] = {}
             self._vllm_config = vllm_config
             tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
             self._audio_token_id = tokenizer.instruct.audio_encoder.special_ids.audio
@@ -339,6 +344,25 @@ class VoxtralTTSForConditionalGeneration(
             dtype=input_hidden_states.dtype,
         )
 
+    def _resolve_flow_matching_generators(
+        self, input_hidden_states: torch.Tensor, **kwargs
+    ) -> list[torch.Generator | None] | None:
+        seeds = resolve_tts_local_seeds(
+            input_hidden_states.shape[0],
+            kwargs.get("sampling_extra_args"),
+        )
+        cache = getattr(self, "_tts_noise_generators", None)
+        if cache is None:
+            cache = {}
+            self._tts_noise_generators = cache
+        return resolve_flow_matching_generators(
+            seeds,
+            kwargs.get("req_ids"),
+            device=input_hidden_states.device,
+            cache=cache,
+            active_req_ids=kwargs.get("active_req_ids"),
+        )
+
     def make_omni_output(
         self, model_outputs: torch.Tensor | OmniOutput | tuple, logits_index: int | None = None, **kwargs
     ) -> OmniOutput:
@@ -348,13 +372,14 @@ class VoxtralTTSForConditionalGeneration(
                 assert logits_index is not None
                 input_hidden_states = hidden_states[logits_index]
                 cfg_alpha = self._extract_cfg_alpha(input_hidden_states, **kwargs)
+                generators = self._resolve_flow_matching_generators(input_hidden_states, **kwargs)
                 if self._cudagraph_acoustic_transformer is not None:
                     fake_eos, multimodal_outputs = self._cudagraph_acoustic_transformer(
-                        input_hidden_states, cfg_alpha=cfg_alpha
+                        input_hidden_states, cfg_alpha=cfg_alpha, generators=generators
                     )
                 else:
                     fake_eos, multimodal_outputs = self.model.compute_mm_logits(
-                        input_hidden_states, cfg_alpha=cfg_alpha
+                        input_hidden_states, cfg_alpha=cfg_alpha, generators=generators
                     )
                 hidden_states[logits_index, 0] = fake_eos
                 return OmniOutput(

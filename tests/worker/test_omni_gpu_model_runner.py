@@ -247,6 +247,24 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     return runner
 
 
+def test_build_model_kwargs_extra_forwards_req_ids_for_tts_seed():
+    runner = _make_runner(req_ids=("r1", "r2"))
+    runner.model_config = SimpleNamespace(has_sampling_extra_args=True)
+    runner._omni_num_scheduled_tokens_np = None
+    runner._omni_query_start_loc_model_kwarg = False
+    runner._sync_local_stage_payloads = lambda: None
+    runner._gather_runtime_additional_information = lambda: {}
+    runner.requests["r1"].sampling_params = SimpleNamespace(extra_args={"tts_local_seed": 11})
+    runner.requests["r2"].sampling_params = SimpleNamespace(extra_args=None)
+
+    extra = OmniGPUModelRunner._build_model_kwargs_extra(runner)
+
+    assert extra["req_ids"] == ["r1", "r2"]
+    assert extra["active_req_ids"] == ["r1", "r2"]
+    assert extra["sampling_extra_args"][0]["tts_local_seed"] == 11
+    assert extra["sampling_extra_args"][1] == {}
+
+
 def _make_runner_for_mimo(req_id="r_mimo"):
     """Create a minimal runner with MiMoAudio-like model and request state."""
     runner = object.__new__(OmniGPUModelRunner)

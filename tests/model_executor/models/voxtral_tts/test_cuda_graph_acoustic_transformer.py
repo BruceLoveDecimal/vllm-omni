@@ -112,6 +112,7 @@ class SyntheticModel(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        generators=None,
     ):
         """Eager fallback path: replicate what the wrapper does."""
         _, AudioSpecialTokens = _voxtral_cudagraph_deps()
@@ -324,3 +325,31 @@ def test_deterministic_across_calls(model, wrapper):
         eos2, codes2 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha))
     torch.testing.assert_close(eos1, eos2, atol=0, rtol=0)
     torch.testing.assert_close(codes1, codes2, atol=0, rtol=0)
+
+
+def _seeded_cuda_generators(*seeds: int) -> list[torch.Generator]:
+    generators = []
+    for seed in seeds:
+        generator = torch.Generator(device=DEVICE)
+        generator.manual_seed(seed)
+        generators.append(generator)
+    return generators
+
+
+def test_seeded_generators_reproducible_across_calls(model, wrapper):
+    """The same per-request seeds must replay the same CUDA-graph noise."""
+    hidden = _random_hidden(2)
+    alpha = _cfg_alpha(2)
+    with torch.no_grad():
+        eos1, codes1 = _unpack_audio_codes(
+            wrapper(hidden, cfg_alpha=alpha, generators=_seeded_cuda_generators(11, 22))
+        )
+        eos2, codes2 = _unpack_audio_codes(
+            wrapper(hidden, cfg_alpha=alpha, generators=_seeded_cuda_generators(11, 22))
+        )
+        _, codes_other = _unpack_audio_codes(
+            wrapper(hidden, cfg_alpha=alpha, generators=_seeded_cuda_generators(33, 22))
+        )
+    torch.testing.assert_close(eos1, eos2, atol=0, rtol=0)
+    torch.testing.assert_close(codes1, codes2, atol=0, rtol=0)
+    assert not torch.equal(codes1, codes_other)
