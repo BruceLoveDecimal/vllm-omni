@@ -28,6 +28,7 @@ RoPE must encode.
 """
 
 from collections.abc import Iterable
+from functools import partial
 
 import numpy as np
 import torch
@@ -36,13 +37,10 @@ from vllm.distributed import parallel_state
 from vllm.distributed import utils as dist_utils
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention import MMEncoderAttention
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.qwen2_vl import Qwen2VisionMLP, Qwen2VisionPatchMerger
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 
 from vllm_omni.transformers_utils.configs.mage_vl import MageVLVisionConfig
@@ -247,40 +245,6 @@ class MageVLVisionAttention(nn.Module):
         return out
 
 
-class MageVLVisionMLP(nn.Module):
-    def __init__(
-        self,
-        config: MageVLVisionConfig,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        use_data_parallel = is_vit_use_data_parallel()
-        self.fc1 = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fc1",
-            disable_tp=use_data_parallel,
-        )
-        self.fc2 = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fc2",
-            disable_tp=use_data_parallel,
-        )
-        self.act = get_act_fn(config.hidden_act)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.fc1(x)
-        x = self.act(x)
-        x, _ = self.fc2(x)
-        return x
-
-
 def _norm_layer(config: MageVLVisionConfig) -> nn.Module:
     if config.layer_norm_type == "rms_norm":
         return nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -300,7 +264,17 @@ class MageVLVisionEncoderLayer(nn.Module):
         self.self_attn = MageVLVisionAttention(
             config, quant_config=quant_config, prefix=f"{prefix}.self_attn"
         )
-        self.mlp = MageVLVisionMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
+        # Same fc1 -> act -> fc2 shape and parameter names as the Qwen2-VL encoder MLP.
+        # ``act_layer`` takes a *type*, and upstream defaults it to QuickGELU, so the
+        # config's activation has to be bound explicitly -- otherwise the activation is
+        # silently swapped and the tower stops matching the reference.
+        self.mlp = Qwen2VisionMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            act_layer=partial(get_act_fn, config.hidden_act),
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
 
     def forward(
         self,
@@ -318,12 +292,8 @@ class MageVLVisionEncoderLayer(nn.Module):
         return x
 
 
-class MageVLVisionPatchMerger(nn.Module):
-    """Fold ``spatial_merge_size**2`` patches into one token and project to the LLM width.
-
-    ``mlp.0`` is column-parallel and ``mlp.2`` row-parallel so the shard boundary stays
-    inside the merger and the output is full width for the language model.
-    """
+class MageVLVisionEncoder(nn.Module):
+    """Holds the encoder layers under ``encoder.layers.N``, matching the checkpoint."""
 
     def __init__(
         self,
@@ -332,38 +302,14 @@ class MageVLVisionPatchMerger(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        use_data_parallel = is_vit_use_data_parallel()
-        self.spatial_merge_size = config.spatial_merge_size
-        self.inner_dim = config.hidden_size * (config.spatial_merge_size**2)
-        self.ln_q = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.mlp = nn.ModuleList(
+        self.layers = nn.ModuleList(
             [
-                ColumnParallelLinear(
-                    self.inner_dim,
-                    self.inner_dim,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.0",
-                    disable_tp=use_data_parallel,
-                ),
-                nn.GELU(),
-                RowParallelLinear(
-                    self.inner_dim,
-                    config.out_hidden_size,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.2",
-                    disable_tp=use_data_parallel,
-                ),
+                MageVLVisionEncoderLayer(
+                    config, quant_config=quant_config, prefix=f"{prefix}.layers.{i}"
+                )
+                for i in range(config.num_hidden_layers)
             ]
         )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ln_q(x).view(-1, self.inner_dim)
-        x, _ = self.mlp[0](x)
-        x = self.mlp[1](x)
-        x, _ = self.mlp[2](x)
-        return x
 
 
 class MageVLVisionTransformer(nn.Module):
@@ -384,17 +330,19 @@ class MageVLVisionTransformer(nn.Module):
         self.embeddings = MageVLVisionEmbeddings(config)
         self.layernorm_pre = _norm_layer(config)
         self.video_rope = MageVLVisionRotaryEmbedding(config)
-        self.encoder = nn.ModuleList(
-            [
-                MageVLVisionEncoderLayer(
-                    config, quant_config=quant_config, prefix=f"{prefix}.encoder.layers.{i}"
-                )
-                for i in range(config.num_hidden_layers)
-            ]
+        self.encoder = MageVLVisionEncoder(
+            config, quant_config=quant_config, prefix=f"{prefix}.encoder"
         )
         self.layernorm_post = _norm_layer(config) if config.use_head else None
-        self.merger = MageVLVisionPatchMerger(
-            config, quant_config=quant_config, prefix=f"{prefix}.merger"
+        # Same ln_q / mlp.0 / mlp.2 layout as the Qwen2-VL merger, so the checkpoint
+        # keys load unchanged; only the norm epsilon comes from Mage's config.
+        self.merger = Qwen2VisionPatchMerger(
+            d_model=config.out_hidden_size,
+            context_dim=config.hidden_size,
+            norm_layer=partial(nn.LayerNorm, eps=config.layer_norm_eps),
+            spatial_merge_size=config.spatial_merge_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.merger",
         )
 
     @property
@@ -425,7 +373,7 @@ class MageVLVisionTransformer(nn.Module):
         # Backend-specific metadata is built by MMEncoderAttention's own helpers: each
         # attention backend consumes a different shape, so hand-computing these would
         # only ever be correct for one of them.
-        attn_backend = self.encoder[0].self_attn.attn.attn_backend
+        attn_backend = self.encoder.layers[0].self_attn.attn.attn_backend
         sequence_lengths = MMEncoderAttention.maybe_compute_seq_lens(
             attn_backend, cu_seqlens_np, x.device
         )
@@ -437,11 +385,11 @@ class MageVLVisionTransformer(nn.Module):
             attn_backend,
             cu_seqlens_np,
             hidden_size=self.config.hidden_size,
-            tp_size=self.encoder[0].self_attn.tp_size,
+            tp_size=self.encoder.layers[0].self_attn.tp_size,
             device=x.device,
         )
 
-        for layer in self.encoder:
+        for layer in self.encoder.layers:
             x = layer(x, cu_seqlens, cos, sin, max_seqlen, sequence_lengths)
 
         if self.layernorm_post is not None:
@@ -451,20 +399,9 @@ class MageVLVisionTransformer(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the tower.
 
-        The checkpoint stores a single fused ``self_attn.qkv`` matrix laid out as
-        ``[all_q | all_k | all_v]``, which is exactly what ``QKVParallelLinear``'s
-        weight loader consumes when no shard id is supplied, so no splitting is needed
-        here. ``encoder.layers.N`` is flattened to ``encoder.N`` to match this module's
-        ``nn.ModuleList``.
+        Module names mirror the checkpoint (``encoder.layers.N.*``, ``merger.mlp.0`` ...)
+        so no renaming is needed. The checkpoint stores a single fused
+        ``self_attn.qkv`` matrix laid out as ``[all_q | all_k | all_v]``, which is what
+        ``QKVParallelLinear``'s loader consumes when no shard id is supplied.
         """
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded: set[str] = set()
-        for name, weight in weights:
-            name = name.replace("encoder.layers.", "encoder.")
-            if name not in params_dict:
-                raise KeyError(f"unexpected Mage-ViT weight: {name}")
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, weight)
-            loaded.add(name)
-        return loaded
+        return AutoWeightsLoader(self).load_weights(weights)
