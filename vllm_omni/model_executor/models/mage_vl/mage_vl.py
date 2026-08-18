@@ -14,7 +14,6 @@ keeps a single visual path and treats video frames as images.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
-from functools import partial
 from typing import Annotated, Any, Literal
 
 import torch
@@ -129,8 +128,11 @@ class MageVLMultiModalProcessor(BaseMultiModalProcessor[MageVLProcessingInfo]):
         patch_sizes = grid_thw.prod(-1)
         return {
             "pixel_values": MultiModalFieldConfig.flat_from_sizes("image", patch_sizes),
+            # Consumed on-device by the 3D rotary table, so it stays on the GPU.
             "patch_positions": MultiModalFieldConfig.flat_from_sizes("image", patch_sizes),
-            "image_grid_thw": MultiModalFieldConfig.batched("image"),
+            # ``build_window_cu_seqlens`` reads this on the host every forward; keeping
+            # it on the CPU avoids a device-to-host sync per vision pass.
+            "image_grid_thw": MultiModalFieldConfig.batched("image", keep_on_cpu=True),
         }
 
     def _get_prompt_updates(
@@ -171,6 +173,12 @@ class MageVLForConditionalGeneration(nn.Module, SupportsMultiModal):
     )
 
     merge_by_field_config = True
+
+    # ``supports_encoder_tp_data`` is deliberately left at its default False: the tower is
+    # written with ``is_vit_use_data_parallel()`` / ``disable_tp=`` so encoder data
+    # parallelism can be switched on later, but the sharded encode path is not implemented
+    # or tested yet. With the flag unset vLLM downgrades "data" to "weights" on its own,
+    # which keeps the model honest about what it supports.
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

@@ -41,6 +41,9 @@ class MageVLVisionConfig(PretrainedConfig):
         use_head: bool = False,
         out_hidden_size: int = 1024,
         spatial_merge_size: int = 2,
+        # Declared explicitly because Qwen2-VL-derived processing helpers read it off the
+        # vision config; the released checkpoint ships temporal_patch_size=1.
+        temporal_patch_size: int = 1,
         tokens_per_second: int = 1,
         frame_windows_size: int = 4,
         use_patch_position_encoding: bool = False,
@@ -64,6 +67,7 @@ class MageVLVisionConfig(PretrainedConfig):
         self.use_head = use_head
         self.out_hidden_size = out_hidden_size
         self.spatial_merge_size = spatial_merge_size
+        self.temporal_patch_size = temporal_patch_size
         self.tokens_per_second = tokens_per_second
         self.frame_windows_size = frame_windows_size
         self.use_patch_position_encoding = use_patch_position_encoding
