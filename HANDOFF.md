@@ -280,21 +280,34 @@ Two traps found while writing those tests, both worth remembering:
   reason. Sampling params must ride in `extra_body`.
 - `--deploy-config` is only accepted alongside `--omni`.
 
-**M3 is half done.** The canvas → model-input half is ported into
-`vllm_omni/transformers_utils/processors/mage_vl_codec.py` and reachable through
-`processor(video_backend="codec", codec_config={"asset_dir": ...})`. Every piece was
-compared elementwise against the checkpoint's own `codec_video_processing_mage_vl.py` over
-randomized inputs on CPU (positions, padding drop, prompt rewrite, pixel-budget clamp,
-config coercion -- all identical), and pinned by 13 CPU tests.
+**M3's preprocessing is done and verified end to end.** The canvas → model-input half
+lives in `vllm_omni/transformers_utils/processors/mage_vl_codec.py`, reachable through
+`processor(videos=..., video_backend="codec")` or
+`codec_config={"asset_dir": ...}`. Every piece was compared against the checkpoint's own
+`codec_video_processing_mage_vl.py`: first on CPU over randomized inputs (all identical),
+then on the real 720-frame `examples/soccer-broadcast.mp4` where the engine output
+(`src_positions`, canvas pixels), `image_grid_thw`, `pixel_values` (18432, 768),
+`patch_positions`, the rewritten prompt (68737 chars) and the prompt token ids (6518
+tokens, 4608 visual) are **all identical**. 32 canvases for 256 sampled frames; the codec
+pass takes ~1.9 s.
 
-What M3 still needs, and why it stopped here: **neither codec engine can run.**
-`engine="hevc"` (the checkpoint default) shells out to an external `cv-preinfer` binary
-that is not bundled with the checkpoint or available here, and `engine="dcvc-rt"` needs
-the checkpoint's `neural_codec/` package with compiled CUDA extensions (255 MB of it is in
-the checkpoint, unbuilt). Both raise `NotImplementedError` naming the missing tool. So
-M3's acceptance #1 (parity against the HF codec path on a real video) is **not
-measurable** until one of those is installed on the box -- that is the next decision, not
-more code.
+The engine turned out to be obtainable after all: `pip install codec-video-prep` (PyPI,
+Linux wheels, needs ffmpeg/ffprobe) provides `cv-preinfer`, so `_run_cv_preinfer` is a
+real driver now, with per-(video, budget) caching. It pins `numpy<2.0`, so it lives in
+its own venv on the box (`/root/autodl-tmp/codecvenv`) and is reached via
+`CV_PREINFER_BIN` / `PATH`; the vllm venv is untouched.
+
+**A real defect in the checkpoint's own defaults, found by running it:** `codec.patch` is
+14 while its image processor is `patch_size=16`. The canvases then tile as 36x20 = 720
+patches (504x280 px) while the processor reads 527, and `codec_positions_for_processor`
+raises a length mismatch -- the reference hits this too. The port derives `patch` from
+the image processor and rejects a conflicting override, with the measurement written into
+the test.
+
+What M3 still needs: the codec path through **vLLM's multimodal plumbing** (the model
+declares image only, so codec inputs are built processor-side rather than by handing the
+server a video), `dcvc-rt` (needs the checkpoint's `neural_codec` CUDA extensions, not
+vendored), and L3 codec cases once the serving path exists.
 
 **M4 needs the box.** The gate (`streammind_gate.py`) is built on
 `mamba_ssm.models.mixer_seq_simple.create_block`, which is CUDA-only: it cannot be
