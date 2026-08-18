@@ -51,11 +51,11 @@ def main():
         # not kernel numerics.
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        for layer in tower.encoder:
+        for layer in tower.encoder.layers:
             layer.self_attn.attn.attn_backend = AttentionBackendEnum.TORCH_SDPA
             layer.self_attn.attn.is_flash_attn_backend = False
         print("forced TORCH_SDPA for the ported tower")
-    print("tower attn backend:", tower.encoder[0].self_attn.attn.attn_backend)
+    print("tower attn backend:", tower.encoder.layers[0].self_attn.attn.attn_backend)
 
     # Stream just the vision weights out of the shards.
     index = torch.load if False else None  # noqa: F841 - placeholder to keep imports tidy

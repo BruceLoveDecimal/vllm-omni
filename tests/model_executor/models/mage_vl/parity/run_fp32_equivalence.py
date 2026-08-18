@@ -16,7 +16,7 @@ torch.set_default_dtype(torch.float32)
 with torch.device("cuda"):
     mine = MageVLVisionTransformer(cfg.vision_config, prefix="visual")
 mine.eval()
-for l in mine.encoder:
+for l in mine.encoder.layers:
     l.self_attn.attn.attn_backend = AttentionBackendEnum.TORCH_SDPA
     l.self_attn.attn.is_flash_attn_backend = False
 with open(f"{MODEL}/model.safetensors.index.json") as f: wmap=json.load(f)["weight_map"]

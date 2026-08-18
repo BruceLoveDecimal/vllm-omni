@@ -49,7 +49,7 @@ def main():
     with torch.device("cuda"):
         mine = MageVLVisionTransformer(cfg.vision_config, prefix="visual")
     mine.eval()
-    for layer in mine.encoder:
+    for layer in mine.encoder.layers:
         layer.self_attn.attn.attn_backend = AttentionBackendEnum.TORCH_SDPA
         layer.self_attn.attn.is_flash_attn_backend = False
 
@@ -102,7 +102,7 @@ def main():
 
         # --- layer 0 pieces, fed the SAME input ---
         x = n_mine
-        L_mine, L_hf = mine.encoder[0], hvis.encoder.layers[0]
+        L_mine, L_hf = mine.encoder.layers[0], hvis.encoder.layers[0]
 
         show("layer0.layer_norm1", L_mine.layer_norm1(x), L_hf.layer_norm1(x.unsqueeze(0)).squeeze(0))
 

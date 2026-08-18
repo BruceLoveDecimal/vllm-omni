@@ -64,7 +64,7 @@ def main():
     mine.load_weights(it())
 
     mine_acts = {}
-    for i, layer in enumerate(mine.encoder):
+    for i, layer in enumerate(mine.encoder.layers):
         layer.register_forward_hook(
             lambda m, inp, out, i=i: mine_acts.__setitem__(i, out.detach())
         )
