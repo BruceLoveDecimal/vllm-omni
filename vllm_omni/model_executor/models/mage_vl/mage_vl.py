@@ -21,6 +21,7 @@ import torch.nn as nn
 from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMultiModal
+from vllm.model_executor.models.qwen2_vl import Qwen2VLProcessingInfo
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -29,11 +30,10 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
-from vllm.multimodal.parse import MultiModalDataItems
+from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
-    BaseProcessingInfo,
     PromptReplacement,
     PromptUpdate,
 )
@@ -62,20 +62,40 @@ class MageVLImagePixelInputs(TensorSchema):
     patch_positions: Annotated[torch.Tensor, TensorShape("np", 3)]
 
 
-class MageVLProcessingInfo(BaseProcessingInfo):
+class MageVLProcessingInfo(Qwen2VLProcessingInfo):
+    """Reuses upstream Qwen2-VL processing arithmetic, minus the video modality.
+
+    The checkpoint's image preprocessing *is* Qwen2-VL's (``smart_resize`` on a
+    ``patch_size * spatial_merge_size`` grid), so ``_get_vision_info`` and the token-count
+    helpers built on it apply unchanged -- including
+    ``get_image_size_with_most_features``, which derives the profiling image from the
+    checkpoint's own ``max_pixels`` instead of a guess.
+    """
+
     def get_hf_config(self) -> MageVLConfig:
         return self.ctx.get_hf_config(MageVLConfig)
-
-    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None}
 
     def get_hf_processor(self, **kwargs: object) -> "MageVLProcessor":
         # The checkpoint's own processor is not a ``ProcessorMixin``, which vLLM's
         # processor cache requires, so the vendored one is requested explicitly.
         return self.ctx.get_hf_processor(MageVLProcessor, **kwargs)
 
-    def get_image_processor(self, **kwargs: object):
-        return self.get_hf_processor(**kwargs).image_processor
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        # Image only: frames are sampled or codec-decoded upstream and enter through the
+        # image tensors, so there is no separate video modality to declare.
+        return {"image": None}
+
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        return {"image": self.get_max_image_tokens()}
+
+    def get_data_parser(self) -> MultiModalDataParser:
+        # Upstream's parser adds video parsing and precomputed-embedding validation; this
+        # port accepts neither, so the base parser is the honest choice.
+        return MultiModalDataParser()
 
 
 class MageVLDummyInputsBuilder(BaseDummyInputsBuilder[MageVLProcessingInfo]):
@@ -89,10 +109,16 @@ class MageVLDummyInputsBuilder(BaseDummyInputsBuilder[MageVLProcessingInfo]):
         mm_options: Mapping[str, Any] | None = None,
     ):
         num_images = mm_counts.get("image", 0)
-        target_width, target_height = 448, 448
+        # Derived from the checkpoint's ``max_pixels`` rather than hardcoded: memory
+        # profiling has to see the largest image the processor will actually accept, or
+        # the encoder is under-provisioned at runtime.
+        target_width, target_height = self.info.get_image_size_with_most_features()
         return {
             "image": self._get_dummy_images(
-                width=target_width, height=target_height, num_images=num_images
+                width=target_width,
+                height=target_height,
+                num_images=num_images,
+                overrides=mm_options.get("image") if mm_options else None,
             )
         }
 
@@ -105,15 +131,26 @@ class MageVLMultiModalProcessor(BaseMultiModalProcessor[MageVLProcessingInfo]):
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
+        """Overriding this is load-bearing, not decoration.
+
+        vLLM picks its mm-only path by asking whether this method is overridden
+        (``_apply_hf_processor_mm_only``). Unoverridden, it calls
+        ``call_hf_processor_mm_only``, which bypasses the processor's ``__call__`` and
+        invokes ``processor.image_processor`` directly -- so ``patch_positions``, which
+        the processor appends around that call, never appears and the tower raises
+        ``KeyError`` at runtime. Upstream keeps the same override for the same reason
+        (``nano_nemotron_vl.py``). The fallback below then covers the mm-only shape in
+        case that branch is ever taken anyway.
+        """
         processed = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
-        if "pixel_values" in processed and "patch_positions" not in processed:
+        if "image_grid_thw" in processed and "patch_positions" not in processed:
             from vllm_omni.transformers_utils.processors.mage_vl import (
                 build_patch_positions,
             )
 
             merge_size = self.info.get_hf_config().vision_config.spatial_merge_size
             processed["patch_positions"] = build_patch_positions(
-                processed["image_grid_thw"], spatial_merge_size=merge_size
+                torch.as_tensor(processed["image_grid_thw"]), spatial_merge_size=merge_size
             )
         return processed
 

@@ -160,3 +160,123 @@ def test_merger_reuse_keeps_checkpoint_key_layout():
     params = inspect.signature(Qwen2VisionPatchMerger.__init__).parameters
     for name in ("d_model", "context_dim", "norm_layer", "spatial_merge_size", "prefix"):
         assert name in params, f"upstream merger signature lost {name!r}"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_processor_drops_the_video_attribute():
+    """The vendored processor must not inherit Qwen2-VL's ``video_processor`` attribute.
+
+    transformers derives a processor's attribute list from the *subclass* ``__init__``
+    signature, and resolves every attribute in it against the checkpoint directory. The
+    Mage-VL checkpoint ships no ``video_preprocessor_config.json``, so keeping
+    ``video_processor`` in the signature turns ``from_pretrained`` into an ``OSError``
+    (and passing ``None`` into a ``TypeError``). Frames arrive as images here, so there is
+    nothing for a video processor to do.
+    """
+    from transformers.models.qwen2_vl import Qwen2VLProcessor
+
+    from vllm_omni.transformers_utils.processors.mage_vl import MageVLProcessor
+
+    assert "video_processor" in Qwen2VLProcessor.get_attributes(), (
+        "upstream no longer declares video_processor; re-check whether this subclass "
+        "still needs its own __init__"
+    )
+    assert MageVLProcessor.get_attributes() == ["image_processor", "tokenizer"]
+
+
+def _stub_processing_info(max_pixels: int = 4_000_000):
+    """A ``MageVLProcessingInfo`` over stub context, for the CPU-only size arithmetic."""
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    from vllm_omni.model_executor.models.mage_vl.mage_vl import MageVLProcessingInfo
+
+    config = MageVLConfig(
+        vision_config={
+            "hidden_size": 1024,
+            "num_attention_heads": 16,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 1,
+        },
+        text_config={"model_type": "qwen3", "hidden_size": 2560},
+    )
+    image_processor = Qwen2VLImageProcessor(
+        patch_size=16, merge_size=2, temporal_patch_size=1,
+        min_pixels=32 * 32, max_pixels=max_pixels,
+    )
+
+    class _StubProcessor:
+        pass
+
+    processor = _StubProcessor()
+    processor.image_processor = image_processor
+
+    class _StubCtx:
+        def get_hf_config(self, cls):
+            return config
+
+        def get_hf_processor(self, cls, **kwargs):
+            return processor
+
+        def get_merged_mm_kwargs(self, kwargs):
+            return dict(kwargs)
+
+    return MageVLProcessingInfo(_StubCtx())
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_profiling_size_comes_from_the_checkpoint_max_pixels():
+    """Dummy data must be the largest image the processor accepts, not a fixed guess.
+
+    ``get_image_size_with_most_features`` is reused from Qwen2-VL: it factorises
+    ``max_pixels / (patch_size * merge_size)**2`` into a non-extreme aspect ratio. With the
+    checkpoint's 4,000,000 max_pixels that is 2016x1984 -> 3906 vision tokens, versus the
+    196 a hardcoded 448x448 would have profiled.
+    """
+    info = _stub_processing_info()
+
+    width, height = info.get_image_size_with_most_features()
+    assert (width, height) == (2016, 1984)
+    assert info.get_max_image_tokens() == 3906
+    assert info.get_supported_mm_limits() == {"image": None}
+    assert info.get_mm_max_tokens_per_item(seq_len=8192, mm_counts={"image": 1}) == {
+        "image": 3906
+    }
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_dummy_mm_data_uses_the_max_feature_size():
+    from vllm_omni.model_executor.models.mage_vl.mage_vl import MageVLDummyInputsBuilder
+
+    info = _stub_processing_info()
+    dummy = MageVLDummyInputsBuilder(info).get_dummy_mm_data(
+        seq_len=8192, mm_counts={"image": 2}, mm_options={}
+    )
+
+    images = dummy["image"]
+    assert len(images) == 2
+    assert all(image.size == (2016, 1984) for image in images)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_processor_override_keeps_vllm_off_the_mm_only_path():
+    """``_call_hf_processor`` must stay overridden, or ``patch_positions`` disappears.
+
+    vLLM decides its mm-only path by whether this method is overridden. Left to the base
+    implementation it calls ``call_hf_processor_mm_only``, which bypasses the processor's
+    ``__call__`` and runs ``processor.image_processor`` directly -- the positions table is
+    then never built and the tower fails with ``KeyError: 'patch_positions'`` at decode
+    time, long after startup looked healthy.
+    """
+    from vllm.multimodal.processing import BaseMultiModalProcessor
+
+    from vllm_omni.model_executor.models.mage_vl.mage_vl import MageVLMultiModalProcessor
+
+    assert (
+        MageVLMultiModalProcessor._call_hf_processor
+        is not BaseMultiModalProcessor._call_hf_processor
+    )

@@ -13,7 +13,7 @@ The table is emitted in the same 2x2 block order the Qwen2-VL image processor us
 """
 
 import torch
-from transformers.processing_utils import ProcessorMixin
+from transformers.models.qwen2_vl import Qwen2VLProcessor
 
 
 def convert_positions_to_block_layout(
@@ -76,94 +76,57 @@ def build_patch_positions(
     return torch.cat(out, dim=0)
 
 
-class MageVLProcessor(ProcessorMixin):
+class MageVLProcessor(Qwen2VLProcessor):
     """Image+text processor for Mage-VL.
 
     The checkpoint ships its own ``MageVLProcessor`` that deliberately does **not**
-    inherit :class:`ProcessorMixin`, which vLLM's processor cache requires. This is a
-    compliant re-implementation of the image path: it wraps the checkpoint's
-    ``Qwen2VLImageProcessor`` (patch 16 / merge 2 / temporal patch 1), expands each
-    ``<|image_pad|>`` placeholder to the merged token count, and emits the per-patch
-    position table the vision tower needs.
+    inherit :class:`~transformers.ProcessorMixin`, which vLLM's processor cache requires.
+    Mage-VL's image path is Qwen2-VL's -- the checkpoint's own preprocessor config *is* a
+    ``Qwen2VLImageProcessor`` (patch 16 / merge 2 / temporal patch 1) -- so this subclasses
+    the upstream processor and adds only what differs:
 
-    Video is intentionally out of scope here: the reference pipeline routes frames
-    through the image tensors after its own sampling/codec stage, so callers hand this
-    processor a list of frames as images.
+    1. ``__init__`` drops ``video_processor``. This is load-bearing, not cosmetic:
+       transformers derives the attribute list from the *subclass* ``__init__`` signature
+       (``ProcessorMixin.get_attributes``), so dropping the parameter is what keeps
+       ``from_pretrained`` from demanding the ``video_preprocessor_config.json`` this
+       checkpoint does not ship. Inheriting the signature verbatim fails both ways:
+       ``from_pretrained`` raises ``OSError`` on the missing config, and passing ``None``
+       raises ``TypeError`` ("a BaseVideoProcessor was expected").
+    2. ``patch_positions`` is appended to the outputs. Mage-ViT's 3D RoPE is driven by an
+       explicit per-patch table rather than by ``grid_thw`` (see the module docstring).
+
+    Video is intentionally out of scope: the reference pipeline routes frames through the
+    image tensors after its own sampling/codec stage, so callers hand this processor a
+    list of frames as images.
     """
-
-    attributes = ["image_processor", "tokenizer"]
-    image_processor_class = "AutoImageProcessor"
-    tokenizer_class = "AutoTokenizer"
 
     def __init__(self, image_processor=None, tokenizer=None, chat_template=None, **kwargs):
         if chat_template is None and tokenizer is not None:
             chat_template = getattr(tokenizer, "chat_template", None)
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
-        self.spatial_merge_size = int(getattr(image_processor, "merge_size", 2))
-        self.image_token = "<|image_pad|>"
-        self.video_token = "<|video_pad|>"
 
-    def __call__(
-        self,
-        text=None,
-        images=None,
-        videos=None,
-        return_tensors: str = "pt",
-        **kwargs,
-    ):
-        from transformers import BatchFeature
+    @property
+    def spatial_merge_size(self) -> int:
+        return int(self.image_processor.merge_size)
 
-        if text is None:
-            raise ValueError("`text` is required")
-        if isinstance(text, str):
-            text = [text]
-        text = list(text)
-
-        out: dict = {}
-        if images is not None:
-            image_outputs = self.image_processor(images=images, return_tensors="pt")
-            grid_thw = image_outputs["image_grid_thw"]
-            merge_factor = self.spatial_merge_size**2
-            token_counts = (grid_thw.prod(-1) // merge_factor).tolist()
-
-            # Expand one placeholder per image, in prompt order. The two-step swap via a
-            # sentinel keeps freshly written placeholders from being re-matched.
-            idx = 0
-
-            def expand(s: str) -> str:
-                nonlocal idx
-                while self.image_token in s and idx < len(token_counts):
-                    s = s.replace(
-                        self.image_token, "<|placeholder|>" * int(token_counts[idx]), 1
-                    )
-                    idx += 1
-                return s.replace("<|placeholder|>", self.image_token)
-
-            text = [expand(s) for s in text]
-
-            out["pixel_values"] = image_outputs["pixel_values"]
-            out["image_grid_thw"] = grid_thw
-            out["patch_positions"] = build_patch_positions(
-                grid_thw, spatial_merge_size=self.spatial_merge_size
+    def __call__(self, images=None, text=None, videos=None, **kwargs):
+        if videos is not None:
+            raise ValueError(
+                "Mage-VL has no video processor: frames are sampled or codec-decoded "
+                "upstream and enter through the image tensors. Pass them as `images`."
             )
 
-        text_inputs = self.tokenizer(text, return_tensors=return_tensors, **kwargs)
-        return BatchFeature(data={**text_inputs, **out}, tensor_type=return_tensors)
-
-    def batch_decode(self, *args, **kwargs):
-        return self.tokenizer.batch_decode(*args, **kwargs)
-
-    def decode(self, *args, **kwargs):
-        return self.tokenizer.decode(*args, **kwargs)
+        outputs = super().__call__(images=images, text=text, **kwargs)
+        if "image_grid_thw" in outputs:
+            outputs["patch_positions"] = build_patch_positions(
+                torch.as_tensor(outputs["image_grid_thw"]),
+                spatial_merge_size=self.spatial_merge_size,
+            )
+        return outputs
 
     @property
     def model_input_names(self):
-        return list(
-            dict.fromkeys(
-                [*self.tokenizer.model_input_names, "pixel_values", "image_grid_thw",
-                 "patch_positions"]
-            )
-        )
+        return list(dict.fromkeys([*super().model_input_names, "patch_positions"]))
 
 
 __all__ = [
