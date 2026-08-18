@@ -316,3 +316,35 @@ def test_modality_declaration_stays_honest_if_a_stage_is_added():
         "a second stage makes the name heuristic live, and it would claim audio support "
         "this model does not have; declare input_modalities on every stage"
     )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_unsupported_parallel_axis_fails_fast():
+    """A strategy asking for sequence parallelism must fail at config time, not run wrong.
+
+    Only weights-TP is implemented for this tower. ``sp_ulysses`` is declared in the axis
+    type system but not translatable, so asking for it has to raise rather than quietly
+    resolve to a single-rank no-op -- the same reasoning that keeps
+    ``supports_encoder_tp_data`` at ``False`` and lets vLLM downgrade encoder "data"
+    parallelism to weights-TP instead of running with incomplete state.
+    """
+    from vllm_omni.config.composable_parallel.strategy_loader import parse_strategy_specs
+    from vllm_omni.config.composable_parallel.translator import (
+        AxisTranslationError,
+        translate_strategy_stack,
+    )
+    from vllm_omni.model_executor.models.mage_vl.mage_vl import (
+        MageVLForConditionalGeneration,
+    )
+
+    specs = parse_strategy_specs({"strategies": {"ar": [{"axis": "sp_ulysses", "size": 2}]}})
+
+    with pytest.raises(AxisTranslationError):
+        translate_strategy_stack(specs["ar"])
+
+    # Weights-TP stays translatable, so this rejection is about the axis, not the model.
+    tp_specs = parse_strategy_specs({"strategies": {"ar": [{"axis": "tp", "size": 2}]}})
+    assert translate_strategy_stack(tp_specs["ar"]).tensor_parallel_size == 2
+
+    assert getattr(MageVLForConditionalGeneration, "supports_encoder_tp_data", False) is False

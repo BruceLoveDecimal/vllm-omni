@@ -118,6 +118,17 @@ Reproduce with the drivers in
 [`tests/model_executor/models/mage_vl/parity/`](../../tests/model_executor/models/mage_vl/parity/)
 (`run_hf_baseline.py` first, then the rest — its README explains the order).
 
+## Performance
+
+Measured on 1x RTX 5090 32GB with the deploy config above (bf16, one
+image, `max_tokens=64`, greedy, streaming). Numbers are a smoke baseline for spotting
+regressions, not a tuned benchmark:
+
+| Scenario | TTFT (median) | Decode throughput |
+| --- | --- | --- |
+| Single stream | 76 ms (52-86 ms over 5 runs) | 161.7 tok/s |
+| 4 concurrent streams | 124 ms | 422.3 tok/s aggregate |
+
 ## Tuning
 
 ### Pixel budget

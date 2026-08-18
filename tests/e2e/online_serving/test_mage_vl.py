@@ -60,8 +60,11 @@ def _greedy_request(messages: list[dict], model: str, **overrides) -> dict:
         "model": model,
         "messages": messages,
         "modalities": ["text"],
-        "temperature": 0.0,
-        "max_tokens": 32,
+        # Sampling params must ride in ``extra_body``: ``send_omni_request`` forwards only
+        # a fixed set of top-level keys, so a top-level ``temperature`` is dropped without
+        # a word and the server samples with the checkpoint's generation_config defaults --
+        # which makes every "is the output stable" assertion below meaningless.
+        "extra_body": {"temperature": 0.0, "max_tokens": 32},
     }
     request.update(overrides)
     return request
