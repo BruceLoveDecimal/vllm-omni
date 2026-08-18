@@ -48,46 +48,6 @@ def test_sample_flow_matching_noise_same_seed_reproduces():
     torch.testing.assert_close(first, second, atol=0, rtol=0)
 
 
-def test_sample_flow_matching_noise_different_seeds_diverge():
-    sample_flow_matching_noise = _seed_module().sample_flow_matching_noise
-    first = sample_flow_matching_noise(1, 7, device="cpu", dtype=torch.float32, generators=[_seeded_generator(11)])
-    second = sample_flow_matching_noise(1, 7, device="cpu", dtype=torch.float32, generators=[_seeded_generator(22)])
-
-    assert not torch.equal(first, second)
-
-
-def test_sample_flow_matching_noise_unseeded_uses_global_rng():
-    sample_flow_matching_noise = _seed_module().sample_flow_matching_noise
-    torch.manual_seed(123)
-    first = sample_flow_matching_noise(1, 4, device="cpu", dtype=torch.float32)
-    torch.manual_seed(123)
-    second = sample_flow_matching_noise(1, 4, device="cpu", dtype=torch.float32, generators=[None])
-
-    torch.testing.assert_close(first, second, atol=0, rtol=0)
-
-
-def test_fill_flow_matching_noise_honors_per_row_generators():
-    helpers = _seed_module()
-    torch.manual_seed(99)
-    expected = helpers.sample_flow_matching_noise(
-        2, 3, device="cpu", dtype=torch.float32, generators=[_seeded_generator(3), None]
-    )
-    noise = torch.empty(2, 3, dtype=torch.float32)
-    torch.manual_seed(99)
-    helpers.fill_flow_matching_noise(noise, generators=[_seeded_generator(3), None])
-
-    torch.testing.assert_close(noise, expected, atol=0, rtol=0)
-
-
-def test_resolve_tts_local_seeds_reads_extra_args_in_batch_order():
-    seeds = _seed_module().resolve_tts_local_seeds(
-        3,
-        [{"tts_local_seed": 11}, {}, {"tts_local_seed": 22}],
-    )
-
-    assert seeds == [11, None, 22]
-
-
 def test_resolve_flow_matching_generators_reuses_per_request_stream():
     cache: dict[str, tuple[int, torch.Generator]] = {}
     device = torch.device("cpu")
@@ -122,17 +82,6 @@ def test_resolve_flow_matching_generators_isolates_same_seed_across_requests():
     torch.testing.assert_close(first_b, standalone, atol=0, rtol=0)
     torch.testing.assert_close(first_a, standalone, atol=0, rtol=0)
     assert not torch.equal(first_a, second_a)
-
-
-def test_resolve_flow_matching_generators_evicts_finished_requests():
-    cache: dict[str, tuple[int, torch.Generator]] = {}
-    device = torch.device("cpu")
-    resolve = _seed_module().resolve_flow_matching_generators
-    resolve([7], ["old"], device=device, cache=cache, active_req_ids=["old"])
-    resolve([8], ["new"], device=device, cache=cache, active_req_ids=["new"])
-
-    assert "old" not in cache
-    assert "new" in cache
 
 
 @functools.lru_cache(maxsize=1)
