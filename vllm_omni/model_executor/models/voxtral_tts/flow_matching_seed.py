@@ -1,12 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Seeded flow-matching noise helpers for Voxtral TTS.
-
-Reuses the existing speech-API ``tts_local_seed`` extra_arg written by
-``serving_speech`` (same field Qwen3-TTS consumes). Each frame builds a
-fresh ``torch.Generator`` from that seed so the ODE initial noise is
-reproducible without a runner-side request-id cache.
-"""
 
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -20,7 +13,6 @@ def generators_from_tts_local_seed(
     *,
     device: torch.device,
 ) -> list[torch.Generator | None] | None:
-    """Build per-row generators from Qwen3's ``tts_local_seed`` extra_arg."""
     extras = list(sampling_extra_args) if sampling_extra_args is not None else []
     generators: list[torch.Generator | None] = []
     any_seeded = False
@@ -45,7 +37,6 @@ def sample_flow_matching_noise(
     dtype: torch.dtype,
     generators: Sequence[torch.Generator | None] | None = None,
 ) -> torch.Tensor:
-    """Draw per-frame flow-matching noise, optionally from per-row generators."""
     if generators is None or all(generator is None for generator in generators):
         return torch.randn(batch_size, n_codebooks, device=device, dtype=dtype)
     if len(generators) != batch_size:
@@ -61,7 +52,6 @@ def fill_flow_matching_noise(
     *,
     actual_size: int | None = None,
 ) -> None:
-    """Fill ``noise`` in-place. Unseeded rows keep the process-wide RNG."""
     row_count = noise.shape[0] if actual_size is None else actual_size
     if generators is None or all(generator is None for generator in generators[:row_count]):
         if actual_size is None:

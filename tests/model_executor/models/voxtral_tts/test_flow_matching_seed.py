@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""L1 tests for Voxtral TTS request-seeded flow-matching noise (#6309)."""
 
 import functools
 import importlib.util

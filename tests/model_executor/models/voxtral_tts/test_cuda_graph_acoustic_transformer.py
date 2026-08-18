@@ -337,7 +337,6 @@ def _seeded_cuda_generators(*seeds: int) -> list[torch.Generator]:
 
 
 def test_seeded_generators_reproducible_across_calls(model, wrapper):
-    """The same per-request seeds must replay the same CUDA-graph noise."""
     hidden = _random_hidden(2)
     alpha = _cfg_alpha(2)
     with torch.no_grad():

@@ -263,8 +263,6 @@ class CUDAGraphAcousticTransformerWrapper:
         self.static_cfg_alpha[padded_size].fill_(1.2)
         self.static_cfg_alpha[padded_size][:actual_size, 0] = cfg_alpha
 
-        # Fresh per-frame noise. Seeded rows use the request generator so the
-        # same /v1/audio/speech seed reproduces the ODE initial condition.
         fill_flow_matching_noise(
             self.static_noise[padded_size],
             generators,
