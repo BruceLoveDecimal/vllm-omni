@@ -14,43 +14,52 @@ implemented as a single-stage understanding pipeline and **was working end to en
 online `/v1/chat/completions` produced token-identical output to the HuggingFace
 reference for images and for frame-sampled video, with streaming and 4-way concurrency
 clean. Then a reuse audit found three real defects and several reuse opportunities; the
-fixes and the safe half of the reuse are committed **but could not be run**, because the
-GPU box will not power on (account balance). Your first job is to re-verify those five
-commits, not to write new code.
+fixes and the reuse have now been **re-verified on the box** (2026-08-19, see §4), with one
+real regression found and fixed on the way. Three items remain unrun because the instance
+powered off mid-run when the balance ran out again: the `vllm-omni serve` deploy-config
+path, `trust_remote_code=False` *serving* (the processor half is proven), and the
+profiling comparison in §5. The dev Mac's venv
+(`/Users/liuqihao/Developer/vllm-omni/.venv`: torch 2.11.0 CPU/MPS, vllm 0.27.0+cpu,
+transformers 5.8.0) runs the CPU tests and settles transformers-runtime questions without
+the box -- run it from the worktree with `PYTHONPATH=$PWD`, since the editable install
+points at the main checkout.
 
 ---
 
 ## 2. Do this first
 
 ```bash
-python3 .claude/skills/autodl-gpu/scripts/autodl.py status pro-787016ace1d3
+~/.claude/skills/autodl-gpu/autodl.sh status pro-787016ace1d3
 ```
 
 If it still reports insufficient balance on power-on, stop and tell the user — nothing
 below can be verified without it. Once it boots, run §5 in order.
 
-**The last five commits are unverified.** In commit order:
+**Status of the previously-unverified commits**, in commit order:
 
-| Commit | Risk | Why it needs a run |
+| Commit | Risk | State |
 |---|---|---|
-| `8ca45ea8` deploy config `stage_id`/`pipeline` | high | Fixes a hard `KeyError`; the yaml path was **never exercised** (all validation went through bare `vllm serve`, which bypasses deploy configs entirely). Verify with `vllm-omni serve`. |
-| `9128219e` `keep_on_cpu` + `temporal_patch_size` | low | Behavioural, not numerical. |
-| `e4a1606f` reuse Qwen2-VL merger + MLP | **highest** | Touches the numerical path. Structure was verified against v0.27.0 source line by line, but never executed. |
-| `a5994c5c` `__init__` exports | none | Import hygiene. |
-| `efc0a305` test additions | none | CPU-only. |
+| `8ca45ea8` deploy config `stage_id`/`pipeline` | high | **Still unrun.** The invocation is `-m vllm_omni.entrypoints.cli.main serve <model> --omni --deploy-config vllm_omni/deploy/mage_vl.yaml`, and **`--deploy-config` is only accepted together with `--omni`** (without it: `unrecognized arguments`). The box died during this launch when the balance ran out, so there is no evidence either way. |
+| `9128219e` `keep_on_cpu` + `temporal_patch_size` | low | **Verified** -- exercised by every run below, and `temporal_patch_size` is what the reused `_get_vision_info` reads. |
+| `e4a1606f` reuse Qwen2-VL merger + MLP | **highest** | **Verified numerically**: fp32 `rel_l2` 4.1865e-06 / cos 1.0000000000, identical to the pre-reuse figure. |
+| `a5994c5c` `__init__` exports | none | Verified by import. |
+| `efc0a305` test additions | none | 15/15 now, on transformers 5.8.0 (Mac) and 5.8.1 (box). |
+| `38744970` reuse Qwen2-VL processor + processing info | **highest** | **Verified** for preprocessing and generation (§4); its profiling change is only half-measured (§5). One regression found and fixed during the run (§8). |
+| *(new)* parity driver fixes | none | The committed drivers indexed `mine.encoder` where the tower has `encoder.layers`; **each one failed on first execution**. Fixed in four scripts. |
 
 ---
 
 ## 3. Machine and environment
 
-AutoDL Pro instance `pro-787016ace1d3` — RTX 5090, 32 GB. Drive it with the
-`autodl-gpu` skill (`.claude/skills/autodl-gpu/scripts/autodl.py`), not the console.
+AutoDL Pro instance `pro-787016ace1d3` -- RTX 5090, 32 GB. Drive it with the
+`autodl-gpu` skill (`~/.claude/skills/autodl-gpu/autodl.sh`), not the console.
 
 ```bash
-S=.claude/skills/autodl-gpu/scripts/autodl.py
-python3 $S on pro-787016ace1d3 --payload gpu --wait   # ALWAYS pass --payload gpu
-python3 $S info pro-787016ace1d3                      # ssh command + password
-python3 $S off pro-787016ace1d3 --wait                # ← the box bills while running
+S=~/.claude/skills/autodl-gpu/autodl.sh
+$S on   pro-787016ace1d3        # always boots GPU mode; no-GPU boot is not API-supported
+$S ssh  pro-787016ace1d3        # host + port + root password, both change every cycle
+$S off  pro-787016ace1d3        # <- the box bills while running
+$S wait pro-787016ace1d3 running
 ```
 
 **Power it off when you finish.** It bills whether or not it computes.
@@ -111,21 +120,23 @@ The criterion used instead is **token-exact generation**, which is strictly stro
 (bit-level agreement vs SSIM's perceptual tolerance), backed by operator-level `rel_l2`
 in fp32.
 
-Measured before the unverified commits:
+Measured **2026-08-19, with the processor/processing-info reuse in place**:
 
 | Check | Result |
 |---|---|
-| Vision tower, fp32, same bf16 weights upcast | `rel_l2` **4.19e-6**, cosine **1.0000000000** |
-| Vision tower, bf16, end to end | cosine 0.9998, `rel_l2` 2.0e-2 — accumulation, not a bug (see §6) |
-| Weight loading | 297/297 tower params; full model no gaps |
-| Offline generation | **3/3 cases token-identical**, greedy |
-| Online `/v1/chat/completions` | **3/3 token-identical**, streaming 24 deltas |
+| Processor vs the checkpoint's own processor | **3/3 elementwise identical**: `input_ids`, `pixel_values` (after the bf16 cast the baseline dumps with), `image_grid_thw`, `patch_positions` |
+| Processor load with `trust_remote_code=False` | **loads**; `get_attributes() == [image_processor, tokenizer]` |
+| Vision tower, fp32, same bf16 weights upcast | `rel_l2` **4.1865e-06**, cosine **1.0000000000** (was 4.19e-6) |
+| Vision tower, bf16, end to end | cosine 0.99980, `rel_l2` 2.0062e-02 — unchanged; accumulation, not a bug (see §6). The driver's own threshold is stricter than this accepted figure and prints FAIL |
+| Weight loading | 297/297 tower params, missing 0 |
+| Offline generation | **3/3 token-identical**, greedy, at `gpu_memory_utilization=0.85` / `image: 4` / `max_model_len=8192` — the enlarged dummy data did not break startup there |
+| Online `/v1/chat/completions` | **3/3 token-identical**, streaming 24 chunks, at `--gpu-memory-utilization 0.45` / `image: 8` |
 | Video (frame-sampled multi-image) | token-identical; 4 concurrent requests → 1 distinct output |
-| CPU tests | 8/8 (now 11 with the new ones, unrun) |
+| CPU tests | 15/15 on transformers 5.8.0 (Mac) and 5.8.1 (box) |
 
-**Never verified at all:** TP > 1 (single-GPU box), `trust_remote_code=False` (every run
-passed `--trust-remote-code`, so the vendoring goal is designed-for but unproven), and
-the `vllm-omni serve` deploy-config path.
+**Still never verified:** TP > 1 (single-GPU box), `trust_remote_code=False` *serving*
+(the processor loads without it, but no engine run has dropped the flag), the
+`vllm-omni serve` deploy-config path, and the profiling comparison in §5.
 
 ---
 
@@ -160,6 +171,15 @@ $V -m vllm.entrypoints.openai.api_server \
 $V tests/model_executor/models/mage_vl/parity/run_online_parity.py
 $V tests/model_executor/models/mage_vl/parity/run_video_parity.py
 ```
+
+Then the profiling consequence of the processor reuse (**new, and the most likely thing
+to break**): dummy data is no longer a hardcoded 448x448 but the checkpoint's own
+`max_pixels`, i.e. 2016x1984 -> 3906 vision tokens per image. At `limit_mm_per_prompt
+image: 8` that profiles ~31k vision tokens. Check whether the server still starts at
+`--gpu-memory-utilization 0.85`, and compare against
+`--mm-processor-kwargs '{"max_pixels": 150000}'` (the reference pipeline's own budget,
+spec §4.2) -- that kwarg feeds both profiling and runtime, so it is the knob if 4M is too
+large a default. Whatever wins goes into `deploy/mage_vl.yaml` + the recipe.
 
 Then the two things that have **never** been run and are the point of the fixes:
 
@@ -234,21 +254,56 @@ Registration happens in three places, all required: `models/registry.py` (`_OMNI
 
 ---
 
-## 8. Reuse left on the table
+## 8. Reuse done, and what it now needs from the box
 
-An audit produced these; the two below were **deliberately not done** because they depend
-on transformers *runtime* behaviour that could not be checked without the box:
+Both items the audit left open are **implemented** (the transformers-runtime blockers were
+resolved on the dev Mac, not guessed):
 
-- `MageVLProcessor` → subclass `transformers.models.qwen2_vl.Qwen2VLProcessor` (≈ −55
-  lines). Its `__call__` already does the same placeholder expansion. Blocker to check:
-  in transformers 5 the class's `attributes` include `video_processor`, and the Mage
-  checkpoint ships no video preprocessor config.
-- `MageVLProcessingInfo` / `MageVLDummyInputsBuilder` → subclass the Qwen2-VL ones
-  (in-repo precedent: `ming_flash_omni_thinker.py:106`). This is a **correctness** fix,
-  not just line count: the current `get_dummy_mm_data` hardcodes 448×448 while upstream
-  uses `get_image_size_with_most_features()`, so memory profiling under-provisions the
-  encoder (the checkpoint's `max_pixels` is 4,000,000). `temporal_patch_size` was already
-  added to the config to unblock this.
+- `MageVLProcessor` now subclasses `transformers.Qwen2VLProcessor`. The blocker was real
+  but **not for the reason the audit guessed**: the checkpoint *does* ship
+  `video_preprocessor_config.json` -- it declares `video_processor_type:
+  MageVLVideoProcessor` with an `auto_map` into the checkpoint's own remote code. Since
+  transformers derives the attribute list from the **subclass** `__init__` signature
+  (`ProcessorMixin.get_attributes`), inheriting Qwen2-VL's signature verbatim puts
+  `video_processor` in that list, and resolving it drags in remote code: measured on the
+  box, `trust_remote_code=False` raises `ValueError` ("contains custom code which must be
+  executed") and `trust_remote_code=True` raises `AttributeError: type object
+  'MageVLVideoProcessor' has no attribute 'register_for_auto_class'`. Overriding
+  `__init__` without the parameter dissolves both, and is what lets the processor load
+  with **`trust_remote_code=False`** -- the first evidence for the vendoring goal, which
+  had never been tested. A CPU test pins
+  `get_attributes() == ["image_processor", "tokenizer"]`.
+  Side effect: upstream also emits `mm_token_type_ids` (transformers defaults
+  `return_mm_token_type_ids=True`); vLLM ignores keys absent from `_get_mm_fields_config`
+  (`MultiModalKwargsItems.from_hf_inputs`), so it is inert.
+- `MageVLProcessingInfo` now subclasses `Qwen2VLProcessingInfo` (image-only limits,
+  image-only `get_mm_max_tokens_per_item`, base data parser -- upstream's parser adds video
+  and embedding validation this port does not accept). The correctness payoff is the dummy
+  size: `get_image_size_with_most_features()` gives 2016x1984 / 3906 tokens from the
+  checkpoint's `max_pixels=4,000,000`, where the old hardcoded 448x448 profiled 196.
+  `MageVLDummyInputsBuilder` stays on `BaseDummyInputsBuilder` (in-repo precedent:
+  `ming_flash_omni_thinker.py:209`) -- with no video modality there is nothing left to
+  inherit -- and now also honours `mm_options` overrides.
+
+**The open decision is the profiling default**, and it needs the box: 3906 tokens/image x 8
+images is honest about what the processor accepts but ~27x what the reference pipeline
+actually runs (spec §4.2 quotes `max_pixels=150000`, ~146 tokens per canvas). Measure
+startup at 0.85 utilisation both ways, then either keep 4M or pin `max_pixels` in
+`deploy/mage_vl.yaml` (`yaml_engine_args` passes `mm_processor_kwargs` through) and say so
+in the recipe. Do not decide this from the source.
+
+**A trap this reuse walked into, worth not repeating.** Deleting the seemingly-dead
+`_call_hf_processor` override (its `patch_positions` fallback looked unreachable once the
+processor emitted the key itself) broke decoding with `KeyError: 'patch_positions'`. vLLM
+selects its mm-only path by *whether that method is overridden*
+(`_apply_hf_processor_mm_only`); unoverridden it calls `call_hf_processor_mm_only`, which
+bypasses the processor's `__call__` and invokes `processor.image_processor` directly, so
+the positions table is never built. Upstream keeps the same override for the same reason
+(`nano_nemotron_vl.py`, whose docstring says so outright). The override is restored with
+that reason written down, and a CPU test now asserts it stays overridden. Note the failure
+surfaces at **decode time**, not startup -- CPU tests and model load both looked healthy.
+
+Net source delta: about -20 lines.
 
 Correctly rejected, with reasons, in the audit: the attention block (upstream needs 3-D
 `[s,b,c]`, this tower is 2-D throughout; and `Qwen2VisionAttention` uses
