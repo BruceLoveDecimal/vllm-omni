@@ -262,6 +262,21 @@ _CI_GENERATED_DIR = _REPO_ROOT / "tests" / ".ci_generated"
 # CI overlays as Python dicts (LSP-friendly). Materialized on demand to
 # tests/.ci_generated/<model>.yaml via get_deploy_config_path("ci/<name>.yaml").
 _CI_OVERLAYS: dict[str, dict[str, Any]] = {
+    "mage_vl": {
+        "base_config": "mage_vl.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_model_len": 8192,
+                "max_num_batched_tokens": 8192,
+                # >1 so the concurrency case actually batches rather than serialising.
+                "max_num_seqs": 4,
+                "gpu_memory_utilization": 0.85,
+                "limit_mm_per_prompt": {"image": 8},
+                "default_sampling_params": {"max_tokens": 32},
+            },
+        ],
+    },
     "qwen2_5_omni": {
         "base_config": "qwen2_5_omni.yaml",
         "async_chunk": False,

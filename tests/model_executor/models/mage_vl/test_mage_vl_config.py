@@ -280,3 +280,39 @@ def test_processor_override_keeps_vllm_off_the_mm_only_path():
         MageVLMultiModalProcessor._call_hf_processor
         is not BaseMultiModalProcessor._call_hf_processor
     )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_modality_declaration_stays_honest_if_a_stage_is_added():
+    """Guard for the day this pipeline stops being single-stage.
+
+    ``serving_chat`` resolves a stage's input modalities from an explicit
+    ``input_modalities`` / ``modalities`` attribute and only falls back to a name
+    heuristic when neither is set. Our stage is named ``ar``, so the fallback lands on
+    ``requires_multimodal_data`` and claims **audio** as well -- wrong for this model. It
+    is inert today because ``_deferred_multimodal_modalities`` returns early for pipelines
+    with fewer than two stages, which is the only caller. The moment M4/M5 adds a second
+    stage that stops being true, so the choice is: declare modalities explicitly, or keep
+    one stage.
+    """
+    from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    stages = OMNI_PIPELINES["mage_vl"].stages
+
+    # The claim above, verified rather than assumed: the fallback does over-declare audio.
+    assert OmniOpenAIServingChat._stage_input_modalities(stages[0]) == {
+        "audio",
+        "image",
+        "video",
+    }
+
+    declares_modalities = all(
+        getattr(stage, "input_modalities", None) or getattr(stage, "modalities", None)
+        for stage in stages
+    )
+    assert len(stages) < 2 or declares_modalities, (
+        "a second stage makes the name heuristic live, and it would claim audio support "
+        "this model does not have; declare input_modalities on every stage"
+    )
