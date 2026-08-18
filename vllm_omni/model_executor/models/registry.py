@@ -114,6 +114,11 @@ _OMNI_MODELS = {
         "omnivoice",
         "OmniVoiceModel",
     ),
+    "MageVLForConditionalGeneration": (
+        "mage_vl",
+        "mage_vl",
+        "MageVLForConditionalGeneration",
+    ),
     "MammothModa2Qwen2ForCausalLM": (
         "mammoth_moda2",
         "mammoth_moda2",

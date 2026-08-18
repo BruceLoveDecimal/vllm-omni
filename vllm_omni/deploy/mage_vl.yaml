@@ -1,0 +1,7 @@
+# Mage-VL: single-stage multimodal understanding (image / video -> text).
+stages:
+  - model_stage: ar
+    devices: "0"
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.85
+    max_model_len: 32768
