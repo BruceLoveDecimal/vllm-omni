@@ -230,6 +230,17 @@ Your model should implement the appropriate interfaces:
 - **`SupportsPP`**: For models that support pipeline parallelism
 - **`SupportsMRoPE`**: For models using multi-dimensional RoPE (if applicable)
 
+Inherit the default multimodal embedding scatter from `SupportsMultiModal.embed_input_ids`
+rather than calling the private `_merge_multimodal_embeddings` helper — the default path
+already handles out-of-vocabulary placeholder masking. Override it only when your model
+genuinely needs different scatter semantics, and document the difference.
+
+Tensor parallelism is **not** declared through an interface: a language backbone
+instantiated via `init_vllm_registered_model()` inherits it, while a custom encoder gets
+it only from the layers you build it with (see [Tensor Parallelism in Custom
+Encoders](#5-tensor-parallelism-in-custom-encoders)). The one related class attribute is
+`supports_encoder_tp_data`, covered in §5.4.
+
 ### 2. Multimodal Registration
 
 If your model processes multimodal inputs, register it with the multimodal registry:
@@ -246,7 +257,84 @@ class YourModel(nn.Module, SupportsMultiModal):
 
 ### 3. Weight Loading
 
-Implement `load_weights()` to handle weight loading with proper prefixing:
+`load_weights()` **must return the `set[str]` of fully-qualified parameter names it loaded.**
+`DefaultModelLoader.load_weights` (upstream `vllm/model_executor/model_loader/default_loader.py`)
+computes `named_parameters() - loaded_weights` and raises
+`ValueError: Following weights were not initialized from checkpoint` on any gap.
+Returning `None` silently disables that check, so treat a `None` return as a bug.
+
+Signature is fixed:
+
+```python
+def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]: ...
+```
+
+#### 3.1 Single model or sub-model: use `AutoWeightsLoader` + `WeightsMapper`
+
+Do **not** hand-write a `params_dict = dict(self.named_parameters())` loop. Declare the
+checkpoint→vLLM name translation as a class attribute and let the upstream loader walk
+the module tree — it selects the right `weight_loader` per parameter automatically,
+loads persistent buffers, and raises on unknown checkpoint keys instead of skipping them.
+
+```python
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+
+class YourModelForConditionalGeneration(nn.Module, SupportsMultiModal):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.visual.": "visual.",
+            "model.language_model.": "language_model.model.",
+            "lm_head.": "language_model.lm_head.",
+            # Map a prefix to ``None`` to drop weights this stage must not load
+            # (e.g. generation-side DiT/VAE tensors in a shared checkpoint).
+            "gen_transformer.": None,
+        },
+    )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+```
+
+**Fused vs. split QKV.** Both layouts are handled by `QKVParallelLinear` — you do not
+merge or split tensors yourself:
+
+- *Checkpoint stores separate `q_proj` / `k_proj` / `v_proj`* → declare the merge in the
+  mapper. `WeightsMapper` tags each tensor with its shard id and `AutoWeightsLoader`
+  dispatches accordingly:
+
+    ```python
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            "attn.q.": ("attn.qkv.", "q"),
+            "attn.k.": ("attn.qkv.", "k"),
+            "attn.v.": ("attn.qkv.", "v"),
+        },
+    )
+    ```
+
+    This replaces the older hand-written `stacked_params_mapping` loop still found in
+    some in-tree models; prefer the mapper form in new code.
+
+- *Checkpoint stores one fused `qkv` matrix* → nothing to declare. `QKVParallelLinear`'s
+  weight loader takes its `loaded_shard_id is None` branch and splits by
+  `[q | k | v]` offsets. This requires the fused matrix to be **block-concatenated**
+  (`[all_q | all_k | all_v]`), which is what a `reshape(..., 3, num_heads, head_dim)` in the
+  reference implementation indicates. If the checkpoint is head-interleaved
+  (`[q0 k0 v0 q1 k1 v1 ...]`) you must de-interleave and document the override
+  (see `MODEL-INV-003` in `docs/design/module/model_integration.md`).
+
+Deliberate exclusions belong in the loader's explicit escape hatches —
+`AutoWeightsLoader(self, skip_prefixes=[...])` for weights you intentionally do not load,
+or `ignore_unexpected_prefixes=` for checkpoint keys you tolerate. Never swallow them
+with a bare `except` or a silent `continue`: broad exception handling on the weight
+loading path is a blocking review finding.
+
+#### 3.2 Composite multi-stage model: fan out, then re-prefix
+
+A unified omni class that owns several stages buckets the checkpoint by prefix,
+delegates to each stage's own `load_weights()`, and re-prefixes the returned names so the
+strict check above sees the correct qualified names:
 
 ```python
 def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -276,6 +364,19 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     return loaded_weights
 ```
 
+`add_prefix_to_loaded_weights` lives in `vllm_omni/model_executor/models/utils.py`.
+Each stage class in the fan-out should itself follow §3.1.
+
+#### 3.3 Related helpers in `vllm_omni/model_executor/models/utils.py`
+
+| Helper | Use when |
+|--------|----------|
+| `add_prefix_to_loaded_weights(weights, prefix)` | Composite models delegating to sub-model `load_weights()` (§3.2) |
+| `reinit_rotary_inv_freq(model, base, match=...)` | A `trust_remote_code` RoPE class registers `inv_freq` with `persistent=False` and is absent from `ROPE_INIT_FUNCTIONS`, so the buffer loads with garbage contents and the first forward emits NaN |
+| `transformers_keys_to_ignore_compat()` | Wrapping a `from_pretrained(..., trust_remote_code=True)` call whose remote code declares `_keys_to_ignore_on_load_unexpected` as a `list` (transformers >= 5.9 combines it with `set` union) |
+
+Reuse these instead of patching `transformers` or mutating buffers inside `forward()`.
+
 ### 4. Output Format
 
 Use `OmniOutput` for stage outputs:
@@ -290,6 +391,91 @@ return OmniOutput(
     next_token_id=next_token_id,
 )
 ```
+
+### 5. Tensor Parallelism in Custom Encoders
+
+A language backbone instantiated through `init_vllm_registered_model()` is already
+tensor-parallel. **Custom encoders you write yourself — a vision tower, an audio
+encoder — are only TP-capable if you build them from the upstream parallel
+primitives.** Writing them with plain `nn.Linear` and a hand-rolled attention breaks TP
+*and* the standard weight-loading path at the same time.
+
+`MODEL-INV-003` (`docs/design/module/model_integration.md`) applies here:
+*"An upstream vLLM implementation SHOULD be reused when its contract is sufficient; an
+override MUST document the behavioral difference."*
+
+#### 5.1 What to build the encoder from
+
+| Encoder part | Use |
+|--------------|-----|
+| QKV projection | `QKVParallelLinear` |
+| Attention output projection | `RowParallelLinear` |
+| MLP / patch-merger projections | `ColumnParallelLinear` → activation → `RowParallelLinear` |
+| Variable-length (`cu_seqlens`) attention | `MMEncoderAttention` |
+| Rotary embedding | `get_rope(...)` and `ApplyRotaryEmb` |
+| TP size / rank | `get_tensor_model_parallel_world_size()`, `get_tensor_model_parallel_rank()`, `divide()` |
+
+Linear layers come from `vllm.model_executor.layers.linear`, `MMEncoderAttention` from
+`vllm.model_executor.layers.attention`, rotary helpers from
+`vllm.model_executor.layers.rotary_embedding`. vLLM-Omni does **not** wrap these — import
+them directly; adding a local wrapper needs a documented behavioral difference.
+
+Reference implementations to copy the shape from: upstream
+`vllm/model_executor/models/qwen2_5_vl.py` (`Qwen2_5_VisionAttention`) and
+`qwen3_vl.py` (`Qwen3_VisionTransformer`, including its `prepare_encoder_metadata`);
+in-tree, `vllm_omni/model_executor/models/hunyuan_image3/siglip2.py`.
+
+Rotary layout note: `ApplyRotaryEmb(is_neox_style=False)` is the interleaved
+(adjacent-pair / GPT-J) convention, `is_neox_style=True` the half-split one. Pick the one
+your reference implementation uses rather than hand-writing a `rotate_half` variant —
+the two are not numerically equivalent, and a mismatch produces a silently wrong encoder.
+
+#### 5.2 `MMEncoderAttention` contract
+
+Three things must be right or the model computes wrong results **without raising**:
+
+1. **`num_heads` is per-partition.** Pass `divide(total_num_heads, tp_size)`, not the
+   global head count.
+2. **Build encoder metadata with its own classmethods**, not by hand:
+   `compute_max_seqlen()`, `maybe_compute_seq_lens()`, and `maybe_recompute_cu_seqlens()`.
+   Each returns a different shape per attention backend (FlashAttention / Triton /
+   FlashInfer / SDPA), so hand-computed metadata can only ever be correct for one backend.
+3. **Pass the encoder's real `tp_size` to `maybe_recompute_cu_seqlens()`.** It rescales
+   `cu_seqlens` by `hidden_size // tp_size`; a wrong value is silent numerical corruption.
+
+Two more rules: keep `max_seqlen` on CPU (attention wrappers call `.item()` on it, and a
+GPU tensor records a wasteful device-to-host copy into the CUDA graph), and pass
+`prefix=` to every parallel layer and to `MMEncoderAttention` — quantization layer
+matching and FP8 scale lookup key on it.
+
+#### 5.3 Common TP mistakes
+
+| Mistake | Correct approach |
+|---------|------------------|
+| Reshaping QKV output with the global head count | `QKVParallelLinear` emits only this rank's `[q\|k\|v]`; reshape with heads-per-partition |
+| Adding an `all_gather` inside the encoder block | Not needed — the `RowParallelLinear` projection already all-reduces |
+| Computing RoPE per layer or per rank | Compute once for the whole encoder and pass it down; head_dim is not sharded, so `cos`/`sin` are rank-invariant and must not be sliced |
+| Attaching a sharding `weight_loader` to norms or patch-embedding convs | They are replicated parameters and load via `default_weight_loader` |
+| Building a patch merger as two `ColumnParallelLinear` layers, or `RowParallelLinear` first | Use `ColumnParallelLinear` → activation → `RowParallelLinear` so the shard boundary stays internal and the output is full-width for the language model |
+| `.item()` / `.cpu()` / value-dependent Python branches in the encoder forward | Remove them: they cost a device sync and can make ranks diverge |
+
+If the encoder's head count is not divisible by the TP size, choose deliberately:
+`is_vit_use_data_parallel(num_heads)` (from `vllm.model_executor.models.vision`) returns
+`True` with a warning and falls back to data parallelism, while `divide()` fails fast at
+init. Prefer an explicit startup error over silently running a wrong configuration.
+
+#### 5.4 Declaring encoder data parallelism
+
+`mm_encoder_tp_mode="data"` replicates encoder weights and splits the input batch across
+ranks instead of sharding weights. A model opts in by setting
+`supports_encoder_tp_data = True` **and** implementing the sharded encode path (upstream
+provides `run_dp_sharded_vision_model` / `run_dp_sharded_mrope_vision_model`).
+
+Leave the flag at its default `False` until that path is implemented and tested — the
+config layer then downgrades `"data"` to `"weights"` automatically, so the model stays
+honest about what it supports. Writing the encoder's layers with
+`disable_tp=is_vit_use_data_parallel()` from the start keeps the option open without
+committing to it.
 
 ## Model Registration
 
