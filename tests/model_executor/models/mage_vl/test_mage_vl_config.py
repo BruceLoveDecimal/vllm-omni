@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU-only checks for the Mage-VL config, registration, and patch positions."""
 
+import inspect
+
 import pytest
 import torch
 
@@ -115,3 +117,46 @@ def test_window_cu_seqlens_rejects_mismatched_totals():
 
     with pytest.raises(ValueError, match="cu_seqlens mismatch"):
         build_window_cu_seqlens(torch.tensor([[1, 4, 4]]), total_patches=99, frame_windows_size=4)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_vision_config_declares_temporal_patch_size():
+    """Qwen2-VL-derived processing helpers read this straight off the vision config."""
+    assert MageVLVisionConfig().temporal_patch_size == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_reused_encoder_mlp_keeps_the_config_activation():
+    """The tower reuses ``Qwen2VisionMLP``, whose ``act_layer`` defaults to QuickGELU.
+
+    Mage-VL is a GELU model, so the config activation must be bound explicitly at the
+    call site. Getting this wrong swaps the activation silently -- weights still load and
+    nothing raises, only the numbers drift.
+    """
+    from functools import partial
+
+    from vllm.model_executor.layers.activation import get_act_fn
+    from vllm.model_executor.models.qwen2_vl import Qwen2VisionMLP
+
+    default_act = inspect.signature(Qwen2VisionMLP.__init__).parameters["act_layer"].default
+    assert default_act is not None, "upstream signature changed; re-check the binding"
+
+    cfg = MageVLVisionConfig(hidden_act="gelu")
+    bound = partial(get_act_fn, cfg.hidden_act)
+    assert type(bound()) is not default_act, (
+        "the config activation must differ from the upstream default, otherwise this "
+        "test cannot detect a missing act_layer binding"
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_merger_reuse_keeps_checkpoint_key_layout():
+    """``Qwen2VisionPatchMerger`` must expose ln_q / mlp.0 / mlp.2, as in the checkpoint."""
+    from vllm.model_executor.models.qwen2_vl import Qwen2VisionPatchMerger
+
+    params = inspect.signature(Qwen2VisionPatchMerger.__init__).parameters
+    for name in ("d_model", "context_dim", "norm_layer", "spatial_merge_size", "prefix"):
+        assert name in params, f"upstream merger signature lost {name!r}"
