@@ -173,6 +173,19 @@ class MageVLProcessor(Qwen2VLProcessor):
 
         settings = dict(codec_config or {})
         asset_dir = settings.pop("asset_dir", None)
+
+        # The codec tiles canvases on its own patch grid and the image processor reads
+        # them back on its own; if the two disagree the position table cannot line up with
+        # the pixels. The checkpoint's shipped codec default (14) does *not* match its own
+        # image processor (16) -- measured -- so derive it instead of trusting the default.
+        processor_patch = int(getattr(self.image_processor, "patch_size", 16))
+        requested_patch = int(settings.setdefault("patch", processor_patch))
+        if requested_patch != processor_patch:
+            raise ValueError(
+                f"codec patch={requested_patch} but the image processor uses "
+                f"patch_size={processor_patch}; canvases would be tiled at one granularity "
+                "and read back at another"
+            )
         cfg = CodecConfig(**settings)
 
         # An asset directory is a codec run someone already did; without one we would
@@ -189,8 +202,10 @@ class MageVLProcessor(Qwen2VLProcessor):
         patch_positions = codec_positions_for_processor(
             src_positions, image_outputs["image_grid_thw"]
         )
+        # decimals is the processor's presentation choice, not asset metadata; the
+        # reference pipeline fixes it at 1.
         prompt = rewrite_text_with_codec_positions(
-            prompts[0], patch_positions, fps=result["fps"], decimals=result["decimals"]
+            prompts[0], patch_positions, fps=result["fps"], decimals=1
         )
 
         text_inputs = self.tokenizer([prompt], return_tensors="pt")

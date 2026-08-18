@@ -22,8 +22,13 @@ directory is the codec engine's job -- see :func:`process_codec_video`.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
@@ -86,6 +91,18 @@ class CodecConfig:
     spatial_mask_mode: str = "off"
     engine: str = "hevc"
     dcvc: DcvcConfig = field(default_factory=DcvcConfig)
+    cache_root: Path = field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "ONLINE_CODEC_CACHE_DIR",
+                os.path.join(
+                    os.getenv("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+                    "online_codec",
+                ),
+            )
+        )
+    )
+    timeout_seconds: int = int(os.getenv("ONLINE_CODEC_TIMEOUT", "7200"))
 
     def __post_init__(self) -> None:
         if isinstance(self.dcvc, dict):
@@ -240,7 +257,12 @@ def codec_image_processor_outputs(image_processor, images: list[Any], max_pixels
 
 
 def load_codec_result(asset_dir: str | Path) -> dict[str, Any]:
-    """Read a codec asset directory into canvases, positions and metadata."""
+    """Read a codec asset directory into canvases, positions and metadata.
+
+    Canvas order comes from ``meta["canvas_files"]`` when the engine recorded it -- that
+    is the engine's own order, and the position table is laid out to match it. Sorting the
+    directory listing is only a fallback.
+    """
     from PIL import Image
 
     asset_dir = Path(asset_dir)
@@ -253,42 +275,125 @@ def load_codec_result(asset_dir: str | Path) -> dict[str, Any]:
         )
 
     meta = json.loads(meta_path.read_text())
-    canvases = sorted(asset_dir.glob("canvas_*.jpg")) or sorted(asset_dir.glob("canvas_*.png"))
-    if not canvases:
-        raise FileNotFoundError(f"no canvas_*.jpg / canvas_*.png found in {asset_dir}")
+    canvas_files = list(meta.get("canvas_files") or [])
+    if not canvas_files:
+        for ext in ("npy", "jpg", "png"):
+            hits = sorted(path.name for path in asset_dir.glob(f"canvas_*.{ext}"))
+            if hits:
+                canvas_files = hits
+                break
+    if not canvas_files:
+        raise FileNotFoundError(f"no canvas_*.npy / .jpg / .png found in {asset_dir}")
+
+    images = []
+    for name in canvas_files:
+        path = asset_dir / name
+        images.append(
+            Image.fromarray(np.load(path)) if name.endswith(".npy")
+            else Image.open(path).convert("RGB")
+        )
 
     return {
-        "images": [Image.open(path).convert("RGB") for path in canvases],
+        "images": images,
         "src_positions": np.load(positions_path),
-        "fps": float(meta["fps"]),
-        "decimals": int(meta.get("decimals", 1)),
+        # The engine records fps; 30 is the reference's fallback for assets that predate it.
+        "fps": float(meta.get("fps") or 30.0),
+        "meta": meta,
     }
 
 
-def process_codec_video(video_url: str, cfg: CodecConfig) -> dict[str, Any]:
-    """Produce a codec asset directory for ``video_url``.
+def _run_cv_preinfer(video_url: str, out_dir: Path, cfg: CodecConfig) -> dict[str, Any]:
+    """Drive the external ``cv-preinfer`` binary (PyPI ``codec-video-prep``).
 
-    Not implemented: both engines need tooling that this repository does not ship. The
-    error names what is missing rather than letting the request fail somewhere downstream
-    with a shape mismatch. Point ``codec_config={"asset_dir": ...}`` at a directory the
-    reference pipeline already produced to use the codec path today.
+    Written to a temp directory and renamed into place, so a killed run cannot leave a
+    half-written asset directory that a later call would happily load.
+    """
+    binary = os.environ.get("CV_PREINFER_BIN", "cv-preinfer")
+    if shutil.which(binary) is None and not os.path.isfile(binary):
+        raise RuntimeError(
+            f"engine='hevc' needs the {binary!r} binary on PATH (pip install "
+            "codec-video-prep, plus ffmpeg/ffprobe). Set CV_PREINFER_BIN to point at it, "
+            "pass codec_config={'asset_dir': ...} for an already-produced directory, or "
+            "use video_backend='frames'."
+        )
+
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=str(out_dir.parent), prefix=f".tmp_{out_dir.name[:48]}_"))
+    command = [
+        binary,
+        "--video", str(video_url),
+        "--out_dir", str(staging),
+        "--num_sampled_frames", str(cfg.num_sampled_frames()),
+        "--grouping_mode", "readiness",
+        "--group_size", str(cfg.group_size),
+        "--images_per_group", str(cfg.images_per_group),
+        "--patch", str(cfg.patch),
+        "--max_pixels", str(cfg.max_pixels),
+        "--readiness_sum_threshold", "0",
+        "--min_group_frames", str(cfg.min_group_frames),
+        "--max_group_frames", str(cfg.max_group_frames),
+        "--avoid_keyframes",
+        "--canvas_format", "jpg",
+    ]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=cfg.timeout_seconds)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"cv-preinfer failed (rc={result.returncode}): "
+                f"{(result.stderr or result.stdout)[-2000:]}"
+            )
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        staging.rename(out_dir)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    return load_codec_result(out_dir)
+
+
+def _cache_dir_for(video_url: str, cfg: CodecConfig) -> Path:
+    """One directory per (video, sampling budget), so a re-run reuses the codec pass."""
+    key = json.dumps(
+        {
+            "video": str(video_url),
+            "engine": cfg.engine,
+            "target_canvas": cfg.target_canvas,
+            "group_size": cfg.group_size,
+            "images_per_group": cfg.images_per_group,
+            "patch": cfg.patch,
+            "max_pixels": cfg.max_pixels,
+            "min_group_frames": cfg.min_group_frames,
+            "max_group_frames": cfg.max_group_frames,
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+    return cfg.cache_root / f"{Path(str(video_url)).stem[:48]}_{digest}"
+
+
+def process_codec_video(video_url: str, cfg: CodecConfig) -> dict[str, Any]:
+    """Produce (or reuse) a codec asset directory for ``video_url``.
+
+    ``dcvc-rt`` is not driven from here: it needs the checkpoint's bundled
+    ``neural_codec`` package and its compiled CUDA extensions, which this repository does
+    not vendor. It says so rather than failing later on a shape mismatch.
     """
     cfg.validate()
-    if cfg.engine in ("hevc", "cv-preinfer"):
-        raise NotImplementedError(
-            "engine='hevc' needs the external 'cv-preinfer' binary, which is not bundled "
-            "with the checkpoint or with vllm-omni. Pass an already-produced asset "
-            "directory via codec_config={'asset_dir': ...}, or use frame sampling "
-            "(video_backend='frames')."
-        )
     if cfg.engine == "dcvc-rt":
         raise NotImplementedError(
             "engine='dcvc-rt' needs the checkpoint's bundled neural_codec package and its "
-            "compiled CUDA extensions, which vllm-omni does not vendor. Pass an "
-            "already-produced asset directory via codec_config={'asset_dir': ...}, or use "
-            "frame sampling (video_backend='frames')."
+            "compiled CUDA extensions, which vllm-omni does not vendor. Use engine='hevc' "
+            "(pip install codec-video-prep), pass codec_config={'asset_dir': ...}, or use "
+            "video_backend='frames'."
         )
-    raise ValueError(f"unknown codec engine: {cfg.engine!r} (use 'hevc' or 'dcvc-rt')")
+    if cfg.engine not in ("hevc", "cv-preinfer"):
+        raise ValueError(f"unknown codec engine: {cfg.engine!r} (use 'hevc' or 'dcvc-rt')")
+
+    out_dir = _cache_dir_for(video_url, cfg)
+    if (out_dir / "meta.json").exists() and (out_dir / "src_patch_position.npy").exists():
+        return load_codec_result(out_dir)
+    return _run_cv_preinfer(video_url, out_dir, cfg)
 
 
 __all__ = [

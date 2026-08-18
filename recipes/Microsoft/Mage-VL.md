@@ -113,6 +113,7 @@ Measured on 1x RTX 5090 against `AutoModelForCausalLM` + the checkpoint's own pr
 | Offline generation | **3/3 token-identical** |
 | Online `/v1/chat/completions` | **3/3 token-identical**, plus a 24-chunk streaming response |
 | Frame-sampled video (4 frames as images) | token-identical; 4 concurrent requests returned one distinct output |
+| Codec-native video preprocessing (720-frame clip) | canvases, `image_grid_thw`, `pixel_values`, `patch_positions` and the rewritten prompt all **elementwise identical** to the reference; prompt token ids identical (6518 tokens, 4608 visual) |
 
 Reproduce with the drivers in
 [`tests/model_executor/models/mage_vl/parity/`](../../tests/model_executor/models/mage_vl/parity/)
@@ -154,27 +155,40 @@ vllm serve microsoft/Mage-VL --mm-processor-kwargs '{"max_pixels": 150000}'
 ### Codec-native video
 
 Long video can go through the checkpoint's codec sampler instead of uniform frames: it
-groups frames by how much new information each carries and tiles the selected patches
-onto a small number of square canvases, so a 256-frame clip costs far fewer visual tokens
-than 256 images would. vllm-omni ports the preprocessing that turns those canvases into
-model inputs — position table, padding-canvas removal, and the prompt rewrite that
-replaces the video placeholder with one timestamped `<|image_pad|>` run per source frame:
+groups frames by how much new information each carries (read off the codec's own bit-cost
+map) and tiles the selected patches onto a few square canvases, so a long clip costs far
+fewer visual tokens than one image per frame would. Measured on the checkpoint's own
+720-frame `examples/soccer-broadcast.mp4`: 256 sampled frames become **32 canvases →
+4608 visual tokens**, and the codec pass itself takes ~1.9 s.
 
-```python
-processor(
-    text=prompt,
-    video_backend="codec",
-    codec_config={"asset_dir": "/path/to/codec/assets"},
-)
+The engine is an external tool. Install it alongside vllm-omni:
+
+```bash
+pip install codec-video-prep  # provides cv-preinfer; also needs ffmpeg/ffprobe on PATH
 ```
 
-**Running the codec itself is not included.** `engine="hevc"` (the checkpoint default)
-shells out to an external `cv-preinfer` binary that neither the checkpoint nor vllm-omni
-ships, and `engine="dcvc-rt"` needs the checkpoint's bundled `neural_codec` package with
-its compiled CUDA extensions. Asking for either raises `NotImplementedError` naming the
-missing tool rather than failing later on a shape mismatch. Until that tooling is
-available, point `codec_config={"asset_dir": ...}` at an asset directory produced by the
-reference pipeline (`canvas_*.jpg` + `src_patch_position.npy` + `meta.json`).
+`codec-video-prep` pins `numpy<2.0`, which will fight a vLLM install. Keep it in its own
+virtualenv and point `CV_PREINFER_BIN` at that venv's `cv-preinfer`, or pre-produce the
+assets and pass the directory:
+
+```python
+processor(text=prompt, videos="clip.mp4", video_backend="codec")           # runs the engine
+processor(text=prompt, video_backend="codec",
+          codec_config={"asset_dir": "/path/to/assets"})                    # reuses a run
+```
+
+Results are cached per (video, sampling budget) under `ONLINE_CODEC_CACHE_DIR` (default
+`$HF_HOME/online_codec`).
+
+**Do not set `codec_config={"patch": ...}` by hand.** The checkpoint ships `codec.patch =
+14` while its image processor uses `patch_size = 16`; with 14 the canvases tile as 36x20 =
+720 patches per canvas and the processor reads 527, so the position table cannot line up
+and preprocessing fails outright. vllm-omni derives the value from the image processor and
+rejects a conflicting override.
+
+`engine="dcvc-rt"` (the neural codec) is not driven from here: it needs the checkpoint's
+bundled `neural_codec` package with compiled CUDA extensions. Asking for it raises
+`NotImplementedError` naming what is missing.
 
 ## Limitations
 
@@ -184,10 +198,11 @@ Untested support is reported as unknown, not as supported:
   linear layers so weights-TP should work, but no multi-GPU run has been made. The model
   leaves `supports_encoder_tp_data` at `False`, so vLLM downgrades encoder "data"
   parallelism to weights-TP on its own rather than running with incomplete state.
-- **Codec-native video is preprocessing-only.** The canvas → model-input half is ported
-  and checked elementwise against the reference; neither codec *engine* runs here (see
-  [Codec-native video](#codec-native-video)), so end-to-end codec parity on a real video
-  is unmeasured.
+- **Codec video is preprocessing-verified, not served end to end.** Preprocessing matches
+  the reference elementwise on a real video, and the `hevc` engine runs from an installed
+  `cv-preinfer`. What is not wired yet is the engine path *through vLLM's multimodal
+  plumbing* — the model declares image only, so codec inputs are built processor-side
+  today rather than by passing a video to the server.
 - **The StreamMind cognition gate is not wired up.** `streammind_gate.safetensors` is
   present in the checkpoint but proactive streaming is a later milestone.
 - **Checkpoint revision:** validation ran against a local snapshot; pin an explicit

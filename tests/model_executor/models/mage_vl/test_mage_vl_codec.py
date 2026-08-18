@@ -155,19 +155,21 @@ def test_codec_config_matches_the_checkpoint_budget():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-@pytest.mark.parametrize(
-    ("engine", "missing"),
-    [("hevc", "cv-preinfer"), ("dcvc-rt", "neural_codec")],
-)
-def test_missing_codec_tooling_fails_with_an_actionable_message(engine, missing):
-    """Neither engine ships here; say which tool is missing and what to do instead."""
-    with pytest.raises(NotImplementedError, match=missing) as excinfo:
-        process_codec_video("video.mp4", CodecConfig(engine=engine))
+def test_missing_codec_tooling_fails_with_an_actionable_message(monkeypatch, tmp_path):
+    """Say which tool is missing and what to do instead, rather than failing downstream."""
+    # hevc drives an external binary; without it the message has to name the package.
+    monkeypatch.setenv("CV_PREINFER_BIN", str(tmp_path / "definitely-not-installed"))
+    with pytest.raises(RuntimeError, match="codec-video-prep") as hevc:
+        process_codec_video("video.mp4", CodecConfig(engine="hevc", cache_root=tmp_path))
+    assert "asset_dir" in str(hevc.value)
 
-    assert "asset_dir" in str(excinfo.value)
+    # dcvc-rt has no driver here at all.
+    with pytest.raises(NotImplementedError, match="neural_codec") as dcvc:
+        process_codec_video("video.mp4", CodecConfig(engine="dcvc-rt", cache_root=tmp_path))
+    assert "asset_dir" in str(dcvc.value)
 
     with pytest.raises(ValueError, match="unknown codec engine"):
-        process_codec_video("video.mp4", CodecConfig(engine="jpeg2000"))
+        process_codec_video("video.mp4", CodecConfig(engine="jpeg2000", cache_root=tmp_path))
 
 
 @pytest.mark.core_model
@@ -176,13 +178,13 @@ def test_codec_asset_directory_round_trips(tmp_path):
     """A directory the reference pipeline produced loads back into canvases + positions."""
     positions = np.array([[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]], dtype=np.int64)
     np.save(tmp_path / "src_patch_position.npy", positions)
-    (tmp_path / "meta.json").write_text('{"fps": 25.0, "decimals": 1}')
+    (tmp_path / "meta.json").write_text('{"fps": 25.0}')
     Image.new("RGB", (32, 32)).save(tmp_path / "canvas_00000.jpg")
 
     result = load_codec_result(tmp_path)
 
     assert len(result["images"]) == 1
-    assert result["fps"] == 25.0 and result["decimals"] == 1
+    assert result["fps"] == 25.0
     assert np.array_equal(result["src_positions"], positions)
 
     with pytest.raises(FileNotFoundError, match="not a codec asset directory"):
@@ -204,7 +206,7 @@ def _codec_asset_dir(tmp_path, *, canvas_px: int = 32, frames=(4, 9), pad_canvas
         rows.extend([[-1, 0, 0]] * per_canvas)
 
     np.save(tmp_path / "src_patch_position.npy", np.array(rows, dtype=np.int64))
-    (tmp_path / "meta.json").write_text('{"fps": 25.0, "decimals": 1}')
+    (tmp_path / "meta.json").write_text('{"fps": 25.0}')
     for index in range(len(frames) + pad_canvases):
         Image.new("RGB", (canvas_px, canvas_px)).save(tmp_path / f"canvas_{index:05d}.jpg")
     return per_canvas // (merge**2)
@@ -275,3 +277,32 @@ def test_processor_rejects_unknown_backends_and_video_tensors():
 
     with pytest.raises(ValueError, match="samples frames upstream"):
         processor(text="hi", videos=["clip.mp4"])
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_codec_patch_size_is_taken_from_the_image_processor(tmp_path):
+    """The codec grid and the image processor grid must be the same grid.
+
+    The checkpoint ships ``codec.patch = 14`` while its image processor is ``patch_size =
+    16``. Measured on a real video, that combination tiles 504x280 canvases as 36x20 = 720
+    patches while the processor reads 527 -- ``codec_positions_for_processor`` then raises
+    a length mismatch. Deriving the value keeps the two grids identical by construction.
+    """
+    _codec_asset_dir(tmp_path, frames=(4,), pad_canvases=0)
+    processor = _processor_over_codec_assets()
+
+    with pytest.raises(ValueError, match="patch=14 but the image processor"):
+        processor(
+            text="<|vision_start|><|video_pad|><|vision_end|>",
+            video_backend="codec",
+            codec_config={"asset_dir": str(tmp_path), "patch": 14},
+        )
+
+    # Left unset it follows the processor, and the two grids agree.
+    out = processor(
+        text="<|vision_start|><|video_pad|><|vision_end|>",
+        video_backend="codec",
+        codec_config={"asset_dir": str(tmp_path)},
+    )
+    assert out["patch_positions"].shape[0] == out["pixel_values"].shape[0]
