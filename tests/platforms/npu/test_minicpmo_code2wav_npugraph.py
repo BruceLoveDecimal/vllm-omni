@@ -29,9 +29,17 @@ pytestmark = [
 ]
 
 
+class _Encoder(nn.Module):
+    """``BatchedToken2Wav`` requires ``flow.encoder`` at construction time."""
+
+    def forward_chunk(self, xs, last_chunk=False, cnn_cache=None, att_cache=None):
+        raise AssertionError("CFM estimator NPUGraph test must not run the flow encoder")
+
+
 class _Flow(nn.Module):
     def __init__(self, estimator: nn.Module):
         super().__init__()
+        self.encoder = _Encoder()
         self.decoder = SimpleNamespace(estimator=estimator)
 
 
