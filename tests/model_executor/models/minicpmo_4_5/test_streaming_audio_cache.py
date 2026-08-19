@@ -4,11 +4,10 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 from torch import nn
+from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 from transformers.models.whisper.modeling_whisper import WhisperConfig
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
@@ -77,8 +76,10 @@ def test_whisper_attention_preserves_streaming_cache(
 
 
 def test_audio_cache_length_uses_current_cache_api() -> None:
-    dynamic_cache = SimpleNamespace(get_seq_length=lambda: 7)
-    encoder_decoder_cache = SimpleNamespace(self_attention_cache=dynamic_cache)
+    key = torch.zeros(1, 1, 7, 2)
+    self_attention_cache = DynamicCache()
+    self_attention_cache.update(key, torch.zeros_like(key), 0)
+    encoder_decoder_cache = EncoderDecoderCache(self_attention_cache, DynamicCache())
 
     assert _get_audio_cache_length(encoder_decoder_cache) == 7
 

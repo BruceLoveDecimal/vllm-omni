@@ -2506,7 +2506,9 @@ def _in_projection(
     return linear(q, w_q, b_q), linear(k, w_k, b_k), linear(v, w_v, b_v)
 
 
-def _get_audio_cache_length(past_key_values: Any) -> int:
+def _get_audio_cache_length(
+    past_key_values: EncoderDecoderCache | DynamicCache | tuple[tuple[torch.Tensor, ...], ...],
+) -> int:
     cache = getattr(past_key_values, "self_attention_cache", past_key_values)
     get_seq_length = getattr(cache, "get_seq_length", None)
     if callable(get_seq_length):
