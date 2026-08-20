@@ -2161,7 +2161,7 @@ class TestMingFlashOmniPipeline:
         assert stages[1].yaml_engine_args["enforce_eager"] is False
         assert stages[1].yaml_engine_args["max_num_seqs"] > 1
         assert stages[1].yaml_engine_args["max_num_batched_tokens"] == 8192
-        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 200
+        assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 201
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1]
 
     def test_tts_yaml_loads_and_merges(self):
@@ -2181,7 +2181,7 @@ class TestMingFlashOmniPipeline:
         assert stages[0].yaml_engine_args["enforce_eager"] is False
         assert stages[0].yaml_engine_args["max_num_seqs"] > 1
         assert stages[0].yaml_engine_args["max_num_batched_tokens"] == 8192
-        assert stages[0].yaml_extras["default_sampling_params"]["max_tokens"] == 200
+        assert stages[0].yaml_extras["default_sampling_params"]["max_tokens"] == 201
         assert stages[0].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1]
 
     def test_thinker_only_pipeline_registered(self):
