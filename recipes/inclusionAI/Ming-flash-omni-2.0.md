@@ -294,8 +294,8 @@ The bundled `ming_flash_omni_tts.yaml` runs the talker on a single GPU and expos
 - Python: 3.10+
 - CUDA Driver Version: 590.48.01
 - CUDA 13.0
-- vLLM version: 0.19.0
-- vLLM-Omni version or commit: 0.19.0rc1
+- vLLM version: 0.27.0
+- vLLM-Omni version or commit: 0.27.0
 
 #### Command
 
@@ -335,6 +335,59 @@ curl -X POST http://localhost:8091/v1/audio/speech \
       "response_format": "wav"
     }' --output ming_online_lingguang.wav
 ```
+
+#### Benchmark
+
+The talker is registered in `benchmarks/tts/model_configs.yaml`, so the standard
+harness drives it directly. Start the server with the command above, then:
+
+```bash
+# Concurrency sweep with quality eval: 100 prompts per level.
+SEED_TTS_EVAL_DEVICE=cuda:0 python benchmarks/tts/bench_tts.py \
+    --model Jonathan1909/Ming-flash-omni-2.0 \
+    --task default_voice \
+    --locale en \
+    --dataset-path linyueqian/seed-tts-eval-subset \
+    --concurrency 1 4 8 \
+    --num-prompts 100 \
+    --num-warmups 2 \
+    --request-seed 42 \
+    --wer-eval \
+    --port 8091 \
+    --output-dir ./results
+```
+
+`--dataset-path` accepts the HF dataset id (downloaded on first use) or a local
+root laid out as `<root>/en/meta.lst`. This is the same 100-prompt subset the
+TTS perf CI uses (`tests/dfx/perf/tests/test_tts.json`).
+
+Reported per concurrency level: request throughput (req/s), end-to-end latency
+(mean and P99, ms), audio RTF, mean audio duration, and — with `--wer-eval` —
+WER under the seed-tts-eval protocol (Whisper-large-v3 ASR, `process_one_official`).
+Report WER as the mean over the 100 items and keep the median alongside it: the
+means are driven by a small number of outliers, so a mean quoted on its own
+overstates the spread. Run each configuration at least three times and report
+the average — single runs of P99 in particular are not stable.
+
+#### Benchmark caveats
+
+- **Pass `--deploy-config` explicitly.** The deploy YAML auto-loaded for this
+  model id brings up thinker + talker; a talker-only benchmark must name
+  `ming_flash_omni_tts.yaml` or it measures a different deployment.
+- **Install the ASR extras before trusting a quality run.** `--wer-eval` is
+  accepted even when they are missing: WER then lands as `null` in the result
+  JSON while the perf table still prints normally. `pip install 'vllm-omni[dev]'`
+  covers both languages (English needs `jiwer`/`zhon`/`transformers`, Chinese
+  additionally `funasr`/`zhconv`). Check `seed_tts_content_evaluated` in the
+  result JSON equals the prompt count before quoting any number.
+- **Speaker-SIM is not produced for this task.** `default_voice` uses the
+  text-only `seed-tts-text` dataset, which carries no reference audio, so the
+  seed-tts-eval protocol skips SIM by design. Use `voice`/`speaker_embedding`
+  for the voice, and do not expect a SIM column.
+- **Throughput does not scale with concurrency here.** The talker runs one CFM
+  audio step per request; cross-request batching of that step is tracked
+  separately under RFC #4129, so higher concurrency raises latency roughly
+  linearly while request throughput stays flat.
 
 #### Notes
 
