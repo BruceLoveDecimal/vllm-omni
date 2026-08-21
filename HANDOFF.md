@@ -324,10 +324,20 @@ criterion should be replaced by what does: preprocessing identical elementwise, 
 `rel_l2` at 1e-6 in fp32, and a decoder bit-identical given the same embeddings. (The
 image path stays token-exact -- short prompts, short answers -- so nothing changes there.)
 
-What M3 still needs: the codec path through **vLLM's multimodal plumbing** (the model
-declares image only, so codec inputs are built processor-side rather than by handing the
-server a video), `dcvc-rt` (needs the checkpoint's `neural_codec` CUDA extensions, not
-vendored), and L3 codec cases once the serving path exists.
+What M3 still needs: the codec path through **vLLM's multimodal plumbing** (see below),
+`dcvc-rt` (needs the checkpoint's `neural_codec` CUDA extensions, not vendored), and L3
+codec cases once the serving path exists.
+
+**What the plumbing has to solve, measured rather than guessed.** For the 720-frame clip
+the rewritten prompt holds **196 vision blocks** (one per source-frame run) backed by
+**32 canvases**, and the run boundaries do *not* line up with canvas boundaries -- a canvas
+mixes frames, and a frame's patches span canvases. So a codec video is one mm item whose
+embeddings scatter across 196 discontiguous spans; vLLM can express exactly that with
+`PromptUpdateDetails.select_token_id`. The harder half is the input side: vLLM decodes
+video into frames before a model sees it, while the codec engine needs the encoded
+bitstream. Bridging that needs either a model-owned data parser that passes the source
+through untouched, or a serving-layer hook -- and the spec's module-boundary rule forbids
+the latter. That is a design decision, not an implementation detail.
 
 **M4 needs the box.** The gate (`streammind_gate.py`) is built on
 `mamba_ssm.models.mixer_seq_simple.create_block`, which is CUDA-only: it cannot be
