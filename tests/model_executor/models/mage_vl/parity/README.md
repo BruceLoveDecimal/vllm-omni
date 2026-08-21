@@ -36,6 +36,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 | `run_video_parity.py` | Frame-sampled video through the online multi-image path (the mode the reference itself supports online), plus a 4-way concurrency check. Needs a running server. |
 | `run_codec_parity.py` | Vision tower on **codec** canvases -- sparse `t`, several source frames per canvas. The image drivers cannot reach that layout. |
 | `run_codec_generation_parity.py` | Codec inputs end to end: our tower into vLLM's decoder, against the checkpoint's `generate`. `MAGE_PARITY_DTYPE=float32` runs the attribution mode described below. |
+| `run_gate_parity.py` | The cognition gate's perception encoder against the checkpoint's own, both full-stream and one segment at a time. Needs `mamba_ssm` importable -- see below. |
 
 Diagnostics, for when a parity check fails:
 
@@ -83,3 +84,18 @@ What it is judged on instead: preprocessing identical elementwise (canvases, gri
 `pixel_values`, `patch_positions`, rewritten prompt, prompt token ids), tower `rel_l2`
 7.39e-06 in fp32, and a decoder that is bit-identical to the reference's given the same
 embeddings.
+
+### Running the gate reference
+
+The checkpoint's `streammind_gate.py` builds its Mamba block through `mamba_ssm`, whose
+CUDA extension has no wheel for the torch versions this project targets. Two steps make it
+importable anyway:
+
+```bash
+MAMBA_SKIP_CUDA_BUILD=TRUE pip install --no-build-isolation --no-deps mamba-ssm einops
+mkdir -p /tmp/shims && touch /tmp/shims/selective_scan_cuda.py   # mamba_ssm imports it eagerly
+MAGE_SHIM_DIR=/tmp/shims python run_gate_parity.py
+```
+
+The driver then points the reference at `selective_scan_ref`, the pure-torch recurrence
+`mamba_ssm` ships as its own definition. The port does not depend on `mamba_ssm` at all.
