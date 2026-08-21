@@ -34,6 +34,8 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 | `run_offline_parity.py` | vLLM offline generation vs reference, token by token. |
 | `run_online_parity.py` | `/v1/chat/completions` vs reference, plus a streaming smoke. Needs a running server. |
 | `run_video_parity.py` | Frame-sampled video through the online multi-image path (the mode the reference itself supports online), plus a 4-way concurrency check. Needs a running server. |
+| `run_codec_parity.py` | Vision tower on **codec** canvases -- sparse `t`, several source frames per canvas. The image drivers cannot reach that layout. |
+| `run_codec_generation_parity.py` | Codec inputs end to end: our tower into vLLM's decoder, against the checkpoint's `generate`. `MAGE_PARITY_DTYPE=float32` runs the attribution mode described below. |
 
 Diagnostics, for when a parity check fails:
 
@@ -43,9 +45,41 @@ Diagnostics, for when a parity check fails:
 | `run_diag_submodule.py` | Bisects layer 0 into patch embed / norms / attention / MLP / activation / rotary tables on identical inputs. |
 | `run_rope_probe.py` | Compares candidate upstream rotary formulations against the reference op. Documents why none of them match. |
 
+## The codec drivers need an engine
+
+`run_codec_parity.py` and `run_codec_generation_parity.py` run the codec sampler unless
+you hand them a directory it already produced:
+
+```bash
+pip install codec-video-prep          # in a SEPARATE venv: it pins numpy<2.0
+export CV_PREINFER_BIN=/path/to/that/venv/bin/cv-preinfer   # plus ffmpeg/ffprobe on PATH
+# or skip the engine entirely:
+export MAGE_CODEC_ASSETS=/path/to/assets
+```
+
 ## Interpreting the numbers
 
 bf16 end-to-end vision `rel_l2` around 2e-2 with cosine ~0.9998 is expected: it is
 rounding accumulated over 24 layers, amplified by large outlier activations. It is *not*
 evidence of a bug — `run_fp32_equivalence.py` returning ~4e-6 is what rules a bug out.
 The load-bearing acceptance criterion is token-exact generation, not tensor closeness.
+
+### Why the codec path is not judged on greedy token equality
+
+The image drivers are: short prompts, short answers, and the port reproduces the
+reference token for token. Codec inputs are the opposite -- 4608 visual tokens feeding an
+open-ended description -- and there the continuation is unstable under perturbations far
+smaller than the port's:
+
+| Comparison (same decoder, same decode path, 32 new tokens) | Agreement |
+|---|---|
+| our tower (fp32) vs reference tower (fp32), visual embeds `rel_l2` 7.39e-06 | 5/32 |
+| **reference tower (fp32) vs reference tower (bf16)** -- the reference against itself | **6/32** |
+| vLLM decoder vs HF decoder, both fed *identical* embeddings | **32/32 exact** |
+
+The middle row is the point: the reference disagrees with itself when only its own dtype
+changes, so token equality cannot tell a correct port from an incorrect one on this input.
+What it is judged on instead: preprocessing identical elementwise (canvases, grid,
+`pixel_values`, `patch_positions`, rewritten prompt, prompt token ids), tower `rel_l2`
+7.39e-06 in fp32, and a decoder that is bit-identical to the reference's given the same
+embeddings.

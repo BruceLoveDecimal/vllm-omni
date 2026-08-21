@@ -114,10 +114,18 @@ Measured on 1x RTX 5090 against `AutoModelForCausalLM` + the checkpoint's own pr
 | Online `/v1/chat/completions` | **3/3 token-identical**, plus a 24-chunk streaming response |
 | Frame-sampled video (4 frames as images) | token-identical; 4 concurrent requests returned one distinct output |
 | Codec-native video preprocessing (720-frame clip) | canvases, `image_grid_thw`, `pixel_values`, `patch_positions` and the rewritten prompt all **elementwise identical** to the reference; prompt token ids identical (6518 tokens, 4608 visual) |
+| Vision tower on codec canvases (sparse `t`, mixed frames) | fp32 `rel_l2` **7.39e-06**, cosine 1.0000000000; bf16 `rel_l2` 2.05e-02 |
+| Decoder on codec inputs | vLLM's decoder is **token-identical (32/32)** to the reference's given the same visual embeddings |
 
 Reproduce with the drivers in
 [`tests/model_executor/models/mage_vl/parity/`](../../tests/model_executor/models/mage_vl/parity/)
 (`run_hf_baseline.py` first, then the rest — its README explains the order).
+
+Note the codec rows are not judged on end-to-end greedy token equality. With 4608 visual
+tokens feeding an open-ended description, the continuation is unstable under perturbations
+smaller than the port's: the reference disagrees with **itself** at token 6 when only its
+own tower dtype changes (fp32 vs bf16), so token equality cannot discriminate a correct
+port there. The parity README shows the measurements.
 
 ## Performance
 

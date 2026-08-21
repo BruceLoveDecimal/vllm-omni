@@ -304,6 +304,26 @@ raises a length mismatch -- the reference hits this too. The port derives `patch
 the image processor and rejects a conflicting override, with the measurement written into
 the test.
 
+**Codec generation, measured and attributed.** `run_codec_parity.py` puts the tower on
+real codec canvases: fp32 `rel_l2` **7.39e-06** / cos 1.0000000000, bf16 2.05e-02 -- the
+same profile as the image path, so sparse `t` and mixed-frame canvases are handled
+correctly. `run_codec_generation_parity.py` then drives generation through vLLM
+(`prompt_embeds`, since the mm plumbing is not wired) and decomposes the result:
+
+| Comparison, 32 new greedy tokens | Agreement |
+|---|---|
+| vLLM decoder vs HF decoder, identical embeddings | **32/32 exact** |
+| our fp32 tower vs reference fp32 tower (embeds `rel_l2` 7.4e-06) | 5/32 |
+| reference fp32 tower vs reference bf16 tower -- *the reference against itself* | 6/32 |
+
+The last row is why M3's "greedy 逐 token 一致" acceptance criterion does not survive
+contact with codec inputs: 4608 visual tokens feeding an open-ended description make the
+continuation unstable under perturbations the reference itself produces by changing its
+own dtype. Token equality cannot discriminate a correct port there, and the spec's
+criterion should be replaced by what does: preprocessing identical elementwise, tower
+`rel_l2` at 1e-6 in fp32, and a decoder bit-identical given the same embeddings. (The
+image path stays token-exact -- short prompts, short answers -- so nothing changes there.)
+
 What M3 still needs: the codec path through **vLLM's multimodal plumbing** (the model
 declares image only, so codec inputs are built processor-side rather than by handing the
 server a video), `dcvc-rt` (needs the checkpoint's `neural_codec` CUDA extensions, not
