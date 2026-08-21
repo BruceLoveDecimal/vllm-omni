@@ -339,11 +339,38 @@ bitstream. Bridging that needs either a model-owned data parser that passes the 
 through untouched, or a serving-layer hook -- and the spec's module-boundary rule forbids
 the latter. That is a design decision, not an implementation detail.
 
-**M4 needs the box.** The gate (`streammind_gate.py`) is built on
-`mamba_ssm.models.mixer_seq_simple.create_block`, which is CUDA-only: it cannot be
-cross-checked on the dev Mac at all, and `mamba_ssm` is not installed on the box either.
-The reuse-first port would go through vLLM's own Mamba layers, but every parity number for
-it has to come from a GPU run.
+**M4 has started: the gate's perception encoder is ported and verified.**
+`vllm_omni/model_executor/models/mage_vl/gate.py` holds the checkpoint's
+``pre_net -> Mamba-1 -> norm -> post_net`` stack with per-session ``(conv_state,
+ssm_state)``. Against the checkpoint's own gate on a real weight load
+(`parity/run_gate_parity.py`, fp32):
+
+| Comparison | Result |
+|---|---|
+| ours vs reference, full stream | `rel_l2` **4.55e-07**, cos 1.0000000000 |
+| ours fed one segment at a time vs reference | `rel_l2` **5.99e-07** |
+| streamed vs one-shot (the streaming contract) | `rel_l2` 4.36e-07 |
+
+Two things worth carrying forward:
+
+- **`mamba_ssm` is not a dependency of the port, only of the reference.** Its CUDA
+  extension has no wheel for torch 2.13/cu13. The reference runs via
+  `MAMBA_SKIP_CUDA_BUILD=TRUE pip install --no-build-isolation --no-deps mamba-ssm` plus an
+  empty `selective_scan_cuda.py` on the path (the package imports it eagerly), with
+  `selective_scan_fn` pointed at `selective_scan_ref`. Both are installed on the box.
+- **vLLM's Mamba kernels were tried first and do not fit.** `causal_conv1d_fn` /
+  `causal_conv1d_update` / `selective_scan_fn` are written for the engine's paged state
+  cache: called without the block bookkeeping (`block_idx_*`, `initial_state_idx`) that
+  only the engine's state manager produces, they **silently return their input untouched**
+  or produce NaN -- measured on a 1-channel micro example, not inferred from a failed
+  parity number. The gate runs outside the engine and advances one segment per call, so it
+  uses an explicit recurrence instead. That also makes it CPU-testable, which is why the
+  gate has 8 CPU tests rather than a GPU-only story.
+
+What M4 still needs: the classifier head (4-layer Qwen3, vocab 2 -- weights are in the
+same checkpoint file), the `DuplexAdapter` with `should_respond` gating, sliding-window
+prompt construction, and the streaming e2e / interrupt tests. The gate's decision math
+(`p_speak` per segment) is reachable today through the reference for golden values.
 
 The reference implementation's sources are cached at
 `<scratchpad>/mage_ref_src/` (checkpoint `.py` + `.json`, no weights) so this reading does
