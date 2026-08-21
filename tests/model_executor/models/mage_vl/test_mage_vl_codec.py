@@ -6,6 +6,8 @@ Every expected value here was cross-checked elementwise against the checkpoint's
 ``codec_video_processing_mage_vl.py`` over randomized inputs before being pinned.
 """
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -306,3 +308,51 @@ def test_codec_patch_size_is_taken_from_the_image_processor(tmp_path):
         codec_config={"asset_dir": str(tmp_path)},
     )
     assert out["patch_positions"].shape[0] == out["pixel_values"].shape[0]
+
+
+def _codec_engine_available() -> bool:
+    import shutil
+
+    binary = os.environ.get("CV_PREINFER_BIN", "cv-preinfer")
+    return (shutil.which(binary) is not None or os.path.isfile(binary)) and shutil.which(
+        "ffprobe"
+    ) is not None
+
+
+@pytest.mark.advanced_model
+@pytest.mark.skipif(
+    not _codec_engine_available(),
+    reason="needs cv-preinfer (pip install codec-video-prep) and ffprobe on PATH",
+)
+@pytest.mark.skipif(
+    not os.environ.get("MAGE_VIDEO"), reason="set MAGE_VIDEO to a video file to run the engine"
+)
+def test_codec_engine_produces_a_consistent_asset_directory(tmp_path):
+    """Run the real engine and check the asset it writes is self-consistent.
+
+    Guarded on the tooling rather than skipped silently in code: `engine="hevc"` shells out
+    to `cv-preinfer`, which ships on PyPI as `codec-video-prep` and pins `numpy<2.0`, so it
+    normally lives in its own virtualenv reached through `CV_PREINFER_BIN`.
+    """
+    cfg = CodecConfig(patch=16, cache_root=tmp_path)
+
+    result = process_codec_video(os.environ["MAGE_VIDEO"], cfg)
+
+    canvases = result["images"]
+    positions = result["src_positions"]
+    assert canvases, "engine produced no canvases"
+    assert len(canvases) <= cfg.target_canvas
+    assert positions.shape[1] == 3
+    assert positions.shape[0] % len(canvases) == 0
+    assert result["fps"] > 0
+
+    # The canvases tile exactly on the configured patch grid -- the property that lets the
+    # image processor read them back without resizing.
+    per_canvas = positions.shape[0] // len(canvases)
+    width, height = canvases[0].size
+    assert (width % cfg.patch, height % cfg.patch) == (0, 0)
+    assert (width // cfg.patch) * (height // cfg.patch) == per_canvas
+
+    # A second call must hit the cache rather than re-running the engine.
+    cached = process_codec_video(os.environ["MAGE_VIDEO"], cfg)
+    assert np.array_equal(cached["src_positions"], positions)
