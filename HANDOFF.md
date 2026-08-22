@@ -367,10 +367,44 @@ Two things worth carrying forward:
   uses an explicit recurrence instead. That also makes it CPU-testable, which is why the
   gate has 8 CPU tests rather than a GPU-only story.
 
-What M4 still needs: the classifier head (4-layer Qwen3, vocab 2 -- weights are in the
-same checkpoint file), the `DuplexAdapter` with `should_respond` gating, sliding-window
-prompt construction, and the streaming e2e / interrupt tests. The gate's decision math
-(`p_speak` per segment) is reachable today through the reference for golden values.
+The classifier head is in too (`MageVLCognitionGate`): 4-layer Qwen3, vocab 2, built from
+`transformers` because it runs outside the engine once per segment and matching the
+reference exactly matters more than sharing an engine path it never enters. Its output is
+the number the policy thresholds, and it lands on the reference:
+
+| Check | Result |
+|---|---|
+| per-segment `p_speak`, one-shot | max abs diff **2.38e-07** |
+| per-segment `p_speak`, fed one segment at a time | max abs diff **2.11e-07** |
+
+The spec's M4 acceptance asks for <= 1e-2, so the trigger sets are identical by a wide
+margin.
+
+**The streaming half is built on the repo's own duplex contracts**, not a new mechanism.
+`vllm_omni/experimental/fullduplex/mage_vl/` holds a `DuplexAdapter` plus its policy, and
+`core/` is untouched -- which is what the package README's recipe asks for. The fit is
+close to exact: `core.DuplexRuntime` already starts a response when a session is
+`proactive` and `should_respond()` is true, so **the gate is `should_respond`**. Barge-in,
+epochs, and stale-output dropping come from `core/` unchanged. Decisions ride the existing
+`response.speak` / `response.listen` events (already projected by
+`openai/realtime_output.py`) through an injected callback, so no event type was invented.
+
+Two policy details that are ours, because the checkpoint ships no streaming driver
+(`inference_streaming.py` is not in the repo -- only the gate module is): a **cooldown**
+after answering, without which the gate re-fires on the next segment and the model talks
+over itself, and a **bounded prompt window** (the gate's state spans the session; the
+prompt cannot). Defaults follow the spec: 8 s segments, tau = 0.5.
+
+12 CPU contract tests drive the **real** `DuplexRuntime` with the model stubbed
+(`tests/e2e/features/fullduplex/mage_vl/`), covering proactive firing, cooldown, mid-stream
+questions, window eviction, barge-in with no stale deltas, and refused modalities.
+
+What M4 still needs: production wiring of `score_segment` (vision tower -> gate) and the
+serving adapter, then the streaming e2e and interrupt tests against a live server -- those
+need the box and a `--omni` duplex deployment, not more contract work. The
+`image_embeds` passthrough the spec lists for the sliding window is deferred with a reason:
+the model does not accept precomputed embeddings as an input today, so the switch would
+have nothing to turn on.
 
 The reference implementation's sources are cached at
 `<scratchpad>/mage_ref_src/` (checkpoint `.py` + `.json`, no weights) so this reading does
