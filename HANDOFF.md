@@ -399,12 +399,35 @@ prompt cannot). Defaults follow the spec: 8 s segments, tau = 0.5.
 (`tests/e2e/features/fullduplex/mage_vl/`), covering proactive firing, cooldown, mid-stream
 questions, window eviction, barge-in with no stale deltas, and refused modalities.
 
-What M4 still needs: production wiring of `score_segment` (vision tower -> gate) and the
-serving adapter, then the streaming e2e and interrupt tests against a live server -- those
-need the box and a `--omni` duplex deployment, not more contract work. The
-`image_embeds` passthrough the spec lists for the sliding window is deferred with a reason:
-the model does not accept precomputed embeddings as an input today, so the switch would
-have nothing to turn on.
+**The production wiring is in and the streaming path runs end to end.**
+`mage_vl/bindings.py` fills the adapter's two seams with the real model:
+`MageVLSegmentScorer` (processor -> vision tower -> gate, holding one session's recurrent
+state) and `build_text_stream` (messages -> `AsyncLLM`, streaming deltas). `AsyncLLM` is
+what makes barge-in real rather than cosmetic: dropping the async iterator aborts the
+request in the engine, so a superseded answer stops occupying it instead of finishing
+invisibly.
+
+`tests/e2e/features/fullduplex/mage_vl/test_streaming_e2e.py` drives that stack over a real
+video on the box (checkpoint + GPU, skipped without both) -- **2 passed in 45 s**:
+
+| Check | Result |
+|---|---|
+| Gate scores over 4 segments, 3 independent runs | bit-identical -- the decision is reproducible, so a trigger-set assertion is not flaky |
+| Threshold above every observed score | zero events: no response, no output at all |
+| Threshold below every observed score | exactly one response, non-empty text |
+| Barge-in mid-answer | `response.cancelled`, no `response.done`, **no delta after the cancel**, epoch advanced once |
+| A fresh request after the aborted one | still generates -- the engine survives the abort |
+
+The e2e judges the **trigger set**, not the generated text: the decision is what this path
+owns, and a single boolean assertion on streamed text is exactly the shape that goes flaky
+(the #5962 lesson).
+
+What M4 still needs: the serving adapter that exposes this over `/v1/realtime?duplex=1`
+(the runtime and adapter are ready; what is missing is the transport wiring and its session
+lifecycle), long-session memory/TTL behaviour, and the perf numbers (gate decision latency,
+trigger-to-first-token). The `image_embeds` passthrough the spec lists for the sliding
+window is deferred with a reason: the model does not accept precomputed embeddings as an
+input today, so the switch would have nothing to turn on.
 
 The reference implementation's sources are cached at
 `<scratchpad>/mage_ref_src/` (checkpoint `.py` + `.json`, no weights) so this reading does
