@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-from functools import lru_cache
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -141,19 +141,24 @@ def _tensor_signature(value: torch.Tensor) -> tuple:
     return tuple(value.shape), str(value.dtype), str(value.device)
 
 
-_DTYPE_MAP = {
-    "torch.float32": torch.float32,
-    "torch.float16": torch.float16,
-    "torch.bfloat16": torch.bfloat16,
-    "torch.float64": torch.float64,
-}
+_DTYPE_MAP = {str(dtype): dtype for dtype in (torch.float32, torch.float16, torch.bfloat16, torch.float64)}
+
+# Capturing needs room for the static buffers plus whatever the graph allocates
+# while recording. Below this much free device memory we stay eager instead of
+# capturing the process into an OOM.
+_MIN_CAPTURE_FREE_BYTES = 1 << 30  # 1 GiB
 
 
 def _tensors_from_key(key: tuple) -> tuple[torch.Tensor, ...]:
-    """Rebuild zero tensors from a cache key (shape, dtype, device tuples)."""
+    """Rebuild zero tensors from a cache key (shape, dtype, device tuples).
+
+    Raises ``KeyError`` for a dtype the key encoding cannot round-trip; the
+    caller degrades to eager rather than capturing a graph whose static buffers
+    have the wrong dtype.
+    """
     tensors = []
     for shape, dtype_str, device_str in key[1:]:
-        dtype = _DTYPE_MAP.get(dtype_str, torch.float32)
+        dtype = _DTYPE_MAP[dtype_str]
         device = torch.device(device_str)
         tensors.append(torch.zeros(shape, dtype=dtype, device=device))
     return tuple(tensors)
@@ -166,56 +171,118 @@ class CFMGraphWrapper:
     as the graph target. The 10-step Euler loop stays in Python, replaying
     the graph 10 times per decode.
 
-    Uses functools.lru_cache for automatic LRU eviction. Cache misses
-    trigger capture; capture failures fall back to eager. Outputs are
-    cloned after replay to prevent streaming cache corruption.
+    Graphs are retired a whole generation at a time rather than one at a time.
+    Destroying a single graph while its peers stay live corrupts them: torch
+    records every capture on one process-wide side stream, and cuBLAS keeps one
+    workspace per (handle, stream) that is first allocated *during* a capture,
+    so it lives inside a graph memory pool while every later graph bakes in the
+    same address. Tearing one graph down releases that pool and leaves the
+    survivors replaying against reclaimed memory -- an illegal memory access at
+    the next replay (issue #6457). Dropping the whole generation at once keeps
+    the cache bounded without ever leaving a live graph behind a dead one.
+
+    Cache misses capture; capture failures disable the wrapper for the rest of
+    the process. Outputs are cloned after replay to prevent streaming cache
+    corruption.
     """
 
-    def __init__(self, graph_fn, *, max_graphs: int = 32) -> None:
+    def __init__(
+        self,
+        graph_fn,
+        *,
+        max_graphs: int = 32,
+        min_free_bytes: int = _MIN_CAPTURE_FREE_BYTES,
+    ) -> None:
         self.graph_fn = graph_fn
-        self.max_graphs = int(max_graphs)
+        self.max_graphs = max(1, int(max_graphs))
+        self.min_free_bytes = int(min_free_bytes)
         self.device = next(graph_fn.__self__.parameters()).device
+        self.enabled = True
+        self._cache: dict[tuple, tuple] = {}
+        self._stats = {
+            "calls": 0,
+            "hits": 0,
+            "captures": 0,
+            "flushes": 0,
+            "eager": 0,
+        }
 
-        @lru_cache(maxsize=self.max_graphs)
-        def _capture_graph(key: tuple):
-            return self._capture(key)
-
-        self._capture_graph = _capture_graph
+    def stats_snapshot(self) -> dict[str, int]:
+        """Bounded cumulative telemetry for the graph cache."""
+        return {**self._stats, "cache_size": len(self._cache)}
 
     def _call_graph_fn(self, args: tuple[torch.Tensor, ...]) -> torch.Tensor:
         return self.graph_fn(args[0], args[1], None, args[2], args[3], args[4], args[5])
 
+    def _eager(self, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._stats["eager"] += 1
+        with torch.no_grad():
+            result = self._call_graph_fn(inputs)
+        return result, inputs[4], inputs[5]
+
+    def _flush(self) -> None:
+        """Retire every captured graph at once.
+
+        The device sync makes sure no replay is still in flight, ``reset()``
+        tears each graph down explicitly instead of whenever Python drops the
+        last reference, and the cuBLAS workspace that this generation baked in
+        goes with it -- otherwise the next generation inherits a pointer into
+        the pool memory we just released.
+        """
+        if not self._cache:
+            return
+        torch.accelerator.synchronize(self.device)
+        for entry in self._cache.values():
+            entry[2].reset()
+        self._cache.clear()
+        clear_cublas_workspaces = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+        if clear_cublas_workspaces is not None:
+            clear_cublas_workspaces()
+        torch.accelerator.synchronize(self.device)
+        torch.accelerator.empty_cache()
+        self._stats["flushes"] += 1
+        logger.info("CFM graph cache flushed; stats=%s", self.stats_snapshot())
+
+    def _disable(self, reason: str, key: tuple) -> None:
+        logger.warning("Disabling CFM CUDA graphs (%s) for shape=%s; using eager", reason, key, exc_info=True)
+        self.enabled = False
+        self._flush()
+
     def _capture(self, key: tuple) -> tuple | None:
         """Capture a CUDA graph for the given key. Returns None on failure."""
-        static_inputs = _tensors_from_key(key)
+        try:
+            static_inputs = _tensors_from_key(key)
+        except KeyError:
+            self._disable("unsupported dtype", key)
+            return None
 
         current_stream = torch.cuda.current_stream(self.device)
         warmup_stream = torch.cuda.Stream(device=self.device)
         warmup_stream.wait_stream(current_stream)
         with torch.cuda.stream(warmup_stream), torch.no_grad():
             for _ in range(3):
-                self._call_graph_fn(static_inputs)
+                warmup_output = self._call_graph_fn(static_inputs)
         current_stream.wait_stream(warmup_stream)
+        del warmup_output
 
         try:
             graph = CUDAGraph()
             with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_output = self._call_graph_fn(static_inputs)
         except Exception:
-            logger.warning(
-                "CFM graph capture failed for shape=%s; using eager",
-                key,
-                exc_info=True,
-            )
+            # A failed capture can leave the capture stream current and the
+            # allocator still routing into the graph pool, so there is no safe
+            # way to keep capturing afterwards.
+            self._disable("capture failed", key)
             return None
 
+        self._stats["captures"] += 1
         logger.info(
-            "Captured CFM CUDA Graph for shape %s (cache=%d/%d, hits=%d, misses=%d)",
+            "Captured CFM CUDA Graph for shape %s (cache=%d/%d, stats=%s)",
             key,
-            self._capture_graph.cache_info().currsize,
+            len(self._cache) + 1,
             self.max_graphs,
-            self._capture_graph.cache_info().hits,
-            self._capture_graph.cache_info().misses,
+            self.stats_snapshot(),
         )
         return (static_inputs, static_output, graph)
 
@@ -229,25 +296,25 @@ class CFMGraphWrapper:
         att_out: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         inputs = (estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out)
+        self._stats["calls"] += 1
 
-        if torch.cuda.is_current_stream_capturing() or estimator_input.device.type != "cuda":
-            with torch.no_grad():
-                result = self._call_graph_fn(inputs)
-            return result, inputs[4], inputs[5]
+        if not self.enabled or torch.cuda.is_current_stream_capturing() or estimator_input.device.type != "cuda":
+            return self._eager(inputs)
 
         key = ("estimator_step",) + tuple(_tensor_signature(v) for v in inputs)
-        entry = self._capture_graph(key)
+        entry = self._cache.get(key)
 
         if entry is None:
-            logger.debug(
-                "CFM graph eager fallback for shape=%s (hits=%d, misses=%d)",
-                key,
-                self._capture_graph.cache_info().hits,
-                self._capture_graph.cache_info().misses,
-            )
-            with torch.no_grad():
-                result = self._call_graph_fn(inputs)
-            return result, inputs[4], inputs[5]
+            if len(self._cache) >= self.max_graphs:
+                self._flush()
+            if current_omni_platform.get_free_memory(self.device) < self.min_free_bytes:
+                return self._eager(inputs)
+            entry = self._capture(key)
+            if entry is None:
+                return self._eager(inputs)
+            self._cache[key] = entry
+        else:
+            self._stats["hits"] += 1
 
         static_inputs, static_output, graph = entry
         for static, current in zip(static_inputs, inputs, strict=True):

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from functools import lru_cache
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -17,6 +16,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
 
@@ -248,50 +248,67 @@ def test_cfm_graph_replay_matches_eager_for_uncached_and_cached_shapes(
             torch.testing.assert_close(graph_cnn, eager_inputs[4], rtol=1e-4, atol=1e-5)
             torch.testing.assert_close(graph_att, eager_inputs[5], rtol=1e-4, atol=1e-5)
 
-    wrapper._capture_graph.cache_clear()
+    wrapper._flush()
 
 
 def _cfm_mock_wrapper(monkeypatch: pytest.MonkeyPatch, *, max_graphs: int = 1) -> CFMGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    # Plenty of headroom so the memory guard never decides the outcome.
+    monkeypatch.setattr(current_omni_platform, "get_free_memory", lambda device=None: 1 << 40)
     wrapper = object.__new__(CFMGraphWrapper)
     wrapper.max_graphs = max_graphs
+    wrapper.min_free_bytes = 0
+    wrapper.enabled = True
     wrapper.graph_fn = Mock(return_value=torch.tensor([42.0]))
     wrapper.device = torch.device("cuda")
-
-    @lru_cache(maxsize=max_graphs)
-    def _capture_graph(key: tuple):
-        return wrapper._do_capture(key)
-
-    wrapper._capture_graph = _capture_graph
-    wrapper._do_capture = Mock(return_value=None)
+    wrapper._cache = {}
+    wrapper._stats = {"calls": 0, "hits": 0, "captures": 0, "flushes": 0, "eager": 0}
+    wrapper._capture = Mock(return_value=None)
     return wrapper
 
 
 def test_cfm_unseen_shape_is_lazily_captured(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapper = _cfm_mock_wrapper(monkeypatch)
-    wrapper._capture_graph = Mock(return_value=None)
 
     inputs = _cfm_inputs(2, 10, 0)
     wrapper.replay(*inputs)
 
-    wrapper._capture_graph.assert_called_once()
+    wrapper._capture.assert_called_once()
     wrapper.graph_fn.assert_called_once()
 
 
 def test_cfm_capture_failure_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapper = _cfm_mock_wrapper(monkeypatch)
-    wrapper._capture_graph = lru_cache(maxsize=1)(lambda key: None)
 
     inputs = _cfm_inputs(2, 10, 0)
     result = wrapper.replay(*inputs)
 
     wrapper.graph_fn.assert_called_once()
     assert result[0] is wrapper.graph_fn.return_value
+    assert wrapper._stats["eager"] == 1
+
+
+def test_cfm_stays_eager_without_capture_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Below the free-memory floor the wrapper must not capture at all."""
+    wrapper = _cfm_mock_wrapper(monkeypatch)
+    wrapper.min_free_bytes = 1 << 30
+    monkeypatch.setattr(current_omni_platform, "get_free_memory", lambda device=None: 1 << 20)
+
+    inputs = _cfm_inputs(2, 10, 0)
+    result = wrapper.replay(*inputs)
+
+    wrapper._capture.assert_not_called()
+    assert result[0] is wrapper.graph_fn.return_value
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_cfm_lru_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify that LRU cache evicts oldest entries when full."""
+def test_cfm_cache_flushes_whole_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A full cache is retired all at once, never one graph at a time.
+
+    Destroying a single graph while its peers stay live is what produced the
+    illegal memory access in #6457, so the cache must never hold a graph that
+    outlived one of its generation-mates.
+    """
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
 
@@ -302,26 +319,32 @@ def test_cfm_lru_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
     with torch.inference_mode():
         inputs_a = _cfm_inputs(2, 10, 0)
         wrapper.replay(*inputs_a)
-        assert wrapper._capture_graph.cache_info().currsize == 1
+        assert len(wrapper._cache) == 1
 
         inputs_b = _cfm_inputs(2, 12, 0)
         wrapper.replay(*inputs_b)
-        assert wrapper._capture_graph.cache_info().currsize == 2
+        assert len(wrapper._cache) == 2
 
+        # A hit must not grow the cache or trigger a flush.
         wrapper.replay(*inputs_a)
-        assert wrapper._capture_graph.cache_info().currsize == 2
+        assert len(wrapper._cache) == 2
+        assert wrapper._stats["flushes"] == 0
+        assert wrapper._stats["hits"] == 1
 
+        # The third distinct shape flushes the generation, then captures alone.
         inputs_c = _cfm_inputs(2, 14, 0)
         wrapper.replay(*inputs_c)
-        assert wrapper._capture_graph.cache_info().currsize == 2
+        assert wrapper._stats["flushes"] == 1
+        assert len(wrapper._cache) == 1
 
-        wrapper.replay(*inputs_b)
-        hits_before = wrapper._capture_graph.cache_info().hits
-        wrapper.replay(*inputs_b)
-        hits_after = wrapper._capture_graph.cache_info().hits
-        assert hits_after == hits_before + 1
+        # The flushed shapes are gone, so they capture again rather than hit.
+        hits_before = wrapper._stats["hits"]
+        wrapper.replay(*inputs_a)
+        assert wrapper._stats["hits"] == hits_before
+        wrapper.replay(*inputs_a)
+        assert wrapper._stats["hits"] == hits_before + 1
 
-    wrapper._capture_graph.cache_clear()
+    wrapper._flush()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
