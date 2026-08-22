@@ -422,10 +422,42 @@ The e2e judges the **trigger set**, not the generated text: the decision is what
 owns, and a single boolean assertion on streamed text is exactly the shape that goes flaky
 (the #5962 lesson).
 
-What M4 still needs: the serving adapter that exposes this over `/v1/realtime?duplex=1`
-(the runtime and adapter are ready; what is missing is the transport wiring and its session
-lifecycle), long-session memory/TTL behaviour, and the perf numbers (gate decision latency,
-trigger-to-first-token). The `image_embeds` passthrough the spec lists for the sliding
+**Serving: `/v1/realtime?duplex=1` does not fit, and the reason is structural.** That
+transport's input layer (`openai/realtime_input.py`) accepts PCM audio buffers and text
+content parts only -- there is no image or video append anywhere in it, content parts are
+filtered to `input_text`/`text`, and it exposes no per-model hook. The
+`ServingRuntimeAdapter` protocol it loads is PCM-shaped as well (`PcmAppendBuffer`,
+`committed_audio_payload`, `interrupted_tts_prefix`, `speech_since_commit`). Serving a
+video-in/text-out model there means teaching the **shared** transport a generic
+input-modality append -- which the fullduplex README explicitly defers ("promote a helper
+from a model package up into `core/` only once a second model actually needs it"), and
+which the spec's module-boundary rule forbids doing as a per-model branch.
+
+So the delivered path is the one the README prescribes for exactly this case, and that
+PersonaPlex already took: a **model-owned** WebSocket server,
+`mage_vl/serving/server.py`, speaking the core duplex protocol verbatim -- `input.append`
+with `modality: video|text`, `response.cancel` for barge-in, and `response.created/delta/
+done/cancelled/error` plus the gate's `response.listen`/`response.speak` coming back. It
+adds only what the transport owes: session admission with a hard capacity limit (a video
+stream admitted late has already missed the footage it would answer about, so refusing
+beats lagging), idle eviction for clients that drop without closing, and a socket-to-runtime
+pump that survives malformed frames. `create_router()` returns a mountable FastAPI router,
+so the OpenAI api_server can carry it when someone wants it there.
+
+8 CPU tests drive it over a real WebSocket (`tests/e2e/features/fullduplex/mage_vl/
+test_serving.py`): proactive answer on the wire, quiet stream reporting only `listen`,
+barge-in with nothing following `response.cancelled`, capacity refusal and slot release,
+malformed frame not ending the stream, and server-level threshold overrides reaching the
+policy.
+
+One trap worth remembering: this module uses `from __future__ import annotations`, and
+FastAPI resolves a handler's annotations against **module globals**. With `WebSocket`
+imported inside the router factory the name did not resolve, and every connection was
+closed at accept time with no error anywhere. The fastapi imports are module-level now,
+with a comment saying why.
+
+What M4 still needs: long-session behaviour under real load (TTL and memory over a
+30-minute stream), and the perf numbers (gate decision latency, trigger-to-first-token). The `image_embeds` passthrough the spec lists for the sliding
 window is deferred with a reason: the model does not accept precomputed embeddings as an
 input today, so the switch would have nothing to turn on.
 
