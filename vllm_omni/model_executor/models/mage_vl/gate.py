@@ -35,6 +35,7 @@ class MageVLGateConfig:
     d_conv: int = 4
     expand: int = 2
     dt_rank: int = 160
+    classifier_layers: int = 4
 
     @property
     def d_inner(self) -> int:
@@ -230,7 +231,98 @@ class MageVLPerceptionEncoder(nn.Module):
         return loaded
 
 
+class MageVLCognitionGate(nn.Module):
+    """Perception encoder plus the checkpoint's speak/listen classifier.
+
+    The classifier is a 4-layer Qwen3 with a two-token vocabulary: each perception token is
+    paired with a target embedding and the pair's *first* position is read out, which under
+    causal attention is the perception token judging itself. It is built from
+    ``transformers`` rather than vLLM's Qwen3: this runs outside the engine, once per
+    segment of video, and the reference builds it the same way -- matching it exactly
+    matters more here than sharing an engine code path this never enters.
+    """
+
+    def __init__(self, config: MageVLGateConfig | None = None):
+        super().__init__()
+        from transformers import Qwen3Config
+        from transformers.models.qwen3 import Qwen3ForCausalLM
+
+        self.config = config or MageVLGateConfig()
+        self.perception = MageVLPerceptionEncoder(self.config)
+        self.classifier = Qwen3ForCausalLM(
+            Qwen3Config(
+                vocab_size=2,
+                hidden_size=self.config.hidden_size,
+                num_hidden_layers=self.config.classifier_layers,
+                num_attention_heads=32,
+                num_key_value_heads=8,
+                intermediate_size=12288,
+                head_dim=128,
+                max_position_embeddings=8192,
+                rms_norm_eps=1e-6,
+                tie_word_embeddings=False,
+                attention_bias=False,
+            )
+        )
+
+    def new_state(self, device=None, dtype: torch.dtype = torch.float32) -> MageVLGateState:
+        return self.perception.new_state(device=device, dtype=dtype)
+
+    def forward(self, vision_tokens: torch.Tensor, state: MageVLGateState) -> torch.Tensor:
+        """``[1, T, patches, D]`` in, ``[1, T, 2]`` silent/speak logits out."""
+        tokens = self.perception(vision_tokens, state)
+        batch, segments, hidden = tokens.shape
+
+        target_ids = torch.zeros(batch * segments, dtype=torch.long, device=tokens.device)
+        targets = self.classifier.model.embed_tokens(target_ids)
+        pair = torch.stack((tokens.reshape(batch * segments, hidden), targets), dim=1)
+
+        rotary = self.classifier.model.rotary_emb
+        saved_inv_freq = rotary.inv_freq
+        try:
+            # The checkpoint was trained with the whole model -- including Qwen3's
+            # non-persistent RoPE buffers -- cast to the model dtype, so a float32 buffer
+            # here would quietly change the angles.
+            rotary.inv_freq = rotary.inv_freq.to(pair.dtype)
+            outputs = self.classifier.model(
+                inputs_embeds=pair,
+                attention_mask=torch.ones(pair.shape[:2], device=pair.device),
+            )
+            logits = self.classifier.lm_head(outputs.last_hidden_state).float()
+        finally:
+            rotary.inv_freq = saved_inv_freq
+
+        return logits[:, 0].reshape(batch, segments, 2)
+
+    def score(self, vision_tokens: torch.Tensor, state: MageVLGateState) -> torch.Tensor:
+        """``p_speak`` per segment, the number the streaming policy thresholds."""
+        return torch.softmax(self(vision_tokens, state), dim=-1)[..., 1]
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load ``streammind_gate.safetensors``: perception plus ``cls_net.*``."""
+        weights = list(weights)
+        perception_keys = {"pre_net.", "post_net.", "mamba_model."}
+
+        loaded = self.perception.load_weights(
+            [(name, tensor) for name, tensor in weights if name.startswith(tuple(perception_keys))]
+        )
+        loaded = {f"perception.{name}" for name in loaded}
+
+        classifier_prefix = "cls_net.cls_model."
+        classifier_weights = {
+            name[len(classifier_prefix) :]: tensor
+            for name, tensor in weights
+            if name.startswith(classifier_prefix)
+        }
+        missing, unexpected = self.classifier.load_state_dict(classifier_weights, strict=False)
+        if missing or unexpected:
+            raise ValueError(f"classifier weights mismatch: {missing=} {unexpected=}")
+        loaded |= {f"classifier.{name}" for name in classifier_weights}
+        return loaded
+
+
 __all__ = [
+    "MageVLCognitionGate",
     "MageVLGateConfig",
     "MageVLGateMamba",
     "MageVLGateState",

@@ -36,7 +36,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 | `run_video_parity.py` | Frame-sampled video through the online multi-image path (the mode the reference itself supports online), plus a 4-way concurrency check. Needs a running server. |
 | `run_codec_parity.py` | Vision tower on **codec** canvases -- sparse `t`, several source frames per canvas. The image drivers cannot reach that layout. |
 | `run_codec_generation_parity.py` | Codec inputs end to end: our tower into vLLM's decoder, against the checkpoint's `generate`. `MAGE_PARITY_DTYPE=float32` runs the attribution mode described below. |
-| `run_gate_parity.py` | The cognition gate's perception encoder against the checkpoint's own, both full-stream and one segment at a time. Needs `mamba_ssm` importable -- see below. |
+| `run_gate_parity.py` | The cognition gate against the checkpoint's own -- perception tokens *and* the per-segment `p_speak` the streaming policy thresholds, both full-stream and one segment at a time. Needs `mamba_ssm` importable -- see below. |
 
 Diagnostics, for when a parity check fails:
 
