@@ -198,6 +198,47 @@ rejects a conflicting override.
 bundled `neural_codec` package with compiled CUDA extensions. Asking for it raises
 `NotImplementedError` naming what is missing.
 
+## Proactive video streaming (experimental)
+
+Mage-VL ships a cognition gate that decides, per segment of video, whether to answer now or
+keep watching -- so a stream needs no "send" button. That path lives in
+[`vllm_omni/experimental/fullduplex/mage_vl/`](../../vllm_omni/experimental/fullduplex/mage_vl/)
+on the package's core duplex contracts, and is served over its own WebSocket:
+
+```python
+from vllm_omni.experimental.fullduplex.mage_vl import MageVLDuplexAdapter, MageVLSegmentScorer, build_text_stream
+from vllm_omni.experimental.fullduplex.mage_vl.serving import MageVLDuplexServer, MageVLServingConfig, create_app
+
+server = MageVLDuplexServer(
+    lambda emit: MageVLDuplexAdapter(
+        MageVLSegmentScorer(processor, vision_tower, gate), build_text_stream(async_llm), on_decision=emit
+    ),
+    MageVLServingConfig(max_sessions=1, idle_timeout_s=300),
+)
+app = create_app(server)   # serves /v1/duplex/mage-vl
+```
+
+The wire protocol is the core duplex protocol, unchanged:
+
+| Client sends | Server sends |
+| --- | --- |
+| `{"type": "input.append", "modality": "video", "data": "<data: URI>"}` | `response.listen` / `response.speak` with `p_speak` metadata |
+| `{"type": "input.append", "modality": "text", "data": "..."}` | `response.created`, `response.delta`, `response.done` |
+| `{"type": "response.cancel"}` (barge-in) | `response.cancelled` -- nothing follows it |
+| `{"type": "close"}` | `error` on a malformed frame; the stream continues |
+
+**Not on `/v1/realtime?duplex=1`.** That transport accepts PCM audio buffers and text
+content parts only -- it has no image or video append and no per-model hook to add one, and
+the `ServingRuntimeAdapter` it loads is PCM-shaped (`PcmAppendBuffer`,
+`interrupted_tts_prefix`). Putting a video model there means teaching the shared transport a
+*generic* input-modality append, which the fullduplex README defers until a second model
+needs it. PersonaPlex made the same call and ships its own serving path.
+
+Tuning: `speak_threshold` (default 0.5), `segment_seconds` (8.0), `window_segments` (how
+many recent segments an answer looks at), and `cooldown_segments` -- the last one is what
+stops the model answering again on the very next segment while the same scene is still on
+screen.
+
 ## Limitations
 
 Untested support is reported as unknown, not as supported:
