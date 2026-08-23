@@ -67,8 +67,10 @@ class _VocoderWorkItem:
     streaming: bool
     stream_finished: bool
     tts_mel: torch.Tensor
-    speech_offset: int = 0
     f0: torch.Tensor | None = None
+    source: torch.Tensor | None = None
+    # Bounded streaming state (``_StreamWindow``); None for non-streaming rows.
+    window: object | None = None
 
 
 # Process-wide cache of per-model mm-processor runtime components (tokenizer,
@@ -1129,7 +1131,7 @@ class CosyVoice3Model(
                         with self._stream_audio_cache_lock:
                             cache_state = self._stream_vocoder_cache_by_req.get(req_id)
 
-                    tts_mel, speech_offset, f0 = self.code2wav.prepare_streaming_mel(
+                    tts_mel, stream_window = self.code2wav.prepare_streaming_mel(
                         token=token.unsqueeze(0),
                         prompt_token=speech_token[:1],
                         prompt_feat=speech_feat[:1],
@@ -1146,8 +1148,9 @@ class CosyVoice3Model(
                             streaming=True,
                             stream_finished=stream_finished,
                             tts_mel=tts_mel,
-                            speech_offset=speech_offset,
-                            f0=f0,
+                            f0=stream_window.f0,
+                            source=stream_window.source,
+                            window=stream_window,
                         )
                     )
                 else:
@@ -1177,13 +1180,14 @@ class CosyVoice3Model(
                 [item.tts_mel for item in vocoder_items],
                 [item.stream_finished if item.streaming else True for item in vocoder_items],
                 [item.f0 for item in vocoder_items],
+                [item.source for item in vocoder_items],
             )
 
             # Phase 3: per-request emission and streaming-cache bookkeeping.
             for item, tts_speech in zip(vocoder_items, speeches):
                 if item.streaming:
                     emitted, new_cache_state = self.code2wav.emit_streaming(
-                        tts_speech, item.tts_mel, item.speech_offset, item.stream_finished, item.f0
+                        tts_speech, item.window, item.stream_finished
                     )
                     if item.req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
                         with self._stream_audio_cache_lock:

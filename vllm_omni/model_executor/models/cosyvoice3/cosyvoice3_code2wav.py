@@ -11,6 +11,8 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -48,6 +50,84 @@ logger = init_logger(__name__)
 # 1280 is the last length where no batch size regresses; it is ~26s of audio at
 # the 50Hz mel rate, well beyond a typical request.
 MAX_BATCHED_VOCODER_FRAMES = 1280
+
+
+# Mel frames of history the conv trunk needs before a windowed decode matches
+# a full replay. Measured on the production conv topology: 32 frames already
+# reaches the float32 round-off floor (8.0e-08, -141.9 dBFS) and 96 or 240
+# frames change nothing, while 16 frames is audibly wrong at -49.8 dBFS. 48
+# keeps a margin over the measured requirement at negligible cost.
+VOCODER_LEFT_CONTEXT_FRAMES = 48
+
+
+@dataclass
+class _StreamWindow:
+    """Bounded decoding state for one streaming request.
+
+    Frame counters are absolute indices into the utterance, which is what makes
+    the sliding window auditable: ``mel``/``f0`` cover
+    ``[ctx_start, ctx_start + mel.shape[-1])``, ``source`` covers
+    ``[ctx_start, src_end)``, and everything below ``emitted_frames`` has
+    already been handed to the caller.
+    """
+
+    mel: torch.Tensor
+    f0: torch.Tensor
+    source: torch.Tensor
+    phase: torch.Tensor | None
+    ctx_start: int
+    src_end: int
+    emitted_frames: int
+
+    @classmethod
+    def from_cache(
+        cls, cache_state: dict | None, *, device: torch.device, dtype: torch.dtype, channels: int
+    ) -> _StreamWindow:
+        """Rebuild the window from a cache entry, or start a fresh utterance."""
+        state = cache_state.get("window") if cache_state else None
+        if not isinstance(state, cls):
+            return cls(
+                mel=torch.zeros((1, channels, 0), device=device, dtype=dtype),
+                f0=torch.zeros((1, 0), device=device, dtype=dtype),
+                source=torch.zeros((1, 1, 0), device=device, dtype=dtype),
+                phase=None,
+                ctx_start=0,
+                src_end=0,
+                emitted_frames=0,
+            )
+        return cls(
+            mel=state.mel.to(device=device, dtype=dtype),
+            f0=state.f0.to(device=device, dtype=dtype),
+            source=state.source.to(device=device, dtype=dtype),
+            phase=None if state.phase is None else state.phase.to(device=device),
+            ctx_start=state.ctx_start,
+            src_end=state.src_end,
+            emitted_frames=state.emitted_frames,
+        )
+
+    def slide(self, samples_per_frame: int, left_context: int) -> _StreamWindow:
+        """Drop history beyond ``left_context`` frames.
+
+        The state stays on its device: the window is ~150KB per request, and
+        round-tripping it through the CPU costs a sync per tensor per chunk —
+        at 8 streams that is 24 device transfers per scheduler step, which
+        measured as a large share of per-chunk wall time.
+        """
+        end = self.ctx_start + self.mel.shape[-1]
+        new_ctx_start = max(0, end - left_context)
+        drop = new_ctx_start - self.ctx_start
+        # Only frames below ``src_end`` are final; the rest were predicted with
+        # a zero look-right and get redone next chunk.
+        keep_f0 = self.src_end - self.ctx_start
+        return _StreamWindow(
+            mel=self.mel[:, :, drop:].detach().contiguous(),
+            f0=self.f0[:, drop:keep_f0].detach().contiguous(),
+            source=self.source[:, :, drop * samples_per_frame :].detach().contiguous(),
+            phase=None if self.phase is None else self.phase.detach(),
+            ctx_start=new_ctx_start,
+            src_end=self.src_end,
+            emitted_frames=self.emitted_frames,
+        )
 
 
 def plan_vocoder_buckets(lengths: list[int], waste_threshold: float = 1.3) -> list[list[int]]:
@@ -246,15 +326,17 @@ class CosyVoice3Code2Wav(nn.Module):
         n_timesteps: int = 10,
         token_offset_tokens: int = 0,
         finalize: bool = False,
-    ) -> tuple[torch.Tensor, int, torch.Tensor]:
-        """Run flow for one streaming chunk and extend the cumulative mel.
+    ) -> tuple[torch.Tensor, _StreamWindow]:
+        """Run flow for one streaming chunk and build the vocoder window.
 
-        Returns the cumulative mel (on the HiFT device/dtype), the
-        emitted-speech offset carried in ``cache_state``, and the f0 for that
-        mel — extended from the cached prefix instead of recomputed, since the
-        predictor's receptive field is finite. Vocoding is left to
-        ``vocode_batch`` so requests scheduled in the same step share one
-        batched HiFT pass; ``emit_streaming`` then slices the new suffix.
+        Returns the bounded mel window (on the HiFT device/dtype) and the
+        window's decoding state. Only ``VOCODER_LEFT_CONTEXT_FRAMES`` frames of
+        history are kept, so per-chunk cost is O(window) rather than O(history);
+        the f0, the excitation and the source generator's phase are carried
+        alongside so the window still decodes to what a full replay would give.
+        Vocoding is left to ``vocode_batch`` so requests scheduled in the same
+        step share one batched HiFT pass, then ``emit_streaming`` slices out
+        the newly complete audio.
         """
         feat = self._forward_mel(
             token=token,
@@ -267,27 +349,36 @@ class CosyVoice3Code2Wav(nn.Module):
             finalize=finalize,
         )
         hift_weight = self.hift.m_source.l_linear.weight
-        chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
+        device, dtype = hift_weight.device, hift_weight.dtype
+        chunk_mel = feat.to(device=device, dtype=dtype)
 
-        cached_mel = None if not cache_state else cache_state.get("mel")
-        speech_offset_obj = None if not cache_state else cache_state.get("speech_offset")
-        try:
-            speech_offset = int(speech_offset_obj) if speech_offset_obj is not None else 0
-        except (TypeError, ValueError):
-            speech_offset = 0
+        prev = _StreamWindow.from_cache(cache_state, device=device, dtype=dtype, channels=chunk_mel.shape[1])
+        spf = self.hift.source_samples_per_frame
+        look_right = self.hift.f0_predictor.condnet[0].causal_padding
 
-        if isinstance(cached_mel, torch.Tensor) and cached_mel.numel() > 0:
-            cached_mel = cached_mel.to(device=chunk_mel.device, dtype=chunk_mel.dtype)
-            tts_mel = torch.cat([cached_mel, chunk_mel], dim=-1) if chunk_mel.numel() > 0 else cached_mel
-        else:
-            tts_mel = chunk_mel
+        mel = torch.cat([prev.mel, chunk_mel], dim=-1) if prev.mel.numel() else chunk_mel
+        end = prev.ctx_start + mel.shape[-1]
 
-        cached_f0 = None if not cache_state else cache_state.get("f0")
-        if not isinstance(cached_f0, torch.Tensor):
-            cached_f0 = None
-        f0 = self.hift.predict_f0(tts_mel, finalize=finalize, cached_f0=cached_f0)
+        f0 = self.hift.predict_f0(mel, finalize=True, cached_f0=prev.f0)
+        # Mid-stream the trailing frames have no look-right yet; leave them for
+        # the next chunk instead of freezing their provisional values.
+        target = end if finalize else end - look_right
+        new_f0 = f0[:, prev.src_end - prev.ctx_start : target - prev.ctx_start]
+        new_source, phase = self.hift.synthesize_source(
+            new_f0, sample_offset=prev.src_end * spf, phase_carry=prev.phase
+        )
+        source = torch.cat([prev.source, new_source], dim=-1) if prev.source.numel() else new_source
 
-        return tts_mel, speech_offset, f0
+        window = _StreamWindow(
+            mel=mel,
+            f0=f0,
+            source=source,
+            phase=phase,
+            ctx_start=prev.ctx_start,
+            src_end=target,
+            emitted_frames=prev.emitted_frames,
+        )
+        return mel, window
 
     @torch.inference_mode()
     def prepare_mel(
@@ -319,40 +410,56 @@ class CosyVoice3Code2Wav(nn.Module):
         mels: list[torch.Tensor],
         finalize_flags: list[bool],
         f0s: list[torch.Tensor | None] | None = None,
+        sources: list[torch.Tensor | None] | None = None,
     ) -> list[torch.Tensor]:
         """Vocode per-request mels, batching rows that share a finalize flag.
 
         Rows are grouped by ``finalize`` (it changes HiFT's look-right
         handling) and length-bucketed to bound padding waste; single-row
         buckets keep today's ``hift.inference`` path bit-for-bit. Rows longer
-        than ``MAX_BATCHED_VOCODER_FRAMES`` skip batching entirely. ``f0s``
-        carries f0 already predicted by ``prepare_streaming_mel``; rows without
-        one fall back to predicting inside HiFT.
+        than ``MAX_BATCHED_VOCODER_FRAMES`` skip batching entirely. ``f0s`` and
+        ``sources`` carry stages ``prepare_streaming_mel`` already produced; the
+        excitation in particular cannot be rebuilt here, since its phase
+        continues from the previous window. Rows without them fall back to
+        computing both inside HiFT.
         """
         results: list[torch.Tensor | None] = [None] * len(mels)
         row_f0 = f0s if f0s is not None else [None] * len(mels)
+        row_src = sources if sources is not None else [None] * len(mels)
         groups: dict[bool, list[int]] = {}
         for i, mel in enumerate(mels):
             if mel.shape[-1] == 0:
                 results[i] = mel.new_zeros((mel.shape[0], 0))
             elif mel.shape[-1] > MAX_BATCHED_VOCODER_FRAMES:
-                results[i] = self.hift.inference(speech_feat=mel, finalize=bool(finalize_flags[i]), f0=row_f0[i])[0]
+                results[i] = self.hift.inference(
+                    speech_feat=mel, finalize=bool(finalize_flags[i]), f0=row_f0[i], source=row_src[i]
+                )[0]
             else:
                 groups.setdefault(bool(finalize_flags[i]), []).append(i)
 
         for finalize, idxs in groups.items():
             for bucket in plan_vocoder_buckets([int(mels[i].shape[-1]) for i in idxs]):
                 group = [idxs[j] for j in bucket]
-                if len(group) == 1:
+                if len(group) == 1 and self.hift.trunk_graph is None:
+                    # Without graph replay the single-row path stays on
+                    # ``inference``, bit-identical to the pre-batching code.
+                    # With it, single rows go through ``inference_batch`` too,
+                    # so a lone stream still gets the captured trunk.
                     tts_speech, _ = self.hift.inference(
-                        speech_feat=mels[group[0]], finalize=finalize, f0=row_f0[group[0]]
+                        speech_feat=mels[group[0]],
+                        finalize=finalize,
+                        f0=row_f0[group[0]],
+                        source=row_src[group[0]],
                     )
                     results[group[0]] = tts_speech
                 else:
                     # All-or-nothing: a mixed bucket falls back to HiFT's single
                     # batched CPU prediction rather than splitting the pass.
                     group_f0 = [row_f0[i] for i in group] if all(row_f0[i] is not None for i in group) else None
-                    speeches = self.hift.inference_batch([mels[i] for i in group], finalize, f0s=group_f0)
+                    group_src = [row_src[i] for i in group] if all(row_src[i] is not None for i in group) else None
+                    speeches = self.hift.inference_batch(
+                        [mels[i] for i in group], finalize, f0s=group_f0, sources=group_src
+                    )
                     for i, tts_speech in zip(group, speeches):
                         results[i] = tts_speech
         return results
@@ -360,25 +467,29 @@ class CosyVoice3Code2Wav(nn.Module):
     def emit_streaming(
         self,
         tts_speech: torch.Tensor,
-        tts_mel: torch.Tensor,
-        speech_offset: int,
+        window: _StreamWindow,
         finalize: bool,
-        f0: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Emit the newly grown speech suffix and build the next cache state."""
+    ) -> tuple[torch.Tensor, dict[str, object] | None]:
+        """Emit the audio this window newly completed, and carry the state on.
+
+        The window decodes ``[ctx_start, src_end)``, but mid-stream HiFT
+        withholds ``conv_pre``'s look-right frames plus one for the istft tail,
+        so only frames below ``covered`` are final. Everything from
+        ``emitted_frames`` up to there is new.
+        """
+        spf = self.hift.source_samples_per_frame
         tts_speech = tts_speech.reshape(tts_speech.shape[0], -1)
-        speech_offset = max(0, min(speech_offset, int(tts_speech.shape[-1])))
-        emitted_speech = tts_speech[:, speech_offset:]
+        covered = window.src_end if finalize else window.src_end - self.hift.conv_pre_look_right - 1
+
+        start = max(0, (window.emitted_frames - window.ctx_start) * spf)
+        stop = max(start, min((covered - window.ctx_start) * spf, int(tts_speech.shape[-1])))
+        emitted_speech = tts_speech[:, start:stop]
 
         if finalize:
             return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), None
 
-        new_state = {
-            "mel": tts_mel.detach().cpu().contiguous(),
-            "speech_offset": int(tts_speech.shape[-1]),
-        }
-        if f0 is not None:
-            new_state["f0"] = f0.detach().cpu().contiguous()
+        window.emitted_frames = covered
+        new_state = {"window": window.slide(spf, VOCODER_LEFT_CONTEXT_FRAMES)}
         return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
 
     @torch.inference_mode()
@@ -394,18 +505,17 @@ class CosyVoice3Code2Wav(nn.Module):
         token_offset_tokens: int = 0,
         finalize: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Decode streaming audio using cumulative mel + emitted-speech offset.
+        """Decode streaming audio from a bounded mel window.
 
-        This mirrors upstream CosyVoice3 streaming semantics more closely than
-        waveform-domain overlap-add: keep a cumulative mel history per request,
-        re-run causal HiFT on the history, and emit only the newly grown speech
-        suffix. That preserves causal look-right handling without double
-        trimming or duplicated overlap at chunk boundaries.
+        Preserves upstream CosyVoice3 streaming semantics — causal look-right
+        handling, no waveform-domain overlap-add — but keeps only the receptive
+        field's worth of history instead of the whole utterance, so per-chunk
+        cost stops growing with the audio produced so far.
 
         Single-request convenience wrapper over ``prepare_streaming_mel`` /
         ``vocode_batch`` / ``emit_streaming``.
         """
-        tts_mel, speech_offset, f0 = self.prepare_streaming_mel(
+        mel, window = self.prepare_streaming_mel(
             token=token,
             prompt_token=prompt_token,
             prompt_feat=prompt_feat,
@@ -415,8 +525,8 @@ class CosyVoice3Code2Wav(nn.Module):
             token_offset_tokens=token_offset_tokens,
             finalize=finalize,
         )
-        tts_speech = self.vocode_batch([tts_mel], [finalize], [f0])[0]
-        return self.emit_streaming(tts_speech, tts_mel, speech_offset, finalize, f0)
+        tts_speech = self.vocode_batch([mel], [finalize], [window.f0], [window.source])[0]
+        return self.emit_streaming(tts_speech, window, finalize)
 
     @torch.inference_mode()
     def forward(
@@ -462,3 +572,14 @@ class CosyVoice3Code2Wav(nn.Module):
         self.hift.load_state_dict(hift_state_dict, strict=True)
         self.hift.to(device).eval()
         logger.info(f"Loaded hift weights from {hift_path}")
+
+        # Bounded streaming windows give the conv trunk a small fixed shape
+        # set, so its ~50 launch-bound kernels can replay as CUDA graphs.
+        # The wrapper falls back to eager per shape, so this is safe to turn
+        # on whenever the vocoder lives on a CUDA device.
+        if device.type == "cuda":
+            from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.trunk_graph import HiFTTrunkGraph
+
+            hift = self.hift
+            self.hift.trunk_graph = HiFTTrunkGraph(lambda mel, s_stft: hift._decode_trunk(hift.conv_pre(mel), s_stft))
+            logger.info("CosyVoice3: HiFT trunk CUDA-graph replay enabled")
