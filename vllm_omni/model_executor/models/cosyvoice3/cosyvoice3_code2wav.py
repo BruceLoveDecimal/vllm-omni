@@ -34,33 +34,6 @@ from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 logger = init_logger(__name__)
 
 
-# Above this mel length the batched vocoder loses to the per-request loop, so
-# long rows fall back to one-at-a-time decoding. Batching pays off while the
-# conv trunk is launch-bound (short rows) and stops paying once the trunk
-# saturates memory bandwidth on its own, where padding and the larger working
-# set only add cost. Streaming never reaches this gate — its windows are
-# bounded near VOCODER_LEFT_CONTEXT_FRAMES, deep inside the winning range —
-# so only offline whole-utterance rows are affected.
-#
-# Calibration (1x RTX PRO 6000 Blackwell, torch 2.13.0+cu130, eager trunk,
-# f0 supplied by the caller, min of 5 whole-pass repeats; measured after the
-# GPU-f0 and device-side conv-cache fixes, which cut the per-row fixed
-# overhead batching used to amortize and moved this crossover down from an
-# earlier 1280). Speedup of one batched call over a per-row loop at batch
-# sizes 2/4/8:
-#      78 frames  1.79x / 3.13x / 4.60x   (the streaming window size)
-#     256 frames  1.76x / 2.25x / 2.21x
-#     512 frames  1.27x / 1.29x / 1.09x
-#     640 frames  1.16x / 1.08x / 0.90x
-#    1024 frames  1.01x / 0.79x / 0.76x
-#    2048 frames  0.80x / 0.70x / 0.73x
-# 512 is the last length where no batch size regresses (~10s of audio at the
-# 50Hz mel rate). An attempt to replace this gate with fixed decode rounds
-# (Qwen3-Omni style) measured slower than the per-row loop at every long
-# length (0.72-0.81x) and lost accuracy past ~30s, so the gate stays.
-MAX_BATCHED_VOCODER_FRAMES = 512
-
-
 # Mel frames of history the conv trunk needs before a windowed decode matches
 # a full replay. Measured on the production conv topology: 32 frames already
 # reaches the float32 round-off floor (8.0e-08, -141.9 dBFS) and 96 or 240
@@ -421,16 +394,26 @@ class CosyVoice3Code2Wav(nn.Module):
         f0s: list[torch.Tensor | None] | None = None,
         sources: list[torch.Tensor | None] | None = None,
     ) -> list[torch.Tensor]:
-        """Vocode per-request mels, batching rows that share a finalize flag.
+        """Vocode per-request mels, batching the streaming windows.
 
-        Rows are grouped by ``finalize`` (it changes HiFT's look-right
-        handling) and length-bucketed to bound padding waste; single-row
-        buckets keep today's ``hift.inference`` path bit-for-bit. Rows longer
-        than ``MAX_BATCHED_VOCODER_FRAMES`` skip batching entirely. ``f0s`` and
-        ``sources`` carry stages ``prepare_streaming_mel`` already produced; the
-        excitation in particular cannot be rebuilt here, since its phase
-        continues from the previous window. Rows without them fall back to
-        computing both inside HiFT.
+        Batching is a streaming-only optimization, and rows announce
+        themselves by carrying an excitation in ``sources`` (the streaming
+        window must, since its phase continues from the previous chunk).
+        Those rows are bounded near ``VOCODER_LEFT_CONTEXT_FRAMES`` — the
+        regime where one batched trunk pass beats a per-row loop by 1.8-4.6x
+        at batch 2-8 and the shape set is small enough for CUDA-graph replay.
+
+        Offline whole-utterance rows carry no excitation and keep the original
+        per-row ``inference`` path: measured on RTX PRO 6000 with the GPU f0
+        and device-side conv caches in place, the per-row loop matches or
+        beats a padded batch from ~512 mel frames up (0.90x at 640, 0.76x at
+        1024 for batch 8), and a fixed-round split (Qwen3-Omni style) measured
+        worse still (0.72-0.81x, with error growing past 30s). Keeping those
+        rows out of the batch also keeps their arbitrary lengths out of the
+        lazy trunk-graph cache.
+
+        Streaming rows are grouped by ``finalize`` (it changes HiFT's
+        look-right handling) and length-bucketed to bound padding waste.
         """
         results: list[torch.Tensor | None] = [None] * len(mels)
         row_f0 = f0s if f0s is not None else [None] * len(mels)
@@ -439,10 +422,8 @@ class CosyVoice3Code2Wav(nn.Module):
         for i, mel in enumerate(mels):
             if mel.shape[-1] == 0:
                 results[i] = mel.new_zeros((mel.shape[0], 0))
-            elif mel.shape[-1] > MAX_BATCHED_VOCODER_FRAMES:
-                results[i] = self.hift.inference(
-                    speech_feat=mel, finalize=bool(finalize_flags[i]), f0=row_f0[i], source=row_src[i]
-                )[0]
+            elif row_src[i] is None:
+                results[i] = self.hift.inference(speech_feat=mel, finalize=bool(finalize_flags[i]), f0=row_f0[i])[0]
             else:
                 groups.setdefault(bool(finalize_flags[i]), []).append(i)
 
@@ -462,12 +443,11 @@ class CosyVoice3Code2Wav(nn.Module):
                     )
                     results[group[0]] = tts_speech
                 else:
-                    # All-or-nothing: a mixed bucket falls back to HiFT's single
-                    # batched CPU prediction rather than splitting the pass.
-                    group_f0 = [row_f0[i] for i in group] if all(row_f0[i] is not None for i in group) else None
-                    group_src = [row_src[i] for i in group] if all(row_src[i] is not None for i in group) else None
                     speeches = self.hift.inference_batch(
-                        [mels[i] for i in group], finalize, f0s=group_f0, sources=group_src
+                        [mels[i] for i in group],
+                        finalize,
+                        f0s=[row_f0[i] for i in group],
+                        sources=[row_src[i] for i in group],
                     )
                     for i, tts_speech in zip(group, speeches):
                         results[i] = tts_speech
