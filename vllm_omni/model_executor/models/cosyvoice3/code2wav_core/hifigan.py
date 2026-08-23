@@ -761,6 +761,9 @@ class CausalHiFTGenerator(HiFTGenerator):
             persistent=False,
         )
         self.conv_pre_look_right = conv_pre_look_right
+        # Optional CUDA-graph replay for the conv trunk (``HiFTTrunkGraph``);
+        # installed by the owning stage once weights are on a CUDA device.
+        self.trunk_graph = None
         self.f0_predictor = f0_predictor
 
     def _decode_trunk(self, x: torch.Tensor, s_stft: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -819,7 +822,7 @@ class CausalHiFTGenerator(HiFTGenerator):
         return sum(m.causal_padding for m in self.f0_predictor.condnet[1:] if hasattr(m, "causal_padding"))
 
     def _predict_f0_raw(self, speech_feat: torch.Tensor, finalize: bool) -> torch.Tensor:
-        """Run the f0 predictor on CPU in float64, cast back to ``speech_feat``.
+        """Run the f0 predictor in float64 on ``speech_feat``'s device.
 
         float64 is what makes caching safe. In float32 the same frame computed
         from differently-aligned slices differs by ~1e-6 relative, and the
@@ -828,17 +831,22 @@ class CausalHiFTGenerator(HiFTGenerator):
         RTX PRO 6000). In float64 the values round to identical float32, so
         cached and full-replay audio stay bit-identical at any length.
 
+        The predictor follows the mel's device rather than being pinned to the
+        CPU: the historical CPU placement was a float32-precision workaround,
+        and once the arithmetic is float64 it only cost a host round trip plus
+        a sync per call — at 8 concurrent streams that was ~100ms of the
+        ~150ms per-chunk budget. fp64 conv throughput is irrelevant at these
+        sizes (a few dozen frames through five small convs).
+
         Converting the module in place (rather than at construction) survives
         the ``.float()`` and ``load_state_dict`` calls the owning stage makes
         after building it. Nothing else calls this predictor directly — the
         non-causal ``HiFTGenerator`` carries its own.
         """
-        if next(self.f0_predictor.parameters()).dtype != torch.float64:
-            self.f0_predictor.to(device="cpu", dtype=torch.float64)
-        # Transfer in the mel's own dtype, widen on the host: half the PCIe
-        # traffic of copying a float64 tensor across.
-        cpu_feat = speech_feat.cpu().to(torch.float64)
-        return self.f0_predictor(cpu_feat, finalize=finalize).to(speech_feat)
+        parameter = next(self.f0_predictor.parameters())
+        if parameter.dtype != torch.float64 or parameter.device != speech_feat.device:
+            self.f0_predictor.to(device=speech_feat.device, dtype=torch.float64)
+        return self.f0_predictor(speech_feat.to(torch.float64), finalize=finalize).to(speech_feat)
 
     @torch.inference_mode()
     def predict_f0(
@@ -921,7 +929,7 @@ class CausalHiFTGenerator(HiFTGenerator):
         else:
             if f0 is None:
                 # mel->f0 NOTE f0_predictor precision is crucial for causal
-                # inference, so it runs on CPU in float64 (see ``_predict_f0_raw``)
+                # inference, so it runs in float64 (see ``_predict_f0_raw``)
                 f0 = self._predict_f0_raw(speech_feat, finalize=finalize)
             # f0->source
             s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
@@ -941,6 +949,7 @@ class CausalHiFTGenerator(HiFTGenerator):
         speech_feats: list[torch.Tensor],
         finalize: bool = True,
         f0s: list[torch.Tensor] | None = None,
+        sources: list[torch.Tensor] | None = None,
     ) -> list[torch.Tensor]:
         """Vocode a batch of variable-length mels in one conv-trunk pass.
 
@@ -970,7 +979,7 @@ class CausalHiFTGenerator(HiFTGenerator):
         hop = int(self.istft_params["hop_len"])
         n_fft = int(self.istft_params["n_fft"])
 
-        if f0s is None:
+        if f0s is None and sources is None:
             # One CPU round trip for the whole batch. ``finalize=True`` here is
             # the zero-cache path; non-finalize rows keep only the prefix that
             # never saw the look-right cache.
@@ -979,14 +988,22 @@ class CausalHiFTGenerator(HiFTGenerator):
 
         s_stft = mel.new_zeros((len(speech_feats), n_fft + 2, t_max * prod + 1))
         for i, t in enumerate(lens):
-            s = self.f0_upsamp(f0s[i][:, None]).transpose(1, 2)
-            s, _, _, _ = self.m_source(s)
-            s_real, s_imag = self._stft(s.transpose(1, 2).squeeze(1))
+            if sources is not None:
+                # A streaming caller carries the excitation across windows; its
+                # phase cannot be restarted here (see ``SineGen2._f02sine``).
+                s = sources[i]
+            else:
+                s, _, _, _ = self.m_source(self.f0_upsamp(f0s[i][:, None]).transpose(1, 2))
+                s = s.transpose(1, 2)
+            s_real, s_imag = self._stft(s.squeeze(1))
             frames = s_real.shape[-1]
             s_stft[i, : n_fft // 2 + 1, :frames] = s_real[0]
             s_stft[i, n_fft // 2 + 1 :, :frames] = s_imag[0]
 
-        magnitude, phase = self._decode_trunk(self.conv_pre(mel), s_stft)
+        if self.trunk_graph is not None:
+            magnitude, phase = self.trunk_graph.run(mel, s_stft)
+        else:
+            magnitude, phase = self._decode_trunk(self.conv_pre(mel), s_stft)
 
         speeches = []
         for i, t in enumerate(lens):
@@ -1120,7 +1137,10 @@ class CausalConv1d(torch.nn.Conv1d):
     def forward(self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)) -> tuple[torch.Tensor]:
         input_timestep = x.shape[2]
         if cache.size(2) == 0:
-            cache = torch.zeros(x.shape[0], x.shape[1], self.causal_padding).to(x)
+            # Allocate on x's device directly: `torch.zeros(...).to(x)` builds
+            # the cache on CPU and copies it over — one host-to-device transfer
+            # per conv per call, and an illegal op under CUDA-graph capture.
+            cache = torch.zeros(x.shape[0], x.shape[1], self.causal_padding, device=x.device, dtype=x.dtype)
         assert cache.size(2) == self.causal_padding
         if self.causal_type == "left":
             x = torch.concat([cache, x], dim=2)

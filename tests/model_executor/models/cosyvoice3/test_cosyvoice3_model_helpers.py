@@ -30,6 +30,21 @@ def _cosyvoice3_model_and_runner():
     return CosyVoice3Model, GPUARModelRunner
 
 
+def _dummy_window(*, emitted_frames: int = 0, frames: int = 3):
+    """A minimal ``_StreamWindow`` for exercising cache hand-off in the forward."""
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import _StreamWindow
+
+    return _StreamWindow(
+        mel=torch.ones((1, 80, frames), dtype=torch.float32),
+        f0=torch.ones((1, frames), dtype=torch.float32),
+        source=torch.ones((1, 1, frames), dtype=torch.float32),
+        phase=None,
+        ctx_start=0,
+        src_end=frames,
+        emitted_frames=emitted_frames,
+    )
+
+
 class _DummyCode2Wav:
     """Mimics the prepare/vocode/emit split the model forward drives.
 
@@ -61,26 +76,32 @@ class _DummyCode2Wav:
         return self._dummy_mel(kwargs["token"])
 
     def prepare_streaming_mel(self, **kwargs):
+        from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import _StreamWindow
+
         self.forward_streaming_calls.append(kwargs)
         mel = self._dummy_mel(kwargs["token"])
-        return mel, 0, mel.reshape(1, -1)
+        frames = mel.shape[-1]
+        window = _StreamWindow(
+            mel=mel,
+            f0=mel.reshape(1, -1),
+            source=mel.reshape(1, 1, -1),
+            phase=None,
+            ctx_start=0,
+            src_end=frames,
+            emitted_frames=0,
+        )
+        return mel, window
 
-    def vocode_batch(self, mels, finalize_flags, f0s=None):
+    def vocode_batch(self, mels, finalize_flags, f0s=None, sources=None):
         self.vocode_batch_calls.append((len(mels), list(finalize_flags)))
         return [mel.reshape(1, -1) for mel in mels]
 
-    def emit_streaming(self, tts_speech, tts_mel, speech_offset, finalize, f0=None):
+    def emit_streaming(self, tts_speech, window, finalize):
         if self.outputs:
             return self.outputs.pop(0)
 
         audio = tts_speech.reshape(1, 1, -1)
-        new_state = None
-        if not finalize:
-            new_state = {
-                "mel": torch.ones((1, 80, max(audio.shape[-1], 1)), dtype=torch.float32),
-                "speech_offset": audio.shape[-1],
-            }
-        return audio, new_state
+        return audio, None if finalize else {"window": window}
 
 
 def _make_code2wav_model(
@@ -298,11 +319,11 @@ def test_forward_reuses_streaming_cache_state_between_chunks():
         outputs=[
             (
                 torch.arange(4, dtype=torch.float32).reshape(1, 1, -1),
-                {"mel": torch.ones((1, 80, 3), dtype=torch.float32), "speech_offset": 4},
+                {"window": _dummy_window(emitted_frames=4)},
             ),
             (
                 torch.full((1, 1, 2), 9.0, dtype=torch.float32),
-                {"mel": torch.ones((1, 80, 5), dtype=torch.float32), "speech_offset": 6},
+                {"window": _dummy_window(emitted_frames=6)},
             ),
         ]
     )
@@ -339,7 +360,7 @@ def test_forward_reuses_streaming_cache_state_between_chunks():
     assert out2.multimodal_outputs["audio"][0].tolist() == [9.0, 9.0]
     cache_state = model.code2wav.forward_streaming_calls[1]["cache_state"]
     assert cache_state is not None
-    assert cache_state["speech_offset"] == 4
+    assert cache_state["window"].emitted_frames == 4
     assert "rid-stream" in model._stream_vocoder_cache_by_req
 
 
@@ -348,7 +369,7 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
         outputs=[
             (
                 torch.arange(4, dtype=torch.float32).reshape(1, 1, -1),
-                {"mel": torch.ones((1, 80, 3), dtype=torch.float32), "speech_offset": 4},
+                {"window": _dummy_window(emitted_frames=4)},
             ),
             (
                 torch.full((1, 1, 1), 7.0, dtype=torch.float32),

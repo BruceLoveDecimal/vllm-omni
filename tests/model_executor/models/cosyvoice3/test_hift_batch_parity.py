@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     _slice_causal_noise,
 )
 from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import (
+    VOCODER_LEFT_CONTEXT_FRAMES,
     CosyVoice3Code2Wav,
     plan_vocoder_buckets,
 )
@@ -193,9 +194,12 @@ def _run_bounded_window_stream(hift, mel, chunk: int, left_context: int) -> torc
 
             src_end, emitted_frames = target, covered
             # Slide the caches down to ``left_context`` frames of history.
+            # Only frames below ``target`` are cached: the ones above it were
+            # predicted with a zero look-right and must be redone next round,
+            # or the provisional values would be frozen into the stream.
             new_ctx_start = max(0, end - left_context)
             drop = new_ctx_start - ctx_start
-            f0_cache = f0_window[:, drop:]
+            f0_cache = f0_window[:, drop : target - ctx_start]
             src_cache = source[:, :, drop * spf :]
             ctx_start = new_ctx_start
 
@@ -227,6 +231,38 @@ def test_bounded_window_streaming_matches_full_replay(chunk: int) -> None:
         f"windowed stream emitted {actual.shape[-1]} samples, full replay {expected.shape[-1]}"
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6)
+
+
+def test_windowed_stream_never_caches_provisional_f0() -> None:
+    """Frames predicted with a zero look-right must not be cached as final.
+
+    ``predict_f0(finalize=True)`` pads the right edge with zeros, so the last
+    few frames of every window are provisional. Caching them would freeze the
+    provisional values into the stream — a drift of ~8e-3 Hz per chunk here,
+    which the phase integral downstream amplifies.
+    """
+    hift = _tiny_hift()
+    torch.manual_seed(13)
+    mel = torch.randn(1, 80, 240)
+    chunk, left_context = 30, 48
+    look_right = hift.f0_predictor.condnet[0].causal_padding
+
+    with torch.inference_mode():
+        truth = hift.predict_f0(mel, finalize=True)
+
+        used = torch.zeros(1, 0)
+        f0_cache, ctx_start = None, 0
+        for end in range(chunk, mel.shape[-1] + 1, chunk):
+            finalize = end >= mel.shape[-1]
+            f0_window = hift.predict_f0(mel[:, :, ctx_start:end], finalize=True, cached_f0=f0_cache)
+            target = end if finalize else end - look_right
+            used = torch.cat([used, f0_window[:, used.shape[-1] - ctx_start : target - ctx_start]], dim=-1)
+            new_ctx_start = max(0, end - left_context)
+            f0_cache = f0_window[:, new_ctx_start - ctx_start : target - ctx_start]
+            ctx_start = new_ctx_start
+
+    assert used.shape == truth.shape
+    torch.testing.assert_close(used, truth, rtol=0, atol=0)
 
 
 def test_bounded_window_needs_enough_left_context() -> None:
@@ -431,8 +467,8 @@ def test_vocode_batch_falls_back_to_per_row_for_long_mels(monkeypatch: pytest.Mo
     monkeypatch.setattr("vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav.MAX_BATCHED_VOCODER_FRAMES", 20)
     batched: list[int] = []
     original = code2wav.hift.inference_batch
-    code2wav.hift.inference_batch = lambda feats, finalize, f0s=None: (
-        batched.append(len(feats)) or original(feats, finalize, f0s)
+    code2wav.hift.inference_batch = lambda feats, finalize, f0s=None, sources=None: (
+        batched.append(len(feats)) or original(feats, finalize, f0s, sources)
     )
 
     torch.manual_seed(4)
@@ -464,3 +500,134 @@ def test_plan_vocoder_buckets_splits_on_padding_waste() -> None:
 
 def test_plan_vocoder_buckets_keeps_similar_lengths_together() -> None:
     assert plan_vocoder_buckets([90, 100, 95, 92], waste_threshold=1.3) == [[1, 2, 3, 0]]
+
+
+def test_code2wav_streaming_window_matches_one_shot() -> None:
+    """Drive the production streaming helpers and compare against one-shot decode.
+
+    Exercises ``prepare_streaming_mel`` → ``vocode_batch`` → ``emit_streaming``
+    with the flow model stubbed out, so it covers the real cache hand-off,
+    frame accounting and sliding — the parts that are easy to get subtly wrong.
+    """
+    code2wav = object.__new__(CosyVoice3Code2Wav)
+    nn.Module.__init__(code2wav)
+    code2wav.hift = _tiny_hift()
+
+    torch.manual_seed(17)
+    total_frames, chunk = 180, 30
+    full_mel = torch.randn(1, 80, total_frames)
+
+    # Stand in for flow: hand back the next slice of the utterance.
+    produced = {"frames": 0}
+
+    def fake_forward_mel(**kwargs):
+        start = produced["frames"]
+        produced["frames"] = min(start + chunk, total_frames)
+        return full_mel[:, :, start : produced["frames"]]
+
+    code2wav._forward_mel = fake_forward_mel
+
+    with torch.inference_mode():
+        expected, _ = code2wav.hift.inference(speech_feat=full_mel, finalize=True)
+
+        emitted, cache = [], None
+        for step in range(total_frames // chunk):
+            finalize = step == total_frames // chunk - 1
+            mel, window = code2wav.prepare_streaming_mel(
+                token=torch.zeros(1, 1, dtype=torch.long),
+                prompt_token=torch.zeros(1, 1, dtype=torch.long),
+                prompt_feat=torch.zeros(1, 1, 80),
+                embedding=torch.zeros(1, 1),
+                cache_state=cache,
+                finalize=finalize,
+            )
+            speech = code2wav.vocode_batch([mel], [finalize], [window.f0], [window.source])[0]
+            audio, cache = code2wav.emit_streaming(speech, window, finalize)
+            emitted.append(audio.reshape(1, -1))
+
+            # The window must stay bounded no matter how long the stream runs.
+            assert mel.shape[-1] <= VOCODER_LEFT_CONTEXT_FRAMES + chunk
+
+        actual = torch.cat(emitted, dim=-1)
+
+    assert actual.shape[-1] == expected.reshape(1, -1).shape[-1]
+    torch.testing.assert_close(actual, expected.reshape(1, -1), rtol=0, atol=1e-6)
+
+
+def test_trunk_graph_on_cpu_stays_eager_and_exact() -> None:
+    """Off-CUDA the wrapper must be a transparent pass-through."""
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.trunk_graph import HiFTTrunkGraph
+
+    hift = _tiny_hift()
+    torch.manual_seed(20)
+    mels = [torch.randn(1, 80, t) for t in (30, 24)]
+
+    with torch.inference_mode():
+        expected = hift.inference_batch(mels, finalize=True)
+        hift.trunk_graph = HiFTTrunkGraph(lambda mel, s_stft: hift._decode_trunk(hift.conv_pre(mel), s_stft))
+        actual = hift.inference_batch(mels, finalize=True)
+
+    assert not hift.trunk_graph._graphs, "no graphs may be captured on CPU"
+    for row, reference in zip(actual, expected):
+        torch.testing.assert_close(row, reference, rtol=0, atol=0)
+
+
+def test_vocode_batch_routes_single_rows_through_graph_path() -> None:
+    """With graph replay installed, a lone stream must also reach inference_batch."""
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.trunk_graph import HiFTTrunkGraph
+
+    code2wav = object.__new__(CosyVoice3Code2Wav)
+    nn.Module.__init__(code2wav)
+    code2wav.hift = _tiny_hift()
+
+    torch.manual_seed(21)
+    mel = torch.randn(1, 80, 26)
+    batched: list[int] = []
+    original = code2wav.hift.inference_batch
+    code2wav.hift.inference_batch = lambda feats, finalize, f0s=None, sources=None: (
+        batched.append(len(feats)) or original(feats, finalize, f0s, sources)
+    )
+
+    with torch.inference_mode():
+        code2wav.vocode_batch([mel], [True])
+        assert batched == [], "without a graph, single rows keep the inference path"
+
+        code2wav.hift.trunk_graph = HiFTTrunkGraph(
+            lambda m, s: code2wav.hift._decode_trunk(code2wav.hift.conv_pre(m), s)
+        )
+        code2wav.vocode_batch([mel], [True])
+        assert batched == [1], "with a graph, single rows use inference_batch"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU")
+def test_trunk_graph_replay_matches_eager_on_cuda() -> None:
+    """Captured replay must reproduce the eager trunk, and reuse its graph."""
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.trunk_graph import HiFTTrunkGraph
+
+    hift = _tiny_hift().cuda()
+    torch.manual_seed(22)
+    mels = [torch.randn(1, 80, 30, device="cuda") for _ in range(2)]
+
+    with torch.inference_mode():
+        eager = hift.inference_batch(mels, finalize=True)
+
+        hift.trunk_graph = HiFTTrunkGraph(lambda mel, s_stft: hift._decode_trunk(hift.conv_pre(mel), s_stft))
+        first = hift.inference_batch(mels, finalize=True)
+        assert len(hift.trunk_graph._graphs) == 1
+
+        # Fresh inputs through the replayed graph. The eager reference must use
+        # the SAME instance (graph toggled off): SineGen2's noise tables are
+        # drawn at construction and not part of the state_dict, so a second
+        # instance decodes with different noise and any comparison is void.
+        mels2 = [torch.randn(1, 80, 30, device="cuda") for _ in range(2)]
+        saved_graph = hift.trunk_graph
+        hift.trunk_graph = None
+        eager2 = hift.inference_batch(mels2, finalize=True)
+        hift.trunk_graph = saved_graph
+        replayed2 = hift.inference_batch(mels2, finalize=True)
+        assert len(hift.trunk_graph._graphs) == 1, "same shape must reuse the captured graph"
+
+    for got, ref in zip(first, eager):
+        torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+    for got, ref in zip(replayed2, eager2):
+        torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
