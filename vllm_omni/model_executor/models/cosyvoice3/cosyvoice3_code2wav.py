@@ -38,18 +38,27 @@ logger = init_logger(__name__)
 # long rows fall back to one-at-a-time decoding. Batching pays off while the
 # conv trunk is launch-bound (short rows) and stops paying once the trunk
 # saturates memory bandwidth on its own, where padding and the larger working
-# set only add cost.
+# set only add cost. Streaming never reaches this gate — its windows are
+# bounded near VOCODER_LEFT_CONTEXT_FRAMES, deep inside the winning range —
+# so only offline whole-utterance rows are affected.
 #
-# Measured on RTX PRO 6000 with f0 supplied by the streaming cache, speedup of
-# batch over loop at batch 2/4/8:
-#     768  frames  1.29x / 1.78x / 1.46x
-#     1280 frames  1.02x / 1.29x / 1.11x
-#     1408 frames  0.97x / 1.16x / 0.85x
-#     2048 frames  1.09x / 0.67x / 0.72x
-#     4096 frames  0.90x / 0.87x / 0.77x
-# 1280 is the last length where no batch size regresses; it is ~26s of audio at
-# the 50Hz mel rate, well beyond a typical request.
-MAX_BATCHED_VOCODER_FRAMES = 1280
+# Calibration (1x RTX PRO 6000 Blackwell, torch 2.13.0+cu130, eager trunk,
+# f0 supplied by the caller, min of 5 whole-pass repeats; measured after the
+# GPU-f0 and device-side conv-cache fixes, which cut the per-row fixed
+# overhead batching used to amortize and moved this crossover down from an
+# earlier 1280). Speedup of one batched call over a per-row loop at batch
+# sizes 2/4/8:
+#      78 frames  1.79x / 3.13x / 4.60x   (the streaming window size)
+#     256 frames  1.76x / 2.25x / 2.21x
+#     512 frames  1.27x / 1.29x / 1.09x
+#     640 frames  1.16x / 1.08x / 0.90x
+#    1024 frames  1.01x / 0.79x / 0.76x
+#    2048 frames  0.80x / 0.70x / 0.73x
+# 512 is the last length where no batch size regresses (~10s of audio at the
+# 50Hz mel rate). An attempt to replace this gate with fixed decode rounds
+# (Qwen3-Omni style) measured slower than the per-row loop at every long
+# length (0.72-0.81x) and lost accuracy past ~30s, so the gate stays.
+MAX_BATCHED_VOCODER_FRAMES = 512
 
 
 # Mel frames of history the conv trunk needs before a windowed decode matches

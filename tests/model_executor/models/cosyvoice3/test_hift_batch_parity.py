@@ -463,7 +463,7 @@ def test_vocode_batch_falls_back_to_per_row_for_long_mels(monkeypatch: pytest.Mo
     code2wav.hift = _tiny_hift()
 
     # Keep the tensors small by lowering the cap instead of building a
-    # 1280-frame mel; the routing decision is what matters here.
+    # 512-frame mel; the routing decision is what matters here.
     monkeypatch.setattr("vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav.MAX_BATCHED_VOCODER_FRAMES", 20)
     batched: list[int] = []
     original = code2wav.hift.inference_batch
