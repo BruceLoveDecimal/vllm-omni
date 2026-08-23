@@ -128,13 +128,19 @@ class SineGen(torch.nn.Module):
         return uv
 
     @torch.no_grad()
-    def forward(self, f0):
+    def forward(self, f0, sample_offset: int = 0, phase_carry: torch.Tensor | None = None):
         """sine_tensor, uv = forward(f0)
         input F0: tensor(batchsize=1, dim=1, length)
                   f0 for unvoiced steps should be 0
         output sine_tensor: tensor(batchsize=1, length, dim)
         output uv: tensor(batchsize=1, length, 1)
+
+        This generator draws a fresh random phase per call, so it cannot be
+        resumed mid-utterance; it accepts the streaming arguments only to share
+        ``SourceModuleHnNSF``'s call shape and rejects a real request to resume.
         """
+        if sample_offset != 0 or phase_carry is not None:
+            raise NotImplementedError("SineGen cannot resume a stream; windowed synthesis needs SineGen2 (causal).")
         f0 = f0.transpose(1, 2)
         F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(f0.device)
         for i in range(self.harmonic_num + 1):
@@ -160,7 +166,23 @@ class SineGen(torch.nn.Module):
         # first: set the unvoiced part to 0 by uv
         # then: additive noise
         sine_waves = sine_waves * uv + noise
-        return sine_waves.transpose(1, 2), uv.transpose(1, 2), noise
+        return sine_waves.transpose(1, 2), uv.transpose(1, 2), noise, None
+
+
+def _slice_causal_noise(table: torch.Tensor, offset: int, length: int, name: str) -> torch.Tensor:
+    """Read ``length`` rows at ``offset`` from a fixed causal noise table.
+
+    The tables are preallocated for 300s of audio. Reading past the end used to
+    silently yield a short tensor and fail later as a shape mismatch deep in the
+    excitation; fail here instead, naming the buffer and the limit.
+    """
+    end = offset + length
+    if end > table.shape[1]:
+        raise ValueError(
+            f"{name} holds {table.shape[1]} samples (~{table.shape[1] / 24000:.0f}s of audio) but the "
+            f"stream reached sample {end}. Causal HiFT cannot synthesize past that length."
+        )
+    return table[:, offset:end]
 
 
 class SineGen2(torch.nn.Module):
@@ -215,21 +237,29 @@ class SineGen2(torch.nn.Module):
         uv = (f0 > self.voiced_threshold).type(torch.float32)
         return uv
 
-    def _f02sine(self, f0_values):
+    def _f02sine(self, f0_values, phase_carry: torch.Tensor | None = None, is_start: bool = True):
         """f0_values: (batchsize, length, dim)
         where dim indicates fundamental tone and overtones
+
+        ``phase_carry`` continues the phase integral from an earlier segment so
+        the sine excitation can be produced window by window instead of over
+        the whole utterance; ``is_start`` marks the true beginning of an
+        utterance, where the fixed initial phase offset is applied. Returns the
+        sines plus the carry to hand to the next window.
         """
         # convert to F0 in rad. The integer part n can be ignored
         # because 2 * np.pi * n doesn't affect phase
         rad_values = (f0_values / self.sampling_rate) % 1
 
-        # initial phase noise (no noise for fundamental component)
-        if self.training is False and self.causal is True:
-            rad_values[:, 0, :] = rad_values[:, 0, :] + self.rand_ini.to(rad_values.device)
-        else:
-            rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device)
-            rand_ini[:, 0] = 0
-            rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
+        # initial phase noise (no noise for fundamental component). Only at the
+        # true start: re-applying it per window would restart the phase.
+        if is_start:
+            if self.training is False and self.causal is True:
+                rad_values[:, 0, :] = rad_values[:, 0, :] + self.rand_ini.to(rad_values.device)
+            else:
+                rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device)
+                rand_ini[:, 0] = 0
+                rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
 
         # instantanouse phase sine[t] = sin(2*pi \sum_i=1 ^{t} rad)
         if not self.flag_for_pulse:
@@ -238,12 +268,23 @@ class SineGen2(torch.nn.Module):
             ).transpose(1, 2)
 
             phase = torch.cumsum(rad_values, dim=1) * 2 * np.pi
+            # [B, dim, T_ds]; this is the quantity the next window resumes from.
+            scaled = phase.transpose(1, 2) * self.upsample_scale
+            # Accumulate the carry in float64 and wrap to one period: sin is
+            # 2*pi-periodic, so wrapping is exact, and it keeps a long stream
+            # from drifting as the running total grows.
+            tail = scaled[:, :, -1:].double()
+            if phase_carry is not None:
+                scaled = scaled + phase_carry.to(scaled.dtype)
+                tail = tail + phase_carry
+            new_carry = torch.remainder(tail, 2 * np.pi)
             phase = torch.nn.functional.interpolate(
-                phase.transpose(1, 2) * self.upsample_scale,
+                scaled,
                 scale_factor=self.upsample_scale,
                 mode="nearest" if self.causal is True else "linear",
             ).transpose(1, 2)
             sines = torch.sin(phase)
+            return sines, new_carry
         else:
             # If necessary, make sure that the first time step of every
             # voiced segments is sin(pi) or cos(0)
@@ -272,20 +313,26 @@ class SineGen2(torch.nn.Module):
 
             # get the sines
             sines = torch.cos(i_phase * 2 * np.pi)
-        return sines
+        return sines, None
 
-    def forward(self, f0):
+    def forward(self, f0, sample_offset: int = 0, phase_carry: torch.Tensor | None = None):
         """sine_tensor, uv = forward(f0)
         input F0: tensor(batchsize=1, length, dim=1)
                   f0 for unvoiced steps should be 0
         output sine_tensor: tensor(batchsize=1, length, dim)
         output uv: tensor(batchsize=1, length, 1)
+
+        ``sample_offset`` is where this segment starts in the utterance. The
+        causal noise buffer is a fixed random table indexed by absolute
+        position, so a window must read it at its own offset rather than from
+        zero, or the excitation would repeat the opening noise every window.
         """
         # fundamental component
         fn = torch.multiply(f0, self.harmonic_ids)
 
         # generate sine waveforms
-        sine_waves = self._f02sine(fn) * self.sine_amp
+        sines, new_carry = self._f02sine(fn, phase_carry=phase_carry, is_start=sample_offset == 0)
+        sine_waves = sines * self.sine_amp
 
         # generate uv signal
         uv = self._f02uv(f0)
@@ -295,14 +342,15 @@ class SineGen2(torch.nn.Module):
         # .       for voiced regions is self.noise_std
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
         if self.training is False and self.causal is True:
-            noise = noise_amp * self.sine_waves[:, : sine_waves.shape[1]].to(sine_waves.device)
+            table = _slice_causal_noise(self.sine_waves, sample_offset, sine_waves.shape[1], "SineGen2.sine_waves")
+            noise = noise_amp * table.to(sine_waves.device)
         else:
             noise = noise_amp * torch.randn_like(sine_waves)
 
         # first: set the unvoiced part to 0 by uv
         # then: additive noise
         sine_waves = sine_waves * uv + noise
-        return sine_waves, uv, noise
+        return sine_waves, uv, noise, new_carry
 
 
 class SourceModuleHnNSF(torch.nn.Module):
@@ -354,24 +402,28 @@ class SourceModuleHnNSF(torch.nn.Module):
         if causal is True:
             self.uv = torch.rand(1, 300 * 24000, 1)
 
-    def forward(self, x):
+    def forward(self, x, sample_offset: int = 0, phase_carry: torch.Tensor | None = None):
         """
         Sine_source, noise_source = SourceModuleHnNSF(F0_sampled)
         F0_sampled (batchsize, length, 1)
         Sine_source (batchsize, length, 1)
         noise_source (batchsize, length 1)
+
+        ``sample_offset``/``phase_carry`` let a caller synthesize one window of
+        a longer utterance; both default to starting a fresh utterance.
         """
         # source for harmonic branch
         with torch.no_grad():
-            sine_wavs, uv, _ = self.l_sin_gen(x)
+            sine_wavs, uv, _, new_carry = self.l_sin_gen(x, sample_offset=sample_offset, phase_carry=phase_carry)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
 
         # source for noise branch, in the same shape as uv
         if self.training is False and self.causal is True:
-            noise = self.uv[:, : uv.shape[1]] * self.sine_amp / 3
+            table = _slice_causal_noise(self.uv, sample_offset, uv.shape[1], "SourceModuleHnNSF.uv")
+            noise = table.to(uv.device) * self.sine_amp / 3
         else:
             noise = torch.randn_like(uv) * self.sine_amp / 3
-        return sine_merge, noise, uv
+        return sine_merge, noise, uv, new_carry
 
 
 class HiFTGenerator(nn.Module):
@@ -572,7 +624,7 @@ class HiFTGenerator(nn.Module):
         f0 = self.f0_predictor(speech_feat)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-        s, _, _ = self.m_source(s)
+        s, _, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
         # mel+source->speech
         generated_speech = self.decode(x=speech_feat, s=s)
@@ -588,7 +640,7 @@ class HiFTGenerator(nn.Module):
         f0 = self.f0_predictor(speech_feat)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-        s, _, _ = self.m_source(s)
+        s, _, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
         # use cache_source to avoid glitch
         if cache_source.shape[2] != 0:
@@ -824,21 +876,55 @@ class CausalHiFTGenerator(HiFTGenerator):
             return tail
         return torch.cat([cached_f0[:, :start].to(tail), tail], dim=-1)
 
+    @property
+    def source_samples_per_frame(self) -> int:
+        """Excitation samples produced per mel frame."""
+        return int(self.f0_upsamp.scale_factor)
+
+    @torch.inference_mode()
+    def synthesize_source(
+        self,
+        f0: torch.Tensor,
+        sample_offset: int = 0,
+        phase_carry: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Build the excitation for ``f0``, resuming an earlier segment.
+
+        Returns ``[1, 1, len(f0) * source_samples_per_frame]`` plus the phase
+        carry for the next segment. Pass both back in to continue: the phase is
+        an integral and the noise tables are indexed by absolute position, so a
+        segment synthesized from scratch would not join the previous one.
+        """
+        s = self.f0_upsamp(f0[:, None]).transpose(1, 2)
+        s, _, _, carry = self.m_source(s, sample_offset=sample_offset, phase_carry=phase_carry)
+        return s.transpose(1, 2), carry
+
     @torch.inference_mode()
     def inference(
         self,
         speech_feat: torch.Tensor,
         finalize: bool = True,
         f0: torch.Tensor | None = None,
+        source: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if f0 is None:
-            # mel->f0 NOTE f0_predictor precision is crucial for causal
-            # inference, so it runs on CPU in float64 (see ``_predict_f0_raw``)
-            f0 = self._predict_f0_raw(speech_feat, finalize=finalize)
-        # f0->source
-        s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-        s, _, _ = self.m_source(s)
-        s = s.transpose(1, 2)
+        """Vocode ``speech_feat``.
+
+        ``f0`` and ``source`` let a caller supply stages it already has: a
+        streaming caller carries the excitation across windows (its phase
+        cannot be restarted, see ``SineGen2._f02sine``) and passes it in as
+        ``source`` shaped ``[1, 1, frames * f0_upsamp.scale_factor]``.
+        """
+        if source is not None:
+            s = source
+        else:
+            if f0 is None:
+                # mel->f0 NOTE f0_predictor precision is crucial for causal
+                # inference, so it runs on CPU in float64 (see ``_predict_f0_raw``)
+                f0 = self._predict_f0_raw(speech_feat, finalize=finalize)
+            # f0->source
+            s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
+            s, _, _, _ = self.m_source(s)
+            s = s.transpose(1, 2)
         if finalize is True:
             generated_speech = self.decode(x=speech_feat, s=s, finalize=finalize)
         else:
@@ -892,7 +978,7 @@ class CausalHiFTGenerator(HiFTGenerator):
         s_stft = mel.new_zeros((len(speech_feats), n_fft + 2, t_max * prod + 1))
         for i, t in enumerate(lens):
             s = self.f0_upsamp(f0s[i][:, None]).transpose(1, 2)
-            s, _, _ = self.m_source(s)
+            s, _, _, _ = self.m_source(s)
             s_real, s_imag = self._stft(s.transpose(1, 2).squeeze(1))
             frames = s_real.shape[-1]
             s_stft[i, : n_fft // 2 + 1, :frames] = s_real[0]
