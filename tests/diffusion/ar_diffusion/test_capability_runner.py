@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU contracts for capability-driven AR-Diffusion sessions."""
 
 from __future__ import annotations
