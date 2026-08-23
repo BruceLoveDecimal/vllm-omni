@@ -251,8 +251,12 @@ def test_bounded_window_needs_enough_left_context() -> None:
     }
     assert errors[16] > 1e-3, errors
     assert errors[32] < 1e-6, errors
-    # Beyond the receptive field, extra context is pure cost.
-    assert errors[96] == pytest.approx(errors[32], abs=1e-9), errors
+    # Beyond the receptive field extra context is pure cost: tripling it must
+    # not buy even an order of magnitude. (Not equality — the two land on the
+    # float32 floor and differ by backend-dependent rounding, so this passed on
+    # one machine and failed on another when it asserted they matched exactly.)
+    assert errors[96] < 1e-6, errors
+    assert errors[32] < errors[96] * 10, errors
 
 
 def test_causal_noise_table_exhaustion_is_reported() -> None:
