@@ -319,7 +319,7 @@ def test_code2wav_forward_finalizes_hift_tail():
             self.m_source = SimpleNamespace(l_linear=SimpleNamespace(weight=torch.ones(1, dtype=torch.float32)))
             self.finalize_calls: list[bool] = []
 
-        def inference(self, speech_feat, finalize=True):
+        def inference(self, speech_feat, finalize=True, f0=None):
             self.finalize_calls.append(bool(finalize))
             return torch.zeros((speech_feat.shape[0], 1, speech_feat.shape[-1]), dtype=speech_feat.dtype), None
 
