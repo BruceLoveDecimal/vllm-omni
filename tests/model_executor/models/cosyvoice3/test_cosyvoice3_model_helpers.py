@@ -31,6 +31,14 @@ def _cosyvoice3_model_and_runner():
 
 
 class _DummyCode2Wav:
+    """Mimics the prepare/vocode/emit split the model forward drives.
+
+    ``forward_calls`` / ``forward_streaming_calls`` keep their historical
+    names: they now record ``prepare_mel`` / ``prepare_streaming_mel`` calls,
+    which receive the same token/offset/finalize/cache_state arguments the
+    old per-request entry points did.
+    """
+
     def __init__(
         self,
         vocab_size: int,
@@ -42,25 +50,34 @@ class _DummyCode2Wav:
         self.outputs = list(outputs or [])
         self.forward_calls: list[dict[str, object]] = []
         self.forward_streaming_calls: list[dict[str, object]] = []
+        self.vocode_batch_calls: list[tuple[int, list[bool]]] = []
 
-    def forward(self, **kwargs):
-        self.forward_calls.append(kwargs)
-        token = kwargs["token"]
+    def _dummy_mel(self, token: torch.Tensor) -> torch.Tensor:
         num_samples = int(token.shape[-1])
         return torch.linspace(-1.0, 1.0, max(num_samples, 1), dtype=torch.float32).reshape(1, 1, -1)
 
-    def forward_streaming(self, **kwargs):
+    def prepare_mel(self, **kwargs):
+        self.forward_calls.append(kwargs)
+        return self._dummy_mel(kwargs["token"])
+
+    def prepare_streaming_mel(self, **kwargs):
         self.forward_streaming_calls.append(kwargs)
+        mel = self._dummy_mel(kwargs["token"])
+        return mel, 0, mel.reshape(1, -1)
+
+    def vocode_batch(self, mels, finalize_flags, f0s=None):
+        self.vocode_batch_calls.append((len(mels), list(finalize_flags)))
+        return [mel.reshape(1, -1) for mel in mels]
+
+    def emit_streaming(self, tts_speech, tts_mel, speech_offset, finalize, f0=None):
         if self.outputs:
             return self.outputs.pop(0)
 
-        token = kwargs["token"]
-        num_samples = int(token.shape[-1])
-        audio = torch.linspace(-1.0, 1.0, max(num_samples, 1), dtype=torch.float32).reshape(1, 1, -1)
+        audio = tts_speech.reshape(1, 1, -1)
         new_state = None
-        if not kwargs.get("finalize", False):
+        if not finalize:
             new_state = {
-                "mel": torch.ones((1, 80, max(num_samples, 1)), dtype=torch.float32),
+                "mel": torch.ones((1, 80, max(audio.shape[-1], 1)), dtype=torch.float32),
                 "speech_offset": audio.shape[-1],
             }
         return audio, new_state

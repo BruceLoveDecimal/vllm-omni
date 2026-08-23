@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from functools import partial
 from math import gcd
 from threading import Lock
@@ -55,6 +56,20 @@ from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _VocoderWorkItem:
+    """Per-request vocoder input collected before the batched HiFT pass."""
+
+    idx: int
+    req_id: str | None
+    streaming: bool
+    stream_finished: bool
+    tts_mel: torch.Tensor
+    speech_offset: int = 0
+    f0: torch.Tensor | None = None
+
 
 # Process-wide cache of per-model mm-processor runtime components (tokenizer,
 # feat_extractor, campplus session/engine). The mm processor is re-created per
@@ -1047,6 +1062,8 @@ class CosyVoice3Model(
             if not isinstance(runtime_info, list):
                 runtime_info = []
 
+            # Phase 1: per-request flow — collect mels for the batched vocoder.
+            vocoder_items: list[_VocoderWorkItem] = []
             for idx, req_ids in enumerate(request_ids_list):
                 raw = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
                 payload = to_struct(raw)
@@ -1112,7 +1129,7 @@ class CosyVoice3Model(
                         with self._stream_audio_cache_lock:
                             cache_state = self._stream_vocoder_cache_by_req.get(req_id)
 
-                    tts_speech, new_cache_state = self.code2wav.forward_streaming(
+                    tts_mel, speech_offset, f0 = self.code2wav.prepare_streaming_mel(
                         token=token.unsqueeze(0),
                         prompt_token=speech_token[:1],
                         prompt_feat=speech_feat[:1],
@@ -1122,16 +1139,20 @@ class CosyVoice3Model(
                         token_offset_tokens=token_offset,
                         finalize=stream_finished,
                     )
-
-                    if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
-                        with self._stream_audio_cache_lock:
-                            if new_cache_state is None or stream_finished:
-                                self._stream_vocoder_cache_by_req.pop(req_id, None)
-                            else:
-                                self._stream_vocoder_cache_by_req[req_id] = new_cache_state
+                    vocoder_items.append(
+                        _VocoderWorkItem(
+                            idx=idx,
+                            req_id=req_id,
+                            streaming=True,
+                            stream_finished=stream_finished,
+                            tts_mel=tts_mel,
+                            speech_offset=speech_offset,
+                            f0=f0,
+                        )
+                    )
                 else:
                     token_offset = max(0, meta.talker_prefill_offset or 0) if meta else 0
-                    tts_speech = self.code2wav.forward(
+                    tts_mel = self.code2wav.prepare_mel(
                         token=token.unsqueeze(0),
                         prompt_token=speech_token[:1],
                         prompt_feat=speech_feat[:1],
@@ -1139,10 +1160,42 @@ class CosyVoice3Model(
                         n_timesteps=10,
                         token_offset_tokens=token_offset,
                     )
+                    vocoder_items.append(
+                        _VocoderWorkItem(
+                            idx=idx,
+                            req_id=req_id,
+                            streaming=False,
+                            stream_finished=stream_finished,
+                            tts_mel=tts_mel,
+                        )
+                    )
 
-                audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+            # Phase 2: one batched HiFT pass over every request scheduled this
+            # step (flow above stays per-request — its prompt conditioning
+            # can't be padded). Non-streaming rows always vocode finalized.
+            speeches = self.code2wav.vocode_batch(
+                [item.tts_mel for item in vocoder_items],
+                [item.stream_finished if item.streaming else True for item in vocoder_items],
+                [item.f0 for item in vocoder_items],
+            )
 
-                audios[idx] = self._stitch_stream_audio(req_id, audio, stream_finished)
+            # Phase 3: per-request emission and streaming-cache bookkeeping.
+            for item, tts_speech in zip(vocoder_items, speeches):
+                if item.streaming:
+                    emitted, new_cache_state = self.code2wav.emit_streaming(
+                        tts_speech, item.tts_mel, item.speech_offset, item.stream_finished, item.f0
+                    )
+                    if item.req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
+                        with self._stream_audio_cache_lock:
+                            if new_cache_state is None or item.stream_finished:
+                                self._stream_vocoder_cache_by_req.pop(item.req_id, None)
+                            else:
+                                self._stream_vocoder_cache_by_req[item.req_id] = new_cache_state
+                    audio = emitted.reshape(-1).to(dtype=torch.float32)
+                else:
+                    audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+
+                audios[item.idx] = self._stitch_stream_audio(item.req_id, audio, item.stream_finished)
 
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audios, "sr": srs})
         else:

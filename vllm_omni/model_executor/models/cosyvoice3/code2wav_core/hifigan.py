@@ -709,16 +709,7 @@ class CausalHiFTGenerator(HiFTGenerator):
         self.conv_pre_look_right = conv_pre_look_right
         self.f0_predictor = f0_predictor
 
-    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0), finalize: bool = True) -> torch.Tensor:
-        s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
-        if finalize is True:
-            x = self.conv_pre(x)
-        else:
-            x = self.conv_pre(x[:, :, : -self.conv_pre_look_right], x[:, :, -self.conv_pre_look_right :])
-            s_stft_real = s_stft_real[:, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)]
-            s_stft_imag = s_stft_imag[:, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)]
-        s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
-
+    def _decode_trunk(self, x: torch.Tensor, s_stft: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, self.lrelu_slope)
             x = self.ups[i](x)
@@ -743,6 +734,19 @@ class CausalHiFTGenerator(HiFTGenerator):
         x = self.conv_post(x)
         magnitude = torch.exp(x[:, : self.istft_params["n_fft"] // 2 + 1, :])
         phase = torch.sin(x[:, self.istft_params["n_fft"] // 2 + 1 :, :])  # actually, sin is redundancy
+        return magnitude, phase
+
+    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0), finalize: bool = True) -> torch.Tensor:
+        s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
+        if finalize is True:
+            x = self.conv_pre(x)
+        else:
+            x = self.conv_pre(x[:, :, : -self.conv_pre_look_right], x[:, :, -self.conv_pre_look_right :])
+            s_stft_real = s_stft_real[:, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)]
+            s_stft_imag = s_stft_imag[:, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)]
+        s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+
+        magnitude, phase = self._decode_trunk(x, s_stft)
 
         x = self._istft(magnitude, phase)
         if finalize is False:
@@ -750,12 +754,87 @@ class CausalHiFTGenerator(HiFTGenerator):
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return x
 
+    @property
+    def f0_left_context(self) -> int:
+        """Mel frames of history f0 prediction needs behind the frame it emits.
+
+        ``condnet[0]`` looks only right; the four convs after it each look
+        ``causal_padding`` frames left, so their paddings sum to the left
+        receptive field.
+        """
+        return sum(m.causal_padding for m in self.f0_predictor.condnet[1:] if hasattr(m, "causal_padding"))
+
+    def _predict_f0_raw(self, speech_feat: torch.Tensor, finalize: bool) -> torch.Tensor:
+        """Run the f0 predictor on CPU in float64, cast back to ``speech_feat``.
+
+        float64 is what makes caching safe. In float32 the same frame computed
+        from differently-aligned slices differs by ~1e-6 relative, and the
+        phase integral downstream turns that into waveform error that *grows*
+        with utterance length (-41 dBFS at 3.5s, -13.5 dBFS at 28s, measured on
+        RTX PRO 6000). In float64 the values round to identical float32, so
+        cached and full-replay audio stay bit-identical at any length.
+
+        Converting the module in place (rather than at construction) survives
+        the ``.float()`` and ``load_state_dict`` calls the owning stage makes
+        after building it. Nothing else calls this predictor directly — the
+        non-causal ``HiFTGenerator`` carries its own.
+        """
+        if next(self.f0_predictor.parameters()).dtype != torch.float64:
+            self.f0_predictor.to(device="cpu", dtype=torch.float64)
+        # Transfer in the mel's own dtype, widen on the host: half the PCIe
+        # traffic of copying a float64 tensor across.
+        cpu_feat = speech_feat.cpu().to(torch.float64)
+        return self.f0_predictor(cpu_feat, finalize=finalize).to(speech_feat)
+
     @torch.inference_mode()
-    def inference(self, speech_feat: torch.Tensor, finalize: bool = True) -> torch.Tensor:
-        # mel->f0 NOTE f0_predictor precision is crucial for causal inference, move
-        # self.f0_predictor to cpu if necessary
-        self.f0_predictor.to("cpu")
-        f0 = self.f0_predictor(speech_feat.cpu(), finalize=finalize).to(speech_feat)
+    def predict_f0(
+        self,
+        speech_feat: torch.Tensor,
+        finalize: bool = True,
+        cached_f0: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict f0, extending ``cached_f0`` rather than redoing the prefix.
+
+        f0[t] depends only on mel[t - ``f0_left_context`` .. t + look-right], so
+        frames predicted from an earlier, shorter mel stay valid when the mel
+        grows: only the tail needs computing, preceded by ``f0_left_context``
+        frames of real warmup. This is what lets the streaming path stop
+        re-running the predictor over the whole cumulative mel every chunk —
+        the predictor measured as ~58% of vocoder wall time.
+        """
+        num_frames = int(speech_feat.shape[-1])
+        # Without look-right the trailing frames can't be predicted yet, so a
+        # non-final chunk stops short of them and picks them up next time.
+        end = num_frames if finalize else num_frames - self.f0_predictor.condnet[0].causal_padding
+        if end <= 0:
+            return speech_feat.new_zeros((speech_feat.shape[0], 0))
+
+        start = 0 if cached_f0 is None else min(int(cached_f0.shape[-1]), end)
+        if start >= end:
+            return cached_f0[:, :end].to(speech_feat)
+
+        warmup = min(start, self.f0_left_context)
+        lo = start - warmup
+        # ``finalize=True`` on the slice regardless of the caller's flag: the
+        # slice runs to the end of the mel, so every frame below ``end`` still
+        # sees its real look-right and the frames above it are dropped here.
+        predicted = self._predict_f0_raw(speech_feat[:, :, lo:], finalize=True)
+        tail = predicted[:, warmup : end - lo]
+        if cached_f0 is None:
+            return tail
+        return torch.cat([cached_f0[:, :start].to(tail), tail], dim=-1)
+
+    @torch.inference_mode()
+    def inference(
+        self,
+        speech_feat: torch.Tensor,
+        finalize: bool = True,
+        f0: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if f0 is None:
+            # mel->f0 NOTE f0_predictor precision is crucial for causal
+            # inference, so it runs on CPU in float64 (see ``_predict_f0_raw``)
+            f0 = self._predict_f0_raw(speech_feat, finalize=finalize)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
         s, _, _ = self.m_source(s)
@@ -767,6 +846,68 @@ class CausalHiFTGenerator(HiFTGenerator):
                 x=speech_feat[:, :, : -self.f0_predictor.condnet[0].causal_padding], s=s, finalize=finalize
             )
         return generated_speech, s
+
+    @torch.inference_mode()
+    def inference_batch(
+        self,
+        speech_feats: list[torch.Tensor],
+        finalize: bool = True,
+        f0s: list[torch.Tensor] | None = None,
+    ) -> list[torch.Tensor]:
+        """Vocode a batch of variable-length mels in one conv-trunk pass.
+
+        Each element of ``speech_feats`` is a ``[1, in_channels, T_i]`` mel;
+        returns a list of ``[1, L_i]`` waveforms, each matching ``inference``
+        run on that row alone with the same ``finalize`` flag (within float32
+        conv-batching tolerance). ``f0s`` supplies already-predicted f0 per row
+        (see ``predict_f0``) so streaming callers skip the predictor entirely.
+
+        Right zero-padding is safe for the conv trunk: every conv is
+        left-causal except ``conv_pre`` and the first f0-predictor conv, whose
+        look-right cache in the single-row path is zeros — identical to the
+        padding. The stft/istft boundary handling is not pad-safe, so the
+        f0→source branch and the final istft run per row on exact lengths
+        (both are negligible next to the trunk).
+        """
+        if not speech_feats:
+            return []
+        lens = [int(feat.shape[-1]) for feat in speech_feats]
+        t_max = max(lens)
+        mel = speech_feats[0].new_zeros((len(speech_feats), speech_feats[0].shape[1], t_max))
+        for i, feat in enumerate(speech_feats):
+            mel[i, :, : lens[i]] = feat[0]
+
+        cp0 = self.f0_predictor.condnet[0].causal_padding
+        prod = int(np.prod(self.upsample_rates))
+        hop = int(self.istft_params["hop_len"])
+        n_fft = int(self.istft_params["n_fft"])
+
+        if f0s is None:
+            # One CPU round trip for the whole batch. ``finalize=True`` here is
+            # the zero-cache path; non-finalize rows keep only the prefix that
+            # never saw the look-right cache.
+            f0 = self._predict_f0_raw(mel, finalize=True)
+            f0s = [f0[i : i + 1, : (t if finalize else t - cp0)] for i, t in enumerate(lens)]
+
+        s_stft = mel.new_zeros((len(speech_feats), n_fft + 2, t_max * prod + 1))
+        for i, t in enumerate(lens):
+            s = self.f0_upsamp(f0s[i][:, None]).transpose(1, 2)
+            s, _, _ = self.m_source(s)
+            s_real, s_imag = self._stft(s.transpose(1, 2).squeeze(1))
+            frames = s_real.shape[-1]
+            s_stft[i, : n_fft // 2 + 1, :frames] = s_real[0]
+            s_stft[i, n_fft // 2 + 1 :, :frames] = s_imag[0]
+
+        magnitude, phase = self._decode_trunk(self.conv_pre(mel), s_stft)
+
+        speeches = []
+        for i, t in enumerate(lens):
+            frames = (t if finalize else t - cp0 - self.conv_pre_look_right) * prod + 1
+            speech = self._istft(magnitude[i : i + 1, :, :frames], phase[i : i + 1, :, :frames])
+            if finalize is False:
+                speech = speech[:, : -prod * hop]
+            speeches.append(torch.clamp(speech, -self.audio_limit, self.audio_limit))
+        return speeches
 
 
 class CausalConv1dUpsample(torch.nn.Conv1d):
