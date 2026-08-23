@@ -428,7 +428,15 @@ def test_streaming_f0_cache_matches_recomputing_each_chunk() -> None:
             torch.testing.assert_close(with_cache, without_cache, rtol=0, atol=0)
 
 
+def _streaming_inputs(hift, mel: torch.Tensor, finalize: bool):
+    """f0 and excitation for a fresh-utterance window, as the streaming path carries them."""
+    f0 = hift.predict_f0(mel, finalize=finalize)
+    source, _ = hift.synthesize_source(f0)
+    return f0, source
+
+
 def test_vocode_batch_mixed_finalize_and_empty_rows() -> None:
+    """Streaming rows with mixed finalize flags and an empty row all round-trip."""
     code2wav = object.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(code2wav)
     code2wav.hift = _tiny_hift()
@@ -443,10 +451,14 @@ def test_vocode_batch_mixed_finalize_and_empty_rows() -> None:
     finalize_flags = [True, True, False, True]
 
     with torch.inference_mode():
-        results = code2wav.vocode_batch(mels, finalize_flags)
-        expected = [
-            None if mel.shape[-1] == 0 else code2wav.hift.inference(speech_feat=mel, finalize=fin)[0]
+        rows = [
+            (None, None) if mel.shape[-1] == 0 else _streaming_inputs(code2wav.hift, mel, fin)
             for mel, fin in zip(mels, finalize_flags)
+        ]
+        results = code2wav.vocode_batch(mels, finalize_flags, [f0 for f0, _ in rows], [src for _, src in rows])
+        expected = [
+            None if mel.shape[-1] == 0 else code2wav.hift.inference(speech_feat=mel, finalize=fin, f0=f0, source=src)[0]
+            for (mel, fin, (f0, src)) in zip(mels, finalize_flags, rows)
         ]
 
     assert results[1].numel() == 0
@@ -457,14 +469,18 @@ def test_vocode_batch_mixed_finalize_and_empty_rows() -> None:
         torch.testing.assert_close(row, reference, rtol=1e-4, atol=1e-5)
 
 
-def test_vocode_batch_falls_back_to_per_row_for_long_mels(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_vocode_batch_batches_streaming_rows_only() -> None:
+    """Rows carrying an excitation batch together; offline rows keep ``inference``.
+
+    The carried excitation is the discriminator: a streaming window must hand
+    its source over (the phase continues from the previous chunk), while an
+    offline whole-utterance row never has one — and, measured on current code,
+    decodes faster per-row than padded into a batch.
+    """
     code2wav = object.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(code2wav)
     code2wav.hift = _tiny_hift()
 
-    # Keep the tensors small by lowering the cap instead of building a
-    # 512-frame mel; the routing decision is what matters here.
-    monkeypatch.setattr("vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav.MAX_BATCHED_VOCODER_FRAMES", 20)
     batched: list[int] = []
     original = code2wav.hift.inference_batch
     code2wav.hift.inference_batch = lambda feats, finalize, f0s=None, sources=None: (
@@ -472,13 +488,22 @@ def test_vocode_batch_falls_back_to_per_row_for_long_mels(monkeypatch: pytest.Mo
     )
 
     torch.manual_seed(4)
-    mels = [torch.randn(1, 80, t) for t in (18, 40, 15)]
+    # The two streaming rows are close in length so the pad-waste bucketer
+    # keeps them in one bucket; the offline row's length is irrelevant.
+    mels = [torch.randn(1, 80, t) for t in (18, 20, 40)]
 
     with torch.inference_mode():
-        results = code2wav.vocode_batch(mels, [True, True, True])
-        expected = [code2wav.hift.inference(speech_feat=mel, finalize=True)[0] for mel in mels]
+        stream_rows = [_streaming_inputs(code2wav.hift, mel, True) for mel in mels[:2]]
+        f0s = [stream_rows[0][0], stream_rows[1][0], None]
+        sources = [stream_rows[0][1], stream_rows[1][1], None]  # last row is offline
 
-    # Only the two short rows batch together; the 40-frame row runs alone.
+        results = code2wav.vocode_batch(mels, [True, True, True], f0s, sources)
+        expected = [
+            code2wav.hift.inference(speech_feat=mel, finalize=True, f0=f0, source=src)[0]
+            for mel, f0, src in zip(mels, f0s, sources)
+        ]
+
+    # The two streaming rows share one batched pass; the offline row never batches.
     assert batched == [2]
     for row, reference in zip(results, expected):
         torch.testing.assert_close(row, reference, rtol=1e-4, atol=1e-5)
@@ -573,7 +598,11 @@ def test_trunk_graph_on_cpu_stays_eager_and_exact() -> None:
 
 
 def test_vocode_batch_routes_single_rows_through_graph_path() -> None:
-    """With graph replay installed, a lone stream must also reach inference_batch."""
+    """With graph replay installed, a lone stream must also reach inference_batch.
+
+    Offline rows (no carried excitation) must stay on ``inference`` either way
+    — batching, and hence the graph cache, is streaming-only.
+    """
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.trunk_graph import HiFTTrunkGraph
 
     code2wav = object.__new__(CosyVoice3Code2Wav)
@@ -589,14 +618,19 @@ def test_vocode_batch_routes_single_rows_through_graph_path() -> None:
     )
 
     with torch.inference_mode():
-        code2wav.vocode_batch([mel], [True])
+        f0, source = _streaming_inputs(code2wav.hift, mel, True)
+
+        code2wav.vocode_batch([mel], [True], [f0], [source])
         assert batched == [], "without a graph, single rows keep the inference path"
 
         code2wav.hift.trunk_graph = HiFTTrunkGraph(
             lambda m, s: code2wav.hift._decode_trunk(code2wav.hift.conv_pre(m), s)
         )
+        code2wav.vocode_batch([mel], [True], [f0], [source])
+        assert batched == [1], "with a graph, single streaming rows use inference_batch"
+
         code2wav.vocode_batch([mel], [True])
-        assert batched == [1], "with a graph, single rows use inference_batch"
+        assert batched == [1], "offline rows never batch, graph or not"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU")
