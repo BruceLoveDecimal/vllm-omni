@@ -18,9 +18,12 @@ if TYPE_CHECKING:
 
 @register_tts_adapter
 class Audio8TTSAdapter(ARTTSAdapter):
-    """Audio8 TTS Preview 0.6B: text-only synthesis and zero-shot voice cloning."""
+    """Audio8 TTS Preview: text-only synthesis and zero-shot voice cloning.
 
-    stage_keys = frozenset({"audio8_tts_slow_ar"})
+    Serves both checkpoints; the 0.1b differs only in its Slow AR stage key.
+    """
+
+    stage_keys = frozenset({"audio8_tts_slow_ar", "audio8_tts_hybrid_slow_ar"})
     name = "audio8_tts"
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:

@@ -170,19 +170,8 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
         self.talker_mtp_graph_safe = True
 
-        self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
-        self._fix_rope_style()
-
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                self.text_config.vocab_size,
-                self.text_config.hidden_size,
-                quant_config=vllm_config.quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
-        else:
-            self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(self.text_config.vocab_size)
+        self._build_backbone(vllm_config, prefix)
+        self._build_output_head(vllm_config, prefix)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
         # Summed multi-codebook input embedding table.
@@ -209,6 +198,33 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
                 prefix="fast_ar",
             )
 
+        self._speaker_cache = get_speaker_cache()
+        self._tokenizer = None
+
+    # -------------------- backbone / head hooks --------------------
+    #
+    # The 0.1b checkpoint keeps everything below (embedding, sampling, Fast AR,
+    # voice cloning, streaming) identical but swaps the Slow AR backbone for a
+    # hybrid Mamba2 + attention Falcon-H1 and the head for a compact one. These
+    # three hooks are the whole variation surface; see
+    # ``audio8_tts_hybrid_slow_ar.py``.
+
+    def _build_backbone(self, vllm_config: VllmConfig, prefix: str) -> None:
+        self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        self._fix_rope_style()
+
+    def _build_output_head(self, vllm_config: VllmConfig, prefix: str) -> None:
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                self.text_config.vocab_size,
+                self.text_config.hidden_size,
+                quant_config=vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(self.text_config.vocab_size)
+
         # Constant logits mask: semantic codes plus <|im_end|>. Safe as a
         # non-persistent buffer under vLLM (module built on the target device),
         # unlike under ``PreTrainedModel.from_pretrained`` on transformers >= 5,
@@ -220,8 +236,16 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
             allowed[self._eos_token_id] = True
         self.register_buffer("_semantic_allowed_mask", allowed, persistent=False)
 
-        self._speaker_cache = get_speaker_cache()
-        self._tokenizer = None
+    def _remap_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterable[tuple[str, torch.Tensor]]:
+        text_config = self.text_config
+        fast_config = self.fast_ar_config
+        return _remap_audio8_tts_weights(
+            weights,
+            q_size=text_config.num_attention_heads * text_config.head_dim,
+            kv_size=text_config.num_key_value_heads * text_config.head_dim,
+            fast_q_size=fast_config.num_attention_heads * fast_config.head_dim,
+            fast_kv_size=fast_config.num_key_value_heads * fast_config.head_dim,
+        )
 
     def _fix_rope_style(self) -> None:
         """Rebuild RoPE as interleaved (GPT-J); vLLM's Qwen2 defaults to NeoX.
@@ -668,15 +692,7 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
     # -------------------- weight loading --------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        text_config = self.text_config
-        fast_config = self.fast_ar_config
-        remapped = _remap_audio8_tts_weights(
-            weights,
-            q_size=text_config.num_attention_heads * text_config.head_dim,
-            kv_size=text_config.num_key_value_heads * text_config.head_dim,
-            fast_q_size=fast_config.num_attention_heads * fast_config.head_dim,
-            fast_kv_size=fast_config.num_key_value_heads * fast_config.head_dim,
-        )
+        remapped = self._remap_weights(weights)
 
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
@@ -733,7 +749,7 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         missing = sorted(set(params_dict) - loaded_params)
         if missing:
             raise ValueError(f"Audio8 TTS Slow AR is missing weights for {missing[:5]} ({len(missing)} total)")
-        logger.info("Loaded %d weights for Audio8TTSSlowARForConditionalGeneration", len(loaded_params))
+        logger.info("Loaded %d weights for %s", len(loaded_params), type(self).__name__)
 
         # The reference precomputes RoPE in bf16; keeping fp32 cos/sin here
         # shifts the logits enough to trigger early EOS (same failure mode as

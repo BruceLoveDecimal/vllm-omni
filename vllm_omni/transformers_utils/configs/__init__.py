@@ -13,6 +13,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "Audio8TTSConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSSlowARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSFastARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
+    "Audio8TTSHybridSlowARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "HiggsAudioV3Config": "vllm_omni.transformers_utils.configs.higgs_audio_v3",
     "FishSpeechConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "FishSpeechSlowARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
@@ -36,6 +37,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
 __all__ = [
     "Audio8TTSConfig",
     "Audio8TTSFastARConfig",
+    "Audio8TTSHybridSlowARConfig",
     "Audio8TTSSlowARConfig",
     "HiggsAudioV3Config",
     "FishSpeechConfig",
