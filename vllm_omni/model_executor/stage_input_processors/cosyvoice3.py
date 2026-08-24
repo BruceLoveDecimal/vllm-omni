@@ -17,6 +17,7 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_flow_left_context
 from vllm_omni.model_executor.models.cosyvoice3.utils import unpad_prompt_conditioning
 
 logger = init_logger(__name__)
@@ -129,6 +130,15 @@ def talker2code2wav_async_chunk(
         pre_lookahead_len = int(cfg.get("codec_pre_lookahead_frames", 3))
         max_chunk_size = int(cfg.get("codec_max_chunk_frames", 4 * chunk_size))
         stream_scale_factor = int(cfg.get("codec_stream_scale_factor", 2))
+        # Bound resent flow history (default 25 tokens = 1s; <= 0 is unbounded).
+        # Growing prefixes increase flow cost and can exceed the TRT profile.
+        # The non-causal DiT uses the full context, so windowing changes new mel
+        # frames; left_context_size only trims regenerated context from output.
+        # A wider window adds context at the cost of latency and memory.
+        # Packed streaming requires 0: windowing shifts its chunk-causal
+        # attention grid and position-fixed noise. Stage 1 rejects this
+        # combination, since only it sees the packed streaming environment.
+        flow_left_context = cosyvoice3_flow_left_context(cfg)
         first_chunk_size = int(cfg.get("codec_first_chunk_frames", chunk_size))
         if (
             chunk_size <= 0
@@ -219,6 +229,7 @@ def talker2code2wav_async_chunk(
                     "pre_lookahead_len": pre_lookahead_len,
                     "token_max_hop_len": max(chunk_size, max_chunk_size),
                     "stream_scale_factor": stream_scale_factor,
+                    "flow_left_context_len": flow_left_context,
                     "terminal_sent": False,
                     "prompt_payload": prompt_payload,
                 }
@@ -299,8 +310,15 @@ def talker2code2wav_async_chunk(
                 prefix_len = length
                 token_offset = emitted_token_len
 
+            # Slide the flow window: resend at most ``flow_left_context_len``
+            # emitted tokens as left context instead of the whole prefix. The
+            # count of newly emitted frames is unchanged, but their content is
+            # not -- see the trade-off note where ``flow_left_context`` is read.
+            flow_left_context_len = int(state.get("flow_left_context_len", flow_left_context))
+            window_start = max(0, token_offset - flow_left_context_len) if flow_left_context_len > 0 else 0
+
         with nullcontext():
-            code_predictor_codes = [int(frame[0]) for frame in token_frames[:prefix_len]]
+            code_predictor_codes = [int(frame[0]) for frame in token_frames[window_start:prefix_len]]
 
         embed_struct = None
         if not state.get("sent_prompt", False):
@@ -313,7 +331,7 @@ def talker2code2wav_async_chunk(
                 finished=torch.tensor(finished, dtype=torch.bool),
                 stream_finished=torch.tensor(finished, dtype=torch.bool),
                 req_id=[request_id],
-                left_context_size=token_offset,
+                left_context_size=token_offset - window_start,
             ),
             embed=embed_struct,
         )
