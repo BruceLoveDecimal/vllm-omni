@@ -93,6 +93,7 @@ th {
 | `Flux2Pipeline` | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` | ✅︎ | ✅︎ | | | — |
 | `FishSpeechSlowARForConditionalGeneration` | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `Audio8TTSSlowARForConditionalGeneration` | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✅︎ | | | | — |
+| `Audio8TTSHybridSlowARForConditionalGeneration` | Audio8 TTS Preview 0.1B (Falcon-H1 hybrid) | `Audio8/Audio8-TTS-Preview-0.1b` | ✅︎ | | | | Audio8 Community License v1.0, not Apache-2.0 |
 | `DreamIDOmniPipeline` | DreamID-Omni | `XuGuo699/DreamID-Omni` | ✅︎ | ✅︎ | | | — |
 | `SenseNovaU1Pipeline` | SenseNova-U1 (DiT-only) | `SenseNova/SenseNova-U1-8B-MoT` | ✅︎ | | | | — |
 | `LancePipeline` | Lance | `bytedance-research/Lance` | ✅︎ | | | | — |

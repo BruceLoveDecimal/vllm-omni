@@ -29,6 +29,16 @@ models:
       default_voice: {}
       voice_clone: {}
 
+  # 0.1b: same DualAR pipeline with a Falcon-H1 hybrid Mamba2 Slow AR.
+  Audio8/Audio8-TTS-Preview-0.1b:
+    supported_tasks: [default_voice, voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: false
+    task_extra_body:
+      default_voice: {}
+      voice_clone: {}
+
   # -CustomVoice checkpoints lack speaker_encoder weights, so voice_clone is
   # NOT supported (an attempt raises ValueError from _extract_speaker_embedding
   # at model runtime).  Use -Base for voice_clone.

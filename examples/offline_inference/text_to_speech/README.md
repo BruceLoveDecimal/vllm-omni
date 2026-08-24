@@ -89,6 +89,22 @@ python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
   masked out.
 - `--num-prompts 4` smoke-tests concurrency (stage 0 runs `max_num_seqs: 4`).
 
+### Audio8 TTS Preview 0.1B
+
+The 0.1b checkpoint runs the same script and pipeline; pass it explicitly:
+
+```bash
+python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
+    --model Audio8/Audio8-TTS-Preview-0.1b \
+    --text "Welcome to Audio8 TTS, a compact multilingual text to speech model."
+```
+
+Its Slow AR is a Falcon-H1 hybrid (Mamba2 + attention) rather than a dense
+transformer, so vLLM keeps a per-request SSM state alongside the paged
+attention KV; the deploy config resolves to `audio8_tts_01b.yaml`
+automatically. The Fast AR, codec, prompt format and sampling are unchanged.
+It is released under the Audio8 Community License v1.0, not Apache-2.0.
+
 ### Measured behaviour (1x H20, shared GPU)
 `--streaming` on a 58-character English sentence: TTFA ~0.74 s (4-frame first
 chunk), 7 chunks, 1.55 s wall for 3.16 s of audio (RTF ~0.49). Treat these as

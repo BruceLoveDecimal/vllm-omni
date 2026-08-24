@@ -227,6 +227,18 @@ The deploy config auto-loads from `vllm_omni/deploy/audio8_tts.yaml` (HF
 registers its own `arktts` config, and transformers would otherwise prefer the
 checkpoint's remote code and bypass it.
 
+The 0.1B checkpoint serves through the same routes and adapter:
+
+```bash
+vllm serve Audio8/Audio8-TTS-Preview-0.1b --omni --port 8092
+```
+
+Its deploy config resolves to `vllm_omni/deploy/audio8_tts_01b.yaml`, selected
+from `slow_backbone: falcon_h1` in the checkpoint config. The Slow AR is a
+Falcon-H1 hybrid, so vLLM holds a per-request Mamba state alongside the paged
+attention KV; request handling, streaming and voice cloning are unchanged. The
+0.1B is released under the Audio8 Community License v1.0, not Apache-2.0.
+
 ### Text-only synthesis
 ```bash
 curl -X POST http://localhost:8092/v1/audio/speech \
