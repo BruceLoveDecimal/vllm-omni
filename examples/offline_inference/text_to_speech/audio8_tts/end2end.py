@@ -135,7 +135,7 @@ def main(args) -> None:
     t_start = time.perf_counter()
     total_audio_seconds = 0.0
     for stage_outputs in omni.generate(prompts):
-        request_output = stage_outputs.request_output
+        request_output = stage_outputs
         if request_output is None or not request_output.outputs:
             continue
         audio, sample_rate = extract_audio(request_output.outputs[0].multimodal_output)
@@ -161,7 +161,7 @@ async def main_streaming(args) -> None:
     chunk_index = 0
 
     async for stage_output in omni.generate(prompt, request_id=request_id):
-        multimodal_output = stage_output.request_output.outputs[0].multimodal_output
+        multimodal_output = stage_output.outputs[0].multimodal_output
         if not multimodal_output:
             continue
         audio = multimodal_output.get("model_outputs")
