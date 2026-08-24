@@ -10,10 +10,33 @@ import torch.nn as nn
 from omegaconf import DictConfig
 from torch.nn import functional as F
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+# Graphs are cached per exact estimator input shape (no padding: the DiT
+# applies its mask only to the block *outputs*, not inside attention, so
+# padded frames would leak into the softmax and change the math). Streaming
+# chunks reuse a handful of shapes per voice, so a small cache covers steady
+# state; bounding the resent left context shrinks that set further.
+_FLOW_CUDA_GRAPH_MAX_ENTRIES = 64
+# Skip capture below this much free device memory so a saturated device
+# degrades to eager instead of capturing itself into an OOM.
+_MIN_CAPTURE_FREE_BYTES = 1 << 30  # 1 GiB
+
+
+class _EstimatorGraphEntry:
+    """One captured estimator forward: the graph plus its static I/O."""
+
+    __slots__ = ("graph", "inputs", "out")
+
+    def __init__(self, graph, inputs, out):
+        self.graph = graph
+        self.inputs = inputs
+        self.out = out
 
 
 class BASECFM(torch.nn.Module, ABC):
@@ -38,7 +61,15 @@ class BASECFM(torch.nn.Module, ABC):
 
 
 class ConditionalCFM(BASECFM):
-    def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
+    def __init__(
+        self,
+        in_channels,
+        cfm_params,
+        n_spks=1,
+        spk_emb_dim=64,
+        estimator: torch.nn.Module = None,
+        flow_graph_config: dict | None = None,
+    ):
         super().__init__(
             n_feats=in_channels,
             cfm_params=cfm_params,
@@ -51,6 +82,16 @@ class ConditionalCFM(BASECFM):
         in_channels = in_channels + (spk_emb_dim if n_spks > 0 else 0)
         # Just change the architecture of the estimator here
         self.estimator = estimator
+        cfg = dict(flow_graph_config or {})
+        self._estimator_graph_enabled = bool(cfg.get("enabled", False))
+        self._estimator_graph_max = max(1, int(cfg.get("max_graphs", _FLOW_CUDA_GRAPH_MAX_ENTRIES)))
+        self._estimator_graph_min_free_bytes = int(cfg.get("min_free_bytes", _MIN_CAPTURE_FREE_BYTES))
+        self._estimator_graphs: dict[tuple, _EstimatorGraphEntry] = {}
+        self._estimator_graph_stats = {"calls": 0, "hits": 0, "captures": 0, "flushes": 0, "eager": 0}
+
+    def flow_graph_stats(self) -> dict[str, int]:
+        """Bounded cumulative telemetry for the Euler graph cache."""
+        return {**self._estimator_graph_stats, "cache_size": len(self._estimator_graphs)}
 
     @torch.inference_mode()
     def forward(
@@ -137,8 +178,130 @@ class ConditionalCFM(BASECFM):
 
         return sol[-1].float()
 
+    def _estimator_graph_usable(self, x) -> bool:
+        # CUDA graphs cover only the in-process torch estimator; the TRT
+        # estimator manages its own streams/host syncs and cannot be captured
+        # here. Capturing while an outer capture is already recording would
+        # nest graphs, so defer to eager there too.
+        return (
+            self._estimator_graph_enabled
+            and isinstance(self.estimator, torch.nn.Module)
+            and not self.estimator.training
+            and x.is_cuda
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _flush_estimator_graphs(self) -> None:
+        """Retire every captured graph at once.
+
+        Never evict a single graph while its peers stay live. torch records
+        every capture on one process-wide side stream, and cuBLAS keeps one
+        workspace per (handle, stream) first allocated *during* a capture, so
+        it lives inside a graph memory pool while every later graph bakes in
+        the same address. Tearing one graph down releases that pool and leaves
+        the survivors replaying against reclaimed memory -- an illegal memory
+        access at the next replay (issue #6457, MiniCPM-o hit this first).
+        Dropping the whole generation keeps the cache bounded without ever
+        leaving a live graph behind a dead one.
+        """
+        if not self._estimator_graphs:
+            return
+        device = next(iter(self._estimator_graphs.values())).inputs[0].device
+        torch.accelerator.synchronize(device)
+        for entry in self._estimator_graphs.values():
+            entry.graph.reset()
+        self._estimator_graphs.clear()
+        clear_cublas_workspaces = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+        if clear_cublas_workspaces is not None:
+            clear_cublas_workspaces()
+        torch.accelerator.synchronize(device)
+        torch.accelerator.empty_cache()
+        self._estimator_graph_stats["flushes"] += 1
+        logger.info("Flow estimator graph cache flushed; stats=%s", self.flow_graph_stats())
+
+    def _disable_estimator_graphs(self, reason: str, key: tuple) -> None:
+        # A failed capture can leave the capture stream current and the
+        # allocator still routing into the graph pool, so there is no safe way
+        # to keep capturing afterwards.
+        logger.warning(
+            "Disabling flow estimator CUDA graphs (%s) for shape=%s; using eager", reason, key, exc_info=True
+        )
+        self._estimator_graph_enabled = False
+        self._flush_estimator_graphs()
+
+    def _graphed_estimator(self, inputs: tuple) -> torch.Tensor | None:
+        """Replay one estimator forward from a per-shape CUDA graph.
+
+        Returns None when no graph can serve this call (cache full, capture
+        failed, or memory too tight), in which case the caller runs eager.
+
+        Capture is attempted on the first miss, with no recurrence or
+        process-lifetime heuristic, because the graph covers a single DiT
+        forward: the very call that captures it replays it for the remaining
+        ``n_timesteps - 1`` Euler steps, so it repays itself within that one
+        call. This is what MiniCPM-o's CFMGraphWrapper does.
+        """
+        key = tuple((tuple(t.shape), t.dtype) for t in inputs)
+        entry = self._estimator_graphs.get(key)
+        if entry is None:
+            if len(self._estimator_graphs) >= self._estimator_graph_max:
+                self._flush_estimator_graphs()
+                return None
+            free_bytes, _total = current_omni_platform.get_device_memory(inputs[0].device)
+            if free_bytes < self._estimator_graph_min_free_bytes:
+                return None
+            try:
+                entry = self._capture_estimator_graph(inputs)
+            except Exception:
+                self._disable_estimator_graphs("capture failed", key)
+                return None
+            self._estimator_graphs[key] = entry
+            self._estimator_graph_stats["captures"] += 1
+            logger.info(
+                "Captured flow estimator CUDA graph for mel_len=%d; stats=%s",
+                inputs[0].shape[-1],
+                self.flow_graph_stats(),
+            )
+        else:
+            self._estimator_graph_stats["hits"] += 1
+
+        for static, current in zip(entry.inputs, inputs, strict=True):
+            static.copy_(current)
+        entry.graph.replay()
+        # The static output is overwritten by the next replay of any graph
+        # sharing the pool, so hand the caller its own copy.
+        return entry.out.clone()
+
+    def _capture_estimator_graph(self, inputs: tuple) -> _EstimatorGraphEntry:
+        static_inputs = tuple(t.clone() for t in inputs)
+
+        # Warm up on a side stream, the canonical capture recipe: it keeps the
+        # warmup's allocations off the stream that is about to record.
+        device = static_inputs[0].device
+        current_stream = torch.cuda.current_stream(device)
+        warmup_stream = torch.cuda.Stream(device=device)
+        warmup_stream.wait_stream(current_stream)
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                warmup_out = self.estimator(*static_inputs)
+        current_stream.wait_stream(warmup_stream)
+        del warmup_out
+
+        graph = torch.cuda.CUDAGraph()
+        # Share the platform's global graph pool, as the other hand-rolled
+        # graph wrappers in this repo do.
+        with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            static_out = self.estimator(*static_inputs)
+        return _EstimatorGraphEntry(graph, static_inputs, static_out)
+
     def forward_estimator(self, x, mask, mu, t, spks, cond):
         if isinstance(self.estimator, torch.nn.Module):
+            self._estimator_graph_stats["calls"] += 1
+            if self._estimator_graph_usable(x):
+                out = self._graphed_estimator((x, mask, mu, t, spks, cond))
+                if out is not None:
+                    return out
+            self._estimator_graph_stats["eager"] += 1
             return self.estimator(x, mask, mu, t, spks, cond)
         else:
             # TensorRT estimator: bind raw device pointers. The flow runs in
@@ -183,8 +346,16 @@ class ConditionalCFM(BASECFM):
 
 
 class CausalConditionalCFM(ConditionalCFM):
-    def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
-        super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
+    def __init__(
+        self,
+        in_channels,
+        cfm_params,
+        n_spks=1,
+        spk_emb_dim=64,
+        estimator: torch.nn.Module = None,
+        flow_graph_config: dict | None = None,
+    ):
+        super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator, flow_graph_config)
 
     @torch.inference_mode()
     def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming: bool = False):

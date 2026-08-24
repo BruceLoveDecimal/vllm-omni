@@ -35,6 +35,13 @@ connectors:
       codec_chunk_frames: 15
       codec_left_context_frames: 25
       codec_vocab_size: 6561
+      # Capture the flow's DiT estimator forward into one CUDA graph per input
+      # shape, replayed for each of the n_timesteps Euler steps. Stage 1 stays
+      # enforce_eager (the vocoder's dynamic convs rule out vLLM's own graphs);
+      # this graphs only the flow estimator. A full cache retires as one whole
+      # generation, never one graph at a time (issue #6457).
+      enable_flow_cuda_graph: true
+      flow_graph_max_graphs: 64
 
 stages:
   - stage_id: 0
