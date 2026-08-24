@@ -32,23 +32,23 @@ def _transfer_manager(
     pre_lookahead_frames: int = 0,
     stream_scale_factor: int = 1,
     max_chunk_frames: int | None = None,
+    left_context_frames: int | None = None,
 ):
     if max_chunk_frames is None:
         max_chunk_frames = chunk_frames
+    extra = {
+        "codec_chunk_frames": chunk_frames,
+        "codec_pre_lookahead_frames": pre_lookahead_frames,
+        "codec_max_chunk_frames": max_chunk_frames,
+        "codec_stream_scale_factor": stream_scale_factor,
+        "codec_vocab_size": 6561,
+    }
+    if left_context_frames is not None:
+        extra["codec_left_context_frames"] = left_context_frames
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         request_payload={},
-        connector=SimpleNamespace(
-            config={
-                "extra": {
-                    "codec_chunk_frames": chunk_frames,
-                    "codec_pre_lookahead_frames": pre_lookahead_frames,
-                    "codec_max_chunk_frames": max_chunk_frames,
-                    "codec_stream_scale_factor": stream_scale_factor,
-                    "codec_vocab_size": 6561,
-                }
-            }
-        ),
+        connector=SimpleNamespace(config={"extra": extra}),
     )
 
 
@@ -325,6 +325,82 @@ def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
     assert payload_ready is not None
     assert payload_ready.codes.audio.tolist() == [8, 9, 10, 11]
     assert payload_ready.meta.left_context_size == 0
+
+
+def _run_chunk(transfer_manager, request, *, finished: bool = False):
+    return talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        multimodal_output=None,
+        request=request,
+        is_finished=finished,
+    )
+
+
+def test_talker2code2wav_async_chunk_slides_flow_window_after_context_cap():
+    transfer_manager = _transfer_manager(left_context_frames=3)
+    request = SimpleNamespace(
+        external_req_id="rid-window",
+        output_token_ids=[1, 2],
+        additional_information={},
+        is_finished=lambda: False,
+    )
+
+    payload1 = _run_chunk(transfer_manager, request)
+    request.output_token_ids = [1, 2, 3, 4]
+    payload2 = _run_chunk(transfer_manager, request)
+    request.output_token_ids = [1, 2, 3, 4, 5, 6]
+    payload3 = _run_chunk(transfer_manager, request)
+
+    # Before the cap engages the full prefix is sent (legacy behavior).
+    assert payload1.codes.audio.tolist() == [1, 2]
+    assert payload1.meta.left_context_size == 0
+    assert payload2.codes.audio.tolist() == [1, 2, 3, 4]
+    assert payload2.meta.left_context_size == 2
+    # emitted=4 > cap=3: the window slides, dropping token index 0.
+    assert payload3.codes.audio.tolist() == [2, 3, 4, 5, 6]
+    assert payload3.meta.left_context_size == 3
+
+
+def test_talker2code2wav_async_chunk_final_flush_respects_flow_window():
+    transfer_manager = _transfer_manager(left_context_frames=3)
+    request = SimpleNamespace(
+        external_req_id="rid-window-final",
+        output_token_ids=[1, 2],
+        additional_information={},
+        is_finished=lambda: False,
+    )
+
+    _run_chunk(transfer_manager, request)
+    request.output_token_ids = [1, 2, 3, 4]
+    _run_chunk(transfer_manager, request)
+    request.output_token_ids = [1, 2, 3, 4, 5, 6]
+    _run_chunk(transfer_manager, request)
+    request.output_token_ids = [1, 2, 3, 4, 5, 6, 7]
+    payload_final = _run_chunk(transfer_manager, request, finished=True)
+
+    # emitted=6, cap=3: final flush sends 3 context tokens + the new tail.
+    assert payload_final.meta.finished.item() is True
+    assert payload_final.codes.audio.tolist() == [4, 5, 6, 7]
+    assert payload_final.meta.left_context_size == 3
+
+
+def test_talker2code2wav_async_chunk_flow_window_disabled_sends_full_prefix():
+    transfer_manager = _transfer_manager(left_context_frames=0)
+    request = SimpleNamespace(
+        external_req_id="rid-window-off",
+        output_token_ids=[1, 2],
+        additional_information={},
+        is_finished=lambda: False,
+    )
+
+    _run_chunk(transfer_manager, request)
+    request.output_token_ids = [1, 2, 3, 4]
+    _run_chunk(transfer_manager, request)
+    request.output_token_ids = [1, 2, 3, 4, 5, 6]
+    payload3 = _run_chunk(transfer_manager, request)
+
+    assert payload3.codes.audio.tolist() == [1, 2, 3, 4, 5, 6]
+    assert payload3.meta.left_context_size == 4
 
 
 def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio():
