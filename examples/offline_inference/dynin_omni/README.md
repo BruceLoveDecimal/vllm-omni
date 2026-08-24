@@ -1,4 +1,4 @@
-# Dynin-Omni Offline End2End Example
+# Dynin-Omni: Offline inference
 
 This folder contains a unified offline inference entrypoint:
 
@@ -42,7 +42,7 @@ pip install \
 ## 3. Hardware and VRAM Requirements
 
 This example uses a 3-stage pipeline on one GPU by default
-([`dynin_omni.yaml`](../../../vllm_omni/model_executor/stage_configs/dynin_omni.yaml)):
+([`dynin_omni.yaml`](../../../vllm_omni/deploy/dynin_omni.yaml)):
 
 - Stage-0 (`token2text`): `gpu_memory_utilization: 0.5`
 - Stage-1 (`token2image`): `gpu_memory_utilization: 0.1`
@@ -107,4 +107,4 @@ python <REPO_ROOT>/examples/offline_inference/dynin_omni/end2end.py \
 - If you want to force local config resolution, pass `--dynin-config-path <PATH_TO_DYNIN_OMNI_YAML>`.
 - If you see the warning
   `max_num_batched_tokens (32768) exceeds max_num_seqs * max_model_len (4096)`,
-  reduce `max_num_batched_tokens` in stage config (for example, `4096` in CI config).
+  reduce `max_num_batched_tokens` in the deploy config (for example, `4096` in the CI config).

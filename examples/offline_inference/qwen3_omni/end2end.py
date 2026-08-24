@@ -19,10 +19,9 @@ from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.media.audio import load_audio
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 SEED = 42
 
@@ -368,7 +367,7 @@ def main(args):
     print(f"query type: {args.query_type}")
 
     for stage_outputs in omni_generator:
-        output = stage_outputs.request_output
+        output = stage_outputs
         if stage_outputs.final_output_type == "text":
             request_id = output.request_id
             text_output = output.outputs[0].text
@@ -422,7 +421,7 @@ def main(args):
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser = TrackingArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
     parser.add_argument(
         "--model",
         type=str,
@@ -485,10 +484,10 @@ def parse_args():
         help="Path to a .txt file with one prompt per line (preferred).",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
         default=None,
-        help="Path to a stage configs file.",
+        help="Path to a deploy config YAML.",
     )
     parser.add_argument(
         "--video-path",
@@ -561,7 +560,6 @@ def parse_args():
         help="Model dtype (auto, half, float16, bfloat16, float, float32).",
     )
 
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

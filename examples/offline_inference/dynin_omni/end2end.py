@@ -18,8 +18,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
 TASK_CHOICES = ("t2t", "t2i", "t2s", "i2i", "i2t", "s2t", "v2t")
 
 TASK_DEFAULT_RUNTIME = {
@@ -743,7 +741,7 @@ def make_mmu_prompt(
 
 def iter_mm_outputs(outputs: list[Any]):
     for omni_out in outputs:
-        req_out = getattr(omni_out, "request_output", None)
+        req_out = omni_out
         req_list = req_out if isinstance(req_out, list) else [req_out]
         for item in req_list:
             if item is None:
@@ -878,10 +876,10 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument("--task", type=str, required=True, choices=TASK_CHOICES)
     parser.add_argument("--model", type=str, required=True, help="HF repo id or local model directory.")
     parser.add_argument(
-        "--stage-config-path",
+        "--deploy-config",
         type=str,
-        default=str(repo_root / "vllm_omni/model_executor/stage_configs/dynin_omni.yaml"),
-        help="Path to stage config yaml.",
+        default=str(repo_root / "vllm_omni/deploy/dynin_omni.yaml"),
+        help="Path to deploy config yaml.",
     )
     parser.add_argument(
         "--dynin-config-path",
@@ -972,8 +970,6 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument("--vq-model-audio-local-files-only", action=argparse.BooleanOptionalAction, default=None)
 
     parser.add_argument("--disable-hf-xet", action=argparse.BooleanOptionalAction, default=True)
-
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
@@ -1398,8 +1394,8 @@ def main() -> None:
 
     from vllm_omni.entrypoints.omni import Omni
 
-    stage_config_path = str(Path(args.stage_config_path).expanduser())
-    omni = Omni(model=model_source, stage_configs_path=stage_config_path, dtype=args.dtype)
+    deploy_config_path = str(Path(args.deploy_config).expanduser())
+    omni = Omni(model=model_source, deploy_config=deploy_config_path, dtype=args.dtype)
     sampling_params_list = [
         SamplingParams(max_tokens=int(args.max_tokens_per_stage), temperature=0.0, top_p=1.0, detokenize=False)
         for _ in range(omni.num_stages)

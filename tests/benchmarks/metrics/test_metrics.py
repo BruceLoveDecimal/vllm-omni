@@ -14,6 +14,37 @@ from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
 
+def test_tpot_matches_mean_itl_per_request():
+    """TPOT and pooled ITL should agree when output_len tracks ITL samples."""
+    output = MixRequestFuncOutput()
+    output.success = True
+    output.prompt_len = 100
+    # Simulate server reporting more tokens than SSE chunks (bundled tokens).
+    # len(itl)=2 → 2 inter-chunk intervals, but server generated 10 tokens.
+    output.output_tokens = 10
+    output.generated_text = "hello world"
+    output.ttft = 0.05
+    output.text_latency = 0.25
+    output.latency = 0.30
+    output.itl = [0.10, 0.10]
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["tpot", "itl"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+
+    assert metrics.mean_tpot_ms == pytest.approx(metrics.mean_itl_ms, rel=1e-6, abs=1e-6)
+
+
 def _make_output(prompt_len: int, output_tokens: int = 10) -> MixRequestFuncOutput:
     """Build a minimal successful MixRequestFuncOutput for metrics aggregation."""
     output = MixRequestFuncOutput()
@@ -61,6 +92,38 @@ def test_total_input_aggregated_from_output_prompt_len():
     assert metrics.total_input == 7992, (
         "total_input should aggregate from outputs[i].prompt_len to reflect the true multimodal input token count"
     )
+
+
+def test_audio_continuity_aggregation():
+    """Continuity rate and underrun percentile must aggregate from per-output fields."""
+    bad = _make_output(100)
+    bad.audio_underrun_s = 0.5
+    bad.audio_continuity_ok = False
+    good_a = _make_output(100)
+    good_a.audio_underrun_s = 0.02
+    good_a.audio_continuity_ok = True
+    good_b = _make_output(100)
+    good_b.audio_underrun_s = 0.0
+    good_b.audio_continuity_ok = True
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[bad, good_a, good_b],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0, 99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_underrun"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    assert metrics.audio_continuity_ok_rate == pytest.approx(2 / 3, abs=1e-6)
+    # p99 of [0.5, 0.02, 0.0] is dominated by the 0.5 outlier.
+    p99 = dict(metrics.percentiles_audio_underrun_s).get(99.0)
+    assert p99 is not None and p99 > 0.4
 
 
 # ============================================================================

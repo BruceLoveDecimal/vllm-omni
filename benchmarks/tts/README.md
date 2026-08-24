@@ -18,8 +18,8 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8000
 ```
 
 The server auto-loads its Deploy YAML from `vllm_omni/deploy/qwen3_tts.yaml`
-(Pipeline + Deploy schema introduced in #2383). No `--stage-configs-path` or
-`--deploy-config` flag is needed for any registered model.
+(Pipeline + Deploy schema introduced in #2383). No explicit `--deploy-config`
+flag is needed for a registered model.
 
 ### 2. Run the benchmark (`vllm bench serve --omni`)
 
@@ -40,7 +40,7 @@ vllm bench serve --omni \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"task_type":"Base"}' \
     --max-concurrency 1 --request-rate inf \
-    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun \
     --save-result --result-dir ./results
 ```
 
@@ -58,7 +58,7 @@ vllm bench serve --omni \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"voice":"Vivian","language":"English","task_type":"CustomVoice"}' \
     --max-concurrency 1 --request-rate inf \
-    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun \
     --save-result --result-dir ./results
 ```
 
@@ -76,9 +76,27 @@ vllm bench serve --omni \
     --num-prompts 20 --num-warmups 2 \
     --extra-body '{"task_type":"VoiceDesign","language":"English"}' \
     --max-concurrency 1 --request-rate inf \
-    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun \
     --save-result --result-dir ./results
 ```
+
+#### Streaming continuity (`audio_underrun`)
+
+`audio_underrun` (seconds) is the per-request worst-case buffer deficit
+under a realtime-rate player simulation. The audio-speech backend records
+chunk arrival times during the SSE stream and surfaces:
+
+- `Mean / Median / P{50,99} AUDIO_UNDERRUN (s)` per the standard percentile
+  output - any positive value means at least one inter-chunk gap was longer
+  than the chunk's audio duration.
+- `Streaming continuity OK rate` - fraction of requests whose worst-case
+  underrun stayed under the threshold (default 100 ms, the commonly cited
+  "audible gap" budget). Override the threshold with
+  `VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S=<float>`.
+
+This captures the failure mode where `RTF_p50 < 1` (server keeps up in
+aggregate) but per-stream chunk arrival is bursty enough that listeners
+still hear gaps - common at high concurrency on streaming TTS pipelines.
 
 #### Add WER / SIM / UTMOS to any of the above
 
@@ -120,6 +138,34 @@ python benchmarks/tts/bench_tts.py \
     --concurrency 4 --num-prompts 200 \
     --output-dir ./results
 ```
+
+#### Fixed IndexTTS 2.5 performance sweep
+
+IndexTTS 2.5 is registered in `model_configs.yaml` like the other TTS models.
+Use `--served-model-name` when the server was launched from a local native
+bundle instead of the registry key. The command below reproduces the acceptance
+workload: Seed-TTS Eval EN, `n=500`, concurrency `4/8/16/32`, five warmups, and
+dataset seed 0.
+
+```bash
+python benchmarks/tts/bench_tts.py \
+    --model IndexTeam/IndexTTS-2.5 \
+    --served-model-name /path/to/indextts-2.5 \
+    --task voice_clone --locale en \
+    --dataset-path /path/to/seedtts_testset \
+    --host 127.0.0.1 --port 8092 \
+    --concurrency 4 8 16 32 \
+    --num-prompts 500 --num-warmups 5 \
+    --output-dir ./results/indextts2_5 \
+    -- \
+    --tokenizer /path/to/indextts-2.5/qwen0.6bemo4-merge \
+    --seed 0 --metric-percentiles 50,95,99 --disable-tqdm --save-detailed
+```
+
+The wrapper benchmarks an already-running server. For reproducible quality
+comparisons, add `--request-seed 42`; production-performance runs should omit
+it. The trailing `--seed 0` controls Seed-TTS row selection rather than model
+sampling.
 
 ### 4. Plot a sweep
 
@@ -215,7 +261,6 @@ sentinel for regressions in this area.
 benchmarks/tts/
 ├── README.md                  (this file)
 ├── bench_tts.py               CLI — serve-mode benchmark driver
-├── bench_voxcpm_offline.py    CLI — offline VoxCPM benchmark (sync + streaming)
 ├── plot_results.py            Generate per-task / per-concurrency curves
 └── model_configs.yaml         Model registry (supported tasks + extra body)
 ```

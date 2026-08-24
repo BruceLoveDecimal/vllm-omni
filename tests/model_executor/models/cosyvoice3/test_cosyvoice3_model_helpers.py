@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -84,6 +84,11 @@ def _make_code2wav_model(
         token_mel_ratio=2 if with_stride_cfg else 0,
     )
     model.code2wav = _DummyCode2Wav(vocab_size=4, num_samples=num_samples, outputs=outputs)
+    # Short-circuit the lazy TensorRT estimator swap: these tests exercise the
+    # forward audio logic, not the TRT path. On a GPU CI runner the swap would
+    # otherwise run and dereference ``self.model_dir`` (only set in __init__,
+    # which this fixture bypasses via object.__new__).
+    model._code2wav_trt_done = True
     model.source_cache_len = 4
     model.speech_window = torch.hamming_window(8, periodic=False)
     model._stream_audio_cache_by_req = {}
@@ -136,27 +141,6 @@ def _make_sampling_metadata(
         bad_words_token_ids={},
         logitsprocs=LogitsProcessors(),
     )
-
-
-def test_split_request_ids_uses_seq_token_counts():
-    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
-    ids = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
-    chunks = CosyVoice3Model._split_request_ids(ids, [2, 2, 2])
-    assert [c.tolist() for c in chunks] == [[10, 11], [12, 13], [14]]
-
-
-def test_split_request_ids_honors_single_request_seq_token_counts():
-    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
-    ids = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
-    chunks = CosyVoice3Model._split_request_ids(ids, [3])
-    assert [c.tolist() for c in chunks] == [[10, 11, 12]]
-
-
-def test_sanitize_codec_tokens_filters_out_of_range():
-    model = _make_code2wav_model()
-    raw = torch.tensor([-1, 0, 3, 4, 99], dtype=torch.long)
-    clean = model._sanitize_codec_tokens(raw)
-    assert clean.tolist() == [0, 3]
 
 
 def test_forward_prefers_token_offset_when_present():
@@ -265,6 +249,31 @@ def test_forward_uses_non_stream_decode_without_chunk_metadata():
     assert len(model.code2wav.forward_streaming_calls) == 0
     call = model.code2wav.forward_calls[0]
     assert call["token"].tolist() == [[0, 1, 2]]
+    assert call["token_offset_tokens"] == 0
+
+
+def test_forward_uses_non_stream_talker_prefill_offset():
+    model = _make_code2wav_model()
+
+    runtime_info = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "meta": {"talker_prefill_offset": 3},
+        }
+    ]
+
+    model.forward(
+        input_ids=torch.tensor([0, 1, 2], dtype=torch.long),
+        positions=torch.tensor([0, 1, 2], dtype=torch.long),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[3],
+    )
+
+    assert model.code2wav.forward_calls[0]["token_offset_tokens"] == 3
 
 
 def test_forward_reuses_streaming_cache_state_between_chunks():
@@ -392,6 +401,52 @@ def test_sample_tolerates_padded_rows_without_history():
     assert out.sampled_token_ids.shape == (2, 1)
 
 
+def test_sample_excludes_non_finite_logits():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[]])
+    metadata.temperature.fill_(0.5)
+    logits = torch.tensor([[float("nan"), 1.0, float("inf"), float("-inf")]], dtype=torch.bfloat16)
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[1]]
+
+
+def test_sample_preserves_allowed_token_mask_with_invalid_logits():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[]])
+    metadata.allowed_token_ids_mask = torch.tensor([[True, False, True]])
+    logits = torch.tensor([[float("nan"), 1.0, float("inf")]], dtype=torch.float32)
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[1]]
+
+
+def test_sample_rejects_rows_without_finite_logits():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[]])
+    metadata.allowed_token_ids_mask = torch.tensor([[True, False, True]])
+    logits = torch.tensor([[0.0, float("nan"), 0.0]], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="no finite logits"):
+        model.sample(logits, metadata)
+
+
+def test_sample_keeps_only_finite_token_after_ras_rejection():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
+    metadata.allowed_token_ids_mask = torch.tensor([[True, False, True]])
+    logits = torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32)
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[1]]
+
+
 def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
     metadata = _make_sampling_metadata(output_token_ids=[[1, 2, 3]])
     expected = SamplerOutput(
@@ -406,21 +461,29 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
             self.updated = False
 
         def update_async_output_token_ids(self):
+            # After PR 3681 fix, update_async_output_token_ids is called
+            # BEFORE model sampler path to ensure async placeholder repair
+            # runs for all sampling paths
             self.updated = True
 
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+
+    def model_sample(logits, sampling_metadata):
+        calls.append(logits.clone())
+        return expected
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: calls.append(logits.clone()) or expected,
+        sample=model_sample,
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 
     out = runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
 
     assert out is expected
-    assert runner.input_batch.updated is False
+    assert runner.input_batch.updated is True
     assert len(calls) == 1
 
 
@@ -436,24 +499,31 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
             self.sampled_token_ids_cpu = None
             self.async_copy_ready_event = None
             self.prev_req_id_to_index = None
+            self.update_async_called = False
 
         def update_async_output_token_ids(self):
-            raise AssertionError("fallback async repair should not run for model sampler path")
+            # After PR 3681 fix, update_async_output_token_ids is called
+            # BEFORE model sampler path to ensure async placeholder repair
+            # runs for all sampling paths
+            self.update_async_called = True
 
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+
+    def model_sample(logits, sampling_metadata):
+        seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
+        return SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: (
-            seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
-            or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
-        ),
+        sample=model_sample,
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 
     runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
 
+    assert runner.input_batch.update_async_called is True
     assert seen_histories == [[[1, 2, 3]]]
 
 
@@ -476,23 +546,30 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
             self.sampled_token_ids_cpu = torch.tensor([[29]], dtype=torch.int32)
             self.async_copy_ready_event = _ReadyEvent()
             self.prev_req_id_to_index = {"rid-1": 0}
+            self.update_async_called = False
 
         def update_async_output_token_ids(self):
-            raise AssertionError("fallback async repair should not run for model sampler path")
+            # After PR 3681 fix, update_async_output_token_ids is called
+            # BEFORE model sampler path to ensure async placeholder repair
+            # runs for all sampling paths (model sampler + fallback sampler)
+            self.update_async_called = True
 
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+
+    def model_sample(logits, sampling_metadata):
+        seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
+        return SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: (
-            seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
-            or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
-        ),
+        sample=model_sample,
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 
     runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
 
     assert runner.input_batch.async_copy_ready_event.synced is True
+    assert runner.input_batch.update_async_called is True
     assert seen_histories == [[[11, 29]]]

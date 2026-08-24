@@ -39,10 +39,9 @@ from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.media.audio import load_audio
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +237,7 @@ async def run_single_request(
             sampling_params_list=sampling_params_list,
             output_modalities=output_modalities,
         ):
-            output = omni_output.request_output
+            output = omni_output
             if omni_output.final_output_type == "text":
                 if stage_0_first_output_ts is None:
                     stage_0_first_output_ts = time.perf_counter()
@@ -383,10 +382,12 @@ async def run_all(args):
     print(f"[Info] Creating AsyncOmni with deploy_config={args.deploy_config}")
     async_omni = None
     try:
-        async_omni = AsyncOmni(**vars(args))
+        # ``from_cli_args`` forwards only explicitly-passed CLI args so
+        # argparse defaults do not silently override deploy YAML values.
+        async_omni = AsyncOmni.from_cli_args(args, model=args.model)
 
-        # Use default sampling params from stage config (they are pre-configured
-        # in the YAML for each stage).
+        # Use default sampling params from the resolved pipeline and deploy
+        # config.
         #
         # NOTE: Since we do not set the sampling params directly, .generate in
         # will automatically set the output kind to delta, since this is what
@@ -453,7 +454,7 @@ async def run_all(args):
 
 
 def parse_args():
-    parser = FlexibleArgumentParser(
+    parser = TrackingArgumentParser(
         description=(
             "Offline inference with async_chunk enabled via AsyncOmni. "
             "Downstream stages start before upstream stages finish, "
@@ -589,7 +590,6 @@ def parse_args():
         default=16000,
         help="Sampling rate for audio loading.",
     )
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

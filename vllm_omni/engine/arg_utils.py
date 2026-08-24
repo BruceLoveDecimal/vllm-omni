@@ -1,16 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import argparse
-import dataclasses
 import json
 import os
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
-from vllm_omni.engine.output_modality import OutputModality
+from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
 
@@ -20,14 +23,29 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "GLMTTSForConditionalGeneration": "glm_tts",
+    "IndexTTS2S2MelDecoder": "indextts2",
+    "IndexTTS2TalkerForConditionalGeneration": "indextts2",
+    "IndexTTS25S2MelDecoder": "indextts2_5",
+    "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
     "OmniVoiceModel": "omnivoice",
+    # PersonaPlex ships an empty config.json, so create_model_config() must patch
+    # model_type=personaplex from the arch name or the staged pipeline can't load
+    # the HF config without manual overrides.
+    "PersonaPlexTalkerForConditionalGeneration": "personaplex",
+    "PersonaPlexCode2Wav": "personaplex",
+    # NemotronVoiceChat ships a NeMo-style config.json without model_type;
+    # create_model_config() patches model_type=nemotron_voicechat from the arch.
+    "NemotronVoiceChatThinkerForConditionalGeneration": "nemotron_voicechat",
+    "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
+    "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
-    "VoxCPMForConditionalGeneration": "voxcpm",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
     "CosyVoice3Model": "CosyVoice-BlankEN",
+    "GLMTTSForConditionalGeneration": "vq32k-phoneme-tokenizer",
 }
 
 
@@ -35,9 +53,31 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
+            IndexTTS2Config,
+            IndexTTS25Config,
+        )
+        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
+            MingDenseConfig,
+            MingMoeConfig,
+        )
+        from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
+            MossTTSLocalConfig,
+            MossTTSRealtimeConfig,
+        )
+        from vllm_omni.model_executor.models.nemotron_voicechat.configuration_nemotron_voicechat import (
+            NemotronVoiceChatConfig,
+        )
+        from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
+            PersonaPlexConfig,
+        )
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+        from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
+        from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
+        from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
         return
@@ -51,7 +91,19 @@ def _register_omni_hf_configs() -> None:
         _CONFIG_REGISTRY = None
 
     for model_type, config_cls in [
+        ("dense", MingDenseConfig),
+        ("bailingmm", MingMoeConfig),
+        ("indextts2", IndexTTS2Config),
+        ("indextts2_5", IndexTTS25Config),
+        ("moss_tts_local", MossTTSLocalConfig),
+        ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
+        ("personaplex", PersonaPlexConfig),
+        ("nemotron_voicechat", NemotronVoiceChatConfig),
+        ("cosyvoice3", CosyVoice3Config),
+        ("glm_tts", GLMTTSConfig),
+        ("omnivoice", OmniVoiceConfig),
+        ("voxcpm2", VoxCPM2Config),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -69,10 +121,19 @@ def register_omni_models_to_vllm():
 
     _register_omni_hf_configs()
 
-    supported_archs = ModelRegistry.get_supported_archs()
+    # Unconditionally (re)register every omni arch into the upstream global
+    # ModelRegistry: vLLM 0.27 added some omni archs (e.g.
+    # Qwen3OmniMoeForConditionalGeneration) to its own registry, but resolves
+    # them to upstream classes that lack omni features (e.g.
+    # buffer_realtime_audio for the realtime endpoint). Registering here
+    # overwrites those entries with the vllm-omni classes, which is the
+    # behavior entrypoints resolving through the global registry rely on
+    # (and matches OmniModelRegistry's omni-wins ordering).
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
-        if arch not in supported_archs:
-            ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+        ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+
+    # Register omni-specific reasoning parsers (e.g., step_audio).
+    import vllm_omni.reasoning  # noqa: F401
 
 
 @dataclass
@@ -102,16 +163,14 @@ class OmniEngineArgs(EngineArgs):
         stage_connector_spec: Extra configuration for stage connector
         async_chunk: If set to True, perform async chunk
         worker_type: Model Type, e.g., "ar" or "generation"
-        task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
-            If not specified, will be inferred from model path.
+        task_type: Model-defined startup task type. Consumers validate the
+            supported values and decide whether it selects request behavior,
+            task-specific weights, or both.
         omni_master_address: TCP address that the OmniMasterServer (running
             inside AsyncOmniEngine) listens on for engine core registrations.
             Required when single-stage mode is active.
         omni_master_port: TCP port for the OmniMasterServer registration
             socket.  Required when single-stage mode is active.
-        stage_configs_path: Optional path to a JSON/YAML file containing
-            stage configurations for the multi-stage pipeline. If None,
-            stage configs are resolved from the model's default configuration.
         output_modalities: Optional list of output modality names to enable
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
@@ -129,15 +188,30 @@ class OmniEngineArgs(EngineArgs):
     custom_process_next_stage_input_func: str | None = None
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
     async_chunk: bool = False
+    retains_state_across_chunks: bool = False
+    # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
+    # Must be declared here so engine_args dict propagation does not silently
+    # drop the value when constructing OmniEngineArgs from kwargs.
+    active_stream_window: int = 0
+    # Engine admission is the single source of truth for per-stage pools of
+    # model-owned streaming state (codec, decoder, and similar resources).
+    duplex_max_sessions: int = 1
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
+    # Dotted path of a per-stage pooling-output decoder applied worker-side.
+    pooling_output_decoder: str | None = None
     task_type: str | None = None
-    worker_cls: str = None
+    worker_cls: str = None  # type: ignore[assignment]  # Upstream default is "auto"; omni resolves
+    # in __post_init__ based on worker_type (ar/generation), so None is safe here.
     enable_sleep_mode: bool = False
     omni: bool = False
+    # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
+    request_batch_max_wait_ms: float = 0.0
+    fa_deterministic: bool = False
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -155,11 +229,15 @@ class OmniEngineArgs(EngineArgs):
 
     omni_master_address: str | None = None
     omni_master_port: int | None = None
-    stage_configs_path: str | None = None
+    # OmniCoordinator integration knobs (process-local).
+    omni_dp_size_local: int = 1
+    omni_lb_policy: str = "random"
+    omni_heartbeat_timeout: float = 30.0
     output_modalities: list[str] | None = None
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+    sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:
@@ -169,30 +247,6 @@ class OmniEngineArgs(EngineArgs):
                 self.worker_cls = current_omni_platform.get_omni_generation_worker_cls()
         load_omni_general_plugins()
         super().__post_init__()
-
-    @classmethod
-    def from_cli_args(cls, args: argparse.Namespace) -> "OmniEngineArgs":
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        engine_args = cls(**{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)})
-        engine_args._explicit_fields = frozenset(
-            attr for attr in attrs if hasattr(args, attr) and getattr(args, attr) is not None
-        )
-        return engine_args
-
-    @classmethod
-    def create(cls, **explicit: Any) -> "OmniEngineArgs":
-        """Tracks caller-set fields for ``Omni(..., engine_args=ea)``."""
-        ea = cls(**explicit)
-        ea._explicit_fields = frozenset(explicit.keys())
-        return ea
-
-    def explicit_kwargs(self) -> dict[str, Any]:
-        explicit = getattr(self, "_explicit_fields", None)
-        if explicit is None:
-            return {
-                f.name: getattr(self, f.name) for f in dataclasses.fields(self) if getattr(self, f.name) is not None
-            }
-        return {k: getattr(self, k) for k in explicit}
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):
@@ -213,7 +267,15 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            return  # can't load config, let vLLM handle the error
+            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
+            # Keep this exception model-scoped so other loader failures retain
+            # vLLM's normal error path.
+            if model_type != "indextts2_5" or not os.path.isdir(self.model):
+                return
+            config_path = os.path.join(self.model, "config.json")
+            if os.path.lexists(config_path):
+                return
+            config_dict = {}
 
         # Create a temp dir with a patched config.json
         temp_dir = tempfile.mkdtemp(prefix="omni_hf_config_")
@@ -240,24 +302,26 @@ class OmniEngineArgs(EngineArgs):
         }
         stage_connector_config["extra"]["stage_id"] = self.stage_id
 
+        hf_overrides = cast(dict[str, Any] | Callable[[Any], Any] | None, getattr(self, "hf_overrides", None))
         # If model_arch is specified, inject it into hf_overrides so vLLM can
         # resolve the architecture even when config.json lacks 'architectures'.
         # Also inject model_type so AutoConfig can resolve the correct config
         # class for models with empty or missing config.json (e.g. CosyVoice3).
         if self.model_arch:
-            if self.hf_overrides is None:
-                self.hf_overrides = {}
-            if isinstance(self.hf_overrides, dict):
-                self.hf_overrides.setdefault("architectures", [self.model_arch])
-                if "model_type" not in self.hf_overrides:
+            if hf_overrides is None:
+                hf_overrides = {}
+                self.hf_overrides = hf_overrides
+            if isinstance(hf_overrides, dict):
+                hf_overrides.setdefault("architectures", [self.model_arch])
+                if "model_type" not in hf_overrides:
                     model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
                     if model_type is not None:
-                        self.hf_overrides.setdefault("model_type", model_type)
+                        hf_overrides.setdefault("model_type", model_type)
 
                 # Stage wrappers (e.g. Code2Wav) may need max_model_len larger
                 # than the base checkpoint's text max_position_embeddings.
                 if self.model_arch == "Qwen3TTSCode2Wav" and self.max_model_len is not None:
-                    self.hf_overrides.setdefault("talker_config", {}).setdefault(
+                    hf_overrides.setdefault("talker_config", {}).setdefault(
                         "max_position_embeddings", int(self.max_model_len)
                     )
 
@@ -273,20 +337,37 @@ class OmniEngineArgs(EngineArgs):
                 if model_type is not None:
                     self._patch_empty_hf_config(model_type)
 
+        tokenizer = cast(str | None, getattr(self, "tokenizer", None))
+
+        # NemotronVoiceChat: the checkpoint's only tokenizer subfolder is the
+        # auxiliary rnnt_tokenizer/ (ASR loss vocab), which the generic
+        # subfolder auto-detect below would wrongly pick up. The text tokenizer
+        # is the Nemotron backbone's, resolved from a local override or its
+        # HF id (cache-friendly).
+        if not tokenizer and self.model_arch in (
+            "NemotronVoiceChatThinkerForConditionalGeneration",
+            "NemotronVoiceChatTalkerForConditionalGeneration",
+            "NemotronVoiceChatCode2Wav",
+        ):
+            self.tokenizer = os.environ.get("NEMOTRON_VOICECHAT_LLM_PATH") or "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+            tokenizer = self.tokenizer
+            logger.info("NemotronVoiceChat: using text tokenizer from %s", tokenizer)
+
         # Auto-detect tokenizer for models that store it in a subdirectory
         # rather than the root (e.g. CosyVoice3 uses CosyVoice-BlankEN/).
-        if not self.tokenizer and self.model:
+        if not tokenizer and self.model:
             model_path = self.model
             if os.path.isdir(model_path) and not os.path.isfile(os.path.join(model_path, "tokenizer_config.json")):
                 for subfolder in sorted(os.listdir(model_path)):
                     candidate = os.path.join(model_path, subfolder)
                     if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "tokenizer_config.json")):
                         self.tokenizer = candidate
+                        tokenizer = candidate
                         logger.info("Auto-detected tokenizer at %s", candidate)
                         break
             elif not os.path.isdir(model_path):
-                subfolder = _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch)
-                if subfolder:
+                tokenizer_subfolder = _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch or "")
+                if tokenizer_subfolder:
                     # Download just the tokenizer files from the subfolder
                     try:
                         from huggingface_hub import snapshot_download
@@ -294,14 +375,15 @@ class OmniEngineArgs(EngineArgs):
                         local_dir = snapshot_download(
                             model_path,
                             allow_patterns=[
-                                f"{subfolder}/tokenizer*",
-                                f"{subfolder}/special_tokens*",
-                                f"{subfolder}/vocab*",
-                                f"{subfolder}/merges*",
-                                f"{subfolder}/added_tokens*",
+                                f"{tokenizer_subfolder}/tokenizer*",
+                                f"{tokenizer_subfolder}/tokenization_*",
+                                f"{tokenizer_subfolder}/special_tokens*",
+                                f"{tokenizer_subfolder}/vocab*",
+                                f"{tokenizer_subfolder}/merges*",
+                                f"{tokenizer_subfolder}/added_tokens*",
                             ],
                         )
-                        candidate = os.path.join(local_dir, subfolder)
+                        candidate = os.path.join(local_dir, tokenizer_subfolder)
                         if os.path.isdir(candidate):
                             self.tokenizer = candidate
                             logger.info("Downloaded tokenizer from %s/%s", model_path, subfolder)
@@ -324,17 +406,23 @@ class OmniEngineArgs(EngineArgs):
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
+            retains_state_across_chunks=self.retains_state_across_chunks,
+            active_stream_window=self.active_stream_window,
+            duplex_max_sessions=self.duplex_max_sessions,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,
+            pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             stage_connector_config=stage_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
+            silence_ban_frames=self.silence_ban_frames,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
+            sampling_extra_args_keys=tuple(self.sampling_extra_args_keys or ()),
         )
         return omni_config
 
@@ -375,7 +463,7 @@ class OmniAsyncEngineArgs(AsyncEngineArgs, OmniEngineArgs):
 # Fields in ``SHARED_FIELDS`` (e.g. ``model``, ``log_stats``) flow to BOTH
 # orchestrator and engine by design.
 #
-# Invariants enforced by ``tests/test_arg_utils.py``:
+# Invariants enforced by ``tests/engine/test_arg_utils_shared_fields.py``:
 #
 #   1. ``OrchestratorArgs`` ∩ ``OmniEngineArgs`` ⊆ ``SHARED_FIELDS``
 #   2. Every CLI flag is classifiable into one of the three buckets
@@ -397,8 +485,7 @@ class OrchestratorArgs:
           forwarding).
 
     Fields that BOTH orchestrator and engine genuinely need (e.g. ``model``,
-    ``log_stats``) should be listed in ``SHARED_FIELDS`` below; ``split_kwargs``
-    will copy them to both buckets.
+    ``log_stats``) should be listed in ``SHARED_FIELDS`` below.
     """
 
     # === Lifecycle ===
@@ -406,7 +493,6 @@ class OrchestratorArgs:
     init_timeout: int = 600
 
     # === Cross-stage Communication ===
-    shm_threshold_bytes: int = 65536
     batch_timeout: int = 10
 
     # === Cluster / Backend ===
@@ -414,21 +500,83 @@ class OrchestratorArgs:
     ray_address: str | None = None
 
     # === Config Files ===
-    stage_configs_path: str | None = None
     deploy_config: str | None = None
     stage_overrides: str | None = None  # raw JSON string; parsed downstream
+    # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
+    # derived sizing onto merged stages, then drops it before per-stage engine args.
+    strategy_config: str | None = None
 
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
 
+    # === Forced aligner (orchestrator injects a pooling stage; never a per-stage knob) ===
+    forced_aligner: str | None = None
+    forced_aligner_config: str | None = None
+    forced_aligner_device: str | None = None
+
     # === Observability ===
     log_stats: bool = False
+    enable_orch_monitor: bool = False
 
     # === Headless Mode (also forwarded to engine — see SHARED_FIELDS) ===
     stage_id: int | None = None
 
     # === Pre-built Objects ===
     parallel_config: Any = None
+
+    # === Diffusion model config ===
+    num_gpus: int | None = None
+    model_class_name: str | None = None
+    diffusion_load_format: str | None = None
+    lora_path: list[str] | None = None
+    lora_backend: str | None = None
+    lora_scale: float | None = None
+    diffusers_load_kwargs: str = "{}"
+    diffusers_call_kwargs: str = "{}"
+    ulysses_degree: int | None = None
+    ulysses_mode: str = "strict"
+    ring_degree: int | None = None
+    allgather_degree: int | None = None
+    diffusion_quantization_config: str | None = None
+    use_hsdp: bool = False
+    hsdp_shard_size: int = -1
+    hsdp_replicate_size: int = 1
+    diffusion_attention_backend: str | None = None
+    fastvideo_vsa_topk: int | None = None
+    diffusion_attention_config: str | None = None
+    diffusion_compile_granularity: str | None = None
+    diffusion_compile_dynamic: bool | None = None
+    cache_backend: str = "none"
+    cache_config: str | None = None
+    enable_cache_dit_summary: bool = False
+    step_execution: bool = False
+    vae_use_slicing: bool = False
+    vae_use_tiling: bool = False
+    enable_multithread_weight_load: bool = True
+    num_weight_load_threads: int = 4
+    enable_cpu_offload: bool = False
+    enable_layerwise_offload: bool = False
+    enable_distributed_layerwise_offload: bool = False
+    dlo_use_allgather: bool = True
+    dlo_resident_layers: int = 0
+    boundary_ratio: float | None = None
+    flow_shift: float | None = None
+    diffusion_kv_cache_dtype: str | None = None
+    diffusion_kv_cache_skip_steps: str | None = None
+    diffusion_kv_cache_skip_layers: str | None = None
+    cfg_parallel_size: int = 1
+    vae_patch_parallel_size: int = 1
+    vae_parallel_mode: str = "tile"
+    text_encoder_tp_size: int = 1
+    default_sampling_params: str | None = None
+    max_generated_image_size: int | None = None
+    tts_max_instructions_length: int | None = None
+    enable_diffusion_pipeline_profiler: bool = False
+    enable_ar_profiler: bool = False
+    auxiliary_text_encoder: str | None = None
+    log_file: str | None = None
+    replica_id: int | None = None
+    omni_replica_address: str | None = None
 
     # === Multi-stage guards ===
     # --tokenizer is captured by the orchestrator and forwarded to stages
@@ -444,7 +592,8 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "model",  # orch: detect model_type; engine: load weights
         "stage_id",  # orch: route (headless); engine: identity
         "log_stats",  # both want the flag
-        "stage_configs_path",  # orch: load legacy YAML; engine: may reference for validation
+        "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
+        "tokenizer",  # orch: detect model type; engine: tokenization
     }
 )
 
@@ -463,163 +612,3 @@ def internal_blacklist_keys() -> frozenset[str]:
     dataclass — this function updates automatically.
     """
     return orchestrator_field_names() - SHARED_FIELDS
-
-
-def split_kwargs(
-    kwargs: dict[str, Any],
-    *,
-    engine_cls: type | None = None,
-    user_typed: set[str] | None = None,
-    strict: bool = False,
-) -> tuple[OrchestratorArgs, dict[str, Any]]:
-    """Partition CLI kwargs into (orchestrator, engine) buckets.
-
-    Args:
-        kwargs: Raw dict, typically ``vars(args)``.
-        engine_cls: Engine dataclass used to whitelist-filter the engine
-            bucket. Defaults to ``OmniEngineArgs``. Pass a custom class
-            for testing.
-        user_typed: Keys the user actually typed on the command line. Used
-            to warn when a user-typed flag is unclassifiable.
-        strict: If True, raise ``ValueError`` on ambiguous (double-classified
-            but not in ``SHARED_FIELDS``) fields. Default False to keep the
-            rollout non-breaking; flip to True in tests and CI.
-
-    Returns:
-        ``(orchestrator_args, engine_kwargs)``. ``engine_kwargs`` has already
-        been whitelist-filtered against ``engine_cls`` — safe to pass directly
-        to ``engine_cls(**engine_kwargs)``.
-    """
-    if engine_cls is None:
-        engine_cls = OmniEngineArgs
-
-    orch_fields = orchestrator_field_names()
-    engine_fields = {f.name for f in fields(engine_cls)}
-
-    orch_kwargs: dict[str, Any] = {}
-    engine_candidate: dict[str, Any] = {}
-    shared_values: dict[str, Any] = {}
-    unclassified: dict[str, Any] = {}
-
-    for key, value in kwargs.items():
-        in_orch = key in orch_fields
-        in_engine = key in engine_fields
-        is_shared = key in SHARED_FIELDS
-
-        if is_shared:
-            shared_values[key] = value
-        elif in_orch and in_engine:
-            # Declared in both but not marked shared → ambiguous.
-            msg = (
-                f"Field {key!r} is defined on both OrchestratorArgs and "
-                f"{engine_cls.__name__} but is not in SHARED_FIELDS. "
-                f"This causes double-routing. Either remove the duplicate or "
-                f"add {key!r} to SHARED_FIELDS if the sharing is intentional."
-            )
-            if strict:
-                raise ValueError(msg)
-            logger.error(msg)
-            # Default: treat as orchestrator-only to preserve existing behavior.
-            orch_kwargs[key] = value
-        elif in_orch:
-            orch_kwargs[key] = value
-        elif in_engine:
-            engine_candidate[key] = value
-        else:
-            unclassified[key] = value
-
-    # Warn on user-typed but unclassifiable flags so we don't silently drop
-    # something the user cared about (fixes the class of bug that spawned #873).
-    if unclassified and user_typed:
-        user_typed_unknown = sorted(k for k in unclassified if k in user_typed)
-        if user_typed_unknown:
-            logger.warning(
-                "CLI flags not consumed by vllm-omni and dropped before "
-                "per-stage engine construction: %s. If these are vllm "
-                "frontend/uvicorn flags (host, port, ssl_*, api_key, …) this "
-                "is expected; otherwise check your spelling.",
-                user_typed_unknown,
-            )
-
-    # Engine bucket: shared + engine-only. We do NOT pass through unclassified
-    # fields — that's exactly the server/uvicorn noise we want to shed.
-    engine_kwargs = {**shared_values, **engine_candidate}
-
-    # Construct the orchestrator dataclass. Shared fields that OrchestratorArgs
-    # also declares get copied into its constructor.
-    orch_init: dict[str, Any] = dict(orch_kwargs)
-    for key, value in shared_values.items():
-        if key in orch_fields:
-            orch_init[key] = value
-    orch_args = OrchestratorArgs(**orch_init)
-
-    return orch_args, engine_kwargs
-
-
-def derive_server_dests_from_vllm_parser() -> frozenset[str]:
-    """Derive the set of argparse dests that belong to vllm's frontend/server.
-
-    Returns every dest registered by ``make_arg_parser`` that is NOT a field
-    of ``OmniEngineArgs`` and NOT a field of ``OrchestratorArgs``. Useful for
-    CI tests to assert all CLI flags are classifiable without maintaining
-    a hardcoded server list.
-
-    Returns empty frozenset if vllm's parser cannot be built (e.g. in a
-    minimal test environment).
-    """
-    try:
-        from vllm.entrypoints.openai.cli_args import make_arg_parser
-        from vllm.utils.argparse_utils import FlexibleArgumentParser
-    except ImportError:
-        logger.debug("Cannot import vllm parser — server-dest derivation skipped")
-        return frozenset()
-
-    try:
-        parser = make_arg_parser(FlexibleArgumentParser())
-        all_dests = {a.dest for a in parser._actions if a.dest and a.dest != "help"}
-    except Exception as exc:
-        logger.debug("Failed to build vllm parser: %s", exc)
-        return frozenset()
-
-    engine_fields = {f.name for f in fields(OmniEngineArgs)}
-    orch_fields = orchestrator_field_names()
-
-    return frozenset(all_dests - engine_fields - orch_fields - SHARED_FIELDS)
-
-
-def orchestrator_args_from_argparse(args: Any) -> OrchestratorArgs:
-    """Build an ``OrchestratorArgs`` from an ``argparse.Namespace``.
-
-    Only copies attributes that exist on the namespace — missing fields fall
-    back to the dataclass default. Useful when the full parser is already
-    built and ``vars(args)`` would include noise.
-    """
-    kwargs: dict[str, Any] = {}
-    for f in fields(OrchestratorArgs):
-        if hasattr(args, f.name):
-            value = getattr(args, f.name)
-            if value is not None or f.default is None:
-                kwargs[f.name] = value
-    return OrchestratorArgs(**kwargs)
-
-
-def nullify_stage_engine_defaults(parser: argparse.ArgumentParser) -> None:
-    """Reset stage-level engine flag defaults to ``None``; preserve real
-    default in help text. Only deploy-YAML override fields are touched.
-    Idempotent."""
-    from vllm_omni.config.stage_config import deploy_override_field_names
-
-    override_dests = deploy_override_field_names()
-
-    for action in parser._actions:
-        if action.dest in ("help", "version") or not action.option_strings:
-            continue
-        if action.dest not in override_dests:
-            continue
-        if action.default is None or action.default is argparse.SUPPRESS:
-            continue
-        if action.help and "(default:" not in action.help and "%(default)" not in action.help:
-            action.help = f"{action.help} (default: {action.default})"
-        action.default = None
-
-    parser._omni_nullified = True  # type: ignore[attr-defined]

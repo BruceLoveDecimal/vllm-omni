@@ -27,8 +27,8 @@ pytestmark = [
     pytest.mark.omni,
 ]
 
-_SKIP_ISSUE_3195 = pytest.mark.skip(
-    reason="https://github.com/vllm-project/vllm-omni/issues/3195",
+_SKIP_ISSUE_5652 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/5652",
 )
 
 QUANTIZED_MODEL = "Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound"
@@ -77,7 +77,7 @@ quant_params = [(QUANTIZED_MODEL, stage_config)]
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_3195
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_text_to_text(omni_runner, omni_runner_handler):
@@ -87,7 +87,7 @@ def test_text_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -96,7 +96,7 @@ def test_text_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_3195
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_audio_to_text(omni_runner, omni_runner_handler):
@@ -111,7 +111,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -120,7 +120,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_3195
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_image_to_text(omni_runner, omni_runner_handler):
@@ -133,7 +133,7 @@ def test_image_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -142,7 +142,7 @@ def test_image_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_3195
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_video_to_text(omni_runner, omni_runner_handler):
@@ -155,7 +155,7 @@ def test_video_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -164,7 +164,7 @@ def test_video_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_3195
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_video_to_audio(omni_runner, omni_runner_handler):
@@ -177,7 +177,7 @@ def test_video_to_audio(omni_runner, omni_runner_handler):
         "modalities": ["audio"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
 
 
 # ------------------------------------------------------------------
@@ -185,7 +185,7 @@ def test_video_to_audio(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
-@_SKIP_ISSUE_3195
+@_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_mix_to_audio(omni_runner, omni_runner_handler):
@@ -204,4 +204,4 @@ def test_mix_to_audio(omni_runner, omni_runner_handler):
         "modalities": ["audio"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"

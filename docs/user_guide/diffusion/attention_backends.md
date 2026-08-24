@@ -1,192 +1,195 @@
 # Diffusion Attention Backends
 
-This document describes the diffusion attention backends available in vLLM-Omni, how to select them globally and per-role, and how to use SageAttention.
+Use this page to select and configure a diffusion attention backend. Backend-
+specific installation, tuning, and compatibility details live in separate
+guides so that the selection contract stays easy to scan.
 
-## Overview
+Diffusion attention backend selection applies to DiT attention in image and
+video generation models. It does **not** change autoregressive LLM attention,
+which uses vLLM's attention selector.
 
-Diffusion attention backend selection is resolved in `vllm_omni.diffusion.attention.selector`. It looks up the backend from a structured `AttentionConfig` carried on `OmniDiffusionConfig` and falls back to the platform default when nothing is configured.
+For the internal selector, registry, and platform contract, see
+[Attention Backend Selection](../../design/feature/attention_backend_selection.md).
 
-This backend is used by diffusion attention layers such as the DiT attention in video and image generation models.
+## Choose a guide
 
-On CUDA, the practical choices today are:
+| Need | Guide |
+| --- | --- |
+| Select a conservative or platform-native dense kernel | [Dense Backends](attention_backends/dense_backends.md) |
+| Use FlashInfer trtllm-gen FMHA, Skip-Softmax, or TRTLLM SAGE quantization | [TRTLLM Attention](attention_backends/trtllm.md) |
+| Install and use SageAttention 2.2 or SageAttention3 | [SageAttention](attention_backends/sage.md) |
+| Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
+| Use block-sparse video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
+| Use FastVideo VSA with FastWan2.2-TI2V-5B on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
 
-- `FLASH_ATTN`: FlashAttention backend. This is the default on supported CUDA systems when FlashAttention is installed.
-- `TORCH_SDPA`: PyTorch `scaled_dot_product_attention`.
-- `SAGE_ATTN`: SageAttention backend, if `sageattention` is installed.
+## Backend options
 
-If no attention backend is configured, vLLM-Omni asks the current platform to choose the default. On CUDA, that normally means `FLASH_ATTN` when available, otherwise `TORCH_SDPA`.
-
-## Backend Options
-
-| Value | Notes |
-|---|---|
-| `FLASH_ATTN` | Default on CUDA when FlashAttention is available. Good default for most diffusion workloads. |
-| `TORCH_SDPA` | Most conservative fallback. Useful for debugging or compatibility. |
-| `SAGE_ATTN` | Requires `sageattention`. Can improve performance on some workloads, but output quality must be validated model-by-model. |
+| Value | Family | Primary use | Detail |
+| --- | --- | --- | --- |
+| `TORCH_SDPA` | Dense | Conservative reference; always available | [Dense Backends](attention_backends/dense_backends.md#torch_sdpa) |
+| `FLASH_ATTN` | Dense | FlashAttention 4/3/2 depending on the installed package and GPU | [Dense Backends](attention_backends/dense_backends.md#flash_attn) |
+| `CUDNN_ATTN` | Dense | Mask-heavy DiTs on Blackwell with cuDNN 9.5 or newer | [Dense Backends](attention_backends/dense_backends.md#cudnn_attn) |
+| `FLASHINFER_ATTN` | Dense or quantized | FlashInfer batch prefill; optional mixed Q/K and V dtypes | [Dense Backends](attention_backends/dense_backends.md#flashinfer_attn) |
+| `TRTLLM_ATTN` | Dense, sparse, or quantized | Datacenter Blackwell with `head_dim=128` and compatible packed paths | [TRTLLM Attention](attention_backends/trtllm.md) |
+| `SAGE_ATTN` | Quantized | SageAttention 2.2 INT8 attention | [SageAttention](attention_backends/sage.md#sage_attn) |
+| `SAGE_ATTN_3` | Quantized | SageAttention3 on Blackwell | [SageAttention](attention_backends/sage.md#sage_attn_3) |
+| `FLASH_ATTN_HUB` | Hub kernel | FlashAttention 2 from Hugging Face `kernels` | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
+| `FLASH_ATTN_3_HUB` | Hub kernel | FlashAttention 3 from Hugging Face `kernels` on Hopper or newer | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
+| `RAINFUSION_ATTN` | Block sparse | MindIE-SD RainFusion video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
+| `FASTVIDEO_VSA` | Block sparse | FastVideo variable sparse self-attention for FastWan2.2-TI2V-5B on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
 
 ## Configuration
 
-Diffusion attention backends can be configured three ways, in priority order:
+Backend selection is resolved in this order:
 
-1. **`--diffusion-attention-config`** — structured per-role config (highest priority).
-2. **`--diffusion-attention-backend` / `DIFFUSION_ATTENTION_BACKEND` env var** — global shorthand that sets the default backend.
-3. **Platform default** — used when nothing is configured.
+1. `--diffusion-attention-config` per-role configuration.
+2. `--diffusion-attention-backend` or `DIFFUSION_ATTENTION_BACKEND` as a
+   global default.
+3. The current platform's default.
 
-`--diffusion-attention-backend` is shorthand for `--diffusion-attention-config.default.backend`. It may be combined with `--diffusion-attention-config.per_role.*` overrides, but is mutually exclusive with `--diffusion-attention-config.default.backend`.
+`--diffusion-attention-backend` is shorthand for
+`--diffusion-attention-config.default.backend`. Do not pass it together with an
+explicit `default.backend` in the structured configuration.
 
 ### Global default
 
-Set the default backend for every diffusion attention layer:
-
 ```bash
-# CLI flag
-vllm-omni serve <model> --diffusion-attention-backend SAGE_ATTN
+vllm-omni serve <model> --diffusion-attention-backend FLASH_ATTN
 
-# Environment variable (also recognized for backwards compatibility)
-export DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN
+# Backwards-compatible environment variable
+export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
 ```
 
 ### Per-role configuration
 
-Roles are free-form strings declared by each diffusion model. The two common categories are `"self"` and `"cross"`; model-specific roles (e.g. `"ltx2.audio_to_video"`) may also be declared. A role string is matched in this order:
+Roles are declared by each diffusion model. Common categories are `self` and
+`cross`; a model may also use a more specific role such as
+`ltx2.audio_to_video`. Resolution order is:
 
-1. Exact `per_role[role]` match
-2. `per_role[role_category]` fallback (e.g. `"ltx2.audio_to_video"` → `"cross"`)
-3. `default`
-4. Platform default
-
-Use vLLM-style dotted flags or one JSON blob:
+1. Exact `per_role[role]` match.
+2. Category `per_role[role_category]` match.
+3. `default`.
+4. Platform default.
 
 ```bash
 # Dotted flags
 vllm-omni serve <model> \
-    --diffusion-attention-config.default.backend FLASH_ATTN \
-    --diffusion-attention-config.per_role.cross.backend TORCH_SDPA
+  --diffusion-attention-config.default.backend FLASH_ATTN \
+  --diffusion-attention-config.per_role.cross.backend TORCH_SDPA
 
-# JSON
+# Equivalent JSON
 vllm-omni serve <model> \
-    --diffusion-attention-config '{"default":{"backend":"FLASH_ATTN"},"per_role":{"cross":{"backend":"TORCH_SDPA"}}}'
+  --diffusion-attention-config \
+  '{"default":{"backend":"FLASH_ATTN"},"per_role":{"cross":{"backend":"TORCH_SDPA"}}}'
 ```
 
-Backends may also accept backend-specific parameters via `extra`:
-
-```bash
---diffusion-attention-config.per_role.self.backend SPARSE_BLOCK \
---diffusion-attention-config.per_role.self.extra.block_size 128
-```
-
-### Programmatic API
-
-When constructing `OmniDiffusionConfig` directly:
+### Python API
 
 ```python
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionSpec,
+    OmniDiffusionConfig,
+)
 
 config = OmniDiffusionConfig(
-    attention_config=AttentionConfig(
+    diffusion_attention_config=AttentionConfig(
         default=AttentionSpec(backend="FLASH_ATTN"),
-        per_role={
-            "cross": AttentionSpec(backend="TORCH_SDPA"),
-        },
+        per_role={"cross": AttentionSpec(backend="TORCH_SDPA")},
     ),
     ...,
 )
 ```
 
-A plain dict is also accepted and normalized to `AttentionConfig`.
+Backend-specific typed blocks are documented with their consumers:
+
+- `quant`: [FlashInfer](attention_backends/dense_backends.md#flashinfer-quantized-attention)
+  and [TRTLLM SAGE](attention_backends/trtllm.md#sage-quantization).
+- `skip_softmax`: [TRTLLM Skip-Softmax](attention_backends/trtllm.md#skip-softmax).
+- `block_sparse`: [RainFusion](attention_backends/rainfusion.md#configuration).
+- `fastvideo_vsa_topk`: [FastVideo VSA](attention_backends/fastvideo_vsa.md#choose-top-k).
+
+## Platform defaults
+
+### Blackwell (sm_100 / sm_103 / sm_120 / sm_121)
+
+The CUDA auto-route preference is:
+
+1. `TRTLLM_ATTN` on datacenter Blackwell (sm_100/sm_103) when FlashInfer is
+   available, `head_dim=128`, and the model declares a compatible packed or
+   mask-free path.
+2. `CUDNN_ATTN` when cuDNN 9.5 or newer is available.
+3. `FLASHINFER_ATTN` when FlashInfer is available but cuDNN is too old.
+4. `FLASH_ATTN` when a compatible package is installed.
+5. `TORCH_SDPA`.
+
+`TRTLLM_ATTN` is not auto-selected on workstation Blackwell
+(sm_120/sm_121), for other head dimensions, or for paths that require an
+unsupported mask.
+
+### Hopper, Ada, and Ampere
+
+The CUDA auto-route uses `FLASH_ATTN` when available and otherwise falls back
+to `TORCH_SDPA`. `CUDNN_ATTN` and `FLASHINFER_ATTN` remain explicit options.
+
+Other platforms validate an explicit backend and choose their own default
+through the platform implementation. Check the startup log to confirm the
+resolved backend.
+
+## Choosing a backend manually
+
+Override the platform default when you need:
+
+- a correctness reference (`TORCH_SDPA`);
+- a backend-specific workaround;
+- training/rollout kernel alignment (Hub backends); or
+- an explicitly validated sparse or quantized speedup.
+
+The startup log prints the resolved backend and whether it came from explicit
+configuration or platform defaulting. If no resolution message appears, check
+earlier logs for diffusion-stage initialization failures.
+
+## Reference benchmark
+
+The following BF16 results were measured on an sm_120 RTX Pro 6000 Blackwell
+with the same prompt and seed across runs. Treat them as reference results, not
+portable guarantees.
+
+| Model | Shape | `TORCH_SDPA` | `CUDNN_ATTN` | `FLASHINFER_ATTN` |
+| --- | --- | ---: | ---: | ---: |
+| HunyuanVideo-1.5 (T2V) | 480p / 33f / 50 steps | 147.05 s | **73.02 s** | 127.84 s |
+| Wan 2.2 14B (T2V) | 480p / 33f / 40 steps | 117.75 s | 117.17 s | **115.07 s** |
+| Qwen-Image (T2I) | 1024² / 50 steps | 17.41 s | **15.14 s** | 16.02 s |
+| FLUX.2-dev (T2I) | 1024² / 50 steps, TP=2 | 53.62 s | **53.30 s** | 54.94 s |
+
+Mask-heavy DiTs favored `CUDNN_ATTN`; lighter-mask or TP-saturated workloads
+were close enough that users should benchmark their exact model and shape.
+
+## Compatibility anchors
+
+The following headings preserve links to sections that moved into dedicated
+guides.
+
+## TRTLLM_ATTN Backend and Skip-Softmax
+
+See [TRTLLM Attention](attention_backends/trtllm.md#skip-softmax).
+
+## TRTLLM_ATTN SAGE Quantization
+
+See [TRTLLM Attention](attention_backends/trtllm.md#sage-quantization).
+
+## RAINFUSION_ATTN Backend and Block-Sparse Video Attention
+
+See [RainFusion](attention_backends/rainfusion.md).
 
 ## SageAttention Installation
 
-vLLM-Omni expects SageAttention to be installed into the same Python environment as vLLM-Omni.
+See [SageAttention](attention_backends/sage.md#installation).
 
-Build from source:
+## SageAttention3 Installation
 
-```bash
-git clone https://github.com/thu-ml/SageAttention.git
-cd SageAttention
+See [SageAttention](attention_backends/sage.md#sageattention3-installation).
 
-export EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=32
-pip install . --no-build-isolation
-```
+## HuggingFace Kernels Hub Backends
 
-Quick check:
-
-```bash
-python -c "import sageattention; print(sageattention.__file__)"
-```
-
-## Usage
-
-### Enable SageAttention
-
-Example: HunyuanVideo-1.5 text-to-video
-
-```bash
-DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN python examples/offline_inference/text_to_video/text_to_video.py \
-    --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v \
-    --prompt "A dog running across a field of golden wheat." \
-    --height 480 --width 832 --num-frames 33 \
-    --num-inference-steps 30 --seed 42 --guidance-scale 6.0 \
-    --tensor-parallel-size 2 \
-    --output ../tmp/hv15_modelopt_sage.mp4
-```
-
-Example: Wan2.2 TI2V 5B
-
-```bash
-DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN python examples/offline_inference/text_to_video/text_to_video.py \
-    --model Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-    --prompt "A dog running across a field of golden wheat." \
-    --height 704 --width 1280 --num-frames 49 \
-    --num-inference-steps 30 --seed 42 --guidance-scale 5.0 \
-    --tensor-parallel-size 2 \
-    --output outputs/wan22_sage.mp4
-```
-
-### Mixed backends across roles
-
-Use `FLASH_ATTN` for self-attention and `TORCH_SDPA` for cross-attention:
-
-```bash
-python examples/offline_inference/text_to_video/text_to_video.py \
-    --model Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-    --prompt "A dog running across a field of golden wheat." \
-    --diffusion-attention-config.per_role.self.backend FLASH_ATTN \
-    --diffusion-attention-config.per_role.cross.backend TORCH_SDPA \
-    --tensor-parallel-size 2 \
-    --output outputs/wan22_mixed.mp4
-```
-
-### Compare against FlashAttention
-
-Unset the backend override, or explicitly use `FLASH_ATTN`:
-
-```bash
-python examples/offline_inference/text_to_video/text_to_video.py \
-    --model Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-    --prompt "A dog running across a field of golden wheat." \
-    --height 704 --width 1280 --num-frames 49 \
-    --num-inference-steps 30 --seed 42 --guidance-scale 5.0 \
-    --tensor-parallel-size 2 \
-    --output outputs/wan22_fa3.mp4
-```
-
-## Validation Guidance
-
-Do not assume that a faster attention backend is numerically interchangeable with `FLASH_ATTN`.
-
-Always compare:
-
-- End-to-end runtime
-- DiT / diffusion stage runtime
-- Output quality against a known-good baseline
-
-At minimum, keep the same:
-
-- model
-- prompt
-- seed
-- resolution
-- frame count
-- inference steps
-- parallel config
+See [Hugging Face Hub Backends](attention_backends/huggingface_hub.md).

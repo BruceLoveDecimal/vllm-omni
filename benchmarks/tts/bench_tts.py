@@ -53,6 +53,8 @@ _TASK_TO_DATASET: dict[str, str] = {
     "voice_clone": "seed-tts",
     "default_voice": "seed-tts-text",
     "voice_design": "seed-tts-design",
+    "dialogue": "ttsd",
+    "sound_effect": "sound-effect",
 }
 
 # Default design dataset path (bundled with the repo)
@@ -81,12 +83,18 @@ def build_bench_args(
     output_dir: str | None,
     result_filename: str | None,
     extra_cli_args: list[str],
+    output_len: int | None = None,
+    served_model_name: str | None = None,
+    num_warmups: int = 2,
+    request_seed: int | None = None,
 ) -> list[str]:
     """Build the ``vllm bench serve --omni`` command for one (task, concurrency) run."""
     dataset_name = _TASK_TO_DATASET[task]
     backend: str = model_cfg["backend"]
     endpoint: str = model_cfg["endpoint"]
-    task_extra_body: dict[str, Any] = (model_cfg.get("task_extra_body") or {}).get(task) or {}
+    task_extra_body: dict[str, Any] = dict((model_cfg.get("task_extra_body") or {}).get(task) or {})
+    if request_seed is not None:
+        task_extra_body["seed"] = request_seed
 
     # Resolve dataset path
     if dataset_path:
@@ -106,7 +114,7 @@ def build_bench_args(
         "--port",
         str(port),
         "--model",
-        model,
+        served_model_name or model,
         "--backend",
         backend,
         "--endpoint",
@@ -116,9 +124,9 @@ def build_bench_args(
         "--num-prompts",
         str(num_prompts),
         "--num-warmups",
-        "2",
+        str(num_warmups),
         "--percentile-metrics",
-        "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "ttft,e2el,audio_rtf,audio_ttfp,audio_duration,audio_underrun",
     ]
 
     if resolved_dataset_path:
@@ -130,11 +138,17 @@ def build_bench_args(
     if task_extra_body:
         cmd += ["--extra-body", json.dumps(task_extra_body, separators=(",", ":"))]
 
+    if model_cfg.get("trust_remote_code"):
+        cmd.append("--trust-remote-code")
+
     if concurrency is not None:
         cmd += ["--max-concurrency", str(concurrency), "--request-rate", "inf"]
 
     if wer_eval:
         cmd.append("--seed-tts-wer-eval")
+
+    if output_len is not None:
+        cmd += ["--hf-output-len", str(output_len)]
 
     if output_dir or result_filename:
         out_dir = output_dir or "."
@@ -143,7 +157,8 @@ def build_bench_args(
         if result_filename:
             cmd += ["--result-filename", result_filename]
 
-    cmd += extra_cli_args
+    passthrough = extra_cli_args[1:] if extra_cli_args[:1] == ["--"] else extra_cli_args
+    cmd += passthrough
     return cmd
 
 
@@ -216,6 +231,12 @@ def main() -> None:
     parser.add_argument(
         "--model", required=True, help="HuggingFace model ID (e.g. Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)"
     )
+    parser.add_argument(
+        "--served-model-name",
+        default=None,
+        help="Model name/path accepted by the running server. Use this when --model selects a registry entry "
+        "but the server was launched from a local bundle path.",
+    )
     parser.add_argument("--task", default="all", help="Task type: voice_clone | default_voice | voice_design | all")
     parser.add_argument("--locale", default="en", choices=["en", "zh"])
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4], metavar="N")
@@ -227,6 +248,13 @@ def main() -> None:
         metavar="N",
         help="Number of prompts per run. If one value, applied to all concurrency levels.",
     )
+    parser.add_argument("--num-warmups", type=int, default=2, help="Warmup requests before each measured run")
+    parser.add_argument(
+        "--request-seed",
+        type=int,
+        default=None,
+        help="Optional model sampling seed added to every request body for reproducible quality runs",
+    )
     parser.add_argument(
         "--dataset-path", default=None, help="Root of seed-tts-eval dataset (required for voice_clone/default_voice)"
     )
@@ -235,8 +263,20 @@ def main() -> None:
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-configs", default=str(_DEFAULT_MODEL_CONFIGS), help="Path to model_configs.yaml")
+    parser.add_argument(
+        "--output-len",
+        type=int,
+        default=None,
+        help="Override per-request max_new_tokens forwarded to the server "
+        "(seed-tts datasets default to 2048; the MOSS-TTS full talker takes "
+        "this as 'max_new_frames' so smaller values cap audio length per "
+        "request and keep bench runtime tractable).",
+    )
     parser.add_argument("extra", nargs=argparse.REMAINDER, help="Extra args passed directly to vllm bench serve")
     args = parser.parse_args()
+
+    if args.num_warmups < 0:
+        parser.error("--num-warmups cannot be negative")
 
     model_configs = load_model_configs(Path(args.model_configs))
     if args.model not in model_configs:
@@ -289,6 +329,10 @@ def main() -> None:
                 output_dir=args.output_dir,
                 result_filename=result_filename,
                 extra_cli_args=args.extra or [],
+                output_len=args.output_len,
+                served_model_name=args.served_model_name,
+                num_warmups=args.num_warmups,
+                request_seed=args.request_seed,
             )
             result = run_one_benchmark(cmd)
             if result is not None:
