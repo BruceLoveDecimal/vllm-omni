@@ -1,6 +1,9 @@
 # NemotronVoiceChat Code2Wav (Vocoder) Streaming Optimization
 
-> **Status:** proposal / spec, revision 2. Rewritten against the in-flight
+> **Status:** proposal / spec, revision 3. Revision 3 adds an informative
+> pipeline-level roadmap and a duplex frame-budget analysis (last section)
+> and records P2's dependency on the in-flight PRs; the normative scope
+> (the vocoder phases) is unchanged. Revision 2 rewrote against the in-flight
 > upstream work: [#6089](https://github.com/vllm-project/vllm-omni/pull/6089)
 > (native full-duplex serving, approved, pending conflict resolution) and
 > [#6354](https://github.com/vllm-project/vllm-omni/pull/6354) (draft,
@@ -167,6 +170,19 @@ batch trivially:
 - Batch math must remain bit-equal to the sequential per-request decode;
   unseen shapes fall back to eager.
 
+**Dependency on the in-flight PRs.** P2's *mechanism* requires the
+per-request cache path to exist — exact-shape buckets only form when
+chunks have a fixed shape, and the objects being stacked are the
+`CausalConv1dCache` instances those PRs create. Either PR satisfies this:
+#6089 covers duplex payloads (`meta.codec_streaming`), #6354 adds the
+offline async-chunk knob. P2's *value*, however, depends on #6354
+specifically: it is the only branch that runs multi-session serving (its
+probe drives 4 concurrent sessions), while merged main and #6089's default
+deployment are single-session (`max_num_seqs: 1`) — there is nothing to
+batch without it. Development can proceed stacked on the #6354 head;
+upstream merge waits for the base to land. P3 items 1–4 are the
+dependency-free lane: they touch only code already on main.
+
 ### P3 — Micro-optimizations
 
 Independent, individually benchmarked; none are touched by the in-flight
@@ -279,3 +295,101 @@ reports TTFP before/after.
 - P2 is inert for single-session deployments and cannot regress them (G3).
 - Each phase remains a separate PR with the current behavior as default-off
   until its acceptance table is green on H100.
+
+## Pipeline roadmap beyond the vocoder (informative)
+
+> This section is informative context, not part of this spec's normative
+> scope (which remains the vocoder phases above). It records where the rest
+> of the pipeline stands after #6354 and why the duplex deployment — the
+> model's core use case — is a deadline problem rather than a throughput
+> problem, so that vocoder work is prioritized by its contribution to that
+> deadline.
+
+### Where the time goes after #6354
+
+Per-stage warm timings from the #6354 recipe (196-frame / 15.7 s fixture,
+1× H100, all stages on one GPU):
+
+| config | thinker | talker | code2wav | total | RTF |
+|---|---|---|---|---|---|
+| parity (merged default) | fp32 eager, 3.35 s | fp32 eager, 6.7 s | 0.06 s | 10.3 s | 0.66 |
+| fast | bf16 + vLLM graphs, 1.8 s | fp32 + step graph, 2.5 s | 0.06 s | 4.4 s | 0.28 |
+| fast_streaming | same, stages overlap | same | incremental | **5.2 s** | 0.33 |
+| native talker (experimental) | same | fp32 paged KV + MoG graph, 1.7 s | 0.06 s | 3.7 s | 0.23 |
+
+Two readings matter. First, offline, the codec is 0.06 s — negligible; the
+vocoder phases above are motivated by streaming real-time behavior and
+multi-session cost, not by the offline share. Second, streaming overlap is
+currently a *net loss* offline (5.2 s vs 4.4 s): three engines contending
+on one GPU with `async_scheduling: false` — evidence that scheduling, not
+kernel math, is a first-class cost.
+
+### Duplex is a deadline problem, not a throughput problem
+
+The duplex contract is a hard frame clock: consume one 80 ms audio frame
+and produce one 80 ms audio frame, every 80 ms, indefinitely. The metric
+that decides viability is the **per-frame wall time distribution against
+the 80 ms deadline** — averages and offline RTF say nothing (RTF 0.23
+offline coexists with a missed frame clock).
+
+#6354's own native-talker numbers show the current margin is negative:
+median inter-packet gap ~81 ms (already past the budget), p95 ~110 ms,
+"RTF ~1.01". The session stays audible only because the first chunk banks
+~400 ms of client-side buffer, which then drains ~1 ms per median frame
+and ~30 ms per p95 spike: long responses arithmetically end in underruns,
+and every transient (a capture-miss eager talker step costs 25–34 ms wall
+for ~9 ms of GPU work — a third of the budget in one spike) lands on the
+user. A further consequence: at ~1.0 RTF per session, multi-session duplex
+capacity is zero regardless of batching.
+
+Per-frame budget composition (one tick): perception step (cache-aware
+conformer, streaming state landed in #6089) + thinker decode step (bf16 +
+vLLM graphs) + talker step (~8.7–11 ms fp32 graph; +8.5 ms with CFG) +
+codec share + data-plane/host overhead. The gap between summed GPU work
+and the ~81 ms median wall strongly suggests host-side scheduling and
+transport dominate the tick — which is the first thing to verify.
+
+### Ranked levers
+
+- **R0 — Instrument the tick.** Per-stage timeline within each 80 ms frame,
+  deadline-miss accounting, p99 and underrun counters over a long soak.
+  Jitter cannot be fixed unattributed; everything below is re-ranked by
+  this data.
+- **R1 — Talker bf16.** The largest per-frame GPU term (and 46 % of the
+  offline total) is still fp32; the thinker's bf16 move bought ~2× and the
+  same lever is unplayed here. Guarded by the code2wav out-of-range
+  tripwire and the paired-ASR harness #6354 established. Also halves talker
+  weights — memory headroom for multi-session.
+- **R2 — Host-path slimming per tick.** Per-frame producer/scheduler
+  overhead, cumulative payload re-ship (the thinker→talker timeline has the
+  same O(T²) shape as the codes; codes covered by P1.2), `.cpu()` syncs
+  (P3.3), and codec burst smoothing: with the incremental cache, per-frame
+  decode (`codec_chunk_frames: 1`) becomes affordable and converts the
+  every-N-frames codec burst into a flat ~0.3 ms/frame cost — directly a
+  jitter lever, and a vocoder deliverable of P1.
+- **R3 — Contention and capture control.** CUDA stream priorities /
+  async scheduling / stage placement for the three engines sharing one
+  GPU (the 5.2 s vs 4.4 s regression is the smoking gun); pre-capture all
+  bucket shapes so no live session ever hits the 25–34 ms eager-fallback
+  spike.
+- **R4 — CFG batch-doubling.** When guidance is enabled, fold the
+  unconditional stream into the native batch instead of mirroring a second
+  HF StaticCache backbone (+8.5 ms/frame today, and extra sessions fall
+  back to eager under CFG).
+- **R5 — Multi-session.** Only meaningful once R1–R3 push per-session
+  p99 well under the frame budget; then P2 (codec batching) plus batched
+  talker stepping set the sessions-per-GPU slope.
+
+### Proposed duplex SLOs (to ratify with maintainers)
+
+| # | Metric | Target |
+|---|--------|--------|
+| D1 | Per-frame wall time, p99 over a ≥ 30 min soak | ≤ 72 ms (0.9 × frame budget) |
+| D2 | Audio underruns with a ≤ 400 ms client buffer, per 30 min | 0 |
+| D3 | TTFP (session start → first audio packet) | ≤ 500 ms |
+| D4 | Session capacity: max N sessions each meeting D1–D2 | reported per config |
+
+The current native head misses D1 at the median (81 ms), so these are
+targets for the R-series, not a description of today; they give the
+vocoder phases their acceptance context — P1's per-frame smoothing and P3's
+sync removal are judged by their D1/D2 contribution, not offline seconds.
