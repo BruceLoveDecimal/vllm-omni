@@ -75,6 +75,7 @@ The design contracts separate selection mechanics from backend algorithms:
 
 - [Prometheus Metrics](metrics.md)
 - [Speech Generation Performance Optimizations](qwen3_omni_tts_performance_optimization.md)
+- [NemotronVoiceChat Vocoder Streaming Optimization (spec)](nemotron_voicechat_vocoder_optimization.md)
 
 ## Module Design Documents
 
