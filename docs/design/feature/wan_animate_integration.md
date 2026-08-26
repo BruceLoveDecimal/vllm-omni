@@ -24,13 +24,22 @@
      latent 跑一遍 transformer("extract" 前向)填充**逐层 KV cache**,去噪时每个
      生成 token 通过 flex-attention BlockMask 同时 attend
      `[生成 token | 同帧对齐的参考 K/V]`(diffusers v0.40,modular-only)。
-3. 推荐接入方式:**原生管线移植(Path A/B 混合)**,新建
-   `vllm_omni/diffusion/models/wan_animate2/`,复用 wan2_2 模块的组件加载与
-   S2V 的分段迭代骨架;transformer 需自研适配(KV-cache 两阶段前向 + 参考注意力,
-   建议用"双注意力 + LSE 合并"替代 flex-attention 硬依赖,见 §5.3)。
-4. 输入通路是 Animate-2 的一大利好:参考图 + 单个驱动视频恰好落在 serving 层
-   **现有的** `image_reference` + `video_reference` 表单能力内,无需扩展 API 面
-   (v1 需要多视频输入扩展,见附录 A)。
+3. **与 Wan2 系列现有四条管线的根本差异**(§2.2):T2V/I2V/S2V/VACE 都是
+   "给条件、生成新内容",Animate 是"驱动视频 → 动作/表情迁移";条件注入上,
+   前者是特征拼接 / 特征注入 / 旁路分支,Animate-2 是**上下文注意力**;
+   长度上 Animate-2 与 S2V 同为分段自回归;拓扑上它是单 transformer
+   (无 T2V/I2V 的 MoE 双模型 + `boundary_ratio`);执行上它是
+   **两阶段前向**(extract + 去噪),为仓库现有执行模型所无。
+4. **必须新增 pipeline,不能复用/继承任何现有 Wan 管线**(§4.1):forward 契约
+   (多出 extract 阶段与 KV cache 生命周期)、条件构造、注意力机制三者均不兼容。
+   但**复用面很大**(§4.3):组件加载、分段循环骨架、条件 mask 公式、TP 化主干
+   block、并行声明均可照搬;真正新写的只有 KV cache 容器 + 两阶段前向 API(§5.2)
+   与参考注意力(§5.3,建议用"双注意力 + LSE 合并"替代 flex-attention 硬依赖)。
+   Animate-1 与 Animate-2 之间同样无法共用管线类。
+5. **新增输入仅一项**:驱动视频(原始视频,无需预提取),走既有
+   `multi_modal_data["video"]`;参考图走 `["image"]`。二者恰好落在 serving 层
+   **现有的** `image_reference` + `video_reference` 能力内,**在线服务零 API 扩展**
+   (§2.4 / §4.5)。相比之下 v1 需要 face/background/mask 三路额外视频输入(附录 A)。
 
 ## 2. 仓库现状
 
@@ -44,7 +53,53 @@
   `DiffusionPipeline`;Animate-2 的 Diffusers 仓库是 modular 格式
   (`modular_model_index.json`,blocks = `WanAnimate2Blocks`),**兜底路径不可用**。
 
-### 2.2 可复用的原生实现资产
+### 2.2 与 Wan2 系列现有管线的定位与机制差异
+
+一句话:仓库现有四条 Wan2.2 管线都是"给条件、生成新内容",而 Animate 是
+"给一段驱动视频、把其中的动作与表情迁移到指定人物",本质是动作重定向
+(motion retargeting);Animate-2 相较 Animate-1 又变了一次范式,把条件从
+**特征注入**改成了**上下文注意力**。这决定了它无法复用任何一条现有管线(§4.1)。
+
+**任务与条件源**:T2V 只有文本;I2V 多一张首帧图;S2V 多一段音频(驱动口型与
+身体节奏);VACE 是结构化视频 + mask 的局部编辑/重绘。Animate 的条件源是**一整段
+人物表演视频**,信息量高一个量级——需同时保留驱动视频的逐帧姿态/肢体/表情,
+与参考图人物的身份/服装/外貌。
+
+**条件注入机制**(最核心的架构分野):
+
+| 管线 | 条件如何进入 DiT | 机制类别 |
+|---|---|---|
+| I2V | 首帧 latent + 4 通道 mask 与噪声**通道拼接**(`in_channels=36`),条件与噪声同网格 | 特征拼接 |
+| S2V | 音频编码为独立 token 流,每隔几层一次 **cross-attention 注入**(`audio_inject_layers` 默认 8 层) | 特征注入 |
+| VACE | 条件走**旁路 `vace_blocks`**,结果以残差加回主干 | 旁路分支 |
+| Animate-1 | pose latent 逐元素加到主干;face token 每 5 层一次**逐帧对齐 cross-attention** | 特征注入 |
+| **Animate-2** | **驱动视频先跑一遍完整 DiT,存下 40 层 K/V 作参考上下文;去噪 token 直接 attend 这些 K/V** | **上下文注意力** |
+
+前四种都是"把条件压缩成特征,再想办法喂给主干";Animate-2 不压缩,而是让驱动视频与
+被生成视频**在同一注意力空间内逐帧对话**,更接近 LLM 的 in-context learning 而非
+ControlNet 式条件注入。代价是需维护 40 层 KV cache,显存开销极大(§8 风险 3)。
+
+**输入契约的简化**:Animate-1 要求用户**预先跑骨架提取与人脸裁剪**(pose 视频 +
+512×512 face 视频两路),Animate-2 直接吃原始驱动视频,预处理全部内化——这是
+Animate-2 对服务端最友好的一点(§4.5)。
+
+**生成长度机制**:T2V / I2V / VACE 单次生成固定帧数(通常 81 帧),长视频靠外部拼接;
+S2V 与 Animate 系列均为**分段自回归**(每段解码回像素、取末尾若干帧重新过 VAE 作为
+下段条件),可生成任意长度。Animate-2 段长 81 帧、段间重叠 1 帧。这一点直接决定了
+多卡下 VAE 解码必须显式 broadcast(S2V 已有该代码),且与连续批处理基本互斥。
+
+**Transformer 拓扑**:T2V / I2V 是 Wan2.2 的 **MoE 双 transformer**
+(high-noise + low-noise,靠 `boundary_ratio` 按 timestep 切换);S2V 与 Animate 系列
+均为**单 transformer**,无 `boundary_ratio`——因此 I2V 的双模型加载与 Cache-DiT
+分段刷新逻辑对 Animate-2 不适用。
+
+**执行模式**:现有全部 diffusion 管线都是单一的"N 步去噪循环"。Animate-2 是
+**两阶段**——每段先跑一次 `extract` 前向(timestep 固定 1、用固定参考提示词,
+只为填 KV cache),再跑 N 步去噪前向,每段实际前向次数为 `1 + N×CFG分支数`,
+中间夹一块段生命周期的大显存。这是 vLLM-Omni 现有执行模型中没有的形态,
+最接近的先例是 S2V 的 `transformer.encode_audio()` 段级预计算(但轻量得多)。
+
+### 2.3 可复用的原生实现资产
 
 | 已有机制 | 位置 | Animate-2 对应 |
 |---|---|---|
@@ -57,12 +112,29 @@
 | 视频多模态输入 pre-process 模板 | VACE `pipeline_wan2_2_vace.py:108-183` | 驱动视频归一化 |
 | `SupportsComponentDiscovery` / `_sp_plan` / `_hsdp_shard_conditions` / TP 化 Wan block | I2V + `wan2_2_transformer.py` | 直接参照(S2V 漏了 ComponentDiscovery 与 packed_modules_mapping,新管线要补) |
 
-### 2.3 输入通路现状
+### 2.4 输入通路现状
 
-媒体只走 `prompt["multi_modal_data"]`(`"image"` / `"video"` / `"audio"`);
+媒体只走 `prompt["multi_modal_data"]`(约定键 `"image"` / `"video"` / `"audio"`),
+`OmniDiffusionSamplingParams` 不携带媒体;非标准键由各模型的 pre-process 函数归一到
+`prompt["additional_information"]`(S2V 的 `pose_video` / `init_first_frame` 即此模式)。
+
 serving 层 `serving_video.py:187-195` 已映射 `image_reference → image`、
-`video_reference → video`。Animate-2 需要的正是这两个,**在线服务零 API 扩展**。
-`ReferenceVideoDecodeSpec`(`models/interface.py:33`)可声明驱动视频解码帧数上限。
+`video_reference → video`、`audio_reference → audio`,即**每种模态各一路引用**。
+各 Wan 管线对该通路的占用情况:
+
+| 管线 | image | video | audio | 是否需扩展 API |
+|---|---|---|---|---|
+| T2V | — | — | — | 否 |
+| I2V | 首帧(+可选 `last_image` 走 `multi_modal_data`) | — | — | 否 |
+| S2V | 参考图 | (`pose_video` 已预留但管线未实现) | 音频 | 否 |
+| VACE | 参考图 | 条件视频 + mask | — | 否(mask 走 `multi_modal_data`) |
+| **Animate-2** | **参考图** | **驱动视频** | — | **否——零扩展** |
+| Animate-1 | 参考图 | pose 视频 | — | **是**:另需 face / background / mask 三路视频 |
+
+**Animate-2 恰好落在现有能力内**,这是它相对 Animate-1 的一大工程优势;
+Animate-1 则必须扩展多视频引用字段(附录 A)。
+`ReferenceVideoDecodeSpec`(`models/interface.py:33`)可声明驱动视频解码帧数上限,
+Cosmos3 有实现先例。
 
 ## 3. Wan2.2-Animate-2-14B 模型架构
 
@@ -93,7 +165,7 @@ ckpts/
 `scheduler`、`guider`(CFG 3.0 基础版 / 1.0 蒸馏版)。
 
 基础版预设:40 步 + CFG 3.0;蒸馏版:10 步、无 CFG、注意力 score_mod
-`log_scale=-1.3`(见 §3.4)。官方 demo 默认 `clip_len=81`、`fps=24`、
+`log_scale=-1.3`(见 §3.2)。官方 demo 默认 `clip_len=81`、`fps=24`、
 720×1280(diffusers modular 默认 800×640 目标面积)、`shift=5.0`。
 
 ### 3.2 Transformer(`WanAnimate2Transformer3DModel` / 官方 `WanxiangAnimate2Transformer`)
@@ -172,11 +244,35 @@ ckpts/
 
 ## 4. 接入总体设计
 
-### 4.1 迁移路径与 checkpoint 格式选择
+### 4.1 迁移路径判定:为什么必须新增 pipeline
+
+**结论:必须新增 pipeline + transformer 两个新模块,且不能复用/继承现有任何一条
+Wan 管线。**
+
+表层原因是注册机制——`registry.py` 的 `_DIFFUSION_MODELS` 按 `model_index.json` 的
+`_class_name` 一对一映射,新模型必然要新 key。但真正的硬约束是下面三条,它们决定了
+即便退而求其次去继承 `Wan22S2VPipeline` 也不可行:
+
+1. **`forward()` 契约不同**。Animate-2 每段多出 `extract_reference()` 阶段与 KV cache
+   的生命周期管理(创建 → 跨全部去噪步复用 → 段末释放),无法塞进 S2V 单阶段
+   forward 的结构;S2V 的 `encode_audio` 虽也是段级预计算,但它输出的是一个小张量,
+   不是需要跨步驻留、参与每层注意力的大块状态。
+2. **条件构造不同**。S2V 是"参考图 latent 作独立 token 流 + 音频 cross-attn",
+   Animate-2 是"参考图占 latent 帧 0 + 驱动视频进 KV cache",两者的张量形状、
+   序列组装方式、mask 语义都对不上,没有可共用的 `prepare_latents`。
+3. **注意力机制不同**。这不是"在 Wan block 上加几个模块"(那样尚可继承,Animate-1
+   就属于此类),而是 self-attention 本身要拼接外部 K/V 并施加帧对齐掩码——属于
+   主干级改动,`WanTransformerBlock` 的 forward 必须重写。
+
+反过来说,**Animate-1 与 Animate-2 之间同样不能共用管线类**:两者除同属角色动画
+任务外,在输入契约、条件注入、transformer 结构上没有任何共享面(§2.2 对比表)。
+若后续同时支持,应是两条独立管线(附录 A)。
 
 按 `add-diffusion-model` skill 的 Step 0 分类,Animate-2 属 **Hybrid**:
 Diffusers 仓库组件标准(UMT5 / `AutoencoderKLWan` / `CLIPVisionModel` 均为仓库
 已用依赖),但管线与 transformer 无标准 `DiffusionPipeline` 可搬,需自研。
+
+### 4.2 checkpoint 格式选择
 
 **首版建议只支持 Diffusers 格式仓库**(`Wan2.2-Animate-2-14B-Diffusers` 与
 Distilled),理由:组件加载与 I2V 现有代码同构、权重为 diffusers 命名的
@@ -185,7 +281,7 @@ T5/VAE/CLIP `.pth`)按需求二期补,模式照抄 S2V `_init_original_format()`
 (含 `_convert_wan_t5_state_dict`;CLIP 需加载 xlm-roberta CLIP,S2V 无先例,
 I2V 原始格式亦未支持 —— 这也是推迟原始格式的原因之一)。
 
-### 4.2 文件布局与注册
+### 4.3 文件布局、复用边界与注册
 
 ```
 vllm_omni/diffusion/models/wan_animate2/
@@ -196,9 +292,24 @@ vllm_omni/diffusion/models/wan_animate2/
 ```
 
 独立目录而非塞进 `wan2_2/`:两阶段前向、参考注意力与 KV cache 使 transformer
-结构性偏离基础 Wan DiT;但通过 import 复用 `wan2_2` 的
-`DistributedRMSNorm`、`WanFeedForward`、`load_transformer_config` 工厂模式与
-latent 标准化助手。
+结构性偏离基础 Wan DiT。
+
+**复用边界**——尽管必须新增管线,真正从零写的只有两块,工作量远小于"新模型"的直觉:
+
+| 部分 | 处置 | 来源 / 说明 |
+|---|---|---|
+| 组件加载(tokenizer / UMT5 / VAE / CLIP) | **照搬** | I2V `pipeline_wan2_2_i2v.py` 的 `has_image_encoder` 探测与 `from_pretrained` 模式;全是仓库已有依赖 |
+| 分段循环骨架(段级 generator 派生、每段重置 scheduler、VAE broadcast、段间 `empty_cache()`) | **照搬** | S2V `forward()` 1316–1460,含已踩过坑的多卡细节 |
+| 段级 DiT 预计算的护栏(CPU-offload 手动搬运、FSDP `unshard/reshard`) | **照搬** | S2V 1362–1381 / transformer 1491–1523 |
+| 条件 mask 构造 `cat([mask4, latent16])` | **照搬公式** | I2V `prepare_latents` 876–978,与 Animate-2 的 `y` 同式 |
+| 驱动视频 pre-process 归一化 | **改写** | VACE `pipeline_wan2_2_vace.py:108-183` 为模板,换成 letterbox + fps 重采样 + zigzag padding |
+| 主干 40 层 block(self-attn / cross-attn / FFN / adaLN) | **继承 + 局部重写** | 与基础 Wan block 同构,TP 化实现(`QKVParallelLinear` / `RowParallelLinear` / `DistributedRMSNorm` / `WanFeedForward`)可直接复用,**TP 支持几乎免费**;仅 self-attn 的 K/V 拼接部分需重写 |
+| 并行声明(`_sp_plan` / `_hsdp_shard_conditions` / `SupportsComponentDiscovery` / `packed_modules_mapping`) | **照填** | I2V + `wan2_2_transformer.py`;S2V 漏了后两项,新管线补上 |
+| **KV cache 容器 + 两阶段前向 API** | **新写** | §5.2 |
+| **参考注意力(帧对齐 + 去 flex-attention 化)** | **新写** | §5.3,核心难点 |
+
+从 `wan2_2` 模块 import 复用的具体符号:`DistributedRMSNorm`、`WanFeedForward`、
+`load_transformer_config` 工厂模式、latent 标准化助手。
 
 注册点:
 
@@ -210,7 +321,7 @@ latent 标准化助手。
 | `wan_animate2/__init__.py` | 导出 |
 | `cache/cachedit/model_specific.py` | 视 §6.5 结论决定是否登记 enabler 或加入 `_NO_CACHE_ACCELERATION` |
 
-### 4.3 Pipeline 设计(`Wan22Animate2Pipeline`)
+### 4.4 Pipeline 设计(`Wan22Animate2Pipeline`)
 
 ```python
 class Wan22Animate2Pipeline(
@@ -296,7 +407,14 @@ post process:输出纯视频,套用 I2V 的 `{"payload","metadata"}` 形态,`fps
 首版将 tensor 侧改为标准 batch 维实现,但 `batch_compatibility_key` 先把可同批
 条件收紧到"完全同构请求";真正多请求同批(KV cache 逐请求隔离)列为后续优化。
 
-### 4.4 输入 / 服务通路
+### 4.5 输入 / 服务通路
+
+**新增的输入契约**:相对现有 Wan 管线,Animate-2 只新增一个必填项——
+**驱动视频**(原始视频,无需预提取骨架/人脸),走既有的 `multi_modal_data["video"]`;
+参考图沿用 `multi_modal_data["image"]`。Animate-2 专有的标量参数
+(`prompt_ref`、`segment_frame_length`)经 `sampling_params.extra_args` 透传,
+由 pre-process 归一到 `additional_information`(S2V 同模式)。
+**无新增媒体模态、无新增 API 字段**(§2.4 对比表)。
 
 离线:
 
@@ -428,7 +546,7 @@ KV cache 天然按 head 分片。参考注意力分支 B 在本地 head 上计�
 
 `_hsdp_shard_conditions` 匹配 `blocks.{i}`;`extract_reference` 在 forward 钩子
 外调用,需 S2V 同款 `unshard()/reshard()` 护栏。`SupportsComponentDiscovery`
-声明齐全(§4.3);layerwise offload 时 `img_emb`、time/text embedding 常驻。
+声明齐全(§4.4);layerwise offload 时 `img_emb`、time/text embedding 常驻。
 官方在 80GB 卡上依赖分组 offload 才能同时容纳权重 + KV cache(diffusers 文档),
 CPU offload 支持应列为 P1 而非可选。
 
