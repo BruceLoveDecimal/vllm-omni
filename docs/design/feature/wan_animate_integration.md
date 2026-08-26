@@ -432,8 +432,15 @@ out = omni.generate(
 
 在线:现有 `/v1/videos` 的 `image_reference` + `video_reference` 直接可用;
 pipeline 实现 `ReferenceVideoDecodeSpec`(帧数上限按时长/段数上限设定)。
-示例:`examples/offline_inference/wan_animate2/` +
-`examples/online_serving/wan_animate2/`(参照 S2V 目录形态)。
+**示例落位**(遵守仓库的 examples 政策:**禁止新增 model-specific 的 Python 示例**,
+`examples/offline_inference/<model>/xxx.py` 是明确的 blocker):
+
+- 复用既有 task 级共享入口 `examples/offline_inference/image_to_video/image_to_video.py`
+  (Wan2.2 / VACE / LTX2 / HunyuanVideo 已共用),为其新增**任务中立**的
+  `--video`(驱动/源视频)开关——VACE 的条件视频同样受益,不是为单一模型加的参数;
+  Animate-2 专有标量走既有的 `--extra-args` 类通道,不新增模型专属 flag;
+- 运行命令与配置写入 `recipes/Wan-AI/Wan2.2-Animate-2.md`(S2V / I2V / VACE 同惯例);
+- 在线服务同样复用既有 `/v1/videos` 表单,不新增模型专属 client 脚本。
 
 ## 5. Transformer 移植设计(核心难点)
 
@@ -601,12 +608,24 @@ PP ❌ / HSDP ✅ / offload ✅ / VAE-Patch ✅ / 量化 ❌ / Step-Exec ❌);
 
 ## 9. 实施里程碑
 
-| 阶段 | 内容 | 验收 |
+完整的里程碑划分、逐条可验收标准、门禁与预案见配套规格文档:
+**[wan_animate2_integration_spec.md](wan_animate2_integration_spec.md)**。
+
+概览:
+
+| 里程碑 | 主题 | 收敛的核心风险 |
 |---|---|---|
-| P0 | transformer 移植 + LSE 注意力 + 单卡 pipeline(Diffusers 格式、蒸馏版优先)+ 注册 + 离线示例 | 与官方/diffusers 输出视觉一致、L1 通过 |
-| P1 | KV cache 显存方案 + CPU offload + TP + CFG 并行 + 基础版(40 步 CFG3.0)+ 在线 serving | L3 smoke、TP2/offload recipes |
-| P2 | SP/USP + HSDP + L4 扩展测试 + 文档矩阵 | 多卡 e2e |
-| P3(独立评估) | Cache-DiT、原始格式 checkpoint、modular 索引探测、真批处理 | — |
+| **M0** | 参考注意力 + 两阶段前向骨架(数值对拍;不需真权重/大显存) | 去 flex-attention 化是否数值等价(§8 风险 1) |
+| **M1** | 单卡最小可运行(蒸馏版、**降分辨率**规避显存墙) | 权重重映射、scheduler 对齐、分段接缝(§8 风险 2) |
+| **M2** | KV cache 显存方案 + 全分辨率 | 62GB 显存墙(§8 风险 3) |
+| **M3** | TP + CFG 并行 + 基础版(40 步 CFG 3.0) | CFG 负分支跳 block 9 的非对称性 |
+| **M4** | SP/USP + HSDP | 参考注意力在序列分片下的正确性 |
+| **M5** | 在线服务 + 文档 + L4 + recipes | 请求级时长上限与准入(§8 风险 6) |
+| **M6** | 可选独立立项:Cache-DiT / 原始格式 / modular 索引 / 真批处理 | §8 风险 4、5 |
+
+两点排序上的关键决策:**M0 把最不确定的注意力改写提到最前**(它不依赖真权重与大显存,
+可最早证伪);**M2 从 M1 中独立出来**,因为 62GB 的 KV cache 会让全分辨率在 M1 阶段
+直接跑不起来,必须把"能不能算对"与"能不能装下"解耦——M1 刻意降分辨率。
 
 ---
 
