@@ -55,14 +55,14 @@ def _wrapper(monkeypatch: pytest.MonkeyPatch, *, max_graphs: int = 4) -> CFMGrap
 
 
 def test_capture_is_not_gated_on_free_device_memory(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A device with no free memory left must still get its graph captured.
+    """Whether to capture must not be decided from free device memory.
 
-    Capture is served by the caching allocator, which hands out memory it has
-    already reserved. On a worker running at the usual
-    ``gpu_memory_utilization`` the driver reports a few hundred MiB free no
-    matter how much of the allocator's own pool is idle, so gating capture on
-    that number turns graphs off permanently and silently. Anything consulting
-    device-level free memory here would fail this test.
+    A capture is served by the caching allocator out of its private graph
+    pool, and the allocator falls back on memory it has already reserved. Free
+    device memory is therefore neither an upper nor a lower bound on what a
+    capture can draw, and a threshold on it decides the wrong question -- one
+    whose answer also silently varies with card size and with whatever else
+    shares the device. Anything consulting it here would fail this test.
     """
     import vllm_omni.platforms as platforms_module
 
@@ -81,18 +81,6 @@ def test_capture_is_not_gated_on_free_device_memory(monkeypatch: pytest.MonkeyPa
     wrapper = _wrapper(monkeypatch)
     wrapper.replay(*_cfm_input_signatures(10))
 
-    wrapper._capture.assert_called_once()
-
-
-def test_capture_is_gated_on_the_graph_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The bound that does apply is ``max_graphs``, via a whole-cache flush."""
-    wrapper = _wrapper(monkeypatch, max_graphs=1)
-    wrapper._flush = Mock()
-    wrapper._cache = {("already_full",): None}
-
-    wrapper.replay(*_cfm_input_signatures(10))
-
-    wrapper._flush.assert_called_once()
     wrapper._capture.assert_called_once()
 
 

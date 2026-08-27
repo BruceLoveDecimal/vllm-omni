@@ -196,9 +196,10 @@ class CFMGraphWrapper:
     belongs to something else. Retiring the whole generation bounds the cache
     without ever leaving a live graph behind a freed one.
 
-    Cache misses capture; capture failures disable the wrapper for the rest of
-    the process. Outputs are cloned after replay to prevent streaming cache
-    corruption.
+    Cache misses capture. A capture failure disables the wrapper for the rest
+    of the process, while a key whose static buffers cannot be rebuilt sends
+    only that one shape eager. Outputs are cloned after replay to prevent
+    streaming cache corruption.
     """
 
     def __init__(

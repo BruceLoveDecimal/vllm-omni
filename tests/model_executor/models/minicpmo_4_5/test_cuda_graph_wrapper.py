@@ -259,8 +259,8 @@ def test_importing_wrapper_does_not_resolve_platform() -> None:
     ``batched_token2wav`` -> ``cuda_graph_wrapper``. Resolving
     ``current_omni_platform`` at module scope re-enters
     ``platforms.__getattr__`` while the singleton is still under construction
-    and the import graph deadlocks, so the attribute must only be touched at
-    call time.
+    and the import graph deadlocks. The module reaches for nothing on
+    ``vllm_omni.platforms`` today; this keeps it that way.
     """
     import importlib
 
