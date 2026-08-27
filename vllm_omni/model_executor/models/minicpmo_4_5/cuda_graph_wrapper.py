@@ -6,7 +6,12 @@ from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-from vllm_omni.platforms import current_omni_platform
+# Import the module, not `current_omni_platform` itself: resolving that
+# attribute constructs the platform singleton, and the NPU platform's __init__
+# patches this very module's importer. A module-level attribute import re-enters
+# `platforms.__getattr__` while the singleton is still being built and
+# deadlocks the import graph (#6457 review).
+from vllm_omni import platforms as omni_platforms
 
 logger = init_logger(__name__)
 
@@ -194,11 +199,16 @@ class CFMGraphWrapper:
         min_free_bytes: int = _MIN_CAPTURE_FREE_BYTES,
     ) -> None:
         self.graph_fn = graph_fn
-        self.max_graphs = max(1, int(max_graphs))
+        self.max_graphs = int(max_graphs)
         self.min_free_bytes = int(min_free_bytes)
         self.device = next(graph_fn.__self__.parameters()).device
-        self.enabled = True
+        # A non-positive budget means "no graphs", the same as
+        # `enable_cfm_graph: false`; clamping it to 1 would instead build a
+        # one-entry cache that flushes on every new shape.
+        self.enabled = self.max_graphs > 0
         self._cache: dict[tuple, tuple] = {}
+        # Shapes whose key cannot round-trip: eager for those, keep the rest.
+        self._unsupported: set[tuple] = set()
         self._stats = {
             "calls": 0,
             "hits": 0,
@@ -223,11 +233,13 @@ class CFMGraphWrapper:
     def _flush(self) -> None:
         """Retire every captured graph at once.
 
-        The device sync makes sure no replay is still in flight, ``reset()``
-        tears each graph down explicitly instead of whenever Python drops the
-        last reference, and the cuBLAS workspace that this generation baked in
-        goes with it -- otherwise the next generation inherits a pointer into
-        the pool memory we just released.
+        Leaving no graph behind a freed one is the whole fix; the sync is there
+        so no replay is still in flight when the graphs go, and ``reset()``
+        tears each one down at a known point instead of whenever Python drops
+        the last reference. Nothing process-wide happens here: dropping the
+        cuBLAS workspace and calling ``empty_cache()`` were both measured to be
+        unnecessary, and the workspace is shared with the HiFT graphs this
+        wrapper does not own.
         """
         if not self._cache:
             return
@@ -235,11 +247,6 @@ class CFMGraphWrapper:
         for entry in self._cache.values():
             entry[2].reset()
         self._cache.clear()
-        clear_cublas_workspaces = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
-        if clear_cublas_workspaces is not None:
-            clear_cublas_workspaces()
-        torch.accelerator.synchronize(self.device)
-        torch.accelerator.empty_cache()
         self._stats["flushes"] += 1
         logger.info("CFM graph cache flushed; stats=%s", self.stats_snapshot())
 
@@ -253,19 +260,25 @@ class CFMGraphWrapper:
         try:
             static_inputs = _tensors_from_key(key)
         except KeyError:
-            self._disable("unsupported dtype", key)
+            # A dtype the key cannot round-trip is a property of this shape, not
+            # a damaged allocator: run it eager and keep serving the rest.
+            logger.warning("CFM graph key carries an unsupported dtype: %s; using eager", key)
+            self._unsupported.add(key)
             return None
 
-        current_stream = torch.cuda.current_stream(self.device)
-        warmup_stream = torch.cuda.Stream(device=self.device)
-        warmup_stream.wait_stream(current_stream)
-        with torch.cuda.stream(warmup_stream), torch.no_grad():
-            for _ in range(3):
-                warmup_output = self._call_graph_fn(static_inputs)
-        current_stream.wait_stream(warmup_stream)
-        del warmup_output
-
         try:
+            # Warmup belongs in the same handler as the capture: it runs the
+            # same kernels, so an OOM or a fault here leaves exactly the dirty
+            # capture-stream / graph-pool state that must stop further capturing.
+            current_stream = torch.cuda.current_stream(self.device)
+            warmup_stream = torch.cuda.Stream(device=self.device)
+            warmup_stream.wait_stream(current_stream)
+            with torch.cuda.stream(warmup_stream), torch.no_grad():
+                for _ in range(3):
+                    warmup_output = self._call_graph_fn(static_inputs)
+            current_stream.wait_stream(warmup_stream)
+            del warmup_output
+
             graph = CUDAGraph()
             with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_output = self._call_graph_fn(static_inputs)
@@ -302,12 +315,14 @@ class CFMGraphWrapper:
             return self._eager(inputs)
 
         key = ("estimator_step",) + tuple(_tensor_signature(v) for v in inputs)
+        if key in self._unsupported:
+            return self._eager(inputs)
         entry = self._cache.get(key)
 
         if entry is None:
             if len(self._cache) >= self.max_graphs:
                 self._flush()
-            if current_omni_platform.get_free_memory(self.device) < self.min_free_bytes:
+            if omni_platforms.current_omni_platform.get_free_memory(self.device) < self.min_free_bytes:
                 return self._eager(inputs)
             entry = self._capture(key)
             if entry is None:

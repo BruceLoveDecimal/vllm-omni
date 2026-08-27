@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,6 +13,7 @@ from vllm.platforms import current_platform
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     HiFTGenerator,
 )
+import vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper as wrapper_module
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
@@ -251,6 +253,32 @@ def test_cfm_graph_replay_matches_eager_for_uncached_and_cached_shapes(
     wrapper._flush()
 
 
+def test_importing_wrapper_does_not_resolve_platform() -> None:
+    """Importing this module must not build the OmniPlatform singleton.
+
+    The NPU platform's ``__init__`` patches Code2Wav, which imports
+    ``batched_token2wav`` -> ``cuda_graph_wrapper``. Resolving
+    ``current_omni_platform`` at module scope re-enters
+    ``platforms.__getattr__`` while the singleton is still under construction
+    and the import graph deadlocks, so the attribute must only be touched at
+    call time.
+    """
+    import importlib
+
+    import vllm_omni.platforms as platforms_module
+
+    name = "vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper"
+    importlib.import_module(name)
+    saved = platforms_module._current_omni_platform
+    try:
+        del sys.modules[name]
+        platforms_module._current_omni_platform = None
+        importlib.import_module(name)
+        assert platforms_module._current_omni_platform is None
+    finally:
+        platforms_module._current_omni_platform = saved
+
+
 def _cfm_mock_wrapper(monkeypatch: pytest.MonkeyPatch, *, max_graphs: int = 1) -> CFMGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     # Plenty of headroom so the memory guard never decides the outcome.
@@ -262,6 +290,7 @@ def _cfm_mock_wrapper(monkeypatch: pytest.MonkeyPatch, *, max_graphs: int = 1) -
     wrapper.graph_fn = Mock(return_value=torch.tensor([42.0]))
     wrapper.device = torch.device("cuda")
     wrapper._cache = {}
+    wrapper._unsupported = set()
     wrapper._stats = {"calls": 0, "hits": 0, "captures": 0, "flushes": 0, "eager": 0}
     wrapper._capture = Mock(return_value=None)
     return wrapper
@@ -277,7 +306,12 @@ def test_cfm_unseen_shape_is_lazily_captured(monkeypatch: pytest.MonkeyPatch) ->
     wrapper.graph_fn.assert_called_once()
 
 
-def test_cfm_capture_failure_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cfm_returning_no_entry_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A capture that yields no entry must still serve the request eagerly.
+
+    ``_capture`` is mocked here, so this says nothing about ``_disable``; see
+    ``test_cfm_capture_failure_disables_further_capture`` for that.
+    """
     wrapper = _cfm_mock_wrapper(monkeypatch)
 
     inputs = _cfm_inputs(2, 10, 0)
@@ -286,6 +320,128 @@ def test_cfm_capture_failure_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch
     wrapper.graph_fn.assert_called_once()
     assert result[0] is wrapper.graph_fn.return_value
     assert wrapper._stats["eager"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cfm_capture_failure_disables_further_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real capture failure must stop the wrapper capturing for good.
+
+    A failed capture can leave the capture stream current and the allocator
+    still routing into the graph pool, so the next shape must not try again.
+    """
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _MiniDiT().eval().cuda()
+    wrapper = CFMGraphWrapper(graph_fn=estimator.blocks_forward_chunk, max_graphs=4)
+
+    def _explode(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(torch.cuda, "graph", _explode)
+
+    with torch.inference_mode():
+        wrapper.replay(*_cfm_inputs(2, 10, 0))
+        assert wrapper.enabled is False
+        assert wrapper._cache == {}
+
+        captures_after_failure = wrapper._stats["captures"]
+        wrapper.replay(*_cfm_inputs(2, 12, 0))
+
+    assert wrapper._stats["captures"] == captures_after_failure
+    assert wrapper._stats["eager"] == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cfm_unsupported_dtype_eagers_only_that_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A key that cannot round-trip is a property of one shape, not of the GPU.
+
+    It must not disable the wrapper or retire the generation the way a capture
+    failure does.
+    """
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _MiniDiT().eval().cuda()
+    wrapper = CFMGraphWrapper(graph_fn=estimator.blocks_forward_chunk, max_graphs=4)
+
+    unbuildable_width = 10
+    real_tensors_from_key = wrapper_module._tensors_from_key
+
+    def _reject_one_shape(key: tuple) -> tuple:
+        if key[1][0][2] == unbuildable_width:
+            raise KeyError("torch.int64")
+        return real_tensors_from_key(key)
+
+    monkeypatch.setattr(wrapper_module, "_tensors_from_key", _reject_one_shape)
+
+    with torch.inference_mode():
+        wrapper.replay(*_cfm_inputs(2, unbuildable_width, 0))
+        assert wrapper.enabled is True
+        assert wrapper._stats["captures"] == 0
+
+        # a capturable shape still gets a graph
+        wrapper.replay(*_cfm_inputs(2, 12, 0))
+        assert wrapper._stats["captures"] == 1
+
+        # and the rejected shape stays eager without retrying the capture
+        wrapper.replay(*_cfm_inputs(2, unbuildable_width, 0))
+        assert wrapper._stats["captures"] == 1
+        assert wrapper._stats["eager"] == 2
+
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_hift_replay_survives_a_cfm_generation_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retiring a CFM generation must not disturb the vocoder.
+
+    Both wrappers capture into ``get_global_graph_pool()`` on torch's shared
+    capture stream, so the HiFT graphs are exactly the live graphs a CFM flush
+    could strand -- which is #6457 pointed at the vocoder.
+    """
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    hift = _small_hift()
+    token2wav = SimpleNamespace(
+        hift=hift,
+        flow=SimpleNamespace(
+            encoder=SimpleNamespace(pre_lookahead_layer=SimpleNamespace(pre_lookahead_len=3)),
+            token_mel_ratio=2,
+        ),
+        mel_cache_len=2,
+        source_cache_len=960,
+    )
+    hift_wrapper = HiFTGraphWrapper(
+        token2wav,
+        connector_config={"codec_chunk_frames": 2, "codec_left_context_frames": 3},
+        capture_batch_sizes=[1],
+    )
+    hift_wrapper.capture()
+
+    estimator = _MiniDiT().eval().cuda()
+    cfm = CFMGraphWrapper(graph_fn=estimator.blocks_forward_chunk, max_graphs=2)
+
+    speech_feat = torch.randn(1, 80, 4, device="cuda")
+    cache_source = torch.zeros(1, 1, 0, device="cuda")
+
+    with torch.inference_mode():
+        expected_speech, expected_source = hift.inference(speech_feat, cache_source)
+
+        for width in (10, 12, 14, 16):
+            cfm.replay(*_cfm_inputs(2, width, 0))
+        assert cfm._stats["flushes"] >= 1, "cache never overflowed; the test proves nothing"
+
+        actual_speech, actual_source = hift_wrapper.replay(speech_feat, cache_source)
+
+    torch.testing.assert_close(actual_speech, expected_speech, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(actual_source, expected_source, rtol=1e-4, atol=1e-5)
+
+    cfm._flush()
 
 
 def test_cfm_stays_eager_without_capture_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
