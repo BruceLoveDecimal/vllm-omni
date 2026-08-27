@@ -10,10 +10,10 @@ import torch
 import torch.nn as nn
 from vllm.platforms import current_platform
 
+import vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper as wrapper_module
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     HiFTGenerator,
 )
-import vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper as wrapper_module
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
