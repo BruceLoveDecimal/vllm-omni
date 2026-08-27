@@ -18,7 +18,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
 )
-from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
 
@@ -281,11 +280,8 @@ def test_importing_wrapper_does_not_resolve_platform() -> None:
 
 def _cfm_mock_wrapper(monkeypatch: pytest.MonkeyPatch, *, max_graphs: int = 1) -> CFMGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    # Plenty of headroom so the memory guard never decides the outcome.
-    monkeypatch.setattr(current_omni_platform, "get_free_memory", lambda device=None: 1 << 40)
     wrapper = object.__new__(CFMGraphWrapper)
     wrapper.max_graphs = max_graphs
-    wrapper.min_free_bytes = 0
     wrapper.enabled = True
     wrapper.graph_fn = Mock(return_value=torch.tensor([42.0]))
     wrapper.device = torch.device("cuda")
@@ -441,19 +437,6 @@ def test_hift_replay_survives_a_cfm_generation_flush(monkeypatch: pytest.MonkeyP
     torch.testing.assert_close(actual_source, expected_source, rtol=1e-4, atol=1e-5)
 
     cfm._flush()
-
-
-def test_cfm_stays_eager_without_capture_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Below the free-memory floor the wrapper must not capture at all."""
-    wrapper = _cfm_mock_wrapper(monkeypatch)
-    wrapper.min_free_bytes = 1 << 30
-    monkeypatch.setattr(current_omni_platform, "get_free_memory", lambda device=None: 1 << 20)
-
-    inputs = _cfm_inputs(2, 10, 0)
-    result = wrapper.replay(*inputs)
-
-    wrapper._capture.assert_not_called()
-    assert result[0] is wrapper.graph_fn.return_value
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

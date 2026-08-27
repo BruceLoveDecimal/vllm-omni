@@ -6,11 +6,6 @@ from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-# Import the module, not `current_omni_platform`: resolving that attribute
-# builds the platform singleton, and the NPU platform's __init__ imports this
-# module. Binding the attribute here would re-enter that construction.
-from vllm_omni import platforms as omni_platforms
-
 logger = init_logger(__name__)
 
 
@@ -146,9 +141,31 @@ def _tensor_signature(value: torch.Tensor) -> tuple:
 
 _DTYPE_MAP = {str(dtype): dtype for dtype in (torch.float32, torch.float16, torch.bfloat16, torch.float64)}
 
-# Capture allocates the static buffers plus whatever the graph records. Below
-# this much free device memory, stay eager rather than risk an OOM.
-_MIN_CAPTURE_FREE_BYTES = 1 << 30  # 1 GiB
+
+def _memory_snapshot(device: torch.device) -> tuple[int, int] | None:
+    """(allocated, reserved) bytes, or None when the device cannot report them.
+
+    Capture draws on the caching allocator, so these are the numbers that say
+    what a capture cost. Free device memory is not: the allocator serves a
+    capture out of memory it has already reserved, which is most of the device
+    on a normally configured worker.
+    """
+    if device.type != "cuda":
+        return None
+    try:
+        return int(torch.accelerator.memory_allocated(device)), int(torch.accelerator.memory_reserved(device))
+    except Exception:
+        return None
+
+
+def _format_memory_delta(before: tuple[int, int] | None, after: tuple[int, int] | None) -> str:
+    if before is None or after is None:
+        return ""
+    mib = 1024 * 1024
+    return (
+        f" [allocated {after[0] / mib:.1f} MiB (+{(after[0] - before[0]) / mib:.1f}), "
+        f"reserved {after[1] / mib:.1f} MiB (+{(after[1] - before[1]) / mib:.1f})]"
+    )
 
 
 def _tensors_from_key(key: tuple) -> tuple[torch.Tensor, ...]:
@@ -189,11 +206,9 @@ class CFMGraphWrapper:
         graph_fn,
         *,
         max_graphs: int = 32,
-        min_free_bytes: int = _MIN_CAPTURE_FREE_BYTES,
     ) -> None:
         self.graph_fn = graph_fn
         self.max_graphs = int(max_graphs)
-        self.min_free_bytes = int(min_free_bytes)
         self.device = next(graph_fn.__self__.parameters()).device
         # A non-positive budget means "no graphs", the same as
         # `enable_cfm_graph: false`. Clamping to 1 would instead build a
@@ -256,6 +271,7 @@ class CFMGraphWrapper:
             self._unsupported.add(key)
             return None
 
+        memory_before = _memory_snapshot(self.device)
         try:
             # Warmup runs the same kernels as the capture, so a fault here
             # leaves the same dirty capture-stream and pool state, and must be
@@ -281,11 +297,12 @@ class CFMGraphWrapper:
 
         self._stats["captures"] += 1
         logger.info(
-            "Captured CFM CUDA Graph for shape %s (cache=%d/%d, stats=%s)",
+            "Captured CFM CUDA Graph for shape %s (cache=%d/%d, stats=%s)%s",
             key,
             len(self._cache) + 1,
             self.max_graphs,
             self.stats_snapshot(),
+            _format_memory_delta(memory_before, _memory_snapshot(self.device)),
         )
         return (static_inputs, static_output, graph)
 
@@ -312,8 +329,6 @@ class CFMGraphWrapper:
         if entry is None:
             if len(self._cache) >= self.max_graphs:
                 self._flush()
-            if omni_platforms.current_omni_platform.get_free_memory(self.device) < self.min_free_bytes:
-                return self._eager(inputs)
             entry = self._capture(key)
             if entry is None:
                 return self._eager(inputs)
