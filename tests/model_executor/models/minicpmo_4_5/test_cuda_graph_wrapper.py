@@ -398,9 +398,8 @@ def test_cfm_unsupported_dtype_eagers_only_that_shape(monkeypatch: pytest.Monkey
 def test_hift_replay_survives_a_cfm_generation_flush(monkeypatch: pytest.MonkeyPatch) -> None:
     """Retiring a CFM generation must not disturb the vocoder.
 
-    Both wrappers capture into ``get_global_graph_pool()`` on torch's shared
-    capture stream, so the HiFT graphs are exactly the live graphs a CFM flush
-    could strand -- which is #6457 pointed at the vocoder.
+    Both wrappers capture into ``get_global_graph_pool()``, so the HiFT graphs
+    are exactly the live graphs a CFM flush could strand.
     """
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
@@ -461,9 +460,8 @@ def test_cfm_stays_eager_without_capture_headroom(monkeypatch: pytest.MonkeyPatc
 def test_cfm_cache_flushes_whole_generation(monkeypatch: pytest.MonkeyPatch) -> None:
     """A full cache is retired all at once, never one graph at a time.
 
-    Destroying a single graph while its peers stay live is what produced the
-    illegal memory access in #6457, so the cache must never hold a graph that
-    outlived one of its generation-mates.
+    Destroying a single graph while its peers stay live strands them, so the
+    cache must never hold a graph that outlived one of its generation-mates.
     """
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)

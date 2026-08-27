@@ -6,11 +6,9 @@ from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-# Import the module, not `current_omni_platform` itself: resolving that
-# attribute constructs the platform singleton, and the NPU platform's __init__
-# patches this very module's importer. A module-level attribute import re-enters
-# `platforms.__getattr__` while the singleton is still being built and
-# deadlocks the import graph (#6457 review).
+# Import the module, not `current_omni_platform`: resolving that attribute
+# builds the platform singleton, and the NPU platform's __init__ imports this
+# module. Binding the attribute here would re-enter that construction.
 from vllm_omni import platforms as omni_platforms
 
 logger = init_logger(__name__)
@@ -148,18 +146,16 @@ def _tensor_signature(value: torch.Tensor) -> tuple:
 
 _DTYPE_MAP = {str(dtype): dtype for dtype in (torch.float32, torch.float16, torch.bfloat16, torch.float64)}
 
-# Capturing needs room for the static buffers plus whatever the graph allocates
-# while recording. Below this much free device memory we stay eager instead of
-# capturing the process into an OOM.
+# Capture allocates the static buffers plus whatever the graph records. Below
+# this much free device memory, stay eager rather than risk an OOM.
 _MIN_CAPTURE_FREE_BYTES = 1 << 30  # 1 GiB
 
 
 def _tensors_from_key(key: tuple) -> tuple[torch.Tensor, ...]:
     """Rebuild zero tensors from a cache key (shape, dtype, device tuples).
 
-    Raises ``KeyError`` for a dtype the key encoding cannot round-trip; the
-    caller degrades to eager rather than capturing a graph whose static buffers
-    have the wrong dtype.
+    Raises ``KeyError`` for a dtype the key cannot round-trip, so the caller
+    can fall back to eager instead of capturing wrong-dtype static buffers.
     """
     tensors = []
     for shape, dtype_str, device_str in key[1:]:
@@ -177,14 +173,11 @@ class CFMGraphWrapper:
     the graph 10 times per decode.
 
     Graphs are retired a whole generation at a time rather than one at a time.
-    Destroying a single graph while its peers stay live corrupts them: torch
-    records every capture on one process-wide side stream, and cuBLAS keeps one
-    workspace per (handle, stream) that is first allocated *during* a capture,
-    so it lives inside a graph memory pool while every later graph bakes in the
-    same address. Tearing one graph down releases that pool and leaves the
-    survivors replaying against reclaimed memory -- an illegal memory access at
-    the next replay (issue #6457). Dropping the whole generation at once keeps
-    the cache bounded without ever leaving a live graph behind a dead one.
+    Every capture shares one private memory pool, so a retired graph's blocks
+    return to that pool while its live peers still hold those addresses in
+    their recorded kernel arguments, and the next replay reads memory that now
+    belongs to something else. Retiring the whole generation bounds the cache
+    without ever leaving a live graph behind a freed one.
 
     Cache misses capture; capture failures disable the wrapper for the rest of
     the process. Outputs are cloned after replay to prevent streaming cache
@@ -203,7 +196,7 @@ class CFMGraphWrapper:
         self.min_free_bytes = int(min_free_bytes)
         self.device = next(graph_fn.__self__.parameters()).device
         # A non-positive budget means "no graphs", the same as
-        # `enable_cfm_graph: false`; clamping it to 1 would instead build a
+        # `enable_cfm_graph: false`. Clamping to 1 would instead build a
         # one-entry cache that flushes on every new shape.
         self.enabled = self.max_graphs > 0
         self._cache: dict[tuple, tuple] = {}
@@ -233,13 +226,10 @@ class CFMGraphWrapper:
     def _flush(self) -> None:
         """Retire every captured graph at once.
 
-        Leaving no graph behind a freed one is the whole fix; the sync is there
-        so no replay is still in flight when the graphs go, and ``reset()``
-        tears each one down at a known point instead of whenever Python drops
-        the last reference. Nothing process-wide happens here: dropping the
-        cuBLAS workspace and calling ``empty_cache()`` were both measured to be
-        unnecessary, and the workspace is shared with the HiFT graphs this
-        wrapper does not own.
+        The sync keeps a replay from being in flight when the graphs go, and
+        the explicit ``reset()`` tears each one down here rather than whenever
+        Python drops the last reference. Nothing process-wide is touched: the
+        cuBLAS workspace is shared with graphs this wrapper does not own.
         """
         if not self._cache:
             return
@@ -260,16 +250,16 @@ class CFMGraphWrapper:
         try:
             static_inputs = _tensors_from_key(key)
         except KeyError:
-            # A dtype the key cannot round-trip is a property of this shape, not
-            # a damaged allocator: run it eager and keep serving the rest.
+            # An unsupported dtype is a property of this shape alone, so run it
+            # eager and keep the other shapes on graphs.
             logger.warning("CFM graph key carries an unsupported dtype: %s; using eager", key)
             self._unsupported.add(key)
             return None
 
         try:
-            # Warmup belongs in the same handler as the capture: it runs the
-            # same kernels, so an OOM or a fault here leaves exactly the dirty
-            # capture-stream / graph-pool state that must stop further capturing.
+            # Warmup runs the same kernels as the capture, so a fault here
+            # leaves the same dirty capture-stream and pool state, and must be
+            # handled the same way.
             current_stream = torch.cuda.current_stream(self.device)
             warmup_stream = torch.cuda.Stream(device=self.device)
             warmup_stream.wait_stream(current_stream)
