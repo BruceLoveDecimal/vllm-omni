@@ -119,6 +119,7 @@ nav:
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
         - Automatic Prefix Caching: design/feature/prefix_caching.md
         - Realtime AR-Diffusion: design/feature/realtime_ar_diffusion.md
+        - LingBot World Stepwise Alignment: design/feature/lingbot_world_stepwise.md
       - Communication:
         - OmniConnector Implementations:
           - Mooncake Store Connector: design/feature/omni_connectors/mooncake_store_connector.md
