@@ -1,6 +1,6 @@
 # LingBot World stepwise request alignment
 
-> **Status:** proposed implementation contract.
+> **Status:** implementation contract.
 > This document specifies how LingBot World v2 realtime generation should use
 > the same request, step, and chunk surface as Helios-style streaming, while
 > keeping AR-Diffusion paged KV ownership on `ARDiffusionEngine`.

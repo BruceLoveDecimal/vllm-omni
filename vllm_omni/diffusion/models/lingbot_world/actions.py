@@ -66,6 +66,30 @@ def parse_lingbot_camera_action_frames(
     return frames
 
 
+def parse_lingbot_camera_action_script(
+    script: object,
+    *,
+    frames_per_chunk: int,
+) -> tuple[tuple[tuple[str, ...], ...], ...]:
+    """Validate a request-scoped list of per-chunk camera action frames."""
+
+    if not isinstance(script, Sequence) or isinstance(script, (str, bytes)):
+        raise ValueError("camera_action_script must be a sequence of per-chunk action lists.")
+    if not script:
+        raise ValueError("camera_action_script must contain at least one chunk.")
+    chunks: list[tuple[tuple[str, ...], ...]] = []
+    for index, chunk in enumerate(script):
+        frames = _normalize_frames(chunk, field=f"camera_action_script[{index}]")
+        if len(frames) != frames_per_chunk:
+            raise ValueError(
+                "camera_action_script chunks must contain exactly "
+                f"{frames_per_chunk} per-latent-frame action lists; "
+                f"chunk {index} has {len(frames)}."
+            )
+        chunks.append(frames)
+    return tuple(chunks)
+
+
 @dataclass(frozen=True)
 class _LingBotCameraReducerState:
     mode: str | None = None

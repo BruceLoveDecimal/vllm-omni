@@ -14,11 +14,10 @@ KV allocation. A model adapter owns model-specific controls and conditioning.
 LingBot World v2 is the first single-KV-branch integration. DreamZero uses the
 same runner capability with two logical CFG branches.
 
-A proposed additional mode keeps AR-Diffusion paged KV but drives one
-`generate()` across many AR blocks through step execution, matching Helios
-chunk streaming. See
-[LingBot World stepwise request alignment](lingbot_world_stepwise.md).
-That mode does not replace this tick contract until it is implemented.
+An additional mode keeps AR-Diffusion paged KV but drives one `generate()`
+across many AR blocks through step execution, matching Helios chunk streaming.
+See [LingBot World stepwise request alignment](lingbot_world_stepwise.md).
+That mode does not replace this tick contract.
 
 ## Identities
 
