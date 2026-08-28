@@ -241,14 +241,20 @@ class MossReferenceEncoder:
             self._resolve_and_encode(ref_str, resolve_ref_audio, get_artifact_key, voice_name, created_at)
         )
         self._inflight[flight_key] = task
-        try:
-            codes, resolve_key = await asyncio.shield(task)
-            return _clone_out(codes), resolve_key
-        finally:
-            # Identity guard: only drop the slot if it still holds *our* task
-            # (a later request may have replaced it after ours completed).
-            if self._inflight.get(flight_key) is task:
-                self._inflight.pop(flight_key, None)
+
+        # Retire the slot when the flight *completes*, not when the creating
+        # caller returns: if the creator is cancelled the shielded task keeps
+        # running, and popping the slot early would let the next arrival start
+        # a duplicate resolve/encode instead of joining this one. Identity
+        # guard: only drop the slot if it still holds *our* task (a later
+        # request may have replaced it after ours completed).
+        def _retire(t: asyncio.Task, key: str = flight_key) -> None:
+            if self._inflight.get(key) is t:
+                self._inflight.pop(key, None)
+
+        task.add_done_callback(_retire)
+        codes, resolve_key = await asyncio.shield(task)
+        return _clone_out(codes), resolve_key
 
     async def _resolve_and_encode(
         self,
