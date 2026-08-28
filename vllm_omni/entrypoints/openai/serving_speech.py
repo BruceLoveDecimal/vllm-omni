@@ -1451,60 +1451,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # conditioning and produces unconditioned/garbage audio online). ----
         proc = self._get_moss_processor()
 
-        # Reference-audio encoding + speaker caching lives in the model package
-        # (moss_tts.reference_encoder), mirroring Fish Speech / CosyVoice3 /
-        # Qwen3-TTS which keep reference handling with the model rather than in
-        # this shared serving file. The per-server encoder adds content-addressed
-        # caching, single-flight, and micro-batched encoding on top of the
-        # speaker cache (see RFC #4676).
-        encoder = self._get_moss_ref_encoder()
-
-        # Named-voice speaker cache is only valid for uploaded speakers
-        # without an inline ref_audio. ``request.voice`` plus a file/URL
-        # otherwise keys on (name, created_at=0) and skips the content-aware
-        # resolve — the adapter already applies this guard when tagging
-        # ``voice_name`` on tts_params.
-        _raw_voice = getattr(request, "voice", None)
-        _raw_voice = _raw_voice.strip() if isinstance(_raw_voice, str) else ""
-        _voice_lower = _raw_voice.lower() if _raw_voice else ""
-        _use_named_voice = bool(_voice_lower) and _voice_lower in self.uploaded_speakers and not has_inline_ref_audio
-        _voice = _voice_lower if _use_named_voice else ""
-        _voice_created = self._voice_created_at(_voice) if _voice else 0
-        # Per-slot resolve keys (0 = ref_audio, 1 = ref_audio_2) for the KV
-        # prefix-cache salt; a dict (not an append list) because the ttsd
-        # encodes run concurrently and completion order is not slot order.
-        _resolve_keys: dict[int, str] = {}
-
-        async def _encode_ref(ref_str: str, *, named_voice: bool, slot: int = 0) -> torch.Tensor:
-            # Named-voice cache is (voice_name, created_at). TTSD speaker 2 is a
-            # different clip, so it must stay anonymous or it reuses speaker 1.
-            use_named = named_voice and bool(_voice)
-            codes, resolve_key = await encoder.encode(
-                ref_str,
-                resolve_ref_audio=self._resolve_ref_audio,
-                get_artifact_key=self._get_resolved_ref_audio_artifact_key,
-                voice_name=_voice if use_named else None,
-                voice_created_at=_voice_created if use_named else 0,
-            )
-            if resolve_key is not None:
-                _resolve_keys[slot] = resolve_key
-            return codes
-
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
-        if v in ("tts", "local"):
-            user_kwargs["reference"] = [await _encode_ref(request.ref_audio, named_voice=True)]
-        elif v == "ttsd":
-            # Encode both speakers concurrently so they land in the same batch
-            # window / share single-flight instead of serializing.
-            if request.ref_audio_2:
-                user_kwargs["reference"] = list(
-                    await asyncio.gather(
-                        _encode_ref(request.ref_audio, named_voice=True, slot=0),
-                        _encode_ref(request.ref_audio_2, named_voice=False, slot=1),
-                    )
-                )
-            else:
-                user_kwargs["reference"] = [await _encode_ref(request.ref_audio, named_voice=True)]
+        resolve_keys: dict[int, str] = {}
+        if v in ("tts", "local", "ttsd"):
+            user_kwargs["reference"], resolve_keys = await self._encode_moss_references(
+                request,
+                has_inline_ref_audio=has_inline_ref_audio,
+                two_speaker=(v == "ttsd"),
+            )
         elif v == "sound_effect":
             user_kwargs["text"] = request.input or ""  # may be empty
             user_kwargs["ambient_sound"] = request.ambient_sound or ""
@@ -1537,11 +1491,76 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         }
         if request.max_new_tokens is not None:
             params["max_new_frames"] = [request.max_new_tokens]
-        if 0 in _resolve_keys:
-            params["ref_audio_cache_key"] = _resolve_keys[0]
-        if 1 in _resolve_keys:
-            params["ref_audio_2_cache_key"] = _resolve_keys[1]
+        if 0 in resolve_keys:
+            params["ref_audio_cache_key"] = resolve_keys[0]
+        if 1 in resolve_keys:
+            params["ref_audio_2_cache_key"] = resolve_keys[1]
         return params
+
+    async def _encode_moss_references(
+        self,
+        request: OpenAICreateSpeechRequest,
+        *,
+        has_inline_ref_audio: bool,
+        two_speaker: bool,
+    ) -> tuple[list, dict[int, str]]:
+        """Encode the request's reference clip(s) into MOSS RVQ code tensors.
+
+        Reference encoding + speaker caching lives in the model package
+        (moss_tts.reference_encoder), mirroring Fish Speech / CosyVoice3 /
+        Qwen3-TTS which keep reference handling with the model rather than in
+        this shared serving file.
+
+        Returns ``(codes_per_speaker, resolve_keys)`` where ``resolve_keys``
+        maps the reference slot (0 = ref_audio, 1 = ref_audio_2) to its
+        content-aware resolve key, for salting the KV prefix cache. A dict
+        rather than an append list because two-speaker encodes run
+        concurrently, so completion order is not slot order.
+        """
+        encoder = self._get_moss_ref_encoder()
+
+        # Named-voice caching is only valid for uploaded speakers without an
+        # inline ref_audio: ``request.voice`` plus a file/URL would otherwise
+        # key on (name, created_at=0) and skip the content-aware resolve.
+        raw_voice = getattr(request, "voice", None)
+        raw_voice = raw_voice.strip() if isinstance(raw_voice, str) else ""
+        voice_lower = raw_voice.lower()
+        use_named_voice = bool(voice_lower) and voice_lower in self.uploaded_speakers and not has_inline_ref_audio
+        voice = voice_lower if use_named_voice else ""
+        voice_created = self._voice_created_at(voice) if voice else 0
+
+        resolve_keys: dict[int, str] = {}
+
+        async def encode_one(ref_str: str, *, named_voice: bool, slot: int):
+            # The named-voice cache key is (voice_name, created_at) and ignores
+            # the clip content, so only the reference that actually belongs to
+            # the uploaded voice may use it; the second speaker is a different
+            # clip and must stay content-addressed or it would silently reuse
+            # the first speaker's codes.
+            use_named = named_voice and bool(voice)
+            codes, resolve_key = await encoder.encode(
+                ref_str,
+                resolve_ref_audio=self._resolve_ref_audio,
+                get_artifact_key=self._get_resolved_ref_audio_artifact_key,
+                voice_name=voice if use_named else None,
+                voice_created_at=voice_created if use_named else 0,
+            )
+            if resolve_key is not None:
+                resolve_keys[slot] = resolve_key
+            return codes
+
+        if two_speaker and request.ref_audio_2:
+            # Encode both speakers concurrently so they land in the same batch
+            # window / share single-flight instead of serializing.
+            refs = list(
+                await asyncio.gather(
+                    encode_one(request.ref_audio, named_voice=True, slot=0),
+                    encode_one(request.ref_audio_2, named_voice=False, slot=1),
+                )
+            )
+        else:
+            refs = [await encode_one(request.ref_audio, named_voice=True, slot=0)]
+        return refs, resolve_keys
 
     async def _build_higgs_audio_v2_params(self, request: OpenAICreateSpeechRequest):
         """Build prompt_token_ids for higgs_audio_v2 via the upstream processor.

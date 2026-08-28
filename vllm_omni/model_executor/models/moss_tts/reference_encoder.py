@@ -10,7 +10,10 @@ processor) and calls :meth:`MossReferenceEncoder.encode` with its generic
 helpers (the audio resolver, the artifact-key lookup, and the process-wide
 speaker cache).
 
-Adds content-addressed caching, single-flight, and micro-batched encoding
+On top of that cache the encoder adds content-addressed keys (the same clip
+arriving via different locators shares one entry), single-flight (concurrent
+requests for one uncached clip join a single encode), and micro-batched
+encoding (cold encodes arriving close together share one processor forward).
 
 Kept import-light (only ``asyncio`` / ``hashlib`` / ``torch`` plus the logger)
 so importing it from the API-server process does not pull the talker/codec.
@@ -70,6 +73,21 @@ def _clone_out(codes: torch.Tensor) -> torch.Tensor:
     return codes.to(torch.int64, copy=True)
 
 
+def _registered_voice(voice_name: str | None, voice_created_at: int) -> tuple[str | None, int]:
+    """Return ``(name, created_at)`` for a registered uploaded voice, else ``(None, 0)``.
+
+    The OpenAI speech API requires a ``voice`` field, and callers often send
+    placeholders such as "default" for ref-audio voice cloning. Only registered
+    uploaded voices have a positive created_at timestamp; other names must not
+    key the cache because the timbre comes from ref_audio.
+    """
+    name = voice_name.strip() if isinstance(voice_name, str) else ""
+    created_at = int(voice_created_at)
+    if name and created_at > 0:
+        return name, created_at
+    return None, 0
+
+
 class _RefEncodeBatcher:
     """Coalesce cold reference encodes into batched processor forwards."""
 
@@ -101,29 +119,33 @@ class _RefEncodeBatcher:
         return await fut
 
     async def _drain_loop(self) -> None:
-        loop = asyncio.get_running_loop()
         assert self._queue is not None
         while True:
             first = await self._queue.get()
-            jobs = [first]
-            if self._window_s > 0:
-                deadline = loop.time() + self._window_s
-                while len(jobs) < self._max_batch:
-                    remaining = deadline - loop.time()
-                    if remaining <= 0:
-                        break
-                    try:
-                        jobs.append(await asyncio.wait_for(self._queue.get(), remaining))
-                    except asyncio.TimeoutError:
-                        break
-            else:
-                # window=0: coalesce only what is already queued, never wait.
-                while len(jobs) < self._max_batch:
-                    try:
-                        jobs.append(self._queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
+            jobs = await self._coalesce(first)
             await self._run_batch(jobs)
+
+    async def _coalesce(self, first: tuple) -> list[tuple]:
+        """Group ``first`` with jobs arriving within the batch window."""
+        jobs = [first]
+        if self._window_s > 0:
+            deadline = asyncio.get_running_loop().time() + self._window_s
+            while len(jobs) < self._max_batch:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    jobs.append(await asyncio.wait_for(self._queue.get(), remaining))
+                except asyncio.TimeoutError:
+                    break
+        else:
+            # window=0: coalesce only what is already queued, never wait.
+            while len(jobs) < self._max_batch:
+                try:
+                    jobs.append(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+        return jobs
 
     async def _run_batch(self, jobs: list[tuple[list, int, asyncio.Future]]) -> None:
         payload = [(wav_list, sr) for wav_list, sr, _ in jobs]
@@ -201,19 +223,11 @@ class MossReferenceEncoder:
         clip was served from the named-voice cache without resolving (the
         caller salts those requests with ``voice_created_at`` instead).
         """
-        voice_name = voice_name.strip() if isinstance(voice_name, str) and voice_name.strip() else None
-        created_at = int(voice_created_at) if voice_name else 0
-        # The OpenAI speech API requires a ``voice`` field, and callers often
-        # send placeholders such as "default" for ref-audio voice cloning. Only
-        # registered uploaded voices have a positive created_at timestamp; other
-        # names must not key the cache because the timbre comes from ref_audio.
-        if voice_name and created_at <= 0:
-            voice_name = None
-            created_at = 0
+        voice_name, created_at = _registered_voice(voice_name, voice_created_at)
 
         if voice_name:
-            # --- hot path: a named voice has a stable key that does not depend
-            # on the resolved audio, so check the cache before resolving. ---
+            # A named voice has a stable key that does not depend on the
+            # resolved audio, so the cache can be checked before resolving.
             flight_key = f"voice:{voice_name.lower()}:{created_at}"
             cached = self._speaker_cache.get(self._make_cache_key(voice_name, created_at))
             if cached is not None:
@@ -228,18 +242,29 @@ class MossReferenceEncoder:
             # same ref_str also share the resolve/download, not just the encode.
             flight_key = "ref:" + _sha1(ref_str)
 
-        # --- single-flight: one encode per uncached reference at a time. ---
-        # ``shield`` so a caller cancelling its own request does not cancel the
-        # shared flight (asyncio would otherwise propagate the cancel into the
-        # awaited task and take down every other waiter with it).
+        codes, resolve_key = await self._single_flight(
+            flight_key,
+            lambda: self._resolve_and_encode(ref_str, resolve_ref_audio, get_artifact_key, voice_name, created_at),
+        )
+        return _clone_out(codes), resolve_key
+
+    async def _single_flight(
+        self,
+        flight_key: str,
+        start_flight: Callable[[], Awaitable[tuple[torch.Tensor, str]]],
+    ) -> tuple[torch.Tensor, str]:
+        """Join the in-flight encode for ``flight_key``, starting one if absent.
+
+        The shared task is awaited through ``shield`` so a caller cancelling
+        its own request does not cancel the flight (asyncio would otherwise
+        propagate the cancel into the awaited task and take down every other
+        waiter with it).
+        """
         task = self._inflight.get(flight_key)
         if task is not None:
-            codes, resolve_key = await asyncio.shield(task)
-            return _clone_out(codes), resolve_key
+            return await asyncio.shield(task)
 
-        task = asyncio.create_task(
-            self._resolve_and_encode(ref_str, resolve_ref_audio, get_artifact_key, voice_name, created_at)
-        )
+        task = asyncio.create_task(start_flight())
         self._inflight[flight_key] = task
 
         # Retire the slot when the flight *completes*, not when the creating
@@ -253,8 +278,7 @@ class MossReferenceEncoder:
                 self._inflight.pop(key, None)
 
         task.add_done_callback(_retire)
-        codes, resolve_key = await asyncio.shield(task)
-        return _clone_out(codes), resolve_key
+        return await asyncio.shield(task)
 
     async def _resolve_and_encode(
         self,
