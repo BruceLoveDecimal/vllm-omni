@@ -95,6 +95,7 @@ from .reference_video import (
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
 )
+from .sliding_window import validate_output_duration
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_align_frame_count,
@@ -819,21 +820,17 @@ class MiniMaxH3Pipeline(
                 raise OmniClientError(
                     f"MiniMax H3 output duration must be in [4, 15] seconds, got {duration!r}"
                 ) from exc
-            if (
-                not math.isfinite(duration)
-                or not MINIMAX_H3_MIN_OUTPUT_SECONDS <= duration <= MINIMAX_H3_MAX_OUTPUT_SECONDS
-            ):
-                raise OmniClientError(f"MiniMax H3 output duration must be in [4, 15] seconds, got {duration}")
+            # Long durations route through the sliding-window validator so the
+            # (15, 60] band reports the windowed-generation status instead of a
+            # flat range error.  Milestone M3 branches to a WindowPlan here.
+            validate_output_duration(duration)
             requested_frames = int(round(duration * fps))
         elif int(sampling.num_frames or 1) > 1:
             requested_frames = int(sampling.num_frames)
         else:
             requested_frames = 124 if task == "ref2va" else 209
             duration = requested_frames / fps
-        if not MINIMAX_H3_MIN_OUTPUT_SECONDS <= requested_frames / fps <= MINIMAX_H3_MAX_OUTPUT_SECONDS:
-            raise OmniClientError(
-                f"MiniMax H3 output duration must be in [4, 15] seconds, got {requested_frames / fps:.3f}"
-            )
+        validate_output_duration(requested_frames / fps)
         num_frames = minimax_h3_align_frame_count(requested_frames)
 
         height = sampling.height
