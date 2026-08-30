@@ -21,6 +21,7 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 import os
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
@@ -571,6 +572,57 @@ class MingAudioGenerator:
         if cfg is None:
             cfg = self.cfg_strength
 
+        randn_tensor, sde_rnd = self._validate_cfm_noise(last_hidden_state, his_lat, randn_tensor, sde_rnd)
+        sde_args = torch.tensor(
+            [cfg, sigma, temperature],
+            device=last_hidden_state.device,
+            dtype=last_hidden_state.dtype,
+        )
+        return self._cfm_sample_core(last_hidden_state, his_lat, randn_tensor, sde_rnd, sde_args)
+
+    def cfm_sample_step_batch(
+        self,
+        last_hidden_state: torch.Tensor,
+        his_lat: torch.Tensor,
+        *,
+        cfg: Sequence[float],
+        sigma: Sequence[float],
+        temperature: Sequence[float],
+        randn_tensor: torch.Tensor,
+        sde_rnd: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One CFM sampling step for a whole batch of requests at once.
+
+        Row ``i`` of every tensor belongs to request ``i``; ``cfg`` / ``sigma``
+        / ``temperature`` carry that request's own sampling knobs. The math is
+        the batched form of :meth:`cfm_sample_step`: the per-row knobs are
+        shaped ``(B, 1, 1)`` so the CFG mix inside ``CFM.sample`` and the SDE
+        shift inside ``integrate_cfm_steps`` broadcast per row instead of
+        applying one scalar to the whole batch. Noise must be supplied by the
+        caller — it is drawn from each request's own generator, which is what
+        keeps a request's latent stream independent of who it is batched with.
+        """
+        bat_size = int(his_lat.shape[0])
+        if not (len(cfg) == len(sigma) == len(temperature) == bat_size):
+            raise ValueError(
+                "per-request sampling knobs must match the batch: "
+                f"batch={bat_size}, cfg={len(cfg)}, sigma={len(sigma)}, temperature={len(temperature)}"
+            )
+        randn_tensor, sde_rnd = self._validate_cfm_noise(last_hidden_state, his_lat, randn_tensor, sde_rnd)
+        sde_args = torch.tensor(
+            [cfg, sigma, temperature],
+            device=last_hidden_state.device,
+            dtype=last_hidden_state.dtype,
+        ).reshape(3, bat_size, 1, 1)
+        return self._cfm_sample_core(last_hidden_state, his_lat, randn_tensor, sde_rnd, sde_args)
+
+    def _validate_cfm_noise(
+        self,
+        last_hidden_state: torch.Tensor,
+        his_lat: torch.Tensor,
+        randn_tensor: torch.Tensor | None,
+        sde_rnd: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         bat_size, _, z_dim = his_lat.shape
         expected_randn_shape = (bat_size, self.patch_size, z_dim)
         if randn_tensor is None:
@@ -584,7 +636,6 @@ class MingAudioGenerator:
                 raise ValueError(f"randn_tensor shape must be {expected_randn_shape}, got {tuple(randn_tensor.shape)}")
             randn_tensor = randn_tensor.to(device=last_hidden_state.device, dtype=last_hidden_state.dtype)
 
-        t = get_epss_timesteps(self._config.steps, device=last_hidden_state.device, dtype=last_hidden_state.dtype)
         expected_sde_shape = (self._config.steps, *expected_randn_shape)
         if sde_rnd is None:
             sde_rnd = torch.randn(
@@ -596,16 +647,20 @@ class MingAudioGenerator:
             if tuple(sde_rnd.shape) != expected_sde_shape:
                 raise ValueError(f"sde_rnd shape must be {expected_sde_shape}, got {tuple(sde_rnd.shape)}")
             sde_rnd = sde_rnd.to(device=last_hidden_state.device, dtype=last_hidden_state.dtype)
-        sde_args = torch.tensor(
-            [cfg, sigma, temperature],
-            device=last_hidden_state.device,
-            dtype=last_hidden_state.dtype,
-        )
+        return randn_tensor, sde_rnd
 
+    def _cfm_sample_core(
+        self,
+        last_hidden_state: torch.Tensor,
+        his_lat: torch.Tensor,
+        randn_tensor: torch.Tensor,
+        sde_rnd: torch.Tensor,
+        sde_args: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        t = get_epss_timesteps(self._config.steps, device=last_hidden_state.device, dtype=last_hidden_state.dtype)
         gen_lat = self._cfm.sample(last_hidden_state, his_lat, randn_tensor, t, sde_args, sde_rnd)
         inputs_embeds = self._aggregator(gen_lat)
         stop_out = self._stop_head(last_hidden_state[:, -1, :]).softmax(dim=-1)
-
         return gen_lat, inputs_embeds, stop_out
 
     def decode_to_waveform(self, latents: list[torch.Tensor], stream_decode: bool = True) -> torch.Tensor:

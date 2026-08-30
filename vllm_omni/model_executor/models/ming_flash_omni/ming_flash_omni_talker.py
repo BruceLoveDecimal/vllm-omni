@@ -349,7 +349,11 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         return hidden_states
 
     def _run_pending_audio_steps(self, rows: torch.Tensor) -> None:
-        """Run one CFM audio step per pending scheduler row.
+        """Run one CFM audio step for every pending scheduler row.
+
+        Rows that are in the audio phase advance together through one batched
+        CFM call (``_talker_audio_step_batch``); a step with a single such row
+        keeps the per-request path unchanged.
 
         ``rows`` is the logits-index-gathered hidden state handed to
         ``compute_logits``: one row per scheduled request in batch order, each
@@ -371,6 +375,8 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             result_req_ids: list[str] = []
             stop_by_req: dict[str, torch.Tensor | None] = {}
             finalized_outputs: list[tuple[str, dict[str, Any]]] = []
+            # Pass 1: classify rows; collect the ones in the audio phase.
+            audio_rows: list[tuple[str, MingTalkerRequestState, torch.Tensor]] = []
             for row_idx, (req_id, should_audio_step, _span_len) in enumerate(self._pending_requests):
                 req_hidden = rows[row_idx : row_idx + 1]
                 result_req_ids.append(req_id)
@@ -381,10 +387,24 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 if state.finished:
                     stop_by_req[req_id] = self._make_stop_token_logits(req_hidden)
                     continue
+                audio_rows.append((req_id, state, req_hidden[-1]))
 
-                # One CFM audio step per request (no cross-request batching:
-                # that is a separate perf track under RFC #4129).
-                _gen_lat, _next_inputs, stop_out = self._talker_audio_step(state, req_hidden[-1])
+            # Pass 2: one CFM call for all audio-phase rows. A lone row keeps
+            # the per-request path so batching never perturbs the single-
+            # request behavior the parity evidence was gathered on.
+            if len(audio_rows) == 1:
+                req_id, state, last_hidden = audio_rows[0]
+                step_outputs = [(req_id, state, self._talker_audio_step(state, last_hidden)[2])]
+            elif audio_rows:
+                batched = self._talker_audio_step_batch([(state, hidden) for _, state, hidden in audio_rows])
+                step_outputs = [
+                    (req_id, state, stop_out)
+                    for (req_id, state, _), (_gen, _embed, stop_out) in zip(audio_rows, batched)
+                ]
+            else:
+                step_outputs = []
+
+            for req_id, state, stop_out in step_outputs:
                 stop_hit = bool(_stop_decision_mask(stop_out)[0])
                 finished = self._request_should_stop(stop_hit, state.step, state.min_steps, state.max_steps)
                 # Delay the stop token by one step. Within a runner step the
@@ -852,11 +872,86 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             randn_tensor=randn_tensor,
             sde_rnd=sde_rnd,
         )
+        self._commit_audio_step(state, gen_lat, next_inputs_embed)
+        return gen_lat, next_inputs_embed, stop_out
+
+    def _talker_audio_step_batch(
+        self,
+        entries: list[tuple[MingTalkerRequestState, torch.Tensor]],
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Phase B for several requests in one batched CFM call.
+
+        Each entry is ``(state, last_hidden)`` for one scheduler row that is in
+        the audio phase this step. The DiT / aggregator / stop-head stacks are
+        batch-first throughout, so the rows are stacked on dim 0 and split
+        again afterwards; every request keeps its own sampling knobs (per-row
+        ``sde_args``) and its own noise (drawn from its per-request generator
+        BEFORE stacking, in row order), so a request's latent stream does not
+        depend on which other requests happen to share the batch.
+
+        State commits happen only after the batched call returns for every
+        row, matching the per-request path's failure behavior: if the CFM step
+        raises, no state in the batch has advanced.
+        """
+        steps = int(self.config.steps)
+        patch_size = int(self.patch_size)
+        hiddens: list[torch.Tensor] = []
+        his_lats: list[torch.Tensor] = []
+        randns: list[torch.Tensor] = []
+        sde_rnds: list[torch.Tensor] = []
+        cfgs: list[float] = []
+        sigmas: list[float] = []
+        temperatures: list[float] = []
+        for state, last_hidden in entries:
+            if state.his_lat is None:
+                raise RuntimeError(f"Ming talker state {state.req_id!r} has no latent history")
+            hidden = _normalize_last_hidden_for_step(last_hidden).to(
+                device=state.his_lat.device, dtype=state.his_lat.dtype
+            )
+            randn_tensor, sde_rnd = _sample_request_noise(
+                state,
+                steps=steps,
+                patch_size=patch_size,
+                latent_dim=int(state.his_lat.shape[-1]),
+                device=hidden.device,
+                dtype=hidden.dtype,
+            )
+            hiddens.append(hidden)
+            his_lats.append(state.his_lat)
+            randns.append(randn_tensor)
+            sde_rnds.append(sde_rnd)
+            cfgs.append(float(state.cfg))
+            sigmas.append(float(state.sigma))
+            temperatures.append(float(state.temperature))
+
+        gen_lat, next_inputs_embed, stop_out = self.audio_generator.cfm_sample_step_batch(
+            torch.cat(hiddens, dim=0),
+            torch.cat(his_lats, dim=0),
+            cfg=cfgs,
+            sigma=sigmas,
+            temperature=temperatures,
+            randn_tensor=torch.cat(randns, dim=0),
+            sde_rnd=torch.cat(sde_rnds, dim=1),
+        )
+
+        outputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for row, (state, _) in enumerate(entries):
+            row_gen = gen_lat[row : row + 1]
+            row_embed = next_inputs_embed[row : row + 1]
+            self._commit_audio_step(state, row_gen, row_embed)
+            outputs.append((row_gen, row_embed, stop_out[row : row + 1]))
+        return outputs
+
+    def _commit_audio_step(
+        self,
+        state: MingTalkerRequestState,
+        gen_lat: torch.Tensor,
+        next_inputs_embed: torch.Tensor,
+    ) -> None:
         state.his_lat = self.audio_generator._update_his_lat(state.his_lat, gen_lat)
         state.all_latents.append(gen_lat)
         state.next_inputs_embed = next_inputs_embed
         state.step += 1
-        return gen_lat, next_inputs_embed, stop_out
 
     @staticmethod
     def _request_should_stop(stop_hit: bool, step: int, min_steps: int, max_steps: int) -> bool:
