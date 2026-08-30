@@ -29,10 +29,7 @@ class DotsTTSAdapter(ARTTSAdapter):
     def __init__(self, ctx):
         super().__init__(ctx)
         self.tokenizer = None
-        self._build_prompt_async = make_async(
-            self._build_prompt,
-            executor=self.ctx.server._tts_executor,
-        )
+        self._build_prompt_async = None
 
     def _build_prompt(self, text: str) -> dict:
         from vllm_omni.model_executor.models.dots_tts.dots_tts_prompt import build_dots_tts_prompt
@@ -67,6 +64,11 @@ class DotsTTSAdapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
+        if self._build_prompt_async is None:
+            self._build_prompt_async = make_async(
+                self._build_prompt,
+                executor=self.ctx.server._tts_executor,
+            )
         prompt = await self._build_prompt_async(request.input)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="dots_tts")
 
