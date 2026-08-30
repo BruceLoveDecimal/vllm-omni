@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Registry of TTS serving adapters, and the model detection built on it.
 
 Adapters register themselves by their ``name`` (the model-type discriminator)
@@ -19,6 +20,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     OutputPolicy,
     PreparedRequest,
     SpeechServingContext,
+    TTSGenerationError,
     TTSModelAdapter,
 )
 
@@ -127,6 +129,7 @@ __all__ = [
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",
+    "TTSGenerationError",
     "TTSModelAdapter",
     "TTS_ADAPTER_REGISTRY",
     "all_tts_model_types",
