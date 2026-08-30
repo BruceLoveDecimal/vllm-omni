@@ -8,7 +8,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Self, cast
+from typing import Any, NamedTuple, Self, cast
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,118 @@ class LingBotTransformerCache:
 
     self_attention: list[LingBotAttentionCache | ARDiffusionPagedLayerContext | ARDiffusionPagedLayerInputs]
     cross_attention: list[LingBotAttentionCache | None]
+
+
+class DenseCacheUpdatePlan(NamedTuple):
+    """Host-side layout decisions for one dense-cache self-attention call.
+
+    Computed OUTSIDE ``torch.compile`` (once per transformer forward — every
+    layer applies the identical transition), so the compiled region never
+    reads the cache's python cursors (``last_start``/``end``/``sink_end``)
+    and never branches on rollout progress. Those per-chunk attribute-value
+    guards were exhausting dynamo's shared recompile budget for the 40
+    ``LingBotAttentionBlock`` instances right as the sliding window filled,
+    silently degrading the rest of the rollout to eager (nondeterministic
+    outputs across processes plus a performance cliff).
+
+    The visible K/V layout of all three update branches collapses to one
+    assembly: ``cat(cache[:old_sink_end], chunk[:incoming_sink_tokens],
+    cache[local_keep_start:local_keep_end], chunk[incoming_sink_tokens:])``.
+    Slice bounds change only as *values* across chunks, which automatic
+    dynamic shapes absorb with a bounded number of graphs.
+    """
+
+    old_sink_end: int
+    incoming_sink_tokens: int
+    local_keep_start: int
+    local_keep_end: int
+    write_back: bool
+    next_end: int
+    next_sink_end: int
+    next_absolute_end: int
+    next_last_start: int
+
+
+def plan_dense_cache_update(
+    cache: LingBotAttentionCache,
+    *,
+    current_start: int,
+    chunk_tokens: int,
+    sink_tokens: int,
+    update_cache: bool,
+) -> DenseCacheUpdatePlan:
+    """Validate the chunk transition and lay out the visible K/V (host-side)."""
+
+    capacity = cache.key.shape[1]
+
+    if cache.last_start is None:
+        if chunk_tokens > capacity:
+            raise ValueError(
+                f"Current chunk has {chunk_tokens} tokens but the cache can hold only {capacity}; "
+                "the full current chunk must remain visible."
+            )
+        old_sink_end = 0
+        incoming_sink_tokens = max(0, min(chunk_tokens, sink_tokens - current_start))
+        local_keep_start = local_keep_end = 0
+        next_sink_end = incoming_sink_tokens
+        next_end = chunk_tokens
+    elif current_start == cache.last_start:
+        if current_start + chunk_tokens != cache.absolute_end:
+            raise ValueError("A repeated current_start must overwrite the same-size current chunk.")
+        if chunk_tokens > cache.end:
+            raise ValueError("The current chunk is no longer fully retained in the cache.")
+        old_sink_end = cache.end - chunk_tokens
+        incoming_sink_tokens = 0
+        local_keep_start = local_keep_end = old_sink_end
+        next_sink_end = cache.sink_end
+        next_end = cache.end
+    else:
+        if current_start < cache.last_start:
+            raise ValueError(f"current_start={current_start} precedes the latest chunk start {cache.last_start}.")
+        if current_start < cache.absolute_end:
+            raise ValueError(
+                f"current_start={current_start} overlaps cached tokens ending at {cache.absolute_end}."
+            )
+        if current_start > cache.absolute_end:
+            raise ValueError(
+                f"New chunks must be contiguous: current_start={current_start}, expected {cache.absolute_end}."
+            )
+
+        incoming_sink_tokens = max(0, min(chunk_tokens, sink_tokens - current_start))
+        old_sink_end = cache.sink_end
+        next_sink_end = cache.sink_end + incoming_sink_tokens
+        new_local_tokens = chunk_tokens - incoming_sink_tokens
+        local_capacity = capacity - next_sink_end
+        if new_local_tokens > local_capacity:
+            raise ValueError("The configured cache cannot retain all sink tokens and the full current chunk.")
+        retained_local_tokens = min(
+            cache.end - cache.sink_end,
+            local_capacity - new_local_tokens,
+        )
+        local_keep_end = cache.end
+        local_keep_start = local_keep_end - max(0, retained_local_tokens)
+        next_end = next_sink_end + (local_keep_end - local_keep_start) + new_local_tokens
+
+    return DenseCacheUpdatePlan(
+        old_sink_end=old_sink_end,
+        incoming_sink_tokens=incoming_sink_tokens,
+        local_keep_start=local_keep_start,
+        local_keep_end=local_keep_end,
+        write_back=bool(update_cache),
+        next_end=next_end,
+        next_sink_end=next_sink_end,
+        next_absolute_end=current_start + chunk_tokens,
+        next_last_start=current_start,
+    )
+
+
+def apply_dense_cache_plan(cache: LingBotAttentionCache, plan: DenseCacheUpdatePlan) -> None:
+    """Advance the host-side cursors of one layer cache (outside compile)."""
+
+    cache.end = plan.next_end
+    cache.absolute_end = plan.next_absolute_end
+    cache.last_start = plan.next_last_start
+    cache.sink_end = plan.next_sink_end
 
 
 def allocate_lingbot_cache(
@@ -186,80 +298,32 @@ class LingBotSelfAttention(nn.Module):
         cache: LingBotAttentionCache,
         key: torch.Tensor,
         value: torch.Tensor,
-        current_start: int,
-        *,
-        sink_tokens: int,
-        update_cache: bool,
+        plan: DenseCacheUpdatePlan,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        chunk_tokens = key.shape[1]
-        capacity = cache.key.shape[1]
-        next_sink_end = cache.sink_end
-
-        if cache.last_start is None:
-            if chunk_tokens > capacity:
-                raise ValueError(
-                    f"Current chunk has {chunk_tokens} tokens but the cache can hold only {capacity}; "
-                    "the full current chunk must remain visible."
-                )
-            next_key = key
-            next_value = value
-            next_sink_end = max(0, min(chunk_tokens, sink_tokens - current_start))
-        elif current_start == cache.last_start:
-            if current_start + chunk_tokens != cache.absolute_end:
-                raise ValueError("A repeated current_start must overwrite the same-size current chunk.")
-            if chunk_tokens > cache.end:
-                raise ValueError("The current chunk is no longer fully retained in the cache.")
-            prefix_end = cache.end - chunk_tokens
-            next_key = torch.cat((cache.key[:, :prefix_end], key), dim=1)
-            next_value = torch.cat((cache.value[:, :prefix_end], value), dim=1)
-        else:
-            if current_start < cache.last_start:
-                raise ValueError(f"current_start={current_start} precedes the latest chunk start {cache.last_start}.")
-            if current_start < cache.absolute_end:
-                raise ValueError(
-                    f"current_start={current_start} overlaps cached tokens ending at {cache.absolute_end}."
-                )
-            if current_start > cache.absolute_end:
-                raise ValueError(
-                    f"New chunks must be contiguous: current_start={current_start}, expected {cache.absolute_end}."
-                )
-
-            incoming_sink_tokens = max(0, min(chunk_tokens, sink_tokens - current_start))
-            old_sink_key = cache.key[:, : cache.sink_end]
-            old_sink_value = cache.value[:, : cache.sink_end]
-            new_sink_key = key[:, :incoming_sink_tokens]
-            new_sink_value = value[:, :incoming_sink_tokens]
-            next_sink_end = cache.sink_end + incoming_sink_tokens
-
-            old_local_key = cache.key[:, cache.sink_end : cache.end]
-            old_local_value = cache.value[:, cache.sink_end : cache.end]
-            new_local_key = key[:, incoming_sink_tokens:]
-            new_local_value = value[:, incoming_sink_tokens:]
-            local_capacity = capacity - next_sink_end
-            if new_local_key.shape[1] > local_capacity:
-                raise ValueError("The configured cache cannot retain all sink tokens and the full current chunk.")
-            retained_local_tokens = min(
-                old_local_key.shape[1],
-                local_capacity - new_local_key.shape[1],
-            )
-            if retained_local_tokens:
-                old_local_key = old_local_key[:, -retained_local_tokens:]
-                old_local_value = old_local_value[:, -retained_local_tokens:]
-            else:
-                old_local_key = old_local_key[:, :0]
-                old_local_value = old_local_value[:, :0]
-
-            next_key = torch.cat((old_sink_key, new_sink_key, old_local_key, new_local_key), dim=1)
-            next_value = torch.cat((old_sink_value, new_sink_value, old_local_value, new_local_value), dim=1)
-
-        next_end = next_key.shape[1]
-        if update_cache:
-            cache.key[:, :next_end].copy_(next_key)
-            cache.value[:, :next_end].copy_(next_value)
-            cache.end = next_end
-            cache.absolute_end = current_start + chunk_tokens
-            cache.last_start = current_start
-            cache.sink_end = next_sink_end
+        # One assembly covers first-chunk, probe-rerun, and advance layouts;
+        # the branch decisions live in ``plan_dense_cache_update`` outside the
+        # compiled region so only slice *values* vary here across chunks.
+        next_key = torch.cat(
+            (
+                cache.key[:, : plan.old_sink_end],
+                key[:, : plan.incoming_sink_tokens],
+                cache.key[:, plan.local_keep_start : plan.local_keep_end],
+                key[:, plan.incoming_sink_tokens :],
+            ),
+            dim=1,
+        )
+        next_value = torch.cat(
+            (
+                cache.value[:, : plan.old_sink_end],
+                value[:, : plan.incoming_sink_tokens],
+                cache.value[:, plan.local_keep_start : plan.local_keep_end],
+                value[:, plan.incoming_sink_tokens :],
+            ),
+            dim=1,
+        )
+        if plan.write_back:
+            cache.key[:, : plan.next_end].copy_(next_key)
+            cache.value[:, : plan.next_end].copy_(next_value)
         return next_key, next_value
 
     def forward(
@@ -271,6 +335,7 @@ class LingBotSelfAttention(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         sink_tokens: int,
         update_cache: bool = True,
+        dense_plan: DenseCacheUpdatePlan | None = None,
     ) -> torch.Tensor:
         # Project logical [B, S, D] tokens into TP-local
         # [B, S, num_local_heads, head_dim].
@@ -301,23 +366,43 @@ class LingBotSelfAttention(nn.Module):
             ).unsqueeze(0)
         else:
             # The direct path sees history + current K/V even when the caller
-            # asks not to mutate persistent cache state.
-            visible_key, visible_value = self._update_cache(
-                cache,
-                key,
-                value,
-                current_start,
-                sink_tokens=sink_tokens,
-                update_cache=update_cache,
-            )
+            # asks not to mutate persistent cache state. The compiled caller
+            # (transformer forward) plans the update outside torch.compile;
+            # the inline fallback keeps direct eager callers working.
+            if dense_plan is None:
+                dense_plan = plan_dense_cache_update(
+                    cache,
+                    current_start=current_start,
+                    chunk_tokens=key.shape[1],
+                    sink_tokens=sink_tokens,
+                    update_cache=update_cache,
+                )
+                visible_key, visible_value = self._update_cache(cache, key, value, dense_plan)
+                if dense_plan.write_back:
+                    apply_dense_cache_plan(cache, dense_plan)
+            else:
+                visible_key, visible_value = self._update_cache(cache, key, value, dense_plan)
             if query.is_cuda and query.shape[0] == 1:
                 # Use the same block-table FlashAttention entry point as the
                 # realtime path so direct replay is a numerical oracle for
                 # paged execution, rather than a comparison between two
                 # different attention kernels.
+                #
+                # Pad the visible K/V up to the cache capacity so the kernel
+                # sees ONE shape for the whole rollout: ``seq_lens`` bounds
+                # the valid rows and the block-table kernel never
+                # dereferences the padded tail, so numerics are unchanged
+                # while dynamo compiles a single graph instead of one per
+                # window-growth stage (the per-stage variants exhausted the
+                # recompile budget and silently fell back to eager).
                 block_size = key.shape[1]
-                key_cache = visible_key[0].unflatten(0, (-1, block_size))
-                value_cache = visible_value[0].unflatten(0, (-1, block_size))
+                capacity = cache.key.shape[1]
+                visible_tokens = visible_key.shape[1]
+                pad_tokens = capacity - visible_tokens
+                padded_key = F.pad(visible_key, (0, 0, 0, 0, 0, pad_tokens))
+                padded_value = F.pad(visible_value, (0, 0, 0, 0, 0, pad_tokens))
+                key_cache = padded_key[0].unflatten(0, (-1, block_size))
+                value_cache = padded_value[0].unflatten(0, (-1, block_size))
                 block_count = key_cache.shape[0]
                 block_table = torch.arange(
                     block_count,
@@ -330,7 +415,7 @@ class LingBotSelfAttention(nn.Module):
                     device=query.device,
                 )
                 seq_lens = torch.tensor(
-                    [visible_key.shape[1]],
+                    [visible_tokens],
                     dtype=torch.int32,
                     device=query.device,
                 )
@@ -342,7 +427,7 @@ class LingBotSelfAttention(nn.Module):
                     query_start_loc=query_start_loc,
                     seq_lens=seq_lens,
                     max_query_len=query.shape[1],
-                    max_seq_len=visible_key.shape[1],
+                    max_seq_len=capacity,
                     softmax_scale=self.head_dim**-0.5,
                 )
             else:
@@ -538,6 +623,7 @@ class LingBotAttentionBlock(nn.Module):
         sink_tokens: int,
         update_cache: bool,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        dense_plan: DenseCacheUpdatePlan | None = None,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         batch_size, token_count, dim = hidden_states.shape
         num_frames = timestep_projection.shape[1]
@@ -556,6 +642,7 @@ class LingBotAttentionBlock(nn.Module):
             rotary_emb=rotary_emb,
             sink_tokens=sink_tokens,
             update_cache=update_cache,
+            dense_plan=dense_plan,
         )
         hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
         hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
@@ -1138,6 +1225,20 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 query_len=hidden_states.shape[1],
             )
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
+        # Every layer applies the identical cache transition, so plan it once
+        # on the host, OUTSIDE the compiled block region: reading the rolling
+        # cursors (or branching on them) inside the blocks installs one dynamo
+        # value guard per chunk on the shared block code object and exhausts
+        # the recompile budget mid-rollout (silent eager fallback).
+        dense_plan = None
+        if cache.self_attention and isinstance(cache.self_attention[0], LingBotAttentionCache):
+            dense_plan = plan_dense_cache_update(
+                cache.self_attention[0],
+                current_start=current_start,
+                chunk_tokens=hidden_states.shape[1],
+                sink_tokens=sink_tokens,
+                update_cache=update_cache,
+            )
         # Phase 3: each layer receives its own cache entry. Text K/V is passed
         # only when absent; the returned cache is stored for subsequent DMD
         # steps and causal blocks in this request.
@@ -1153,8 +1254,12 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
                 rotary_emb=rotary_emb,
+                dense_plan=dense_plan,
             )
             cache.cross_attention[index] = cross_cache
+        if dense_plan is not None and dense_plan.write_back:
+            for layer_cache in cache.self_attention:
+                apply_dense_cache_plan(cast(LingBotAttentionCache, layer_cache), dense_plan)
 
         # Phase 4: map tokens to per-patch 16-channel flow values and restore
         # [B, C, F, H, W] for the Pipeline's sampler update.
