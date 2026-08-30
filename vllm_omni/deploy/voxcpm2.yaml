@@ -43,6 +43,9 @@ stages:
           enable_loc_dit_reduce_overhead_no_cg: true
           enable_unified_decode_graph: true
           unified_decode_graph_max_batch_size: 8
+          # Keep pure decode graph batches under saturation, while allowing
+          # sparse arrivals to prefill immediately when sequence slots are free.
+          unified_decode_graph_admit_when_unsaturated: true
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

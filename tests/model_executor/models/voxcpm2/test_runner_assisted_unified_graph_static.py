@@ -197,7 +197,8 @@ def test_voxcpm2_scheduler_policy_stays_model_local():
     assert "def schedule(" not in voxcpm2_scheduler_source
     assert "create_request_queue" not in voxcpm2_scheduler_source
     assert "original_waiting.prepend_requests(deferred_waiting)" not in voxcpm2_scheduler_source
-    assert "return self._should_defer_waiting_for_unified_decode_graph()" in voxcpm2_scheduler_source
+    assert "unified_decode_graph_admit_when_unsaturated" in voxcpm2_scheduler_source
+    assert "time.monotonic()" not in voxcpm2_scheduler_source
     assert "vllm_omni.model_executor.models.voxcpm2.scheduler.VoxCPM2OmniARAsyncScheduler" in pipeline_source
 
 
@@ -207,6 +208,7 @@ def test_voxcpm2_deploy_defaults_to_full_unified_graph_only():
     assert "max_num_seqs: 8" in source
     assert "enable_unified_decode_graph: true" in source
     assert "unified_decode_graph_max_batch_size: 8" in source
+    assert "unified_decode_graph_admit_when_unsaturated: true" in source
     assert "unified_decode_graph_pre_capture_sizes" not in source
     assert "enable_runner_assisted_unified_decode_graph" not in source
     assert "allow_unified_decode_graph_batch_attention" not in source
