@@ -5,7 +5,7 @@
 ## Summary
 
 - Vendor: rednote-hilab
-- Model: `rednote-hilab/dots.tts-soar`
+- Model: `dots-studio/dots.tts-soar`
 - Task: Text-to-speech, zero-shot synthesis only
 - Mode: Offline inference and OpenAI-compatible online serving
 - Maintainer: Community
@@ -13,7 +13,7 @@
 ## When to use this recipe
 
 Use this recipe as a known-good starting point for running
-`rednote-hilab/dots.tts-soar` on vLLM-Omni on consumer-class GPUs.
+`dots-studio/dots.tts-soar` on vLLM-Omni on consumer-class GPUs.
 dots.tts is a ~1.7B-parameter continuous-AR TTS model (Qwen2.5-1.5B base LM
 + 344M DiT flow-matching head + 180M AudioVAE) that emits 48 kHz mono audio.
 It follows the same "vLLM-native base LM + side-path computation" pattern as
@@ -74,7 +74,7 @@ release runs `enforce_eager: true`, so it doesn't apply today).
 
 ```bash
 python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
-    --model rednote-hilab/dots.tts-soar \
+    --model dots-studio/dots.tts-soar \
     --text "Hello, this is a test of dots TTS running on vLLM Omni."
 ```
 
@@ -89,7 +89,7 @@ Pass `--deploy-config <path>` to override.
 
 ```bash
 python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
-    --model rednote-hilab/dots.tts-soar \
+    --model dots-studio/dots.tts-soar \
     --text "Hello, this is a test of dots TTS running on vLLM Omni."
 ```
 
@@ -110,7 +110,7 @@ described in [Known limitations](#known-limitations)).
 **T2 — online text-only synthesis**:
 
 ```bash
-vllm serve rednote-hilab/dots.tts-soar --omni --trust-remote-code --port 8091
+vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
 ```
 
 ```bash
@@ -129,7 +129,7 @@ The endpoint also supports raw streaming audio with `stream=true`,
 #### Notes
 
 - Output: 48 kHz mono WAV.
-- Checkpoints: `rednote-hilab/dots.tts-soar` is the validated default
+- Checkpoints: `dots-studio/dots.tts-soar` is the validated default
   used throughout this recipe. `rednote-hilab/dots.tts-base` shares the
   same architecture but is unvalidated in this repo. `rednote-hilab/dots.tts-mf`
   (MeanFlow, 2-4 step) is not supported — see below.

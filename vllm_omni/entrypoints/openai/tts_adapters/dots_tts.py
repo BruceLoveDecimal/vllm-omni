@@ -4,6 +4,7 @@
 from typing import TYPE_CHECKING
 
 from transformers import AutoTokenizer
+from vllm.utils.async_utils import make_async
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
@@ -27,9 +28,21 @@ class DotsTTSAdapter(ARTTSAdapter):
 
     def __init__(self, ctx):
         super().__init__(ctx)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.ctx.engine_client.model_config.model, trust_remote_code=True
+        self.tokenizer = None
+        self._build_prompt_async = make_async(
+            self._build_prompt,
+            executor=self.ctx.server._tts_executor,
         )
+
+    def _build_prompt(self, text: str) -> dict:
+        from vllm_omni.model_executor.models.dots_tts.dots_tts_prompt import build_dots_tts_prompt
+
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.ctx.engine_client.model_config.model,
+                trust_remote_code=True,
+            )
+        return build_dots_tts_prompt(self.tokenizer, text)
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         if not request.input or not request.input.strip():
@@ -54,9 +67,7 @@ class DotsTTSAdapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        from vllm_omni.model_executor.models.dots_tts.dots_tts_prompt import build_dots_tts_prompt
-
-        prompt = build_dots_tts_prompt(self.tokenizer, request.input)
+        prompt = await self._build_prompt_async(request.input)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="dots_tts")
 
     def apply_sampling_overrides(

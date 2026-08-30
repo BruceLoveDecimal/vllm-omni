@@ -3908,11 +3908,6 @@ def dots_tts_server(mocker: MockerFixture):
     mock_models = mocker.MagicMock()
     mock_models.is_base_model.return_value = True
 
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.tts_adapters.dots_tts.AutoTokenizer.from_pretrained",
-        return_value=mocker.MagicMock(),
-    )
-
     return OmniOpenAIServingSpeech(
         engine_client=mock_engine_client,
         models=mock_models,
@@ -3947,11 +3942,15 @@ class TestDotsTTSServing:
         assert error is not None
         assert "x_vector_only_mode" in error
 
-    def test_dots_tts_adapter_builds_prompt(self, dots_tts_server, mocker: MockerFixture):
-        mocker.patch.object(dots_tts_server._adapter, "build", return_value=PreparedRequest(prompt="Hello"))
+    def test_dots_tts_adapter_awaits_async_prompt_builder(self, dots_tts_server, mocker: MockerFixture):
+        build_prompt_async = mocker.patch.object(
+            dots_tts_server._adapter,
+            "_build_prompt_async",
+            new=mocker.AsyncMock(return_value={"prompt_token_ids": [1, 2, 3]}),
+        )
         request = OpenAICreateSpeechRequest(input="Hello")
         asyncio.run(dots_tts_server._prepare_speech_generation(request))
-        dots_tts_server._adapter.build.assert_called_once()
+        build_prompt_async.assert_awaited_once_with("Hello")
 
     def test_dots_tts_adapter_apply_sampling_overrides(self, dots_tts_server, mocker: MockerFixture):
         mocker.patch.object(dots_tts_server._adapter, "build", return_value=PreparedRequest(prompt="Hello"))

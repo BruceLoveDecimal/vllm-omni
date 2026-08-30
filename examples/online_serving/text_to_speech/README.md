@@ -24,7 +24,7 @@ For the full list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
-| dots.tts | `rednote-hilab/dots.tts-soar` | — (text-only) | ✓ (PCM stream) | — (default placeholder only) | — |
+| dots.tts | `dots-studio/dots.tts-soar` | — (text-only) | ✓ (PCM stream) | — (default placeholder only) | — |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 | SoulX-Singer | `Soul-AILab/SoulX-Singer` | ✓ (prompt audio) | — (batch only) | — (prompt + target audio) | — (chat client) |
 
@@ -110,7 +110,7 @@ precomputed speaker embeddings are not supported yet.
 ### Launch
 
 ```bash
-vllm serve rednote-hilab/dots.tts-soar --omni --trust-remote-code --port 8091
+vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
 ```
 
 ### Sending requests
