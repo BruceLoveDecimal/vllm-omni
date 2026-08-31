@@ -191,6 +191,26 @@ async def test_named_voice_created_at_isolation(make_encoder):
     assert proc.total_items == 2  # original generation still cached
 
 
+async def test_named_voice_keys_are_case_insensitive(make_encoder):
+    """Flight key and cache key must agree on one spelling of the voice name."""
+    proc, audio = _FakeProcessor(delay_s=0.02), _FakeAudio()
+    audio.register("ref", 7)
+    enc = make_encoder(proc)
+
+    # Concurrent callers differing only by case share one flight...
+    r1, r2 = await asyncio.gather(
+        _encode(enc, audio, "ref", voice_name="Alice", voice_created_at=1),
+        _encode(enc, audio, "ref", voice_name="ALICE", voice_created_at=1),
+    )
+    assert proc.total_items == 1
+    assert int(r1[0, 0]) == 7 and int(r2[0, 0]) == 7
+
+    # ...and populate the slot every later spelling hits.
+    out = await _encode(enc, audio, "ref", voice_name="alice", voice_created_at=1)
+    assert proc.total_items == 1
+    assert int(out[0, 0]) == 7
+
+
 async def test_unregistered_default_voice_uses_ref_content_key(make_encoder):
     proc, audio = _FakeProcessor(), _FakeAudio()
     audio.register("first", 7, artifact="c7")

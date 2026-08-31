@@ -80,8 +80,13 @@ def _registered_voice(voice_name: str | None, voice_created_at: int) -> tuple[st
     placeholders such as "default" for ref-audio voice cloning. Only registered
     uploaded voices have a positive created_at timestamp; other names must not
     key the cache because the timbre comes from ref_audio.
+
+    The name is lowercased here so every derived key agrees on one spelling:
+    if the cache key kept the caller's casing while the flight key normalized
+    it, two concurrent callers differing only by case would share a flight but
+    populate different cache slots.
     """
-    name = voice_name.strip() if isinstance(voice_name, str) else ""
+    name = voice_name.strip().lower() if isinstance(voice_name, str) else ""
     created_at = int(voice_created_at)
     if name and created_at > 0:
         return name, created_at
@@ -228,7 +233,7 @@ class MossReferenceEncoder:
         if voice_name:
             # A named voice has a stable key that does not depend on the
             # resolved audio, so the cache can be checked before resolving.
-            flight_key = f"voice:{voice_name.lower()}:{created_at}"
+            flight_key = f"voice:{voice_name}:{created_at}"
             cached = self._speaker_cache.get(self._make_cache_key(voice_name, created_at))
             if cached is not None:
                 return _clone_out(cached["codes"]), None
