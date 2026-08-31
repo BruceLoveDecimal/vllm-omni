@@ -4,10 +4,14 @@
 """
 Online serving smoke for SANA-WM image-to-video (first-frame I2V via ``/v1/videos``).
 
-Boots the server straight from the model id — the Stage-1 repo's
-``model_index.json`` names ``SanaWmPipeline``, so the class resolves on its own
-— submits one async ``/v1/videos`` job with a first-frame reference image, and
-asserts the job completes and returns video bytes.
+Boots the server straight from the model id — the two-stage repo's
+``model_index.json`` names ``SanaWmTwoStagesPipeline``, so the class resolves on
+its own — submits one async ``/v1/videos`` job with a first-frame reference
+image, and asserts the job completes and returns video bytes.
+
+This is the only SANA-WM serving smoke. The two-stage pipeline runs the same
+Stage-1 sampler before handing its latents to the LTX-2 refiner, so serving the
+two-stage repo covers the Stage-1 serving path as well.
 
 From ``tests/``::
 
@@ -24,14 +28,14 @@ import pytest
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 from vllm_omni.diffusion.models.sana_wm import (
-    SANA_WM_MODEL_ID,
     SANA_WM_OUTPUT_HEIGHT,
     SANA_WM_OUTPUT_WIDTH,
+    SANA_WM_TWO_STAGES_MODEL_ID,
 )
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-MODEL = SANA_WM_MODEL_ID
+MODEL = SANA_WM_TWO_STAGES_MODEL_ID
 PROMPT = "A slow forward camera move through a quiet city street."
 NEGATIVE_PROMPT = "blurry, low quality, distorted, watermark"
 
@@ -82,7 +86,7 @@ def _get_diffusion_feature_cases(model: str):
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_image_to_video_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    """Default SANA-WM I2V smoke: async ``/v1/videos`` job completes and returns video bytes."""
+    """Two-stage SANA-WM I2V smoke: async ``/v1/videos`` job completes and returns video bytes."""
     request_config = {
         "model": omni_server.model,
         "image_reference": _first_frame_data_url(),

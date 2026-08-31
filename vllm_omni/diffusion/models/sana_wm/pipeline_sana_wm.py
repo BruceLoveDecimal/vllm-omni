@@ -67,6 +67,9 @@ logger = init_logger(__name__)
 # (allow_patterns=["*"]); a repo that also carried the refiner would pull tens of
 # GB this path never loads.
 SANA_WM_MODEL_ID = "BBBBruce/SANA-WM_bidirectional-stage1-diffusers"
+# The two-stage repo carries the same Stage-1 tree plus refiner/. Kept separate
+# from SANA_WM_MODEL_ID so a Stage-1 deployment never prefetches the refiner.
+SANA_WM_TWO_STAGES_MODEL_ID = "BBBBruce/SANA-WM_bidirectional-diffusers"
 
 SANA_WM_STAGE1_DIT_FILE = "transformer/diffusion_pytorch_model.safetensors"
 SANA_WM_CONFIG_FILE = "transformer/config.json"
@@ -106,6 +109,23 @@ SANA_WM_STAGE1_PATTERNS = (
 SANA_WM_STAGE1_DIT_SUBFOLDER = "transformer"
 SANA_WM_STAGE1_DIT_BASENAME = Path(SANA_WM_STAGE1_DIT_FILE).name
 
+# Refiner layout. Only ``SanaWmTwoStagesPipeline`` asks for these: the refiner
+# lives in a separate HF repo (``SANA_WM_TWO_STAGES_MODEL_ID``) so a Stage-1
+# deployment never prefetches the tens of GB it would not load.
+SANA_WM_REFINER_SUBFOLDER = "refiner"
+SANA_WM_REFINER_TRANSFORMER_CONFIG_FILE = "refiner/transformer/config.json"
+SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE = "refiner/transformer/diffusion_pytorch_model.safetensors"
+SANA_WM_REFINER_CONNECTORS_CONFIG_FILE = "refiner/connectors/config.json"
+SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE = "refiner/connectors/diffusion_pytorch_model.safetensors"
+SANA_WM_REFINER_TEXT_ENCODER_DIR = "refiner/text_encoder"
+SANA_WM_REFINER_PATTERNS = (
+    SANA_WM_REFINER_TRANSFORMER_CONFIG_FILE,
+    SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE,
+    SANA_WM_REFINER_CONNECTORS_CONFIG_FILE,
+    SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE,
+    f"{SANA_WM_REFINER_TEXT_ENCODER_DIR}/*",
+)
+
 
 @dataclass(frozen=True)
 class SanaWmLocalPaths:
@@ -116,6 +136,13 @@ class SanaWmLocalPaths:
     stage1_dit: Path
     vae_config: Path
     vae_weights: Path
+    # Populated only when the caller asked for the refiner tree.
+    refiner_root: Path | None = None
+    refiner_transformer_config: Path | None = None
+    refiner_transformer_weights: Path | None = None
+    refiner_connectors_config: Path | None = None
+    refiner_connectors_weights: Path | None = None
+    refiner_text_encoder_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -137,20 +164,41 @@ class SanaWmNativeParams:
     cfg_scale: float = SANA_WM_DEFAULT_GUIDANCE_SCALE
 
 
-def build_sana_wm_download_patterns() -> tuple[str, ...]:
+def build_sana_wm_download_patterns(*, include_refiner: bool = False) -> tuple[str, ...]:
     """Return the minimal HF allow-patterns needed for SANA-WM."""
 
+    if include_refiner:
+        return tuple(SANA_WM_STAGE1_PATTERNS) + tuple(SANA_WM_REFINER_PATTERNS)
     return tuple(SANA_WM_STAGE1_PATTERNS)
 
 
-def resolve_sana_wm_local_paths(snapshot_dir: str | Path) -> SanaWmLocalPaths:
+def resolve_sana_wm_local_paths(
+    snapshot_dir: str | Path,
+    *,
+    include_refiner: bool = False,
+) -> SanaWmLocalPaths:
     root = Path(snapshot_dir)
+    if not include_refiner:
+        return SanaWmLocalPaths(
+            root=root,
+            config=root / SANA_WM_CONFIG_FILE,
+            stage1_dit=root / SANA_WM_STAGE1_DIT_FILE,
+            vae_config=root / SANA_WM_VAE_CONFIG_FILE,
+            vae_weights=root / SANA_WM_VAE_WEIGHT_FILE,
+        )
+    refiner_root = root / SANA_WM_REFINER_SUBFOLDER
     return SanaWmLocalPaths(
         root=root,
         config=root / SANA_WM_CONFIG_FILE,
         stage1_dit=root / SANA_WM_STAGE1_DIT_FILE,
         vae_config=root / SANA_WM_VAE_CONFIG_FILE,
         vae_weights=root / SANA_WM_VAE_WEIGHT_FILE,
+        refiner_root=refiner_root,
+        refiner_transformer_config=root / SANA_WM_REFINER_TRANSFORMER_CONFIG_FILE,
+        refiner_transformer_weights=root / SANA_WM_REFINER_TRANSFORMER_WEIGHT_FILE,
+        refiner_connectors_config=root / SANA_WM_REFINER_CONNECTORS_CONFIG_FILE,
+        refiner_connectors_weights=root / SANA_WM_REFINER_CONNECTORS_WEIGHT_FILE,
+        refiner_text_encoder_dir=root / SANA_WM_REFINER_TEXT_ENCODER_DIR,
     )
 
 
@@ -161,6 +209,16 @@ def validate_sana_wm_local_paths(paths: SanaWmLocalPaths) -> None:
         paths.vae_config,
         paths.vae_weights,
     ]
+    if paths.refiner_root is not None:
+        required.extend(
+            [
+                paths.refiner_transformer_config,
+                paths.refiner_transformer_weights,
+                paths.refiner_connectors_config,
+                paths.refiner_connectors_weights,
+                paths.refiner_text_encoder_dir / "config.json",
+            ]
+        )
     missing = [path for path in required if not path.exists()]
     if missing:
         joined = ", ".join(str(path) for path in missing)
@@ -172,6 +230,7 @@ def resolve_or_download_sana_wm_checkpoint(
     *,
     revision: str | None = None,
     cache_dir: str | None = None,
+    include_refiner: bool = False,
 ) -> SanaWmLocalPaths:
     """Resolve a local SANA-WM tree or download the required HF files."""
 
@@ -183,12 +242,12 @@ def resolve_or_download_sana_wm_checkpoint(
             download_weights_from_hf_specific(
                 model,
                 cache_dir,
-                list(build_sana_wm_download_patterns()),
+                list(build_sana_wm_download_patterns(include_refiner=include_refiner)),
                 revision=revision,
                 require_all=True,
             )
         )
-    paths = resolve_sana_wm_local_paths(snapshot_dir)
+    paths = resolve_sana_wm_local_paths(snapshot_dir, include_refiner=include_refiner)
     validate_sana_wm_local_paths(paths)
     return paths
 
@@ -208,6 +267,21 @@ def build_sana_wm_output_envelope(
     """
     payload_key = "latents" if output_type == "latent" else "video"
     return {"payload": {payload_key: output}, "metadata": {"sana_wm": metadata}}
+
+
+def read_sana_wm_envelope_payload(output: Any) -> Any:
+    """Return the single payload value carried by a SANA-WM output envelope."""
+    payload = output.get("payload") if isinstance(output, dict) else None
+    if not isinstance(payload, dict) or len(payload) != 1:
+        raise ValueError("Expected a single-entry SANA-WM output envelope from the Stage-1 backend.")
+    return next(iter(payload.values()))
+
+
+def read_sana_wm_envelope_metadata(output: Any) -> dict[str, Any]:
+    """Return the ``sana_wm`` metadata group of a SANA-WM output envelope."""
+    metadata = output.get("metadata") if isinstance(output, dict) else None
+    group = metadata.get("sana_wm") if isinstance(metadata, dict) else None
+    return dict(group) if isinstance(group, dict) else {}
 
 
 def get_sana_wm_pre_process_func(od_config: OmniDiffusionConfig):
@@ -264,6 +338,8 @@ class SanaWmPipeline(
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+    # Overridden by SanaWmTwoStagesPipeline, which resolves the refiner tree too.
+    include_refiner: ClassVar[bool] = False
     # Skip the startup warmup: the generic dummy request carries a blank image
     # with no camera poses and no action string, which SANA-WM's request
     # validation always rejects. The first real request does the warming.
@@ -325,6 +401,7 @@ class SanaWmPipeline(
         self.release_paths = resolve_or_download_sana_wm_checkpoint(
             self.od_config.model,
             revision=self.od_config.revision,
+            include_refiner=self.include_refiner,
         )
         self.sana_wm_config = SanaWmConfig.from_json(self.release_paths.config)
         return self.release_paths
@@ -382,18 +459,22 @@ class SanaWmPipeline(
         self._load_vae(dtype=dtype)
         self._place_aux_components()
 
-    def _place_aux_components(self) -> None:
-        """Move the discovered auxiliary components onto the local device.
+    def _placement_is_external(self) -> bool:
+        """True when offload or HSDP, not this pipeline, places components.
 
-        Skipped when offload or HSDP owns placement — those paths expect the
-        components to still be on CPU when they take over.
+        Those paths expect every component to still be on CPU when they take
+        over, so they can shard it, stream it block by block, or stage it.
         """
         parallel_config = getattr(self.od_config, "parallel_config", None)
-        if (
+        return bool(
             getattr(self.od_config, "enable_cpu_offload", False)
             or getattr(self.od_config, "enable_layerwise_offload", False)
             or getattr(parallel_config, "use_hsdp", False)
-        ):
+        )
+
+    def _place_aux_components(self) -> None:
+        """Move the discovered auxiliary components onto the local device."""
+        if self._placement_is_external():
             return
         modules = ModuleDiscovery.discover(self)
         for module in (*modules.encoders, *modules.vaes, *modules.resident_modules):

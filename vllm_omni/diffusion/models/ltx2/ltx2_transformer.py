@@ -482,6 +482,33 @@ class LTX2AudioVideoAttnProcessor:
 
         return cos, sin
 
+    def _run_attention(
+        self,
+        attn: "LTX2Attention",
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        context_tokens: int | None,
+    ) -> torch.Tensor:
+        """Full attention, or -- for a streaming refiner's sink prefix -- two
+        calls: the first ``context_tokens`` tokens attend only to themselves,
+        the rest attend to everything. Two calls instead of a ``(seq, seq)``
+        additive mask keep every backend off the quadratic-memory path.
+        """
+
+        n = context_tokens
+        if n is None or not 0 < n < query.shape[1]:
+            return attn.attn(query, key, value, attn_metadata)
+        if self._is_sp_enabled():
+            raise NotImplementedError(
+                "context-prefix attention is not sequence-parallel: the prefix boundary is "
+                "not a rank-local index once the sequence is sharded. Run with sequence_parallel_size=1."
+            )
+        prefix = attn.attn(query[:, :n].contiguous(), key[:, :n].contiguous(), value[:, :n].contiguous(), attn_metadata)
+        rest = attn.attn(query[:, n:].contiguous(), key, value, attn_metadata)
+        return torch.cat([prefix, rest], dim=1)
+
     def __call__(
         self,
         attn: "LTX2Attention",
@@ -491,6 +518,7 @@ class LTX2AudioVideoAttnProcessor:
         query_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         key_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         perturbation_mask: torch.Tensor | None = None,
+        context_tokens: int | None = None,
     ) -> torch.Tensor:
         is_self_attention = encoder_hidden_states is None
         batch_size, sequence_length, _ = hidden_states.shape if is_self_attention else encoder_hidden_states.shape
@@ -547,7 +575,7 @@ class LTX2AudioVideoAttnProcessor:
         value_heads = value.unflatten(2, (attn.heads, attn.head_dim))
 
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
-        hidden_states = attn.attn(query, key, value_heads, attn_metadata)
+        hidden_states = self._run_attention(attn, query, key, value_heads, attn_metadata, context_tokens)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
         if perturbation_mask is not None:
@@ -1035,6 +1063,7 @@ class LTX2VideoTransformerBlock(nn.Module):
         encoder_attention_mask: torch.Tensor | None = None,
         audio_encoder_attention_mask: torch.Tensor | None = None,
         self_attention_mask: torch.Tensor | None = None,
+        self_attention_context_tokens: int | None = None,
         audio_self_attention_mask: torch.Tensor | None = None,
         a2v_cross_attention_mask: torch.Tensor | None = None,
         v2a_cross_attention_mask: torch.Tensor | None = None,
@@ -1063,6 +1092,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             query_rotary_emb=video_rotary_emb,
             attention_mask=self_attention_mask,
             perturbation_mask=video_self_attention_perturbation_mask,
+            context_tokens=self_attention_context_tokens,
         )
         hidden_states = hidden_states + attn_hidden_states * gate_msa
 
@@ -1897,6 +1927,9 @@ class LTX2VideoTransformer3DModel(nn.Module):
         encoder_attention_mask: torch.Tensor | None = None,
         audio_encoder_attention_mask: torch.Tensor | None = None,
         audio_attention_mask: torch.Tensor | None = None,
+        self_attention_context_tokens: int | None = None,
+        use_a2v_cross_attention: bool = True,
+        use_v2a_cross_attention: bool = True,
         num_frames: int | None = None,
         height: int | None = None,
         width: int | None = None,
@@ -1932,6 +1965,16 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 Optional multiplicative text attention mask of shape `(batch_size, text_seq_len)` for audio modeling.
             audio_attention_mask (`torch.Tensor`, *optional*):
                 Optional audio-token key padding mask shared by audio self-attention and audio-to-video attention.
+            self_attention_context_tokens (`int`, *optional*):
+                Length of a leading run of video tokens that must not attend to the tokens after it -- the sink
+                frames of a streaming refiner. Not supported under sequence parallelism, where the prefix boundary
+                is not a rank-local index.
+            use_a2v_cross_attention (`bool`, defaults to `True`):
+                Forwarded to every block. Disabling it cuts the only path by which audio reaches the video stream,
+                so a caller that also discards `audio_sample` gets a video-only result (e.g. the SANA-WM refiner,
+                whose checkpoint ships no audio weights).
+            use_v2a_cross_attention (`bool`, defaults to `True`):
+                Forwarded to every block; the video-to-audio direction of the above.
             num_frames (`int`, *optional*):
                 The number of latent video frames. Used if calculating the video coordinates for RoPE.
             height (`int`, *optional*):
@@ -2118,6 +2161,9 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 "ca_audio_rotary_emb": audio_cross_attn_rotary_emb,
                 "encoder_attention_mask": encoder_attention_mask,
                 "audio_encoder_attention_mask": audio_encoder_attention_mask,
+                "self_attention_context_tokens": self_attention_context_tokens,
+                "use_a2v_cross_attention": use_a2v_cross_attention,
+                "use_v2a_cross_attention": use_v2a_cross_attention,
                 "audio_self_attention_mask": audio_attention_mask,
                 "a2v_cross_attention_mask": audio_attention_mask,
                 "video_self_attention_perturbation_mask": perturbation_mask_for("video_self_attention", block_idx),

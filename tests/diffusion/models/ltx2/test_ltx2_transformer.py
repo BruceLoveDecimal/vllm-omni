@@ -480,3 +480,145 @@ def test_ltx_gated_attention_uses_tp_sharded_projection(monkeypatch):
     assert gate_kwargs["gather_output"] is False
     assert gate_kwargs["return_bias"] is False
     assert attention.query_num_heads == 2
+
+
+class _Tripwire(nn.Module):
+    def forward(self, *_args, **_kwargs):
+        raise AssertionError("a cross-modal module ran while a2v/v2a were disabled")
+
+
+class _FakeAttention:
+    def __init__(self, calls):
+        self._calls = calls
+
+    def attn(self, query, key, _value, _metadata):
+        self._calls.append((query.shape[1], key.shape[1]))
+        return torch.zeros_like(query)
+
+
+def test_ltx_context_prefix_attention_splits_into_two_calls(monkeypatch):
+    processor_cls = ltx2_transformer.LTX2AudioVideoAttnProcessor
+    monkeypatch.setattr(processor_cls, "_is_sp_enabled", staticmethod(lambda: False))
+    processor = processor_cls()
+    calls = []
+    query = key = value = torch.zeros(1, 5, 2, 4)
+
+    output = processor._run_attention(_FakeAttention(calls), query, key, value, None, 2)
+
+    # The 2 context tokens see only themselves; the 3 current tokens see all 5.
+    assert calls == [(2, 2), (3, 5)]
+    assert output.shape == (1, 5, 2, 4)
+
+
+def test_ltx_context_prefix_attention_rejects_sequence_parallelism(monkeypatch):
+    processor_cls = ltx2_transformer.LTX2AudioVideoAttnProcessor
+    monkeypatch.setattr(processor_cls, "_is_sp_enabled", staticmethod(lambda: True))
+    processor = processor_cls()
+    query = key = value = torch.zeros(1, 5, 2, 4)
+
+    with pytest.raises(NotImplementedError, match="not sequence-parallel"):
+        processor._run_attention(_FakeAttention([]), query, key, value, None, 2)
+
+
+@pytest.mark.parametrize("context_tokens", [None, 0, 5, 7])
+def test_ltx_context_prefix_attention_is_a_no_op_outside_the_sequence(context_tokens):
+    processor = ltx2_transformer.LTX2AudioVideoAttnProcessor()
+    calls = []
+    query = key = value = torch.zeros(1, 5, 2, 4)
+
+    processor._run_attention(_FakeAttention(calls), query, key, value, None, context_tokens)
+
+    assert calls == [(5, 5)]
+
+
+def test_ltx_block_disabled_av_cross_attention_keeps_streams_independent():
+    """With a2v/v2a off, audio must not reach video -- the SANA-WM refiner leans on this."""
+
+    class CaptureAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.context_tokens = "unset"
+
+        def forward(self, hidden_states, encoder_hidden_states=None, **kwargs):
+            self.context_tokens = kwargs.get("context_tokens", "unset")
+            return torch.zeros_like(hidden_states)
+
+    class ZeroOutput(nn.Module):
+        def forward(self, hidden_states):
+            return torch.zeros_like(hidden_states)
+
+    block = object.__new__(LTX2VideoTransformerBlock)
+    nn.Module.__init__(block)
+    block.video_cross_attn_adaln = False
+    block.audio_cross_attn_adaln = False
+    block.cross_attn_adaln = False
+    block.scale_shift_table = nn.Parameter(torch.zeros(6, 2))
+    block.audio_scale_shift_table = nn.Parameter(torch.zeros(6, 2))
+    for name in ("norm1", "norm2", "norm3", "audio_norm1", "audio_norm2", "audio_norm3"):
+        setattr(block, name, nn.Identity())
+    block.attn1 = CaptureAttention()
+    block.attn2 = CaptureAttention()
+    block.audio_attn1 = CaptureAttention()
+    block.audio_attn2 = CaptureAttention()
+    block.ff = ZeroOutput()
+    block.audio_ff = ZeroOutput()
+    # The audio<->video exchange must not run at all when both flags are off.
+    for name in ("audio_to_video_norm", "video_to_audio_norm", "audio_to_video_attn", "video_to_audio_attn"):
+        setattr(block, name, _Tripwire())
+
+    def run(audio):
+        hidden_states, _ = block(
+            torch.ones(1, 3, 2),
+            audio,
+            torch.ones(1, 1, 2),
+            torch.ones(1, 1, 2),
+            temb=torch.zeros(1, 3, 12),
+            temb_audio=torch.zeros(1, 1, 12),
+            temb_ca_scale_shift=torch.empty(0),
+            temb_ca_audio_scale_shift=torch.empty(0),
+            temb_ca_gate=torch.empty(0),
+            temb_ca_audio_gate=torch.empty(0),
+            self_attention_context_tokens=1,
+            use_a2v_cross_attention=False,
+            use_v2a_cross_attention=False,
+        )
+        return hidden_states
+
+    video_a = run(torch.full((1, 1, 2), 5.0))
+    video_b = run(torch.full((1, 1, 2), -3.0))
+
+    # Different audio, identical video: the only coupling was the disabled a2v path.
+    torch.testing.assert_close(video_a, video_b, rtol=0, atol=0)
+    assert block.attn1.context_tokens == 1
+
+
+def test_ltx_forward_threads_context_tokens_and_av_switches_to_blocks(monkeypatch):
+    captured = {}
+
+    class CaptureBlock(nn.Module):
+        def forward(self, hidden_states, audio_hidden_states, *_args, **kwargs):
+            captured.update(kwargs)
+            return hidden_states, audio_hidden_states
+
+    # _build_tiny_ltx_transformer installs its own FakeBlock at construction;
+    # swap the built blocks for the capturing one afterwards.
+    model = _build_tiny_ltx_transformer(monkeypatch)
+    model.transformer_blocks = nn.ModuleList([CaptureBlock()])
+
+    model(
+        hidden_states=torch.zeros(1, 2, 4),
+        audio_hidden_states=torch.zeros(1, 1, 4),
+        encoder_hidden_states=torch.zeros(1, 1, 8),
+        audio_encoder_hidden_states=torch.zeros(1, 1, 8),
+        timestep=torch.tensor([[0.0, 2.0]]),
+        audio_timestep=torch.tensor([[0.0]]),
+        video_coords=torch.zeros(1, 3, 2, 2),
+        audio_coords=torch.zeros(1, 1, 1, 2),
+        self_attention_context_tokens=1,
+        use_a2v_cross_attention=False,
+        use_v2a_cross_attention=False,
+    )
+
+    assert captured["self_attention_context_tokens"] == 1
+    assert captured["use_a2v_cross_attention"] is False
+    assert captured["use_v2a_cross_attention"] is False

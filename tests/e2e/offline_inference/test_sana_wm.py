@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""Offline SANA-WM e2e: the two-stage pipeline generates a video.
+
+This is the only SANA-WM offline e2e. ``SanaWmTwoStagesPipeline`` runs the same
+Stage-1 sampler before handing its latents to the LTX-2 refiner, and decodes
+through the same SANA VAE, so it covers the Stage-1 path too.
+``SANA_WM_E2E_MODEL`` / ``SANA_WM_E2E_MODEL_CLASS`` still point it elsewhere --
+at the Stage-1-only repo, for instance, which needs far less disk and VRAM.
+"""
+
 from __future__ import annotations
 
 import os
@@ -57,7 +66,8 @@ def _assert_sana_wm_e2e_shape(
 ) -> None:
     if output_type == "latent":
         # Latent output is channel-first: (C, T, H, W) after removing the
-        # batch dimension. Stage-1 emits LTX-2 latents with 128 channels.
+        # batch dimension. Both pipelines emit 128-channel latents -- the
+        # refiner returns Stage-1's latent space, refined in place.
         assert video.shape[0] == 128
         assert 0 < video.shape[1] <= num_frames
         return
@@ -68,9 +78,9 @@ def _run_sana_wm_e2e(*, output_type: str) -> np.ndarray:
     import torch
 
     from vllm_omni.diffusion.models.sana_wm import (
-        SANA_WM_MODEL_ID,
         SANA_WM_OUTPUT_HEIGHT,
         SANA_WM_OUTPUT_WIDTH,
+        SANA_WM_TWO_STAGES_MODEL_ID,
     )
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -79,8 +89,8 @@ def _run_sana_wm_e2e(*, output_type: str) -> np.ndarray:
     if not torch.cuda.is_available():
         pytest.skip("Sana-WM e2e requires CUDA.")
 
-    model = os.environ.get("SANA_WM_E2E_MODEL", SANA_WM_MODEL_ID)
-    model_class_name = os.environ.get("SANA_WM_E2E_MODEL_CLASS", "SanaWmPipeline")
+    model = os.environ.get("SANA_WM_E2E_MODEL", SANA_WM_TWO_STAGES_MODEL_ID)
+    model_class_name = os.environ.get("SANA_WM_E2E_MODEL_CLASS", "SanaWmTwoStagesPipeline")
     num_frames = int(os.environ.get("SANA_WM_E2E_NUM_FRAMES", "9"))
     stage1_steps = int(
         os.environ.get(
@@ -151,6 +161,7 @@ def _run_sana_wm_e2e(*, output_type: str) -> np.ndarray:
 
 
 def test_sana_wm_native_generates_video() -> None:
+    """Generate a clip end to end and check its shape."""
     output_type = os.environ.get("SANA_WM_E2E_OUTPUT_TYPE", "np")
     video = _run_sana_wm_e2e(output_type=output_type)
     if output_type == "latent":

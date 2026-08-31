@@ -82,6 +82,7 @@ EXCLUDED_MODELS = [
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
     "SanaWmPipeline",
+    "SanaWmTwoStagesPipeline",
 ]
 
 
