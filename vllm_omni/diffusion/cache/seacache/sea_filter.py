@@ -8,6 +8,8 @@ import math
 import torch
 
 
+# SeaCache paper: "Spectral-Evolution-Aware Cache for Accelerating Diffusion Models"
+# https://arxiv.org/abs/2602.18993
 def apply_sea_filter(hidden_states: torch.Tensor, sigma: float, power_exp: float = 3.0) -> torch.Tensor:
     """Apply the separable SEA Wiener filter over ``(T, H, W)``."""
     original_dtype = hidden_states.dtype
