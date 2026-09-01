@@ -614,7 +614,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # RequestBatchSamplingParamsKey, so the first request's num_inference_steps applies
         # to the whole runner batch.
         num_inference_steps = first_req.sampling_params.num_inference_steps
-        if num_inference_steps is None and od_config.cache_backend in (
+        if num_inference_steps is None and od_config.cache_backend in ("sea_cache", "seacache"):
+            # Cosmos3 resolves mode-specific defaults inside pipeline.forward().
+            # Zero tells SeaCache to adopt the current request's _num_timesteps
+            # through its callback after that resolution, rather than reusing
+            # the previous request's default.
+            num_inference_steps = 0
+        elif num_inference_steps is None and od_config.cache_backend in (
             "tea_cache",
             "step_cache",
         ):
