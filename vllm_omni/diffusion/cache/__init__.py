@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Cache module for diffusion model inference acceleration.
 
 This module provides a unified cache backend system for different caching strategies:
 - TeaCache: Timestep Embedding Aware Cache for adaptive transformer caching
 - MagCache: Magnitude-based Cache for adaptive transformer caching
+- EasyCache: Runtime-adaptive block-stack caching without model-specific calibration
 - cache-dit: DBCache, SCM, and TaylorSeer caching strategies
 
 Cache backends are instantiated directly via their constructors and configured via OmniDiffusionConfig.

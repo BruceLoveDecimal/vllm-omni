@@ -29,6 +29,7 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 |--------|-------------|----------|
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
+| **[EasyCache](diffusion/cache_acceleration/easycache.md)** | Runtime-adaptive block-stack caching driven by an online transformation-rate estimate | Video DiTs (e.g. SANA-Video), no per-model calibration |
 
 
 #### Lossless Acceleration

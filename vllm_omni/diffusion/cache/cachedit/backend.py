@@ -15,7 +15,7 @@ from cache_dit import BlockAdapter, DBCacheConfig
 from cache_dit.caching.cache_adapters.cache_adapter import CachedAdapter
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.cache.base import CacheBackend
+from vllm_omni.diffusion.cache.base import CacheBackend, dit_module_names
 from vllm_omni.diffusion.cache.cachedit.config import (
     CacheDiTAdapterConfig,
     CacheDiTConfig,
@@ -34,29 +34,10 @@ CacheDiTEnabler: TypeAlias = Callable[[Any, DiffusionCacheConfig], RefreshCacheC
 CUSTOM_DIT_ENABLERS: dict[str, CacheDiTEnabler] = {}
 
 
-def _dit_module_names(pipeline: SupportsComponentDiscovery) -> tuple[str, ...]:
-    """Return the pipeline DiT attributes that are present at runtime."""
-    names = getattr(pipeline, "_dit_modules", None)
-    if not isinstance(names, (list, tuple)):
-        names = ("transformer",)
-
-    resolved_names = []
-    for name in names:
-        if not isinstance(name, str):
-            continue
-        try:
-            module = attrgetter(name)(pipeline)
-        except AttributeError:
-            continue
-        if module is not None:
-            resolved_names.append(name)
-    return tuple(resolved_names)
-
-
 def cache_summary(pipeline: SupportsComponentDiscovery, details: bool = True) -> None:
     """Log Cache-DiT statistics for every transformer on the pipeline."""
 
-    transformers = [attrgetter(name)(pipeline) for name in _dit_module_names(pipeline)]
+    transformers = [attrgetter(name)(pipeline) for name in dit_module_names(pipeline)]
     for transformer in transformers:
         if not BlockAdapter.is_cached(transformer):
             continue
@@ -257,7 +238,7 @@ class CacheDiTBackend(CacheBackend):
             self._refresh_funcs = [custom_enabler(pipeline, self.config)]
             self._cache_targets = [_default_get_pipeline_transformer(pipeline)]
         else:
-            for name in _dit_module_names(pipeline):
+            for name in dit_module_names(pipeline):
                 get_transformer = _make_pipeline_transformer_getter(name)
                 block_adapter = _maybe_build_block_adapter(pipeline, get_transformer)
                 adapter_cls = _maybe_get_cached_adapter_cls(pipeline, get_transformer)

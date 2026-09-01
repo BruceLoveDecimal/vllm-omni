@@ -943,6 +943,13 @@ class AsyncOmniEngine:
                 "mag_max_skip_steps": 5,
                 "mag_retention_ratio": 0.1,
             }
+        if cache_backend in ("easy_cache", "easycache"):
+            return {
+                "easy_threshold": 0.1,
+                "easy_warmup_steps": 5,
+                "easy_cooldown_steps": 1,
+                "easy_max_skip_steps": 0,
+            }
         if cache_backend == "step_cache":
             return {
                 "step_cache_dit_enabled": True,

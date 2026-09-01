@@ -23,11 +23,59 @@ All backends implement the same interface:
 """
 
 from abc import ABC, abstractmethod
+from operator import attrgetter
 from typing import Any
 
 import torch.nn as nn
 
 from vllm_omni.diffusion.data import DiffusionCacheConfig
+
+
+def dit_module_names(pipeline: Any) -> tuple[str, ...]:
+    """Return the pipeline DiT attributes that are present at runtime.
+
+    A pipeline that serves several tasks from separate DiT partitions (MiniMax
+    H3) or runs a two-expert schedule (Wan 2.2) declares every denoising module
+    in ``_dit_modules``. Backends must install and refresh their state on all of
+    them, not only on ``transformer``.
+    """
+    names = getattr(pipeline, "_dit_modules", None)
+    if not isinstance(names, (list, tuple)):
+        names = ("transformer",)
+
+    resolved_names = []
+    for name in names:
+        if not isinstance(name, str):
+            continue
+        try:
+            module = attrgetter(name)(pipeline)
+        except AttributeError:
+            continue
+        if module is not None:
+            resolved_names.append(name)
+    return tuple(resolved_names)
+
+
+def resolve_denoise_steps(pipeline: Any, num_inference_steps: int) -> int:
+    """Return how many transformer forwards ``num_inference_steps`` will run.
+
+    Cache backends schedule warmup and cooldown against the number of times the
+    block stack is invoked, but a request's ``num_inference_steps`` does not
+    always equal that count: MiniMax H3 speaks in sigma points and denoises the
+    intervals between them, so a 50-point request runs 49 forwards. A pipeline
+    whose two counts differ reports the real one through ``cache_denoise_steps``;
+    every other pipeline is left unchanged.
+    """
+    resolve = getattr(pipeline, "cache_denoise_steps", None)
+    if not callable(resolve):
+        return num_inference_steps
+    resolved = int(resolve(num_inference_steps))
+    if resolved <= 0:
+        raise ValueError(
+            f"{type(pipeline).__name__}.cache_denoise_steps returned {resolved} for "
+            f"num_inference_steps={num_inference_steps}; it must be positive"
+        )
+    return resolved
 
 
 class CacheBackend(ABC):

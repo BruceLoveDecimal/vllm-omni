@@ -1102,6 +1102,18 @@ class MiniMaxH3Pipeline(
         """True when --lora-path was consumed as a load-time weight fusion."""
         return self._fasth3 is not None
 
+    def cache_denoise_steps(self, num_inference_steps: int) -> int:
+        """Transformer forwards behind a request asking for ``num_inference_steps``.
+
+        H3 counts sigma points and denoises the intervals between them, so a
+        request for 50 steps invokes the block stack 49 times. Reporting the
+        request count instead would push a cache backend's cooldown window one
+        step past the end of the run, silently dropping it. Distilled schedules
+        already state the interval count, and one extra cooldown step is the
+        harmless direction for them: they are too short to skip anything.
+        """
+        return max(int(num_inference_steps) - 1, 1)
+
     def _transformer_for_task(self, task: str) -> MiniMaxH3DiTModel:
         if task == "ref2va" and hasattr(self, "transformers_ref"):
             return self.transformers_ref

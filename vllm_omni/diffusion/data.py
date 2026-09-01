@@ -487,6 +487,8 @@ class DiffusionCacheConfig:
                     scm_steps_mask_policy, scm_steps_policy
         - MagCache: mag_threshold, mag_max_skip_steps, mag_retention_ratio,
                     mag_ratios, mag_calibrate
+        - EasyCache: easy_threshold, easy_warmup_steps, easy_cooldown_steps,
+                     easy_max_skip_steps
         - step_cache: step_cache_dit_enabled, velocity_sim_thresholds,
                           velocity_skip_countdowns, step_cache_dit_min_history
 
@@ -517,6 +519,16 @@ class DiffusionCacheConfig:
     mag_ratios: list[float] | None = None
     # Default: False calibration mode (computes mag_ratios on first run)
     mag_calibrate: bool = False
+
+    # EasyCache parameters [easy_cache only]
+    # Default: 0.1 accumulated predicted relative change before recomputing
+    easy_threshold: float = 0.1
+    # Default: 5 initial steps that always compute (estimator warmup)
+    easy_warmup_steps: int = 5
+    # Default: 1 final step that always computes
+    easy_cooldown_steps: int = 1
+    # Default: 0 = no cap on consecutive skipped steps
+    easy_max_skip_steps: int = 0
 
     # cache-dit parameters [cache-dit only]
     # Default: 1 forward compute block (optimized for single-transformer models)

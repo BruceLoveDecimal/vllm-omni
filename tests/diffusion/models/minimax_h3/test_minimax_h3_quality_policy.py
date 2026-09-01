@@ -48,6 +48,29 @@ def _resolve_quality(policy, **overrides):
     return policy.resolve(**values)
 
 
+def test_high_quality_rejected_when_server_runs_another_cache_backend():
+    """quality=high must not stack Cache-DiT on top of EasyCache's block hooks."""
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import (
+        MiniMaxH3QualityPolicy,
+    )
+
+    policy = MiniMaxH3QualityPolicy(_quality_od_config(cache_backend="easy_cache"))
+
+    with pytest.raises(OmniClientError, match="easy_cache"):
+        _resolve_quality(policy)
+
+
+def test_omitted_quality_leaves_easy_cache_backend_untouched():
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import (
+        MiniMaxH3QualityPolicy,
+    )
+
+    policy = MiniMaxH3QualityPolicy(_quality_od_config(cache_backend="easy_cache"))
+
+    assert _resolve_quality(policy, quality=None).cache_dit is None
+    assert _resolve_quality(policy, quality="lossless").cache_dit is None
+
+
 def test_high_quality_policy_emits_cache_profile_without_deployment_gates():
     from vllm_omni.diffusion.models.minimax_h3.quality_policy import (
         MiniMaxH3QualityPolicy,

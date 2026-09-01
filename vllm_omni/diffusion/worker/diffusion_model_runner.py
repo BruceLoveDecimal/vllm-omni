@@ -25,6 +25,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.base import resolve_denoise_steps
 from vllm_omni.diffusion.cache.cachedit import cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
@@ -634,15 +635,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if num_inference_steps is None and od_config.cache_backend in (
             "tea_cache",
             "step_cache",
+            "easy_cache",
+            "easycache",
         ):
             # When num_inference_steps is None, some pipelines defer to their
             # own defaults. TeaCache refresh ignores this value; step_cache
             # refresh is a no-op because per-chunk state resets in the denoise
-            # loop. Use the pipeline default when available to keep refresh
-            # behavior aligned with single-request execution.
+            # loop; EasyCache only needs it for its cooldown window. Use the
+            # pipeline default when available to keep refresh behavior aligned
+            # with single-request execution.
             num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
         if num_inference_steps is not None:
+            num_inference_steps = resolve_denoise_steps(self.pipeline, num_inference_steps)
             self.cache_backend.refresh(self.pipeline, num_inference_steps)
         else:
             logger.warning(
