@@ -123,6 +123,41 @@ instead of producing that line.
   publish it still run sparse, but without an exact prefix; a warning is
   logged once.
 
+## Measured on MiniMax-H3
+
+Two RTX PRO 6000 Blackwell (SM120), the two-GPU configuration from the
+[MiniMax-H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-RTX-PRO-6000.md)
+(TP2, Ulysses 1, tiled VAE). T2VA, 1344x768, `duration=5.0`, 50 steps,
+`flow_shift=12`, `seed=1101`, BF16, one request at a time, two warmup
+requests before the measured one. Both arms ran the same prompt, seed and
+shape; `CUDNN_ATTN` is the recipe's baseline backend on this part.
+
+| Measurement | CUDNN_ATTN | SOL_ATTN |
+| --- | ---: | ---: |
+| Client end to end | 307.04 s | 240.81 s |
+| Denoise, 50 steps | 300.63 s | 234.32 s |
+| Per step | 6.013 s | 4.686 s |
+| VAE decode | 5.436 s | 5.433 s |
+| Peak HBM per GPU | 78394 MB | 78394 MB |
+
+That is 1.28x on denoise with the default policy, which leaves the first 10
+of 50 steps and 2 of 50 DiT blocks dense. The packed sequence was 37735
+valid rows with a 439-row prefix, so 7 of 590 KV blocks were exact sink
+blocks. No forward declined the sparse path.
+
+Output quality against the same-seed `CUDNN_ATTN` render, measured frame by
+frame over the 124 frames:
+
+| Metric | Mean | Worst frame |
+| --- | ---: | ---: |
+| SSIM | 0.9273 | 0.9173 |
+| PSNR | 31.42 dB | 30.18 dB |
+
+Both arms were bit-identical between their own warmup and measured renders,
+so that difference is the approximation, not run-to-run noise. Sol-Attn is
+an approximation: validate it on your own prompts before serving it, and
+raise `dense_steps` or `tau` if global structure drifts.
+
 ## Geometry handling
 
 The backend reads the valid length of packed document 0 from the packed
