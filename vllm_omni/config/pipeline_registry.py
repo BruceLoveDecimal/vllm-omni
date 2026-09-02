@@ -198,18 +198,13 @@ def register_pipeline(pipeline: PipelineConfig | PipelineResolverFunc, model_typ
     since resolvers can return multiple different PipelineConfigs depending on the
     consumed config.
     """
-    errors: list[str] = []
     if isinstance(pipeline, PipelineConfig):
-        errors = pipeline.validate()
         model_type = model_type if model_type is not None else pipeline.model_type
-    else:
-        if model_type is None:
-            raise ValueError("Model type must be explicitly provided when registering a pipeline resolver")
+    elif model_type is None:
+        raise ValueError("Model type must be explicitly provided when registering a pipeline resolver")
 
     if model_type in OMNI_PIPELINES:
-        errors.append(f"Model type {model_type} is already registered; the old mapping will be clobbered")
-    if errors:
-        logger.warning("Registration for pipeline of type %s produced the following issues: %s", model_type, errors)
+        logger.warning(f"Model type {model_type} is already registered; the old mapping will be clobbered")
     OMNI_PIPELINES[model_type] = pipeline
 
 

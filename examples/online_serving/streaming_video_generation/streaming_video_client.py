@@ -9,7 +9,7 @@ the received bytes to disk when the session finishes or is interrupted.
 LingBot-World 2.0; text-only models need no image.
 
 Requirements:
-    pip install websockets
+    pip install av websockets
 """
 
 import argparse
