@@ -36,9 +36,9 @@ def enable_cosmos3_seacache(
 ) -> SeaCacheRootHook:
     transformer = getattr(pipeline, "transformer", None)
     if transformer is None:
-        raise ValueError("Cosmos3 SeaCache requires pipeline.transformer")
+        raise ValueError("SeaCache requires a pipeline with a transformer")
     if not callable(getattr(transformer, "_run_gen_layers", None)):
-        raise ValueError("Cosmos3 transformer does not expose the SeaCache GEN-stack boundary")
+        raise ValueError("Pipeline transformer does not expose the block boundary required by SeaCache")
 
     sea_config = SeaCacheConfig(
         threshold=config.sea_threshold,
@@ -57,7 +57,8 @@ def enable_cosmos3_seacache(
         ),
     )
     logger.info(
-        "SeaCache enabled for Cosmos3 (threshold=%s, residual_order=%d, max_consecutive_cached=%d, power_exp=%s)",
+        "SeaCache enabled for %s (threshold=%s, residual_order=%d, max_consecutive_cached=%d, power_exp=%s)",
+        pipeline.__class__.__name__,
         sea_config.threshold,
         sea_config.residual_order,
         sea_config.max_consecutive_cached,
@@ -73,7 +74,7 @@ CUSTOM_SEACACHE_ENABLERS = {
 
 
 class SeaCacheBackend(CacheBackend):
-    """SeaCache backend for vLLM-Omni's native Cosmos3 transformer."""
+    """Backend for spectral-evolution-aware diffusion caching."""
 
     def __init__(self, config: DiffusionCacheConfig):
         super().__init__(config)
@@ -83,7 +84,7 @@ class SeaCacheBackend(CacheBackend):
         pipeline_type = pipeline.__class__.__name__
         enabler = CUSTOM_SEACACHE_ENABLERS.get(pipeline_type)
         if enabler is None:
-            raise ValueError(f"SeaCache currently supports Cosmos3 pipelines only, got {pipeline_type}")
+            raise ValueError(f"SeaCache does not support pipeline type {pipeline_type}")
         hook = enabler(pipeline, self.config)
         self._transformer_id = id(pipeline.transformer)
         self.enabled = True
@@ -97,14 +98,14 @@ class SeaCacheBackend(CacheBackend):
     ) -> None:
         transformer = getattr(pipeline, "transformer", None)
         if transformer is None:
-            raise ValueError("Cosmos3 SeaCache requires pipeline.transformer")
+            raise ValueError("SeaCache requires a pipeline with a transformer")
         if not self.enabled or self._transformer_id != id(transformer):
             self.enable(pipeline)
 
         registry = getattr(transformer, "_hook_registry", None)
         hook = registry.get_hook(SeaCacheRootHook._HOOK_NAME) if registry is not None else None
         if not isinstance(hook, SeaCacheRootHook):
-            raise RuntimeError("SeaCache hook is not installed on the Cosmos3 transformer")
+            raise RuntimeError("SeaCache hook is not installed on the pipeline transformer")
         hook.refresh(transformer, num_inference_steps)
         pipeline._sea_cache_hook = hook
         if verbose:

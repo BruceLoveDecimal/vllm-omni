@@ -19,7 +19,7 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
     - cache_dit: Uses CacheDiTBackend with enable()/refresh() interface
     - tea_cache: Uses TeaCacheBackend with enable()/refresh() interface
     - mag_cache: Uses MagCacheBackend with enable()/refresh() interface
-    - sea_cache: Uses SeaCacheBackend for Cosmos3 spectral residual caching
+    - sea_cache: Uses SeaCacheBackend for spectral residual caching
     - step_cache: Uses StepCacheBackend for DreamZero velocity step skip
 
     Args:

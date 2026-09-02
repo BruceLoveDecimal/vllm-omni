@@ -47,7 +47,7 @@ def _is_parameter_sharded(module: torch.nn.Module) -> bool:
 
 
 class SeaCacheRootHook(ModelHook):
-    """Drive the SeaCache gate and the Cosmos3 forward guard."""
+    """Drive SeaCache gating and transformer forward control."""
 
     _HOOK_NAME = "sea_cache"
 
@@ -233,7 +233,7 @@ class SeaCacheRootHook(ModelHook):
             self._warn_once("SeaCache was not refreshed with a positive inference step count; running full.")
             return args, kwargs
         if self._parameter_sharded:
-            self._warn_once("SeaCache cannot bypass parameter-sharded Cosmos3 GEN layers; running full.")
+            self._warn_once("SeaCache cannot bypass parameter-sharded transformer blocks; running full.")
             return args, kwargs
 
         try:
@@ -309,7 +309,7 @@ class SeaCacheRootHook(ModelHook):
             else:
                 state.history.clear()
                 state.accumulated_distance = 0.0
-                self._warn_once("SeaCache did not receive a GEN residual; clearing cache history.")
+                self._warn_once("SeaCache did not receive a transformer residual; clearing cache history.")
         self._clear_forward_control(module)
         return output
 

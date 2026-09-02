@@ -9,7 +9,10 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SeaCacheConfig:
-    """Configuration for Cosmos3 SeaCache."""
+    """Configuration for SeaCache.
+
+    Defaults are tuned for Cosmos3 and may require adjustment for other models.
+    """
 
     threshold: float = 0.25
     residual_order: int = 1
