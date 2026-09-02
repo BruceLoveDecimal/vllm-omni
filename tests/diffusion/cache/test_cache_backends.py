@@ -365,13 +365,10 @@ class TestCacheDiTBackend:
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
-    def test_enable_dreamid_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
-        """Test DreamID uses pipeline.transformer for cache enable/refresh.
-
-        NOTE: DreamID no longer has a custom enabler, so this tests against the generic path.
-        """
+    def test_enable_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
+        """Generic cache path should pick up ``transformer.fused_blocks``."""
         mock_pipeline = Mock()
-        mock_pipeline.__class__.__name__ = "DreamIDOmniPipeline"
+        mock_pipeline.__class__.__name__ = "FakeFusedBlocksPipeline"
         mock_pipeline.transformer = Mock()
         mock_pipeline.transformer.fused_blocks = Mock()
         mock_pipeline.transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(
@@ -470,6 +467,66 @@ class TestTeaCacheBackend:
         # Verify hook was applied
         assert backend.enabled is True
         mock_apply_hook.assert_called_once()
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_enable_uses_generic_default_threshold(self, mock_apply_hook):
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "QwenImagePipeline"
+        pipeline.transformer = Mock()
+        pipeline.transformer.__class__.__name__ = "QwenImageTransformer2DModel"
+
+        TeaCacheBackend(DiffusionCacheConfig()).enable(pipeline)
+        assert mock_apply_hook.call_args.args[1].rel_l1_thresh == 0.2
+
+    @pytest.mark.parametrize("partition", ["fl2va", "combined"])
+    @pytest.mark.parametrize(
+        ("configured_threshold", "expected_threshold"),
+        [(None, 0.17), (0.2, 0.2)],
+    )
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_minimax_h3_only_enables_fl2va_teacache(
+        self,
+        mock_apply_hook,
+        partition,
+        configured_threshold,
+        expected_threshold,
+    ):
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "MiniMaxH3Pipeline"
+        pipeline.partition = partition
+        pipeline.transformer = Mock()
+        pipeline.transformer.__class__.__name__ = "MiniMaxH3DiTModel"
+        pipeline.transformers_ref = Mock()
+
+        config = (
+            DiffusionCacheConfig()
+            if configured_threshold is None
+            else DiffusionCacheConfig(rel_l1_thresh=configured_threshold)
+        )
+        backend = TeaCacheBackend(config)
+        backend.enable(pipeline)
+
+        mock_apply_hook.assert_called_once()
+        transformer, teacache_config = mock_apply_hook.call_args.args
+        assert transformer is pipeline.transformer
+        assert transformer is not pipeline.transformers_ref
+        assert teacache_config.rel_l1_thresh == expected_threshold
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_minimax_h3_rejects_ref2va_teacache(self, mock_apply_hook):
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "MiniMaxH3Pipeline"
+        pipeline.partition = "ref2va"
+        pipeline.transformer = Mock()
+        pipeline.transformer.__class__.__name__ = "MiniMaxH3DiTModel"
+
+        backend = TeaCacheBackend(DiffusionCacheConfig())
+
+        with pytest.raises(ValueError, match="only supports the MiniMax-H3 FL2VA partition"):
+            backend.enable(pipeline)
+
+        assert backend.enabled is False
+        mock_apply_hook.assert_not_called()
 
     @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
     def test_enable_with_coefficients(self, mock_apply_hook):
