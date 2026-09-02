@@ -127,6 +127,63 @@ class TestAttentionSpec:
         with pytest.raises(ValueError, match="block_sparse is only supported by"):
             AttentionSpec(backend="FLASH_ATTN", block_sparse={"sparsity": 0.8})
 
+    def test_sol_attn_defaults_applied_when_backend_selected(self):
+        spec = AttentionSpec(backend="SOL_ATTN")
+        assert spec.sol_attn.dense_layer_indices == {0, 1}
+        assert spec.backend_kwargs() == {
+            "tau": 1.0,
+            "thresh_type": "diag",
+            "kv_splits": None,
+            "dense_steps": 10,
+            "dense_layers": [0, 1],
+            "sink_mode": "prefix",
+            "strict": False,
+        }
+
+    def test_sol_attn_values_forwarded(self):
+        spec = AttentionSpec(
+            backend="SOL_ATTN",
+            sol_attn={
+                "tau": 1.5,
+                "thresh_type": "exact",
+                "kv_splits": 4,
+                "dense_steps": 4,
+                "dense_layers": "0-1,38",
+                "sink_mode": "none",
+                "strict": True,
+            },
+        )
+        assert spec.backend_kwargs() == {
+            "tau": 1.5,
+            "thresh_type": "exact",
+            "kv_splits": 4,
+            "dense_steps": 4,
+            "dense_layers": [0, 1, 38],
+            "sink_mode": "none",
+            "strict": True,
+        }
+        assert AttentionSpec(backend="SOL_ATTN", sol_attn={"kv_splits": "auto"}).backend_kwargs()["kv_splits"] is None
+        assert AttentionSpec(backend="SOL_ATTN", sol_attn={"dense_layers": None}).backend_kwargs()["dense_layers"] == []
+
+    def test_sol_attn_rejected_on_other_backend(self):
+        with pytest.raises(ValueError, match="sol_attn is only supported by the SOL_ATTN"):
+            AttentionSpec(backend="FLASH_ATTN", sol_attn={"tau": 1.0})
+
+    @pytest.mark.parametrize(
+        "sol_attn",
+        [
+            {"tau": float("nan")},
+            {"thresh_type": "mean"},
+            {"kv_splits": 3},
+            {"kv_splits": True},
+            {"dense_steps": -1},
+            {"sink_mode": "text"},
+        ],
+    )
+    def test_sol_attn_invalid_values(self, sol_attn):
+        with pytest.raises(ValueError):
+            AttentionSpec(backend="SOL_ATTN", sol_attn=sol_attn)
+
     @pytest.mark.parametrize(
         "block_sparse",
         [{"sparsity": 1.5}, {"start_step": -1}, {"end_step": -1}, {"precision": "bogus"}],

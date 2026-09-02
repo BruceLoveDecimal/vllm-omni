@@ -92,6 +92,7 @@ nav:
         - SageAttention: user_guide/diffusion/attention_backends/sage.md
         - Hugging Face Hub: user_guide/diffusion/attention_backends/huggingface_hub.md
         - RainFusion: user_guide/diffusion/attention_backends/rainfusion.md
+        - Sol-Attn: user_guide/diffusion/attention_backends/sol_attn.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md

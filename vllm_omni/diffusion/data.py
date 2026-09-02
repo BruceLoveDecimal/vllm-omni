@@ -1736,6 +1736,59 @@ class BlockSparseSpec:
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
+SOL_ATTN_THRESH_TYPES = ("diag", "exact")
+SOL_ATTN_KV_SPLITS = (1, 2, 4)
+SOL_ATTN_SINK_MODES = ("prefix", "none")
+
+
+@dataclass
+class SolAttnSpec:
+    """User-facing controls for the SOL_ATTN on-the-fly sparse attention backend.
+
+    ``tau`` scales the routing threshold (larger routes fewer key blocks
+    exactly) and ``thresh_type`` picks the diagonal or full-covariance
+    threshold estimate. ``kv_splits`` is the split-KV factor (``"auto"`` follows
+    Sol-Engine: 4 on H100 for sequences of at least 65536 tokens, else 1).
+    ``dense_steps`` keeps the first N denoise steps dense and ``dense_layers``
+    (an index selector such as "0-1,38") keeps individual DiT blocks dense;
+    those are the accuracy knobs. ``sink_mode`` keeps the packed prefix (text,
+    conditions, audio) as an exact KV sink (``"prefix"``) or routes it like
+    everything else (``"none"``). ``strict`` raises on kernel failures instead
+    of silently running dense.
+    """
+
+    tau: float = 1.0
+    thresh_type: str = "diag"
+    kv_splits: int | str | None = None
+    dense_steps: int = 10
+    dense_layers: str | list[int] | None = "0-1"
+    sink_mode: str = "prefix"
+    strict: bool = False
+    dense_layer_indices: set[int] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.tau = float(self.tau)
+        if not math.isfinite(self.tau):
+            raise ValueError(f"sol_attn.tau must be finite; got {self.tau!r}.")
+        if self.thresh_type not in SOL_ATTN_THRESH_TYPES:
+            raise ValueError(
+                f"sol_attn.thresh_type must be one of {list(SOL_ATTN_THRESH_TYPES)}; got {self.thresh_type!r}."
+            )
+        if self.kv_splits in (None, "auto"):
+            self.kv_splits = None
+        else:
+            if isinstance(self.kv_splits, bool) or self.kv_splits not in SOL_ATTN_KV_SPLITS:
+                raise ValueError(
+                    f"sol_attn.kv_splits must be 'auto' or one of {list(SOL_ATTN_KV_SPLITS)}; got {self.kv_splits!r}."
+                )
+            self.kv_splits = int(self.kv_splits)
+        if self.dense_steps < 0:
+            raise ValueError(f"sol_attn.dense_steps must be >= 0; got {self.dense_steps!r}.")
+        if self.sink_mode not in SOL_ATTN_SINK_MODES:
+            raise ValueError(f"sol_attn.sink_mode must be one of {list(SOL_ATTN_SINK_MODES)}; got {self.sink_mode!r}.")
+        self.dense_layer_indices = parse_kv_cache_skip_selector(self.dense_layers) or set()
+
+
 @dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
@@ -1745,6 +1798,7 @@ class AttentionSpec:
     quant: AttnQuantSpec | None = None
     fastvideo_vsa_topk: int | None = None
     block_sparse: BlockSparseSpec | None = None
+    sol_attn: SolAttnSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -1753,6 +1807,16 @@ class AttentionSpec:
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
+        self.sol_attn = self._coerce(self.sol_attn, SolAttnSpec, "sol_attn")
+        if self.backend.upper() == "SOL_ATTN":
+            # Selecting the backend is the opt-in; the Sol-Engine MiniMax-H3
+            # policy applies unless a block overrides it.
+            self.sol_attn = self.sol_attn or SolAttnSpec()
+        elif self.sol_attn is not None:
+            raise ValueError(
+                f"sol_attn is only supported by the SOL_ATTN backend, but backend={self.backend!r}. "
+                "Remove sol_attn or set backend to SOL_ATTN."
+            )
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -1819,6 +1883,15 @@ class AttentionSpec:
             kw["precision"] = bs.precision
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
+        if self.sol_attn is not None:
+            sa = self.sol_attn
+            kw["tau"] = sa.tau
+            kw["thresh_type"] = sa.thresh_type
+            kw["kv_splits"] = sa.kv_splits
+            kw["dense_steps"] = sa.dense_steps
+            kw["dense_layers"] = sorted(sa.dense_layer_indices or ())
+            kw["sink_mode"] = sa.sink_mode
+            kw["strict"] = sa.strict
 
         return kw or None
 

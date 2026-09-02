@@ -61,8 +61,9 @@ unstructured keyword dictionaries:
 - `quant` is consumed by FlashInfer and TRTLLM with backend-specific value
   validation;
 - `skip_softmax` is consumed by TRTLLM; and
-- `block_sparse` is consumed by block-sparse backends such as RainFusion; and
-- `fastvideo_vsa_topk` is consumed by FastVideo VSA.
+- `block_sparse` is consumed by block-sparse backends such as RainFusion;
+- `fastvideo_vsa_topk` is consumed by FastVideo VSA; and
+- `sol_attn` is consumed by Sol-Attn.
 
 A backend reads only the fields it owns and rejects incompatible values. New
 options should be added to a shared typed spec only when more than one backend

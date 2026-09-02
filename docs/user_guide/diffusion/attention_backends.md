@@ -21,6 +21,7 @@ For the internal selector, registry, and platform contract, see
 | Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | Use block-sparse video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | Use FastVideo VSA with FastWan2.2-TI2V-5B or FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
+| Use training-free on-the-fly sparse attention (Sol-Attn) for video DiTs such as MiniMax-H3 on CUDA | [Sol-Attn](attention_backends/sol_attn.md) |
 
 ## Backend options
 
@@ -37,6 +38,7 @@ For the internal selector, registry, and platform contract, see
 | `FLASH_ATTN_3_HUB` | Hub kernel | FlashAttention 3 from Hugging Face `kernels` on Hopper or newer | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | `RAINFUSION_ATTN` | Block sparse | MindIE-SD RainFusion video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | `FASTVIDEO_VSA` | Block sparse | FastVideo variable sparse self-attention for FastWan2.2-TI2V-5B and FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
+| `SOL_ATTN` | Block sparse | Sol-Attn on-the-fly sparse attention with an exact prefix sink for video DiTs on CUDA | [Sol-Attn](attention_backends/sol_attn.md) |
 
 ## Configuration
 
@@ -108,6 +110,7 @@ Backend-specific typed blocks are documented with their consumers:
 - `skip_softmax`: [TRTLLM Skip-Softmax](attention_backends/trtllm.md#skip-softmax).
 - `block_sparse`: [RainFusion](attention_backends/rainfusion.md#configuration).
 - `fastvideo_vsa_topk`: [FastVideo VSA](attention_backends/fastvideo_vsa.md#choose-top-k).
+- `sol_attn`: [Sol-Attn](attention_backends/sol_attn.md#configuration).
 
 ## Platform defaults
 
