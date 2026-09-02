@@ -23,7 +23,8 @@ Sol-Engine:
 ``AttentionMetadata.video_layout`` supplies the prefix length, and the packed
 padding metadata supplies the valid length of document 0, so a model that
 already publishes both (MiniMax-H3 does) needs no code changes. Anything the
-sparse path cannot serve delegates to ``FLASH_ATTN`` with the same metadata.
+sparse path cannot serve delegates to a dense backend with the same metadata:
+the platform default by default, or the backend named in ``dense_backend``.
 
 The kernel is an optional external package (``pip install -e
 techniques/sparse_backends`` from the ``sol-engine`` branch). It is imported
@@ -50,7 +51,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
     VideoTokenLayout,
 )
-from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
@@ -142,6 +143,7 @@ class SolAttnConfig:
     dense_layers: frozenset[int] = frozenset({0, 1})
     sink_mode: str = "prefix"
     strict: bool = False
+    dense_backend: str | None = None
 
     @classmethod
     def from_backend_kwargs(cls, backend_kwargs: Mapping[str, Any] | None) -> SolAttnConfig:
@@ -167,6 +169,8 @@ class SolAttnConfig:
         if dense_steps < 0:
             raise ValueError(f"SOL_ATTN dense_steps must be >= 0, got {dense_steps}")
         dense_layers = bk.get("dense_layers")
+        dense_backend = bk.get("dense_backend")
+        dense_backend = str(dense_backend) if dense_backend else None
         return cls(
             tau=tau,
             thresh_type=thresh_type,
@@ -175,6 +179,7 @@ class SolAttnConfig:
             dense_layers=frozenset(int(i) for i in dense_layers) if dense_layers is not None else frozenset({0, 1}),
             sink_mode=sink_mode,
             strict=bool(bk.get("strict", False)),
+            dense_backend=dense_backend,
         )
 
 
@@ -198,9 +203,10 @@ class SolAttnBackend(AttentionBackend):
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
         # The sparse path reads the valid length of document 0 off the packed
-        # metadata and never touches attn_mask; the dense fallback is
-        # FLASH_ATTN, whose packed varlen path has the same property.
-        return FlashAttentionBackend.supports_packed_mask_free()
+        # metadata and never touches attn_mask. Models that pack a [real, pad]
+        # layout may therefore skip building the mask; a declined forward
+        # reaches a dense backend that consumes the same packed metadata.
+        return True
 
     @classmethod
     def supports_multi_doc_packed_varlen(cls) -> bool:
@@ -237,8 +243,8 @@ class SolAttnImpl(AttentionImpl):
     Every call that the kernel cannot serve — warmup denoise steps, dense
     layers, a missing valid-length contract, masks, joint or piecewise
     attention, non-BF16 activations, a kernel failure in non-strict mode —
-    delegates to FlashAttention with the untouched metadata, so a model can
-    select this backend unconditionally.
+    delegates to the dense fallback backend with the untouched metadata, so a
+    model can select this backend unconditionally.
     """
 
     def __init__(
@@ -262,23 +268,24 @@ class SolAttnImpl(AttentionImpl):
         self.config = SolAttnConfig.from_backend_kwargs(backend_kwargs)
         self.layer_idx = _try_extract_layer_index(prefix)
 
-        if causal:
-            raise ValueError(
-                "SOL_ATTN does not support causal attention: the kernel is noncausal and routes "
-                "KV blocks by proxy score. Select FLASH_ATTN for causal roles."
-            )
-        if head_size != _HEAD_DIM:
-            raise ValueError(
-                f"SOL_ATTN requires head_size={_HEAD_DIM}, got {head_size}. Select FLASH_ATTN for this role."
-            )
-        if qkv_layout is not None and qkv_layout.upper() != _INPUT_LAYOUT:
-            raise ValueError(
-                f"SOL_ATTN needs {_INPUT_LAYOUT} tensors to locate the sequence axis, but this layer "
-                f"declares qkv_layout={qkv_layout!r}. Select FLASH_ATTN for this role."
+        # A layer the kernel can never serve delegates for the run instead of
+        # aborting startup: one selection covers every role a model declares,
+        # and a model's cross-attention or refiner role commonly has a
+        # different head size. ``strict`` turns this back into an error for
+        # anyone validating that a configuration really is sparse.
+        self.unsupported_layer = self._unsupported_layer_reason(causal, head_size, qkv_layout)
+        if self.unsupported_layer is not None:
+            if self.config.strict:
+                raise ValueError(f"SOL_ATTN cannot serve this layer: {self.unsupported_layer}")
+            logger.warning_once(
+                "SOL_ATTN delegates this layer to its dense fallback for the whole run: %s",
+                self.unsupported_layer,
             )
         self._validate_parallel_config()
 
-        self.dense_fallback = FlashAttentionBackend.get_impl_cls()(
+        dense_backend_cls = self._resolve_dense_backend(self.config.dense_backend, head_size)
+        self.dense_backend_name = dense_backend_cls.get_name()
+        self.dense_fallback = dense_backend_cls.get_impl_cls()(
             num_heads=num_heads,
             head_size=head_size,
             softmax_scale=softmax_scale,
@@ -293,15 +300,54 @@ class SolAttnImpl(AttentionImpl):
         # actually taken; without it the run was dense.
         logger.info_once(
             "SOL_ATTN configured: tau=%.3f, thresh_type=%s, kv_splits=%s, dense_steps=%d, dense_layers=%s, "
-            "sink_mode=%s, strict=%s (dense fallback: FLASH_ATTN).",
+            "sink_mode=%s, strict=%s, dense fallback=%s.",
             self.config.tau,
             self.config.thresh_type,
             "auto" if self.config.kv_splits is None else self.config.kv_splits,
             self.config.dense_steps,
-            sorted(self.config.dense_layers),
+            tuple(sorted(self.config.dense_layers)),
             self.config.sink_mode,
             self.config.strict,
+            self.dense_backend_name,
         )
+
+    @staticmethod
+    def _unsupported_layer_reason(causal: bool, head_size: int, qkv_layout: str | None) -> str | None:
+        """Why this layer can never take the sparse path, or None."""
+        if causal:
+            return "the kernel is noncausal and routes KV blocks by proxy score, but this layer is causal"
+        if head_size != _HEAD_DIM:
+            return f"the kernel requires head_size={_HEAD_DIM}, but this layer declares {head_size}"
+        if qkv_layout is not None and qkv_layout.upper() != _INPUT_LAYOUT:
+            return (
+                f"SOL_ATTN needs {_INPUT_LAYOUT} tensors to locate the sequence axis, but this layer "
+                f"declares qkv_layout={qkv_layout!r}"
+            )
+        return None
+
+    @staticmethod
+    def _resolve_dense_backend(dense_backend: str | None, head_size: int) -> type[AttentionBackend]:
+        """Pick the backend that serves every forward the kernel declines.
+
+        The dense path carries the warmup steps, the dense layers and every
+        declined forward, so it must be a kernel this GPU actually has. It
+        therefore defaults to the platform's own choice rather than a fixed
+        backend: FLASH_ATTN has no SM120 kernel image in the common wheels, and
+        hardcoding it would abort the process on consumer Blackwell the first
+        time a warmup step ran.
+        """
+        from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
+
+        if dense_backend is not None:
+            backend_cls = DiffusionAttentionBackendEnum[dense_backend.upper()].get_class()
+            if backend_cls.get_name() == SolAttnBackend.get_name():
+                raise ValueError("SOL_ATTN dense_backend must name a dense backend, not SOL_ATTN itself")
+            backend_cls.validate_available()
+            return backend_cls
+        # attention_config is deliberately not forwarded: the active config is
+        # what selected SOL_ATTN, and resolving it again would return SOL_ATTN.
+        backend_cls, _ = get_attn_backend_for_role(role="sol_attn.dense_fallback", head_size=head_size)
+        return backend_cls
 
     @staticmethod
     def _validate_parallel_config() -> None:
@@ -352,7 +398,7 @@ class SolAttnImpl(AttentionImpl):
         attn_metadata: AttentionMetadata | None,
         reason: str,
     ) -> torch.Tensor:
-        if reason not in ("warmup_step", "dense_layer"):
+        if reason not in ("warmup_step", "dense_layer", "unsupported_layer"):
             logger.warning_once("SOL_ATTN staying dense: %s", reason)
         return self.dense_fallback.forward(query, key, value, attn_metadata)
 
@@ -367,12 +413,15 @@ class SolAttnImpl(AttentionImpl):
     ) -> SolAttnPlan | str:
         """Return the kernel geometry, or the reason this forward stays dense."""
         cfg = self.config
+        if self.unsupported_layer is not None:
+            # Already reported once at construction; keep the per-forward path quiet.
+            return "unsupported_layer"
         if self.layer_idx is not None and self.layer_idx in cfg.dense_layers:
             return "dense_layer"
         if cfg.dense_layers and self.layer_idx is None:
             logger.warning_once(
                 "SOL_ATTN cannot resolve a layer index from this attention prefix; dense_layers=%s is ignored.",
-                sorted(cfg.dense_layers),
+                tuple(sorted(cfg.dense_layers)),
             )
         if cfg.dense_steps > 0:
             step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
@@ -387,6 +436,16 @@ class SolAttnImpl(AttentionImpl):
 
         if self.qkv_layout is None:
             return f"this layer does not declare qkv_layout; SOL_ATTN needs {_INPUT_LAYOUT} to locate the sequence axis"
+        # Contract checks first: an unsupported attention shape is a property of
+        # the model's request, true on any device, and names a cause the user
+        # can act on. The tensor checks below describe the kernel's own limits.
+        if attn_metadata is not None:
+            if attn_metadata.attn_mask is not None:
+                return "attention masks are not supported"
+            if attn_metadata.full_attn_spans is not None:
+                return "piecewise/full attention spans are not supported"
+            if attn_metadata.joint_query is not None or attn_metadata.joint_key is not None:
+                return "joint attention metadata is not supported"
         if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
             return f"expected [B, S, H, D] tensors, got {tuple(query.shape)}"
         if query.shape != key.shape or query.shape != value.shape:
@@ -401,13 +460,6 @@ class SolAttnImpl(AttentionImpl):
             return f"q/k/v must be CUDA tensors, got {query.device.type}"
 
         batch, total_len = int(query.shape[0]), int(query.shape[1])
-        if attn_metadata is not None:
-            if attn_metadata.attn_mask is not None:
-                return "attention masks are not supported"
-            if attn_metadata.full_attn_spans is not None:
-                return "piecewise/full attention spans are not supported"
-            if attn_metadata.joint_query is not None or attn_metadata.joint_key is not None:
-                return "joint attention metadata is not supported"
 
         used_len = self._resolve_used_len(attn_metadata, total_len)
         if isinstance(used_len, str):
@@ -428,7 +480,7 @@ class SolAttnImpl(AttentionImpl):
             cfg.tau,
             cfg.thresh_type,
             cfg.dense_steps,
-            sorted(cfg.dense_layers),
+            tuple(sorted(cfg.dense_layers)),
             cfg.sink_mode,
             used_len,
             sink_start,

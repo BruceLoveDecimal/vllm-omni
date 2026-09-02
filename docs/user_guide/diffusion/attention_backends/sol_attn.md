@@ -20,8 +20,11 @@ The integration follows the MiniMax-H3 policy validated in Sol-Engine:
 
 Every call the kernel cannot serve — warmup steps, dense layers, attention
 masks, joint or piecewise attention, non-BF16 activations, a kernel failure
-when `strict` is off — delegates to `FLASH_ATTN` with the same metadata, so a
-model can select `SOL_ATTN` globally.
+when `strict` is off — delegates to a dense backend with the same metadata, so
+a model can select `SOL_ATTN` globally. One selection covers every role a
+model declares, so a role the kernel can never serve (a causal role, or one
+whose head size is not 128) delegates for the whole run instead of failing
+startup; `strict` turns that back into an error.
 
 ## Installation
 
@@ -50,7 +53,8 @@ before the model is built.
 | `dense_steps` | integer, `>= 0` | Number of early denoise steps kept dense. Default `10` |
 | `dense_layers` | selector such as `"0-1,38"` | DiT blocks kept dense. Default `"0-1"` |
 | `sink_mode` | `"prefix"`, `"none"` | Keep the published prefix as an exact KV sink (default) or route it like every other block |
-| `strict` | bool | Raise on kernel failures instead of silently running dense. Default `false` |
+| `strict` | bool | Raise on kernel failures, and on a role the kernel cannot serve, instead of silently running dense. Default `false` |
+| `dense_backend` | a backend name such as `"CUDNN_ATTN"` | Backend for the warmup steps, dense layers and declined forwards. Defaults to the platform's own choice |
 
 ```bash
 vllm-omni serve MiniMaxAI/MiniMax-H3 \
@@ -81,12 +85,13 @@ plausible measurement.
 
 ```text
 Resolved diffusion attention backend 'SOL_ATTN' for role='self' via attention_config
-SOL_ATTN configured: tau=1.000, thresh_type=diag, kv_splits=auto, dense_steps=10, dense_layers=[0, 1], sink_mode=prefix, strict=False (dense fallback: FLASH_ATTN).
+SOL_ATTN configured: tau=1.000, thresh_type=diag, kv_splits=auto, dense_steps=10, dense_layers=(0, 1), sink_mode=prefix, strict=False, dense fallback=CUDNN_ATTN.
 SOL_ATTN active: tau=1.000, thresh_type=diag, dense_steps=10, dense_layers=[0, 1], sink_mode=prefix, used_len=38247, sink=[0, 951), total_len=38272, heads=7.
 ```
 
 - The `Resolved ...` line comes from the selector and confirms the role was
-  routed to `SOL_ATTN` rather than the platform default.
+  routed to `SOL_ATTN` rather than the platform default. A second such line
+  names the dense fallback, resolved for role `sol_attn.dense_fallback`.
 - `SOL_ATTN configured` is logged once when the attention layers are built and
   echoes the resolved `sol_attn` block.
 - `SOL_ATTN active` is logged on the first forward that actually reaches the
@@ -102,6 +107,11 @@ instead of producing that line.
 
 - CUDA only, compute capability >= 8.0, `head_dim=128`, BF16 activations,
   noncausal self-attention with `qkv_layout="BSND"`.
+- The dense fallback follows the platform default rather than a fixed
+  backend. That matters on consumer Blackwell (SM120), where the common
+  FlashAttention wheels carry no kernel image and abort the process; the
+  platform routes to `CUDNN_ATTN` there instead. Override with
+  `dense_backend` when you want a specific one.
 - Ulysses sequence parallelism is supported: after the all-to-all each rank
   holds the whole sequence for its own heads, and routing is decided per
   (query, head). Ring sequence parallelism is rejected at construction

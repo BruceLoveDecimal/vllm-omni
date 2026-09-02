@@ -1764,6 +1764,7 @@ class SolAttnSpec:
     dense_layers: str | list[int] | None = "0-1"
     sink_mode: str = "prefix"
     strict: bool = False
+    dense_backend: str | None = None
     dense_layer_indices: set[int] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -1786,6 +1787,10 @@ class SolAttnSpec:
             raise ValueError(f"sol_attn.dense_steps must be >= 0; got {self.dense_steps!r}.")
         if self.sink_mode not in SOL_ATTN_SINK_MODES:
             raise ValueError(f"sol_attn.sink_mode must be one of {list(SOL_ATTN_SINK_MODES)}; got {self.sink_mode!r}.")
+        if self.dense_backend is not None:
+            self.dense_backend = str(self.dense_backend).upper()
+            if self.dense_backend == "SOL_ATTN":
+                raise ValueError("sol_attn.dense_backend must name a dense backend, not SOL_ATTN itself.")
         self.dense_layer_indices = parse_kv_cache_skip_selector(self.dense_layers) or set()
 
 
@@ -1892,6 +1897,7 @@ class AttentionSpec:
             kw["dense_layers"] = sorted(sa.dense_layer_indices or ())
             kw["sink_mode"] = sa.sink_mode
             kw["strict"] = sa.strict
+            kw["dense_backend"] = sa.dense_backend
 
         return kw or None
 

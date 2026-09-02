@@ -138,6 +138,7 @@ class TestAttentionSpec:
             "dense_layers": [0, 1],
             "sink_mode": "prefix",
             "strict": False,
+            "dense_backend": None,
         }
 
     def test_sol_attn_values_forwarded(self):
@@ -161,9 +162,16 @@ class TestAttentionSpec:
             "dense_layers": [0, 1, 38],
             "sink_mode": "none",
             "strict": True,
+            "dense_backend": None,
         }
         assert AttentionSpec(backend="SOL_ATTN", sol_attn={"kv_splits": "auto"}).backend_kwargs()["kv_splits"] is None
         assert AttentionSpec(backend="SOL_ATTN", sol_attn={"dense_layers": None}).backend_kwargs()["dense_layers"] == []
+
+    def test_sol_attn_dense_backend_normalized_and_guarded(self):
+        spec = AttentionSpec(backend="SOL_ATTN", sol_attn={"dense_backend": "cudnn_attn"})
+        assert spec.backend_kwargs()["dense_backend"] == "CUDNN_ATTN"
+        with pytest.raises(ValueError, match="not SOL_ATTN itself"):
+            AttentionSpec(backend="SOL_ATTN", sol_attn={"dense_backend": "SOL_ATTN"})
 
     def test_sol_attn_rejected_on_other_backend(self):
         with pytest.raises(ValueError, match="sol_attn is only supported by the SOL_ATTN"):

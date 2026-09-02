@@ -47,6 +47,9 @@ USED_LEN = PREFIX_ROWS + VIDEO_ROWS
 
 
 def make_impl(prefix: str = "transformer.blocks.5.attn", **backend_kwargs: Any) -> SolAttnImpl:
+    # Pin the dense fallback so these CPU tests never depend on which backend
+    # the host platform would resolve; the default path is covered separately.
+    backend_kwargs.setdefault("dense_backend", "TORCH_SDPA")
     return SolAttnImpl(
         num_heads=8,
         head_size=HEAD_DIM,
@@ -119,6 +122,7 @@ def test_config_defaults_follow_sol_engine_h3_policy():
         dense_layers=frozenset({0, 1}),
         sink_mode="prefix",
         strict=False,
+        dense_backend=None,
     )
 
 
@@ -142,6 +146,7 @@ def test_config_parses_serialized_spec_kwargs():
     assert cfg.sink_mode == "none"
     assert cfg.strict is True
     assert SolAttnConfig.from_backend_kwargs({"kv_splits": "auto"}).kv_splits is None
+    assert SolAttnConfig.from_backend_kwargs({"dense_backend": "CUDNN_ATTN"}).dense_backend == "CUDNN_ATTN"
 
 
 @pytest.mark.parametrize(
@@ -167,7 +172,9 @@ def test_config_rejects_invalid_values(backend_kwargs):
         ({"qkv_layout": "BNSD"}, "BSND"),
     ],
 )
-def test_impl_rejects_unsupported_layer_shapes(kwargs, match):
+def test_impl_delegates_layers_the_kernel_cannot_serve(kwargs, match):
+    """A model selects one backend for every role it declares, so a role the
+    kernel cannot serve delegates for the run rather than aborting startup."""
     init_kwargs: dict[str, Any] = {
         "num_heads": 8,
         "head_size": HEAD_DIM,
@@ -175,10 +182,54 @@ def test_impl_rejects_unsupported_layer_shapes(kwargs, match):
         "causal": False,
         "prefix": "transformer.blocks.5.attn",
         "qkv_layout": "BSND",
+        "backend_kwargs": {"dense_backend": "TORCH_SDPA"},
     }
     init_kwargs.update(kwargs)
-    with pytest.raises(ValueError, match=match):
+    impl = SolAttnImpl(**init_kwargs)
+    assert impl.unsupported_layer is not None and match in impl.unsupported_layer
+    q = torch.zeros(1, USED_LEN, 8, HEAD_DIM, dtype=torch.bfloat16)
+    assert impl._resolve_plan(q, q, q, h3_metadata()) == "unsupported_layer"
+
+    # strict is for validating that a configuration really runs sparse, so it
+    # turns the same condition back into a startup error.
+    init_kwargs["backend_kwargs"] = {"dense_backend": "TORCH_SDPA", "strict": True}
+    with pytest.raises(ValueError, match="cannot serve this layer"):
         SolAttnImpl(**init_kwargs)
+
+
+def test_dense_fallback_defaults_to_the_platform_choice(monkeypatch):
+    """The fallback carries warmup steps and dense layers, so it must be a
+    backend this GPU has. It follows the platform, not a hardcoded kernel."""
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+
+    calls: dict[str, Any] = {}
+
+    def fake_resolver(*, role, head_size, **kwargs):
+        calls.update(role=role, head_size=head_size, kwargs=kwargs)
+        return SDPABackend, None
+
+    monkeypatch.setattr("vllm_omni.diffusion.attention.selector.get_attn_backend_for_role", fake_resolver)
+    impl = SolAttnImpl(
+        num_heads=8,
+        head_size=HEAD_DIM,
+        softmax_scale=HEAD_DIM**-0.5,
+        causal=False,
+        prefix="transformer.blocks.5.attn",
+        qkv_layout="BSND",
+        backend_kwargs={},
+    )
+    assert impl.dense_backend_name == SDPABackend.get_name()
+    assert calls["head_size"] == HEAD_DIM
+    # The active config is what selected SOL_ATTN; re-resolving through it
+    # would hand the sparse backend back as its own fallback.
+    assert "attention_config" not in calls["kwargs"]
+
+
+def test_explicit_dense_backend_is_used_and_cannot_be_sol_attn():
+    impl = make_impl(dense_backend="cudnn_attn")
+    assert impl.dense_backend_name == "CUDNN_ATTN"
+    with pytest.raises(ValueError, match="not SOL_ATTN itself"):
+        make_impl(dense_backend="SOL_ATTN")
 
 
 # -- dense/sparse gating ---------------------------------------------------------
