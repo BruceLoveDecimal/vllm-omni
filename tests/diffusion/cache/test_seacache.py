@@ -3,13 +3,13 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm_omni.diffusion.cache.seacache import (
-    DenoiseStepTracker,
     SeaCacheBackend,
     SeaCacheConfig,
     SeaCacheRootHook,
@@ -67,8 +67,21 @@ class TinyCosmos3Transformer(torch.nn.Module):
 class Cosmos3OmniDiffusersPipeline:
     def __init__(self) -> None:
         self.transformer = TinyCosmos3Transformer()
-        self._num_timesteps = 0
-        self.scheduler = SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000))
+        self._current_step_index: int | None = None
+        self._current_sigma: float | None = None
+        self._num_timesteps: int | None = None
+
+    @property
+    def current_step_index(self) -> int | None:
+        return self._current_step_index
+
+    @property
+    def current_sigma(self) -> float | None:
+        return self._current_sigma
+
+    @property
+    def num_timesteps(self) -> int | None:
+        return self._num_timesteps
 
 
 def _latent(value: float) -> torch.Tensor:
@@ -80,17 +93,34 @@ def _run_step(
     timestep: int,
     value: float,
     *,
+    hook: SeaCacheRootHook | None = None,
+    context: str = "cond",
     control: float | None = None,
     noisy_frame_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     controls = None if control is None else [_latent(control)]
-    with torch.inference_mode():
+    cache_context = hook.cache_context(context) if hook is not None else nullcontext()
+    with torch.inference_mode(), cache_context:
         return transformer(
             hidden_states=_latent(value),
             timestep=torch.tensor([timestep]),
             noisy_frame_mask=noisy_frame_mask,
             control_latents=controls,
         )
+
+
+def _apply_test_hook(
+    transformer: TinyCosmos3Transformer,
+    metadata: SimpleNamespace,
+    config: SeaCacheConfig | None = None,
+) -> SeaCacheRootHook:
+    return apply_sea_cache_hook(
+        transformer,
+        config or SeaCacheConfig(threshold=100.0),
+        current_step_callback=lambda: metadata.step,
+        current_sigma_callback=lambda: metadata.sigma,
+        num_inference_steps_callback=lambda: metadata.num_steps,
+    )
 
 
 def test_config_validation() -> None:
@@ -154,67 +184,95 @@ def test_indicator_distance_and_linear_extrapolation() -> None:
     )
 
 
-def test_tracker_handles_cfg_transfer_and_new_sample() -> None:
-    tracker = DenoiseStepTracker()
-    assert tracker.advance(1000.0) == (True, False)
-    assert tracker.pass_name == "cfg0"
-    assert tracker.advance(1000.0) == (False, False)
-    assert tracker.pass_name == "cfg1"
-    assert tracker.advance(1000.0) == (False, False)
-    assert tracker.pass_name == "cfg2"
-    assert tracker.advance(750.0) == (True, False)
-    assert tracker.step == 1
-    assert tracker.pass_name == "cfg0"
-    assert tracker.advance(1000.0) == (True, True)
-
-
 def test_hook_skips_middle_steps_and_forces_endpoints() -> None:
     transformer = TinyCosmos3Transformer()
-    hook = apply_sea_cache_hook(
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=4)
+    hook = _apply_test_hook(
         transformer,
+        metadata,
         SeaCacheConfig(threshold=100.0, max_consecutive_cached=2),
     )
-    hook.refresh(transformer, num_inference_steps=4)
+    hook.refresh(transformer)
 
     for step, timestep in enumerate((1000, 750, 500, 250)):
-        _run_step(transformer, timestep, 1.0 - step * 0.01)
+        metadata.step = step
+        metadata.sigma = timestep / 1000
+        _run_step(transformer, timestep, 1.0 - step * 0.01, hook=hook)
 
     assert hook.full_count == 2
     assert hook.skip_count == 2
-    assert [step for step, _ in hook.state_manager._states["cfg0"].history] == [0, 3]
+    assert [step for step, _ in hook.state_manager._states["cond"].history] == [0, 3]
 
 
 def test_hook_keeps_three_transfer_branches_separate() -> None:
     transformer = TinyCosmos3Transformer()
-    hook = apply_sea_cache_hook(
-        transformer,
-        SeaCacheConfig(threshold=100.0),
-    )
-    hook.refresh(transformer, num_inference_steps=3)
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
+    hook = _apply_test_hook(transformer, metadata)
+    hook.refresh(transformer)
 
-    for timestep, value in ((1000, 1.0), (500, 0.9)):
-        _run_step(transformer, timestep, value, control=0.5)
-        _run_step(transformer, timestep, value)
-        _run_step(transformer, timestep, value, control=0.5)
+    contexts = ("cond", "cond_no_control", "uncond")
+    for step, (timestep, value) in enumerate(((1000, 1.0), (500, 0.9))):
+        metadata.step = step
+        metadata.sigma = timestep / 1000
+        _run_step(transformer, timestep, value, hook=hook, context=contexts[0], control=0.5)
+        _run_step(transformer, timestep, value, hook=hook, context=contexts[1])
+        _run_step(transformer, timestep, value, hook=hook, context=contexts[2], control=0.5)
 
-    assert set(hook.state_manager._states) == {"cfg0", "cfg1", "cfg2"}
+    assert set(hook.state_manager._states) == set(contexts)
     assert hook.full_count == 3
     assert hook.skip_count == 3
-    assert len(hook.state_manager._states["cfg0"].previous_indicator) == 2
-    assert len(hook.state_manager._states["cfg1"].previous_indicator) == 1
+    assert len(hook.state_manager._states["cond"].previous_indicator) == 2
+    assert len(hook.state_manager._states["cond_no_control"].previous_indicator) == 1
 
 
 def test_hook_fails_open_without_noisy_vision() -> None:
     transformer = TinyCosmos3Transformer()
-    hook = apply_sea_cache_hook(transformer, SeaCacheConfig(threshold=100.0))
-    hook.refresh(transformer, num_inference_steps=3)
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
+    hook = _apply_test_hook(transformer, metadata)
+    hook.refresh(transformer)
     all_clean = torch.zeros(1, 1, 2, 1, 1)
 
-    _run_step(transformer, 1000, 1.0, noisy_frame_mask=all_clean)
-    _run_step(transformer, 500, 0.9, noisy_frame_mask=all_clean)
+    _run_step(transformer, 1000, 1.0, hook=hook, noisy_frame_mask=all_clean)
+    metadata.step = 1
+    metadata.sigma = 0.5
+    _run_step(transformer, 500, 0.9, hook=hook, noisy_frame_mask=all_clean)
 
     assert hook.full_count == 0
     assert hook.skip_count == 0
+
+
+def test_hook_fails_open_without_explicit_context() -> None:
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=2)
+    hook = _apply_test_hook(transformer, metadata)
+    hook.refresh(transformer)
+
+    _run_step(transformer, 1000, 1.0)
+
+    assert hook.full_count == 0
+    assert hook.skip_count == 0
+    assert hook.state_manager._states == {}
+
+
+def test_hook_uses_exact_sigma_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.cache.seacache import hook as hook_module
+
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.37, num_steps=2)
+    observed_sigmas: list[float] = []
+    original_filter = hook_module.apply_sea_filter
+
+    def recording_filter(hidden_states: torch.Tensor, sigma: float, power_exp: float) -> torch.Tensor:
+        observed_sigmas.append(sigma)
+        return original_filter(hidden_states, sigma, power_exp)
+
+    monkeypatch.setattr(hook_module, "apply_sea_filter", recording_filter)
+    hook = _apply_test_hook(transformer, metadata)
+    hook.refresh(transformer)
+    _run_step(transformer, timestep=999, value=1.0, hook=hook)
+
+    assert observed_sigmas
+    assert all(sigma == pytest.approx(0.37) for sigma in observed_sigmas)
 
 
 def test_backend_selector_and_refresh() -> None:
@@ -230,31 +288,40 @@ def test_backend_selector_and_refresh() -> None:
 
     pipeline = Cosmos3OmniDiffusersPipeline()
     backend.enable(pipeline)
-    backend.refresh(pipeline, num_inference_steps=7)
     hook = pipeline.transformer._hook_registry.get_hook(SeaCacheRootHook._HOOK_NAME)
-    assert hook.num_inference_steps == 7
+    assert isinstance(hook, SeaCacheRootHook)
+    pipeline._current_step_index = 0
+    pipeline._current_sigma = 1.0
+    pipeline._num_timesteps = 7
+    _run_step(pipeline.transformer, 1000, 1.0, hook=hook)
+    assert hook.full_count == 1
+
+    backend.refresh(pipeline, num_inference_steps=7)
+    assert hook.full_count == 0
+    assert hook.skip_count == 0
+    assert hook.state_manager._states == {}
 
 
-def test_backend_defers_pipeline_default_step_count() -> None:
+def test_backend_uses_resolved_pipeline_metadata_not_refresh_argument() -> None:
     pipeline = Cosmos3OmniDiffusersPipeline()
     backend = SeaCacheBackend(DiffusionCacheConfig())
     backend.enable(pipeline)
-    backend.refresh(pipeline, num_inference_steps=0)
-    pipeline._num_timesteps = 35
-
-    _run_step(pipeline.transformer, 1000, 1.0)
-
     hook = pipeline.transformer._hook_registry.get_hook(SeaCacheRootHook._HOOK_NAME)
-    assert hook.num_inference_steps == 35
-    assert hook.full_count == 1
-
-    # The next request is refreshed before Cosmos3 resolves its mode-specific
-    # default. It must adopt 50 rather than retaining the previous 35.
-    backend.refresh(pipeline, num_inference_steps=0)
+    assert isinstance(hook, SeaCacheRootHook)
+    backend.refresh(pipeline, num_inference_steps=35)
     pipeline._num_timesteps = 50
-    _run_step(pipeline.transformer, 1000, 1.0)
-    assert hook.num_inference_steps == 50
+    pipeline._current_step_index = 0
+    pipeline._current_sigma = 1.0
+    _run_step(pipeline.transformer, 1000, 1.0, hook=hook)
     assert hook.full_count == 1
+    assert hook.num_inference_steps_callback is not None
+    assert hook.num_inference_steps_callback() == 50
+
+    pipeline._current_step_index = 1
+    pipeline._current_sigma = 0.98
+    _run_step(pipeline.transformer, 980, 0.99, hook=hook)
+    assert hook.full_count == 1
+    assert hook.skip_count == 1
 
 
 def test_shared_config_defaults() -> None:

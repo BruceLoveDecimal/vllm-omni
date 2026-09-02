@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import inspect
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -17,7 +18,7 @@ from vllm_omni.diffusion.cache.seacache.sea_filter import (
     extrapolate_residual,
     indicator_distance,
 )
-from vllm_omni.diffusion.cache.seacache.state import DenoiseStepTracker, SeaCacheState
+from vllm_omni.diffusion.cache.seacache.state import SeaCacheState
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
 
 logger = init_logger(__name__)
@@ -55,25 +56,24 @@ class SeaCacheRootHook(ModelHook):
         self,
         config: SeaCacheConfig,
         *,
-        num_train_timesteps: int = 1000,
-        num_inference_steps_callback: Callable[[], int] | None = None,
+        current_step_callback: Callable[[], int | torch.Tensor | None] | None = None,
+        current_sigma_callback: Callable[[], float | torch.Tensor | None] | None = None,
+        num_inference_steps_callback: Callable[[], int | torch.Tensor | None] | None = None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.num_train_timesteps = int(num_train_timesteps)
-        self.num_inference_steps = 0
+        self.current_step_callback = current_step_callback
+        self.current_sigma_callback = current_sigma_callback
         self.num_inference_steps_callback = num_inference_steps_callback
         self.state_manager = StateManager(SeaCacheState)
-        self.tracker = DenoiseStepTracker()
         self._warned_messages: set[str] = set()
         self.full_count = 0
         self.skip_count = 0
+        self._current_step_index: int | None = None
         self._parameter_sharded = False
         self._collective_skip_groups: list[torch.distributed.ProcessGroup] = []
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
-        if self.num_train_timesteps <= 0:
-            raise ValueError(f"num_train_timesteps must be positive, got {self.num_train_timesteps}")
         self._parameter_sharded = _is_parameter_sharded(module)
         seen_groups: set[int] = set()
         for block in getattr(module, "gen_layers", ()):
@@ -90,6 +90,15 @@ class SeaCacheRootHook(ModelHook):
         if message not in self._warned_messages:
             logger.warning(message)
             self._warned_messages.add(message)
+
+    @contextmanager
+    def cache_context(self, name: str) -> Iterator[None]:
+        previous_context = self.state_manager._context
+        self.state_manager.set_context(name)
+        try:
+            yield
+        finally:
+            self.state_manager.set_context(previous_context)
 
     @staticmethod
     def _clear_forward_control(module: torch.nn.Module) -> None:
@@ -156,13 +165,17 @@ class SeaCacheRootHook(ModelHook):
         state: SeaCacheState,
         indicator: list[torch.Tensor] | None,
         step: int,
+        num_inference_steps: int,
     ) -> bool:
+        if state.last_step is not None and step != state.last_step + 1:
+            state.reset()
+        state.last_step = step
         max_consecutive = bool(
             self.config.max_consecutive_cached and state.consecutive_cached >= self.config.max_consecutive_cached
         )
         forced_compute = (
             step < 1
-            or step >= self.num_inference_steps - 1
+            or step >= num_inference_steps - 1
             or max_consecutive
             or not state.history
             or indicator is None
@@ -219,19 +232,24 @@ class SeaCacheRootHook(ModelHook):
         **kwargs: Any,
     ) -> tuple[tuple, dict]:
         self._clear_forward_control(module)
+        self._current_step_index = None
         if torch.is_grad_enabled():
             self._warn_once("SeaCache is inference-only; autograd-enabled calls run in full.")
             return args, kwargs
-        if self.num_inference_steps <= 0 and self.num_inference_steps_callback is not None:
-            try:
-                callback_steps = int(self.num_inference_steps_callback())
-                if callback_steps > 0:
-                    self.num_inference_steps = callback_steps
-            except (TypeError, ValueError):
-                pass
-        if self.num_inference_steps <= 0:
-            self._warn_once("SeaCache was not refreshed with a positive inference step count; running full.")
+        if self.state_manager._current_context is None:
+            self._warn_once("SeaCache requires an explicit cache context; running full.")
             return args, kwargs
+        callbacks = (
+            self.current_step_callback,
+            self.current_sigma_callback,
+            self.num_inference_steps_callback,
+        )
+        if any(callback is None for callback in callbacks):
+            self._warn_once("SeaCache requires scheduler step, sigma, and step-count callbacks; running full.")
+            return args, kwargs
+        assert self.current_step_callback is not None
+        assert self.current_sigma_callback is not None
+        assert self.num_inference_steps_callback is not None
         if self._parameter_sharded:
             self._warn_once("SeaCache cannot bypass parameter-sharded transformer blocks; running full.")
             return args, kwargs
@@ -239,35 +257,40 @@ class SeaCacheRootHook(ModelHook):
         try:
             bound = self._bind_forward_arguments(module, args, kwargs)
             hidden_states = bound.get("hidden_states")
-            timestep = bound.get("timestep")
             noisy_frame_mask = bound.get("noisy_frame_mask")
             control_latents = bound.get("control_latents")
             if not isinstance(hidden_states, torch.Tensor) or hidden_states.ndim != 5:
                 raise ValueError("hidden_states must be a rank-5 tensor")
-            if not isinstance(timestep, torch.Tensor) or timestep.numel() == 0:
-                raise ValueError("timestep must be a non-empty tensor")
-            if timestep.numel() != 1:
-                raise ValueError("batched timesteps are not supported")
             if isinstance(noisy_frame_mask, torch.Tensor) and not bool(torch.any(noisy_frame_mask != 0).item()):
                 self._warn_once("SeaCache requires noisy vision; conditioning-only calls run in full.")
                 return args, kwargs
 
-            timestep_key = float(timestep.flatten()[0].item())
-            if not math.isfinite(timestep_key):
-                raise ValueError("timestep must be finite")
-            sigma = timestep_key / self.num_train_timesteps
-            if not 0.0 <= sigma <= 1.0:
-                raise ValueError(f"derived sigma must be in [0, 1], got {sigma}")
-        except (TypeError, ValueError, RuntimeError) as error:
+            step = self.current_step_callback()
+            sigma = self.current_sigma_callback()
+            num_inference_steps = self.num_inference_steps_callback()
+            if isinstance(step, torch.Tensor):
+                step = step.item()
+            if isinstance(sigma, torch.Tensor):
+                sigma = sigma.item()
+            if isinstance(num_inference_steps, torch.Tensor):
+                num_inference_steps = num_inference_steps.item()
+            if step is None or sigma is None or num_inference_steps is None:
+                raise ValueError("scheduler metadata is unavailable")
+            step = int(step)
+            sigma = float(sigma)
+            num_inference_steps = int(num_inference_steps)
+            if (
+                step < 0
+                or num_inference_steps <= 0
+                or step >= num_inference_steps
+                or not math.isfinite(sigma)
+                or not 0.0 <= sigma <= 1.0
+            ):
+                raise ValueError("expected a valid step index and exact sigma in [0, 1]")
+        except (IndexError, TypeError, ValueError, RuntimeError) as error:
             self._warn_once(f"SeaCache metadata is invalid; running full: {error}")
             return args, kwargs
 
-        is_new_step, is_new_sample = self.tracker.advance(timestep_key)
-        if is_new_step and (is_new_sample or self.tracker.step >= self.num_inference_steps):
-            self.state_manager.reset()
-            self.tracker.reset_for_new_sample()
-
-        self.state_manager.set_context(self.tracker.pass_name)
         state: SeaCacheState = self.state_manager.get_state()
         try:
             indicator = self._build_indicator(hidden_states, control_latents, sigma)
@@ -275,19 +298,20 @@ class SeaCacheRootHook(ModelHook):
             self._warn_once(f"SeaCache could not construct its vision indicator; running full: {error}")
             indicator = None
 
-        local_compute = self._resolve_gate(state, indicator, self.tracker.step)
+        local_compute = self._resolve_gate(state, indicator, step, num_inference_steps)
         should_compute = self._synchronize_compute(local_compute, hidden_states.device)
         if should_compute and not local_compute:
             state.accumulated_distance = 0.0
 
         if should_compute:
             module._seacache_record = True
+            self._current_step_index = step
             self.full_count += 1
             return args, kwargs
 
         residual = extrapolate_residual(
             state.history,
-            self.tracker.step,
+            step,
             self.config.residual_order,
         )
         if residual.device != hidden_states.device:
@@ -302,8 +326,8 @@ class SeaCacheRootHook(ModelHook):
         if getattr(module, "_seacache_record", False):
             state: SeaCacheState = self.state_manager.get_state()
             residual = getattr(module, "_seacache_last_residual", None)
-            if isinstance(residual, torch.Tensor):
-                state.history.append((self.tracker.step, residual.detach().clone()))
+            if isinstance(residual, torch.Tensor) and self._current_step_index is not None:
+                state.history.append((self._current_step_index, residual.detach().clone()))
                 state.history = state.history[-(self.config.residual_order + 1) :]
                 state.consecutive_cached = 0
             else:
@@ -311,20 +335,18 @@ class SeaCacheRootHook(ModelHook):
                 state.accumulated_distance = 0.0
                 self._warn_once("SeaCache did not receive a transformer residual; clearing cache history.")
         self._clear_forward_control(module)
+        self._current_step_index = None
         return output
 
     def reset_state(self, module: torch.nn.Module) -> torch.nn.Module:
         self.state_manager.reset()
-        self.tracker.reset()
         self.full_count = 0
         self.skip_count = 0
+        self._current_step_index = None
         self._clear_forward_control(module)
         return module
 
-    def refresh(self, module: torch.nn.Module, num_inference_steps: int) -> None:
-        if num_inference_steps < 0:
-            raise ValueError(f"num_inference_steps must be non-negative, got {num_inference_steps}")
-        self.num_inference_steps = int(num_inference_steps)
+    def refresh(self, module: torch.nn.Module) -> None:
         self.reset_state(module)
 
 
@@ -332,13 +354,15 @@ def apply_sea_cache_hook(
     module: torch.nn.Module,
     config: SeaCacheConfig,
     *,
-    num_train_timesteps: int = 1000,
-    num_inference_steps_callback: Callable[[], int] | None = None,
+    current_step_callback: Callable[[], int | torch.Tensor | None] | None = None,
+    current_sigma_callback: Callable[[], float | torch.Tensor | None] | None = None,
+    num_inference_steps_callback: Callable[[], int | torch.Tensor | None] | None = None,
 ) -> SeaCacheRootHook:
     registry = HookRegistry.get_or_create(module)
     hook = SeaCacheRootHook(
         config,
-        num_train_timesteps=num_train_timesteps,
+        current_step_callback=current_step_callback,
+        current_sigma_callback=current_sigma_callback,
         num_inference_steps_callback=num_inference_steps_callback,
     )
     registry.register_hook(SeaCacheRootHook._HOOK_NAME, hook)

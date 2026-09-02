@@ -45,7 +45,7 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
         return TeaCacheBackend(cache_config)
     elif cache_backend == "mag_cache":
         return MagCacheBackend(cache_config)
-    elif cache_backend in ("sea_cache", "seacache"):
+    elif cache_backend == "sea_cache":
         return SeaCacheBackend(cache_config)
     elif cache_backend in ("step_cache", "stepcache", "step_cache_dit"):
         return StepCacheBackend(cache_config)

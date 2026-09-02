@@ -18,18 +18,6 @@ from vllm_omni.diffusion.data import DiffusionCacheConfig
 logger = init_logger(__name__)
 
 
-def _num_train_timesteps(pipeline: Any) -> int:
-    scheduler = getattr(pipeline, "scheduler", None)
-    scheduler_config = getattr(scheduler, "config", None)
-    value = getattr(scheduler_config, "num_train_timesteps", 1000)
-    if isinstance(scheduler_config, dict):
-        value = scheduler_config.get("num_train_timesteps", value)
-    value = int(value)
-    if value <= 0:
-        raise ValueError(f"Scheduler num_train_timesteps must be positive, got {value}")
-    return value
-
-
 def enable_cosmos3_seacache(
     pipeline: Any,
     config: DiffusionCacheConfig,
@@ -49,11 +37,12 @@ def enable_cosmos3_seacache(
     hook = apply_sea_cache_hook(
         transformer,
         sea_config,
-        num_train_timesteps=_num_train_timesteps(pipeline),
+        current_step_callback=lambda: getattr(pipeline, "current_step_index", None),
+        current_sigma_callback=lambda: getattr(pipeline, "current_sigma", None),
         num_inference_steps_callback=lambda: getattr(
             pipeline,
-            "_num_timesteps",
-            0,
+            "num_timesteps",
+            None,
         ),
     )
     logger.info(
@@ -96,6 +85,7 @@ class SeaCacheBackend(CacheBackend):
         num_inference_steps: int,
         verbose: bool = True,
     ) -> None:
+        del num_inference_steps
         transformer = getattr(pipeline, "transformer", None)
         if transformer is None:
             raise ValueError("SeaCache requires a pipeline with a transformer")
@@ -106,10 +96,7 @@ class SeaCacheBackend(CacheBackend):
         hook = registry.get_hook(SeaCacheRootHook._HOOK_NAME) if registry is not None else None
         if not isinstance(hook, SeaCacheRootHook):
             raise RuntimeError("SeaCache hook is not installed on the pipeline transformer")
-        hook.refresh(transformer, num_inference_steps)
+        hook.refresh(transformer)
         pipeline._sea_cache_hook = hook
         if verbose:
-            logger.debug(
-                "SeaCache state refreshed (num_inference_steps=%d)",
-                num_inference_steps,
-            )
+            logger.debug("SeaCache state refreshed")

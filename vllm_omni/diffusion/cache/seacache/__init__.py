@@ -7,13 +7,9 @@ from vllm_omni.diffusion.cache.seacache.hook import (
     SeaCacheRootHook,
     apply_sea_cache_hook,
 )
-from vllm_omni.diffusion.cache.seacache.state import (
-    DenoiseStepTracker,
-    SeaCacheState,
-)
+from vllm_omni.diffusion.cache.seacache.state import SeaCacheState
 
 __all__ = [
-    "DenoiseStepTracker",
     "SeaCacheBackend",
     "SeaCacheConfig",
     "SeaCacheRootHook",
