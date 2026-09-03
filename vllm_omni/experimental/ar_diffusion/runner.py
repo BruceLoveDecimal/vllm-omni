@@ -33,7 +33,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def paging_block_size(tokens_per_frame: int, supported: Sequence[int | MultipleOf] | None = None) -> int:
+def paging_block_size(
+    tokens_per_frame: int,
+    supported: Sequence[int | MultipleOf] | None = None,
+    *,
+    head_size: int | None = None,
+) -> int:
     """Choose the paging unit, which is not the eviction unit.
 
     AR-Diffusion evicts by frame; the attention kernel tiles by a fixed number
@@ -65,7 +70,7 @@ def paging_block_size(tokens_per_frame: int, supported: Sequence[int | MultipleO
         # re-import it depend on nothing else holding it first.
         from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import supported_kernel_block_sizes
 
-        supported = supported_kernel_block_sizes()
+        supported = supported_kernel_block_sizes(head_size)
     if not supported:
         raise ValueError("The attention kernel advertises no legal block size.")
 
@@ -185,7 +190,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             num_kv_heads=spec.num_kv_heads,
             head_size=spec.head_size,
             dtype=self.od_config.dtype,
-            block_size=paging_block_size(spec.tokens_per_frame),
+            block_size=paging_block_size(spec.tokens_per_frame, head_size=spec.head_size),
             max_model_len=spec.max_model_len,
             available_bytes=self._available_memory_bytes() if available_bytes is None else available_bytes,
             kv_branches=spec.kv_branches,

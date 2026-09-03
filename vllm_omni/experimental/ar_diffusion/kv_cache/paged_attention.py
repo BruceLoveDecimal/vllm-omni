@@ -120,14 +120,46 @@ class ARDiffusionPagedForwardContext:
         return int(self.adapter.num_computed_tokens) % self.block_size
 
     @property
-    def max_video_blocks(self) -> int:
-        """Blocks the visible window spans, rounded up.
+    def sink_tokens(self) -> int:
+        """Tokens in the protected prefix. The sink is declared in frames."""
+        return int(self.kv_cache.spec.sink_chunks) * self.chunk_size
 
-        Rounding up is what keeps the block table a fixed shape: the window is
-        a token count, and flooring it would understate the capacity whenever
-        it is not a whole number of blocks.
+    @property
+    def sink_blocks(self) -> int:
+        """Blocks the sink spans, rounded up so a straddling block stays protected."""
+        return -(-self.sink_tokens // self.block_size)
+
+    @property
+    def recent_blocks(self) -> int:
+        """Blocks the recent sliding tail spans.
+
+        The tail is a token count that ends wherever the current chunk ends,
+        which is an arbitrary offset once a frame is not a whole number of
+        blocks. Covering an interval of that length from an arbitrary start
+        takes one block more than its own ceiling, so the extra block is added
+        whenever the geometry can be unaligned at all. Without it the tail is
+        short by up to ``block_size`` tokens the window is supposed to keep.
         """
-        return -(-self.max_video_tokens // self.block_size)
+        recent_tokens = max(self.max_video_tokens - self.sink_tokens, 0)
+        blocks = -(-recent_tokens // self.block_size)
+        return blocks + (1 if self.chunk_size % self.block_size else 0)
+
+    @property
+    def max_video_blocks(self) -> int:
+        """Blocks the visible window spans.
+
+        The sink and the recent tail are rounded up *separately*. Deriving the
+        tail by subtracting the sink from a single rounded total makes the sink's
+        round-up come out of the tail's budget, so the tail silently loses real
+        tokens. Both ends must be supersets: a window that is a little wide
+        attends genuine neighbouring tokens, while a window that is a little
+        short drops context the model was trained to see.
+
+        When a frame is already a legal block both terms are exact and this is
+        ``sink_chunks + window_chunks`` -- precisely the width every geometry
+        that pages one frame per block has today.
+        """
+        return self.sink_blocks + self.recent_blocks
 
     @property
     def num_current_video_blocks(self) -> int:
@@ -247,7 +279,7 @@ class ARDiffusionPagedForwardContext:
         # number from the end -- silently, since the shapes stay right.
         all_video_blocks = list(dict.fromkeys(self.history_block_ids + self.current_video_block_ids))
         max_video_blocks = self.max_video_blocks
-        sink_blocks = -(-(int(self.kv_cache.spec.sink_chunks) * self.chunk_size) // self.block_size)
+        sink_blocks = self.sink_blocks
 
         # What was actually written: committed history, capped by whatever the
         # window still holds, plus this forward's own tokens.
@@ -262,7 +294,17 @@ class ARDiffusionPagedForwardContext:
                 visible_video_blocks += all_video_blocks[-tail_blocks:]
             live_tokens = min(resident_history + self.seq_len, len(visible_video_blocks) * self.block_size)
 
-        video_len = min(live_tokens, len(visible_video_blocks) * self.block_size)
+        # Cap by what was actually WRITTEN, never by the run's capacity. Every
+        # visible block is full except the last, which holds this forward's own
+        # tail; when a chunk is not a whole number of blocks that tail leaves
+        # the rest of its block unwritten, and capacity would hand those dead
+        # slots to the kernel as though they were tokens. The failure is silent
+        # -- the shapes stay right and the frames stay plausible -- so this is
+        # the invariant the whole unaligned path rests on.
+        history_offset = self._history_tokens % self.block_size
+        last_block_written = ((history_offset + self.seq_len - 1) % self.block_size) + 1
+        written_extent = (len(visible_video_blocks) - 1) * self.block_size + last_block_written
+        video_len = min(live_tokens, written_extent)
         return visible_video_blocks, video_len
 
     def build_block_table(
@@ -684,7 +726,7 @@ def _resolve_fa_version(head_size: int) -> int:
     return version
 
 
-def supported_kernel_block_sizes() -> list[int | MultipleOf]:
+def supported_kernel_block_sizes(head_size: int | None = None) -> list[int | MultipleOf]:
     """Block sizes the kernel this module dispatches to will accept.
 
     Same shape as vLLM's ``AttentionBackend.get_supported_kernel_block_sizes``
@@ -694,16 +736,31 @@ def supported_kernel_block_sizes() -> list[int | MultipleOf]:
     ``flash_attn_varlen_func`` itself, choosing between vLLM's CUDA build and
     ROCm's AITER a few lines below, and only this module knows which.
 
-    It lives next to that choice so there is one place to change. The
-    constraint is a property of the kernel, not of the card, and the kernels
-    reachable from here agree on 16 today: vLLM's CUDA FlashAttention, ROCm
-    AITER, and upstream ``flash_attn`` all advertise ``MultipleOf(16)``. Other
-    backends in the same tree do not -- ``hpc_attn`` accepts only 64, and
-    FlashInfer advertises pages of 128 or more solely on Blackwell -- so a
-    caller must treat this as data to be queried, never as the number 16.
+    It lives next to that choice so there is one place to change, and it
+    answers per *dispatch target*, not with one constant:
+
+    * FA2 rejects a page that is not a multiple of 16. The check is in
+      ``csrc/flash_attn/flash_api.cpp`` -- "Paged KV cache block size must be
+      divisible by 16" -- and it is what every non-Hopper CUDA card hits,
+      because ``get_flash_attn_version`` resolves 2 everywhere FA3 has no
+      kernels.
+    * FA3 carries no such check, so the frame stays the page on Hopper. That
+      matters: answering 16 unconditionally would repage the one architecture
+      that runs the default resolution today, turning a 19-entry block table
+      into a 1756-entry one for no reason.
+    * The ROCm branch packs the visible pages into contiguous varlen K/V before
+      it calls anything, so no page size ever reaches a kernel there.
+
+    Note this is the constraint of the kernel, not of the card, and a caller
+    must treat the answer as data -- other backends in the same tree disagree
+    (``hpc_attn`` takes only 64), so never hard-code the number 16 against it.
     """
     from vllm.v1.attention.backend import MultipleOf
 
+    if torch.version.hip is not None:
+        return [MultipleOf(1)]
+    if head_size is not None and _resolve_fa_version(int(head_size)) >= 3:
+        return [MultipleOf(1)]
     return [MultipleOf(16)]
 
 

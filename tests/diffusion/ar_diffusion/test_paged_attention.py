@@ -1119,9 +1119,76 @@ def test_a_ragged_window_keeps_the_block_table_a_fixed_shape():
     assert len(widths) == 1, f"block table width varied across ticks: {sorted(widths)}"
     # The window has to have actually filled, or none of the above was tested.
     assert max(kv_lens) > min(kv_lens)
-    # Rounding up keeps at most one block more than the token window asks for.
+    # The sink and the recent tail are rounded up independently, so the window
+    # can carry at most two blocks more than the token count asks for -- and,
+    # far more importantly, never fewer. Deriving the tail by subtracting the
+    # sink from one rounded total spends the sink's round-up out of the tail's
+    # budget, and the tail then silently drops real tokens it is supposed to
+    # keep. A window that is slightly wide attends genuine neighbouring
+    # tokens; a window that is slightly short loses context.
     assert max(kv_lens) <= ctx.max_video_blocks * BLOCK
-    assert max(kv_lens) < max_video_tokens + BLOCK
+    assert max_video_tokens <= max(kv_lens) < max_video_tokens + 2 * BLOCK
+
+
+def test_the_recent_window_never_comes_up_short():
+    """Every token the window is supposed to keep must be reachable.
+
+    The sink and the recent tail each start at an arbitrary offset once a frame
+    is not a whole number of blocks, so each has to round *up* on its own.
+    Deriving the tail by subtracting a rounded sink from a single rounded total
+    spends the sink's round-up out of the tail's budget: the tail then ends up
+    one block narrower than the window it stands for, and quietly stops
+    covering the oldest tokens of the recent history. Nothing downstream
+    notices -- the table shape is right, the kernel succeeds, and the frames
+    stay plausible -- so the containment is asserted here.
+    """
+    device = torch.device("cpu")
+    kv, st = make_state(device=device, window_chunks=2, sink_chunks=1, chunk_size=RAGGED_CHUNK)
+    sink_tokens = int(kv.spec.sink_chunks) * int(kv.spec.chunk_size)
+    window_tokens = int(kv.spec.sliding_window)
+
+    for _ in range(6):
+        ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=True)[0].forward_ctx
+        ctx.ensure_video_slots(device)
+        visible, _ = ctx.video_block_table(device)
+        table = kv.block_table(ctx.adapter)
+        end = ctx._history_tokens + RAGGED_CHUNK
+
+        wanted = {int(table[pos // BLOCK]) for pos in range(max(0, end - window_tokens), end)}
+        wanted |= {int(table[pos // BLOCK]) for pos in range(0, min(sink_tokens, end))}
+        wanted.discard(kv.null_block_id)
+
+        missing = wanted - set(visible)
+        assert not missing, f"the window dropped blocks {sorted(missing)} that hold live tokens"
+        st.commit_paged_context(POS)
+
+
+def test_a_kernel_without_the_divisibility_check_keeps_the_frame_as_the_page(monkeypatch):
+    """FA3 carries no page-size check, so Hopper must keep paging by frame.
+
+    Answering ``MultipleOf(16)`` for every CUDA card repages the one
+    architecture that already runs the checkpoint's default resolution,
+    turning a 19-entry block table into a 1756-entry one to satisfy a
+    constraint that card does not have. The check FA2 does carry lives in
+    ``csrc/flash_attn/flash_api.cpp``; the Hopper build has no counterpart.
+    """
+    import importlib
+
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    # Resolved through sys.modules at call time: other tests in this file pop
+    # the module to re-import it, so a reference captured earlier can be stale.
+    pa = importlib.import_module("vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention")
+    if torch.version.hip is not None:
+        pytest.skip("the ROCm branch packs before the kernel, so no page size reaches one")
+
+    monkeypatch.setattr(pa, "_resolve_fa_version", lambda head_size: 3)
+    assert paging_block_size(1560, pa.supported_kernel_block_sizes(HEAD_DIM)) == 1560
+
+    monkeypatch.setattr(pa, "_resolve_fa_version", lambda head_size: 2)
+    assert paging_block_size(1560, pa.supported_kernel_block_sizes(HEAD_DIM)) == 16
+    # A frame that is a legal block stays one either way.
+    assert paging_block_size(1440, pa.supported_kernel_block_sizes(HEAD_DIM)) == 1440
 
 
 def test_the_checkpoints_own_default_resolution_can_build_a_cache():
