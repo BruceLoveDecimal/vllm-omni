@@ -203,8 +203,20 @@ class SeaCacheRootHook(ModelHook):
 
     def _synchronize_compute(self, compute: bool, device: torch.device) -> bool:
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return compute
+            return True if self._parameter_sharded else compute
         decision = torch.tensor(int(compute), dtype=torch.int32, device=device)
+        if self._parameter_sharded:
+            from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+            world_group = get_world_group()
+            if world_group.world_size > 1:
+                torch.distributed.all_reduce(
+                    decision,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=world_group.device_group,
+                )
+            return bool(decision.item())
+
         for group in self._collective_skip_groups:
             torch.distributed.all_reduce(
                 decision,
@@ -250,9 +262,6 @@ class SeaCacheRootHook(ModelHook):
         assert self.current_step_callback is not None
         assert self.current_sigma_callback is not None
         assert self.num_inference_steps_callback is not None
-        if self._parameter_sharded:
-            self._warn_once("SeaCache cannot bypass parameter-sharded transformer blocks; running full.")
-            return args, kwargs
 
         try:
             bound = self._bind_forward_arguments(module, args, kwargs)

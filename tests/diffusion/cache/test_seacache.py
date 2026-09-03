@@ -204,6 +204,87 @@ def test_hook_skips_middle_steps_and_forces_endpoints() -> None:
     assert [step for step, _ in hook.state_manager._states["cond"].history] == [0, 3]
 
 
+def test_parameter_sharded_hook_skips_when_all_world_ranks_agree(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
+    hook = _apply_test_hook(transformer, metadata)
+    hook._parameter_sharded = True
+    world_group = object()
+    reduced_groups: list[object] = []
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: SimpleNamespace(world_size=2, device_group=world_group),
+    )
+
+    def all_reduce(decision, *, op, group):
+        assert op == torch.distributed.ReduceOp.MAX
+        reduced_groups.append(group)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    _run_step(transformer, 1000, 1.0, hook=hook)
+    metadata.step = 1
+    metadata.sigma = 0.5
+    _run_step(transformer, 500, 0.99, hook=hook)
+
+    assert hook.full_count == 1
+    assert hook.skip_count == 1
+    assert reduced_groups == [world_group, world_group]
+
+
+def test_parameter_sharded_peer_forces_full_compute(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
+    hook = _apply_test_hook(transformer, metadata)
+    hook._parameter_sharded = True
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: SimpleNamespace(world_size=2, device_group=object()),
+    )
+    reduce_count = 0
+
+    def all_reduce(decision, *, op, group):
+        nonlocal reduce_count
+        del op, group
+        reduce_count += 1
+        if reduce_count == 2:
+            decision.fill_(1)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    _run_step(transformer, 1000, 1.0, hook=hook)
+    metadata.step = 1
+    metadata.sigma = 0.5
+    _run_step(transformer, 500, 0.99, hook=hook)
+
+    assert hook.full_count == 2
+    assert hook.skip_count == 0
+    assert hook.state_manager._states["cond"].accumulated_distance == 0.0
+
+
+def test_parameter_sharded_hook_fails_open_without_distributed_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook = SeaCacheRootHook(SeaCacheConfig())
+    hook._parameter_sharded = True
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    assert hook._synchronize_compute(False, torch.device("cpu")) is True
+
+
 def test_hook_keeps_three_transfer_branches_separate() -> None:
     transformer = TinyCosmos3Transformer()
     metadata = SimpleNamespace(step=0, sigma=1.0, num_steps=3)
