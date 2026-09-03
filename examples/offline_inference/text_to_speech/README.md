@@ -24,7 +24,7 @@ list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
-| dots.tts | `dots-studio/dots.tts-soar` | single (native AR) | — (text-only) | ✓ (online) | no-reference synthesis | 48 kHz |
+| dots.tts | `dots-studio/dots.tts-soar` | single (native AR) | ✓ | ✓ (online) | reference-audio-only conditioning | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
@@ -495,7 +495,25 @@ python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
 ```
 
 ### Voice cloning
-Not wired in this release. Generation is text-only and does not consume reference audio, a named voice, or a precomputed speaker embedding. The CAM++ x-vector speaker encoder weights load, but `end2end.py` has no `--ref-audio`/`--ref-text` flags yet.
+Two strengths, selected by whether you supply the reference transcript:
+
+```bash
+# Timbre only: the CAM++ x-vector conditions every DiT step.
+python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
+    --model dots-studio/dots.tts-soar \
+    --text "Hello from a cloned voice." \
+    --ref-audio reference.wav
+
+# Prompt prefill: additionally seeds the reference's audio latents into the
+# DiT history and the patch-encoder KV cache. Stronger cloning, and the
+# prompt grows by one token per 160 ms of reference audio.
+python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
+    --model dots-studio/dots.tts-soar \
+    --text "Hello from a cloned voice." \
+    --ref-audio reference.wav --ref-text "transcript of reference.wav"
+```
+
+The x-vector and the reference latents are cached per reference audio, so repeated use of the same voice pays both encoders only once. Precomputed speaker embeddings (`speaker_embedding` / `x_vector_only_mode`) remain unsupported.
 
 ### Streaming
 The AudioVAE decoder emits incremental audio through its internal streaming path (`init_stream_state` / `stream_step` / `stream_flush`). Online streaming is exposed through the OpenAI-compatible `/v1/audio/speech` endpoint with `stream=true`; see the [online serving guide](../../online_serving/text_to_speech/README.md#dotstts). The offline `end2end.py` script returns the consolidated waveform.

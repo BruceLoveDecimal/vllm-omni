@@ -4560,22 +4560,8 @@ def dots_tts_server(mocker: MockerFixture):
 
 
 class TestDotsTTSServing:
-    def test_dots_tts_prompt_validation(self, dots_tts_server):
-        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "ref_text" in error
-
-        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "ref_audio" in error
-
-        request = OpenAICreateSpeechRequest(input="Hello", voice="test")
-        error = dots_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "voice" in error
-
+    def test_dots_tts_rejects_qwen3_only_speaker_fields(self, dots_tts_server):
+        """dots.tts conditions on audio, never on a precomputed embedding."""
         request = OpenAICreateSpeechRequest(input="Hello", speaker_embedding=[1, 2, 3])
         error = dots_tts_server._validate_tts_request(request)
         assert error is not None
@@ -4586,6 +4572,23 @@ class TestDotsTTSServing:
         assert error is not None
         assert "x_vector_only_mode" in error
 
+    def test_dots_tts_rejects_unknown_voice(self, dots_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", voice="test")
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "voice" in error
+
+    def test_dots_tts_rejects_ref_text_without_ref_audio(self, dots_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "ref_text requires ref_audio" in error
+
+    def test_dots_tts_accepts_reference_audio(self, dots_tts_server):
+        """Reference audio is a supported conditioning input, not an error."""
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        assert dots_tts_server._validate_tts_request(request) is None
+
     def test_dots_tts_adapter_awaits_async_prompt_builder(self, dots_tts_server, mocker: MockerFixture):
         build_prompt_async = mocker.patch.object(
             dots_tts_server._adapter,
@@ -4594,7 +4597,15 @@ class TestDotsTTSServing:
         )
         request = OpenAICreateSpeechRequest(input="Hello")
         asyncio.run(dots_tts_server._prepare_speech_generation(request))
-        build_prompt_async.assert_awaited_once_with("Hello")
+        build_prompt_async.assert_awaited_once_with(
+            "Hello",
+            ref_audio=None,
+            ref_sr=None,
+            ref_text=None,
+            prompt_patch_count=0,
+            prompt_audio_samples=0,
+            ref_audio_key=None,
+        )
 
     def test_dots_tts_adapter_apply_sampling_overrides(self, dots_tts_server, mocker: MockerFixture):
         mocker.patch.object(dots_tts_server._adapter, "build", return_value=PreparedRequest(prompt="Hello"))

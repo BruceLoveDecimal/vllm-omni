@@ -6,6 +6,7 @@ Reference checkpoint: dots-studio/dots.tts-soar.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from pathlib import Path
@@ -39,6 +40,19 @@ def parse_args():
         type=str,
         default="output_audio",
         help="Directory for output WAV files.",
+    )
+    parser.add_argument(
+        "--ref-audio",
+        type=str,
+        default=None,
+        help="Reference audio file for voice cloning. Alone it conditions the DiT on the "
+        "speaker's timbre; with --ref-text it also prefills the reference into the AR loop.",
+    )
+    parser.add_argument(
+        "--ref-text",
+        type=str,
+        default=None,
+        help="Transcript of --ref-audio. Enables prompt prefill (stronger cloning).",
     )
     parser.add_argument(
         "--deploy-config",
@@ -86,17 +100,43 @@ def main():
 
     from vllm_omni.model_executor.models.dots_tts.dots_tts_prompt import (
         build_dots_tts_prompt,
+        prompt_audio_plan,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
+    ref_audio = ref_sr = None
+    prompt_patch_count = prompt_audio_samples = 0
+    if args.ref_audio:
+        ref_samples, ref_sr = sf.read(args.ref_audio, dtype="float32", always_2d=True)
+        ref_audio = ref_samples.mean(axis=1).tolist()
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+        samples_per_patch = int(hf_config.patch_size) * math.prod(hf_config.vocoder["downsample_rates"])
+        prompt_patch_count, prompt_audio_samples = prompt_audio_plan(
+            len(ref_audio),
+            ref_sr,
+            samples_per_patch=samples_per_patch,
+            target_sample_rate=int(hf_config.vocoder["sample_rate"]),
+        )
+    elif args.ref_text:
+        raise SystemExit("--ref-text requires --ref-audio.")
+
     prompt = build_dots_tts_prompt(
-        tokenizer=tokenizer,
-        text=args.text,
+        tokenizer,
+        args.text,
+        ref_audio=ref_audio,
+        ref_sr=ref_sr,
+        ref_text=args.ref_text,
+        prompt_patch_count=prompt_patch_count,
+        prompt_audio_samples=prompt_audio_samples,
+        ref_audio_key=args.ref_audio,
     )
 
     print(f"Model       : {args.model}")
     print(f"Text        : {args.text}")
+    print(f"Reference   : {args.ref_audio or 'none (zero-shot)'}")
     print(f"Output dir  : {output_dir}")
     print(f"Prompt len  : {len(prompt['prompt_token_ids'])} tokens")
 
