@@ -53,6 +53,7 @@ EXPECTED_MODEL_TYPES = {
     "voxtral_tts",
     "fish_tts",
     "cosyvoice3",
+    "dots_tts",
     "omnivoice",
     "covo_audio",
     "ming_tts",

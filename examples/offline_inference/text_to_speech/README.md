@@ -24,7 +24,7 @@ list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
-| dots.tts | `rednote-hilab/dots.tts-soar` | single (native AR) | — (not wired yet) | — | — | 48 kHz |
+| dots.tts | `rednote-hilab/dots.tts-soar` | single (native AR) | ✓ | ✓ (online) | reference-audio-only conditioning | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
@@ -495,10 +495,47 @@ python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
 ```
 
 ### Voice cloning
-Not wired in this release — generation is zero-shot only. The CAM++ x-vector speaker encoder weights load, but `end2end.py` has no `--ref-audio`/`--ref-text` flags yet.
+Two strengths, selected by whether you supply the reference transcript:
+
+```bash
+# Timbre only: the CAM++ x-vector conditions every DiT step.
+python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
+    --model rednote-hilab/dots.tts-soar \
+    --text "Hello from a cloned voice." \
+    --ref-audio reference.wav
+
+# Prompt prefill: additionally seeds the reference's audio latents into the
+# DiT history and the patch-encoder KV cache. Stronger cloning, and the
+# prompt grows by one token per 160 ms of reference audio.
+python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
+    --model rednote-hilab/dots.tts-soar \
+    --text "Hello from a cloned voice." \
+    --ref-audio reference.wav --ref-text "transcript of reference.wav"
+```
+
+The x-vector and the reference latents are cached per reference audio, so
+repeated use of the same voice pays both encoders only once.
+
+### Online serving
+`/v1/audio/speech` is wired through `tts_adapters/dots_tts.py`:
+
+```bash
+vllm serve rednote-hilab/dots.tts-soar --omni
+curl http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "model": "rednote-hilab/dots.tts-soar",
+  "input": "Hello from dots.tts.",
+  "ref_audio": "file:///path/to/reference.wav",
+  "ref_text": "transcript of reference.wav"
+}' --output out.wav
+```
+
+The server issues a synthetic warmup request at startup, so the first real
+request does not pay the side path's lazy initialization.
 
 ### Streaming
-The AudioVAE decoder has an internal streaming path (`init_stream_state` / `stream_step` / `stream_flush`) used to avoid boundary artifacts between 160 ms patches, but it is not yet exposed through an online serving endpoint or example.
+The AudioVAE decoder's streaming path (`init_stream_state` / `stream_step` /
+`stream_flush`) avoids boundary artifacts between 160 ms patches and backs
+the endpoint's `"stream": true` responses.
 
 ### Notes
 - Output: 48 kHz mono WAV.

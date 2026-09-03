@@ -6,9 +6,8 @@
 
 - Vendor: rednote-hilab
 - Model: `rednote-hilab/dots.tts-soar`
-- Task: Text-to-speech, zero-shot synthesis only
-- Mode: Offline end-to-end example only (not yet wired for online serving —
-  see [Known limitations](#known-limitations))
+- Task: Text-to-speech, zero-shot synthesis and voice cloning
+- Mode: Offline `Omni()` and online `/v1/audio/speech`
 - Maintainer: Community
 
 ## When to use this recipe
@@ -82,6 +81,36 @@ The deploy config at
 is loaded automatically by the model registry (HF `model_type=dots_tts`).
 Pass `--deploy-config <path>` to override.
 
+#### Online serving
+
+```bash
+vllm serve rednote-hilab/dots.tts-soar --omni
+```
+
+The speech endpoint resolves `tts_adapters/dots_tts.py` (detection is by
+`model_arch`, since `latent_generator` is VoxCPM2's stage key) and issues a
+synthetic warmup request at startup, moving the side path's lazy
+initialization off the first real request.
+
+Three conditioning modes:
+
+| Request fields | Conditioning |
+|---|---|
+| `input` | zero-shot |
+| `input`, `ref_audio` | CAM++ x-vector conditions the DiT (`g_cond`) |
+| `input`, `ref_audio`, `ref_text` | additionally prefills the reference's audio latents into the DiT history and the patch-encoder KV cache |
+
+The x-vector and the reference latent distribution are cached process-wide
+by reference-audio identity (the serving layer's resolved-ref-audio key),
+so a repeated voice re-runs neither encoder. Measured on the RTX 5090 box
+below for a 3.7 s reference, that is **63 ms** of engine-blocking work per
+request (CAM++ 53 ms + AudioVAE 10 ms) elided on a cache hit — blocking for
+every request in the step, not just the one that supplied the reference.
+
+Startup warmup absorbs the side path's one-time initialization: the warmup
+request took **2.3 s** while the same request in steady state takes
+**1.28 s**, so ~1.0 s moves off the first real request.
+
 #### Verification
 
 **T1 — offline zero-shot synthesis**:
@@ -106,6 +135,27 @@ Whisper transcription of the output matched the input text with no
 dropped leading word (confirms the streaming-vocoder patch-boundary fix
 described in [Known limitations](#known-limitations)).
 
+**T2 — voice cloning**, verified on 1 x RTX 5090 32GB by taking a zero-shot
+output as the reference and measuring CAM++ x-vector cosine similarity
+between the reference and each generated clip:
+
+| Conditioning | cosine similarity to reference |
+|---|---|
+| zero-shot (no reference) | 0.10 - 0.38 |
+| `ref_audio` only | 0.73 - 0.81 |
+| `ref_audio` + `ref_text` (prompt prefill) | 0.76 - 0.78 |
+
+Both conditioning modes move speaker identity decisively away from the
+unconditioned baseline. The two modes are not separable on this test: the
+reference is itself a zero-shot output of the same model, and the
+per-request DiT noise varies run to run, so the spread across repeats
+exceeds the gap between them. Measured over 3 offline and 6 online runs.
+
+**T3 — concurrency**: 9 overlapping `/v1/audio/speech` requests mixing all
+three conditioning modes across two different references completed with no
+server errors, confirming per-request isolation of the new prompt-prefill
+state.
+
 #### Notes
 
 - Output: 48 kHz mono WAV.
@@ -123,17 +173,15 @@ described in [Known limitations](#known-limitations)).
 
 ## Known limitations
 
-- **No online serving yet.** dots.tts is not registered in
-  `vllm_omni/entrypoints/openai/tts_adapters/` (the framework other TTS
-  models in this repo use for `/v1/audio/speech`), so `vllm serve
-  rednote-hilab/dots.tts-soar --omni` will start but the OpenAI-compatible
-  speech endpoint does not know how to build request params for it yet.
-  Offline `Omni()` (as used in `end2end.py`) is the only supported path
-  today.
-- **Voice cloning is not wired.** The CAM++ x-vector speaker encoder
-  weights load and are exercised by `load_weights()`, but nothing in the
-  prompt builder consumes a reference audio yet — generation is zero-shot
-  only. `end2end.py` has no `--ref-audio`/`--ref-text` flags.
+- **Reference audio is capped at 30 s** by the serving adapter. Prompt
+  prefill costs one prompt token per 160 ms of reference audio and shares
+  the talker's 1024-patch FM workspace with the generated audio, and the
+  CAM++ extractor crops to 10 s regardless.
+- **Reference encoding runs on the engine's critical path.** The CAM++ and
+  AudioVAE encoders run inside `preprocess()`, so a cache-missing reference
+  stalls the whole engine step. The cross-request cache makes this a
+  once-per-voice cost; a burst of distinct references still pays it per
+  request.
 - **`dots.tts-mf` (MeanFlow, 2-4 step) checkpoint is not supported.** Only
   the fixed 10-step Euler DiT sampler used by `dots.tts-soar` /
   `dots.tts-base` is implemented.
