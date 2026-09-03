@@ -22,9 +22,14 @@ Mirrors upstream rednote-hilab/dots.tts (pinned @ a393d2e):
   * Cross-step state is isolated per request in ``_RequestState``
     (keyed by request_id); eviction is deferred to the end of
     ``forward()`` so a finishing request's audio still drains.
-  * The CAM++ speaker encoder is constructed and its weights load, but
-    voice cloning is not exposed yet — generation is zero-shot and the
-    DiT falls back to its null conditioning (``fm_null_g_cond``).
+  * Voice cloning runs in ``preprocess()``: the CAM++ speaker encoder
+    turns the reference waveform into an x-vector (``_xvec_proj`` →
+    ``g_cond``, DiT conditioning), and with a reference transcript the
+    AudioVAE also encodes the reference to latents that seed the DiT
+    history and the patch-encoder KV cache (upstream "prompt prefill").
+    Both artifacts are cached across requests by reference-audio
+    identity.  Zero-shot requests keep the DiT's null conditioning
+    (``fm_null_g_cond``).
 
 Debugging: set ``DOTS_TTS_BETA_TRACE=1`` for an env-gated per-patch
 rms/max trace across the full side path (zero overhead when unset).
@@ -55,6 +60,10 @@ from vllm_omni.model_executor.models.dots_tts.dots_tts_dit import DiT
 from vllm_omni.model_executor.models.dots_tts.dots_tts_patch_encoder import (
     VAESemanticEncoder,
 )
+from vllm_omni.model_executor.models.dots_tts.dots_tts_prompt import (
+    MAX_AUDIO_PATCHES,
+    prompt_audio_plan,
+)
 from vllm_omni.model_executor.models.dots_tts.dots_tts_speaker_encoder import (
     SpeakerXVectorFeatures,
 )
@@ -63,6 +72,7 @@ from vllm_omni.model_executor.models.dots_tts.dots_tts_vocoder import (
     AudioVAEConfig,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
 
@@ -96,13 +106,25 @@ _FM_HIDDEN = 1024  # DiT.hidden_size  (also LLM↔DiT projection target)
 _LATENT_DIM = 128  # AudioVAE.latent_dim
 _LATENT_PATCH_SIZE = 4  # config.patch_size — DiT samples 4 latent frames / audio patch
 _HIDDEN_PATCH_SIZE = 1  # upstream core.py hardcodes self.hidden_patch_size = 1
-_MAX_AUDIO_PATCHES = 1024  # ~164 s @ 4×1920/48k; bounds per-request FM static buffer
+_MAX_AUDIO_PATCHES = MAX_AUDIO_PATCHES  # ~164 s @ 4x1920/48k; bounds per-request FM static buffer
 _DIT_NUM_STEPS = int(
     os.environ.get("DOTS_TTS_DIT_NUM_STEPS", "10")
 )  # env-gated; upstream default 10 for fixed-step Euler
 _DIT_GUIDANCE_SCALE = 1.2  # upstream default guidance_scale for soar
 _DIT_NOISE_SEED = 20260601  # base seed for per-request FM noise (voxcpm2 parity)
 _PATCH_ENCODER_OUT_DS_RATE = 2  # patch_size / in_ds_rate = 4 / 2 (VAESemanticEncoder hardcodes in_ds_rate=2)
+_SPEAKER_SCALE = 1.5  # upstream default speaker_scale (runtime.py:341/695)
+# Conditioning artifacts (CAM++ x-vector, AudioVAE latent distribution) are
+# cached in the process-wide speaker cache under this model type, so a
+# repeated reference voice pays the encoders once instead of once per
+# request.  Mirrors upstream's ``_prompt_feature_cache`` (model.py:816),
+# with vllm-omni's shared LRU providing the eviction + byte accounting.
+_PROMPT_CACHE_MODEL_TYPE = "dots_tts"
+# Base seed for the AudioVAE posterior draw in prompt prefill.  Upstream
+# samples with the global RNG (core.py:742 ``torch.randn_like``); we key the
+# draw off the reference-audio identity instead so a cache hit and a cache
+# miss produce the same latents and a voice reproduces run-to-run.
+_PROMPT_LATENT_SEED = 20260602
 
 
 class _IOHelper:
@@ -173,10 +195,21 @@ class _RequestState:
     fm_null_g_cond: torch.Tensor | None = None  # [1, _FM_HIDDEN]
     fm_seq_len: int = 0
     fm_capacity: int = 0
-    # Speaker x-vector after _xvec_proj.  Zero-shot generation leaves this
-    # None → DiT falls back to fm_null_g_cond; voice-clone wiring is a
-    # follow-up.
+    # Speaker x-vector after _xvec_proj (voice cloning).  Zero-shot
+    # generation leaves this None → DiT falls back to fm_null_g_cond.
     g_cond: torch.Tensor | None = None
+    # Prompt-prefill reference latents, normalized and patchified to
+    # [1, prompt_patch_count, _LATENT_PATCH_SIZE, _LATENT_DIM].  Set by
+    # preprocess() and consumed once by the prefill step's
+    # _seed_prompt_fm_history, which interleaves them with the prompt-span
+    # LLM hiddens in the DiT history buffer.
+    prompt_patches: torch.Tensor | None = None
+    # Prompt prefill regenerates the reference's final audio patch as its
+    # first sampled patch; upstream discards it (model.py:1459
+    # ``should_drop_regenerated_prompt_patch``).  It still drives the AR
+    # loopback and the DiT history — only the waveform is suppressed, and
+    # the vocoder stream therefore starts on the first payload patch.
+    drop_next_patch: bool = False
     # AR-loop bookkeeping.
     # patch_encoder_state holds conv_tail + per-layer KV caches for the
     # patch_encoder's streaming decode (mirrors upstream state.patch_encoder_state).
@@ -290,6 +323,22 @@ def _validate_architecture_constants(hf_config: Any, dit_config: _DiTConfig) -> 
             "dots.tts checkpoint config disagrees with this integration's "
             "architecture constants: " + ", ".join(mismatches)
         )
+
+
+def _unwrap_reference_audio(ref: Any) -> tuple[Any, int]:
+    """Unwrap the ``[[samples, sample_rate]]`` reference-audio envelope.
+
+    Shape follows voxcpm2's ``reference_audio`` / ``prompt_audio`` entries
+    so the two models share one serving-side convention.
+    """
+    entry = ref[0] if isinstance(ref, (list, tuple)) and len(ref) == 1 and isinstance(ref[0], (list, tuple)) else ref
+    if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+        raise ValueError(f"dots.tts reference audio must be [[samples, sample_rate]], got {type(ref)!r}.")
+    samples, sample_rate = entry
+    sample_rate = int(sample_rate)
+    if sample_rate <= 0:
+        raise ValueError(f"dots.tts reference audio sample_rate must be positive, got {sample_rate}.")
+    return samples, sample_rate
 
 
 class DotsTTSForConditionalGeneration(nn.Module):
@@ -434,6 +483,18 @@ class DotsTTSForConditionalGeneration(nn.Module):
         self._pending_requests: list[tuple[str, bool, torch.Tensor, int]] = []
         self._deferred_cleanup_ids: set[str] = set()
 
+        # Cross-request conditioning cache (CAM++ x-vector + AudioVAE latent
+        # distribution), keyed by the serving layer's reference-audio
+        # identity.  Shared process-wide LRU, so a hot voice never re-runs
+        # either encoder on the engine's critical path.
+        self._prompt_feature_cache = get_speaker_cache()
+        # Device the CAM++ extractor has been synced to; see
+        # _align_speaker_encoder_device.
+        self._speaker_encoder_device: torch.device | None = None
+        # samples_per_patch — one audio patch is _LATENT_PATCH_SIZE latent
+        # frames, each hop_size waveform samples (upstream model.py:802).
+        self._samples_per_patch = _LATENT_PATCH_SIZE * int(self._audio_vae.hop_size)
+
         # Audio side-channel:
         # _audio_queue: _finish_decode pushes (req_id, audio_tensor) tuples
         #   here; make_omni_output drains them into multimodal_outputs each
@@ -548,11 +609,16 @@ class DotsTTSForConditionalGeneration(nn.Module):
         embed_tokens.  Caller (serving layer or test harness) is
         responsible for the wrap — talker just embeds whatever it gets.
 
+        Voice cloning rides in ``additional_information``: a reference
+        waveform alone yields the DiT's ``g_cond``, and a reference
+        waveform plus its transcript additionally seeds the AR loop
+        (``prompt prefill``), which replaces the trailing
+        ``<audio_gen_span>`` rows of ``embeds`` with patch-encoder
+        outputs of the reference latents.
+
         Decode (span_len == 1): use ``state.curr_embed_for_next`` from
         the previous step's AR loopback (DiT → patch_encoder output);
         zero fallback only if the loopback hasn't produced one yet.
-
-        Voice clone is intentionally not wired here — zero-shot only.
 
         Returns ``(input_ids unchanged, embeds [span_len, hidden_size],
         {})``.  ``forward()`` consumes ``self._pending_requests`` to
@@ -587,7 +653,11 @@ class DotsTTSForConditionalGeneration(nn.Module):
             # Reset AR-loop state on every prefill.
             state.patch_encoder_state = None
             state.vocoder_stream_state = None
+            state.g_cond = None
+            state.prompt_patches = None
+            state.drop_next_patch = False
             embeds = self.model.embed_tokens(input_ids)
+            embeds = self._apply_prompt_conditioning(state, info_dict, embeds)
         else:
             curr = state.curr_embed_for_next
             if curr is not None:
@@ -604,6 +674,258 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
         self._pending_requests.append((req_id, is_prefill, embeds, span_len))
         return input_ids, embeds, {}
+
+    # ── voice cloning ──
+
+    def _apply_prompt_conditioning(
+        self,
+        state: _RequestState,
+        info_dict: dict[str, Any],
+        embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Turn reference audio in ``info_dict`` into DiT / AR-loop conditioning.
+
+        Mirrors upstream ``_prepare_prompt_conditioning`` (model.py:852)
+        plus ``_prefill_prompt_latents`` (model.py:969):
+
+        * ``reference_audio`` — x-vector only.  ``g_cond`` conditions
+          every DiT step; the token sequence is the zero-shot one.
+        * ``prompt_audio`` + ``prompt_text`` — additionally encode the
+          reference to latents, prefill the patch encoder with them, and
+          write the resulting embeddings over the trailing
+          ``<audio_gen_span>`` rows of ``embeds``.  The DiT history is
+          seeded from those same latents on the prefill step
+          (:meth:`_seed_prompt_fm_history`), which needs the prompt-span
+          LLM hiddens and therefore cannot run until ``forward()``.
+
+        Returns ``embeds`` (unchanged for zero-shot requests).
+        """
+        prefill_ref = info_dict.get("prompt_audio")
+        ref = prefill_ref if prefill_ref is not None else info_dict.get("reference_audio")
+        if ref is None:
+            return embeds
+        samples, ref_sr = _unwrap_reference_audio(ref)
+
+        device = embeds.device
+        prompt_patch_count, target_samples = prompt_audio_plan(
+            len(samples),
+            ref_sr,
+            samples_per_patch=self._samples_per_patch,
+            target_sample_rate=int(self._audio_vae.sample_rate),
+        )
+        # The caller sized prompt_token_ids from the same plan.  Check before
+        # the prefill gate, not inside it: a caller that reserved spans while
+        # we plan none would otherwise skip the prefill silently and feed the
+        # LM raw <audio_gen_span> embeddings.
+        if prefill_ref is not None:
+            declared = int(info_dict.get("prompt_patch_count", 0))
+            if declared != prompt_patch_count:
+                raise ValueError(
+                    f"dots.tts prompt prefill patch-count mismatch: prompt declares {declared}, "
+                    f"reference audio ({len(samples)} samples @ {ref_sr} Hz) plans {prompt_patch_count}."
+                )
+        use_prompt_prefill = prefill_ref is not None and prompt_patch_count > 0
+
+        cache_key = self._prompt_cache_key(info_dict)
+        cached = dict(self._prompt_feature_cache.get(cache_key) or {}) if cache_key is not None else {}
+
+        waveform: torch.Tensor | None = None
+
+        def _waveform() -> torch.Tensor:
+            nonlocal waveform
+            if waveform is None:
+                waveform = self._prepare_reference_waveform(samples, ref_sr, target_samples, device)
+            return waveform
+
+        # 1. CAM++ x-vector → g_cond.  Upstream only caches the embedding
+        #    when the reference fits the extractor's crop window, because a
+        #    longer reference is cropped and the crop is not part of the key
+        #    (model.py:842 ``_can_cache_speaker_embedding``).
+        speaker_embedding = cached.get("speaker_embedding")
+        can_cache_speaker = self._can_cache_speaker_embedding(target_samples)
+        if speaker_embedding is None or not can_cache_speaker:
+            self._align_speaker_encoder_device(device)
+            speaker_embedding = self._speaker_encoder(_waveform().squeeze(1))
+            if can_cache_speaker:
+                cached["speaker_embedding"] = speaker_embedding.detach().cpu()
+        else:
+            speaker_embedding = speaker_embedding.to(device=device)
+        xvec_dtype = next(self._xvec_proj.parameters()).dtype
+        state.g_cond = self._xvec_proj(speaker_embedding.to(dtype=xvec_dtype) * _SPEAKER_SCALE).detach()
+
+        if not use_prompt_prefill:
+            if cache_key is not None and cached:
+                self._prompt_feature_cache.put(cache_key, cached)
+            return embeds
+
+        # 2. AudioVAE posterior over the reference → sampled latents.
+        latent_distribution = cached.get("prompt_latent_distribution")
+        if latent_distribution is None:
+            latent_distribution = self._audio_vae.extract_latents(_waveform())
+            cached["prompt_latent_distribution"] = latent_distribution.detach().cpu()
+        latent_distribution = latent_distribution.to(device=device, dtype=torch.float32)
+        if cache_key is not None:
+            self._prompt_feature_cache.put(cache_key, cached)
+
+        prompt_latents = self._sample_prompt_latents(latent_distribution, cache_key)
+        # Drop the reference's final patch: the model regenerates it as its
+        # first sampled patch (upstream model.py:924 + :1459).
+        prompt_latents = prompt_latents[:, : prompt_patch_count * _LATENT_PATCH_SIZE]
+        state.prompt_patches = (
+            self._io_helper.normalize(prompt_latents)
+            .reshape(1, prompt_patch_count, _LATENT_PATCH_SIZE, _LATENT_DIM)
+            .to(dtype=embeds.dtype)
+        )
+        state.drop_next_patch = True
+
+        # 3. Patch-encoder prefill over the raw reference latents; its
+        #    outputs replace the <audio_gen_span> embeddings, and its KV
+        #    cache carries into the decode loop.
+        if embeds.size(0) < prompt_patch_count + 1:
+            raise ValueError(
+                f"dots.tts prompt prefill needs {prompt_patch_count + 1} prompt positions "
+                f"(one <audio_gen_start> + {prompt_patch_count} <audio_gen_span>), got {embeds.size(0)}."
+            )
+        state.patch_encoder_state = self._patch_encoder.init_decode_state(
+            max_audio_patch_count=_MAX_AUDIO_PATCHES,
+            batch_size=1,
+            device=device,
+            dtype=embeds.dtype,
+        )
+        prompt_embeddings, state.patch_encoder_state = self._patch_encoder.prefill(
+            prompt_latents.to(dtype=embeds.dtype),
+            state.patch_encoder_state,
+        )
+        embeds = embeds.clone()
+        embeds[-prompt_patch_count:] = prompt_embeddings[0].to(dtype=embeds.dtype)
+        return embeds
+
+    def _align_speaker_encoder_device(self, device: torch.device) -> None:
+        """Move the CAM++ extractor onto ``device`` once.
+
+        Its CAM++ parameters are already there — vLLM builds the model
+        under a device context — but ``torchaudio.transforms.Resample``
+        materializes its sinc kernel on CPU regardless, and until voice
+        cloning landed nothing ever ran this module's forward, so the
+        mismatch never surfaced.  Guarded by ``_speaker_encoder_device``
+        so it costs one comparison per reference-audio request.
+        """
+        if self._speaker_encoder_device == device:
+            return
+        self._speaker_encoder.to(device=device)
+        self._speaker_encoder_device = device
+
+    def _can_cache_speaker_embedding(self, prompt_sample_count: int) -> bool:
+        """Whether the x-vector is a pure function of the cache key.
+
+        Mirrors upstream model.py:842: past ``max_audio_seconds`` the CAM++
+        wrapper crops, and the crop is not captured by the key.
+        """
+        max_audio_seconds = float(self._speaker_encoder.max_audio_seconds)
+        if max_audio_seconds <= 0:
+            return True
+        return prompt_sample_count <= round(self._speaker_encoder.sample_rate * max_audio_seconds)
+
+    def _prompt_cache_key(self, info_dict: dict[str, Any]) -> tuple[str, str, int] | None:
+        """Cross-request cache key for this request's reference audio.
+
+        The serving layer supplies ``ref_audio_key`` — its own resolved
+        ref-audio identity (URL plus mtime/size for local files, or a
+        voice name plus upload timestamp).  Hashing the waveform here
+        instead would put a full pass over the samples on the engine's
+        critical path for no extra safety.  Without a key the reference is
+        re-encoded every request.
+        """
+        ref_key = info_dict.get("ref_audio_key")
+        if not isinstance(ref_key, str) or not ref_key:
+            return None
+        return self._prompt_feature_cache.make_cache_key(ref_key, _PROMPT_CACHE_MODEL_TYPE)
+
+    def _prepare_reference_waveform(
+        self,
+        samples: Any,
+        ref_sr: int,
+        target_samples: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Reference waveform as fp32 ``[1, 1, target_samples]`` at the VAE rate.
+
+        Upstream resamples on load and then zero-pads up to a whole number
+        of audio patches (model.py:794).  We pad or truncate to exactly the
+        length :func:`prompt_audio_plan` predicted, so the patch count the
+        serving layer encoded into ``prompt_token_ids`` cannot drift from
+        the one the encoders produce.
+        """
+        import torchaudio
+
+        if isinstance(samples, torch.Tensor):
+            audio = samples.detach().to(dtype=torch.float32).reshape(-1)
+        else:
+            audio = torch.as_tensor(samples, dtype=torch.float32).reshape(-1)
+        audio = audio.to(device=device)
+        target_sr = int(self._audio_vae.sample_rate)
+        if int(ref_sr) != target_sr:
+            audio = torchaudio.functional.resample(audio, int(ref_sr), target_sr)
+        if audio.numel() < target_samples:
+            audio = torch.nn.functional.pad(audio, (0, target_samples - audio.numel()))
+        return audio[:target_samples].reshape(1, 1, target_samples)
+
+    def _sample_prompt_latents(
+        self,
+        latent_distribution: torch.Tensor,
+        cache_key: tuple[str, str, int] | None,
+    ) -> torch.Tensor:
+        """Draw ``[1, T, _LATENT_DIM]`` latents from the AudioVAE posterior.
+
+        Upstream ``IOHelper.sample_from_latent`` (core.py:742) draws from
+        the global RNG.  We seed a private Generator from the reference's
+        cache key so a voice sounds the same whether the distribution came
+        from the cache or was just computed, and across runs.
+        """
+        mean, log_std = latent_distribution.chunk(2, dim=1)
+        seed_source = f"{_PROMPT_LATENT_SEED}:{cache_key[0] if cache_key else ''}".encode()
+        digest = hashlib.blake2b(seed_source, digest_size=8).digest()
+        gen = torch.Generator(device=mean.device)
+        gen.manual_seed(int.from_bytes(digest, "little") & 0x7FFF_FFFF_FFFF_FFFF)
+        noise = torch.empty_like(mean)
+        noise.normal_(generator=gen)
+        return (mean + noise * torch.exp(log_std)).transpose(1, 2)
+
+    def _seed_prompt_fm_history(
+        self,
+        state: _RequestState,
+        req_hidden: torch.Tensor,
+    ) -> None:
+        """Interleave prompt hiddens and reference latents into the DiT history.
+
+        Mirrors the prompt-span loop of upstream ``_prefill``
+        (model.py:1163): for each reference patch, append the LLM hidden at
+        the position *before* its span, then the patch's latents.  The
+        buffer therefore reaches the decode loop in the same
+        ``[hidden, latent, hidden, latent, ...]`` layout a zero-shot
+        request builds one step at a time, and ``_finish_decode`` appends
+        the final ``<audio_gen_span>`` hidden right after this returns.
+        """
+        prompt_patches = state.prompt_patches
+        assert prompt_patches is not None
+        count = int(prompt_patches.size(1))
+        if req_hidden.size(0) < count + 1:
+            raise ValueError(
+                f"dots.tts prompt prefill expected at least {count + 1} prefill hiddens, got {req_hidden.size(0)}."
+            )
+        needed = (count + 1) * (_HIDDEN_PATCH_SIZE + _LATENT_PATCH_SIZE)
+        if state.fm_seq_len + needed > state.fm_capacity:
+            raise ValueError(
+                f"dots.tts reference audio is too long: {count} prompt patches need {needed} FM slots, "
+                f"capacity is {state.fm_capacity}."
+            )
+        # The hidden at index -(count + 1) is <audio_gen_start>'s; each
+        # following one belongs to a <audio_gen_span> position.
+        hiddens = req_hidden[-(count + 1) :]
+        for index in range(count):
+            self._append_hidden_chunk(state, hiddens[index : index + 1].unsqueeze(0))
+            self._append_history_chunk(state, prompt_patches[:, index])
+        state.prompt_patches = None
 
     def postprocess(self, *args: Any, **kwargs: Any) -> dict:
         return {}
@@ -666,6 +988,11 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 dtype=req_hidden.dtype,
             )
 
+        # Voice-clone prompt prefill: seed the DiT history from the
+        # reference latents before this step's own hidden goes in.
+        if state.prompt_patches is not None:
+            self._seed_prompt_fm_history(state, req_hidden)
+
         # This step's append would overflow the per-request FM buffer.
         # Stop gracefully (same path as a model-decided stop below) instead
         # of raising past _append_hidden_chunk/_append_history_chunk —
@@ -675,9 +1002,13 @@ class DotsTTSForConditionalGeneration(nn.Module):
             state.is_stopping = True
             stop_logits = torch.tensor([[0.0, 1.0]], device=req_hidden.device, dtype=req_hidden.dtype)
             state.precomputed_stop_logits = stop_logits
-            tail = self._audio_vae.stream_flush(state.vocoder_stream_state)
-            if tail.size(-1) > 0:
-                self._audio_queue.append((req_id, tail.reshape(-1)))
+            # No stream state yet means no audio has been emitted (a prompt
+            # prefill whose reference already filled the buffer), and
+            # stream_flush would dereference it.
+            if state.vocoder_stream_state is not None:
+                tail = self._audio_vae.stream_flush(state.vocoder_stream_state)
+                if tail.size(-1) > 0:
+                    self._audio_queue.append((req_id, tail.reshape(-1)))
             self._results_queue.append((req_id, stop_logits))
             return
 
@@ -705,9 +1036,17 @@ class DotsTTSForConditionalGeneration(nn.Module):
         #    (_generate_latents_stream drops one patch only under prompt
         #    prefill / voice clone), and our prefill patch #0 corresponds
         #    to upstream's first decode-loop patch.
-        wav = self._run_vocoder_stream_step(state, audio_patch_raw)
-        if wav.size(-1) > 0:
-            self._audio_queue.append((req_id, wav.reshape(-1)))
+        #    The one exception is prompt prefill's regenerated reference
+        #    tail patch, which upstream discards before the vocoder ever
+        #    sees it (model.py:1459) — so the stream state stays
+        #    unallocated and starts on the first payload patch.
+        wav = None
+        if state.drop_next_patch:
+            state.drop_next_patch = False
+        else:
+            wav = self._run_vocoder_stream_step(state, audio_patch_raw)
+            if wav.size(-1) > 0:
+                self._audio_queue.append((req_id, wav.reshape(-1)))
 
         if is_prefill:
             if self._beta_trace:
@@ -718,7 +1057,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
                     audio_patch=audio_patch,
                     audio_patch_raw=audio_patch_raw,
                     next_embeds=next_embeds,
-                    wav=wav if wav.size(-1) > 0 else None,
+                    wav=wav if wav is not None and wav.size(-1) > 0 else None,
                     prob_stop=None,
                 )
             state.prefill_completed = True
@@ -760,7 +1099,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 audio_patch=audio_patch,
                 audio_patch_raw=audio_patch_raw,
                 next_embeds=next_embeds,
-                wav=wav if wav.size(-1) > 0 else None,
+                wav=wav if wav is not None and wav.size(-1) > 0 else None,
                 prob_stop=eos_logits[0, -1, 1].item(),
             )
 

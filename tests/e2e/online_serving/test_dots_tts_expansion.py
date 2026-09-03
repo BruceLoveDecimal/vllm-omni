@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-E2E Online expansion tests for dots.tts(text-only).
+E2E Online expansion tests for dots.tts (zero-shot synthesis).
 """
 
 import os

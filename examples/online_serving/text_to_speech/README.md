@@ -24,7 +24,7 @@ For the full list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
-| dots.tts | `dots-studio/dots.tts-soar` | — (text-only) | ✓ (PCM stream) | — (default placeholder only) | — |
+| dots.tts | `dots-studio/dots.tts-soar` | ✓ | ✓ (PCM stream) | ✓ (`/v1/audio/voices` upload) | — |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
@@ -102,9 +102,14 @@ For full request-shape documentation (all parameters, response formats, error co
 
 ## dots.tts
 
-Single-stage, text-only TTS at 48 kHz. The current integration supports
-no-reference synthesis; voice cloning, reference audio, named voices, and
-precomputed speaker embeddings are not supported yet.
+Single-stage TTS at 48 kHz. Three conditioning modes: zero-shot,
+reference audio alone (CAM++ x-vector), and reference audio plus its
+transcript (which additionally prefills the reference into the AR loop).
+Precomputed speaker embeddings (`speaker_embedding` / `x_vector_only_mode`)
+are not supported.
+
+The server issues a synthetic warmup request at startup, so the first real
+request does not pay the side path's lazy initialization.
 
 ### Launch
 
@@ -134,7 +139,22 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "stream_format": "audio",
         "response_format": "pcm"
     }' --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
+
+# Voice cloning: ref_audio alone conditions on timbre; adding ref_text
+# also prefills the reference into the AR loop.
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello from a cloned voice.",
+        "ref_audio": "file:///path/to/reference.wav",
+        "ref_text": "transcript of reference.wav",
+        "response_format": "wav"
+    }' --output cloned.wav
 ```
+
+Reference audio is capped at 30 s. The x-vector and reference latents are
+cached process-wide by reference identity, so a repeated voice re-runs
+neither encoder.
 
 ---
 
