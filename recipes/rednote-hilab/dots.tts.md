@@ -6,7 +6,7 @@
 
 - Vendor: rednote-hilab
 - Model: `dots-studio/dots.tts-soar`
-- Task: Text-to-speech, zero-shot synthesis only
+- Task: Text-to-speech, zero-shot synthesis and voice cloning
 - Mode: Offline inference and OpenAI-compatible online serving
 - Maintainer: Community
 
@@ -107,7 +107,7 @@ Whisper transcription of the output matched the input text with no
 dropped leading word (confirms the streaming-vocoder patch-boundary fix
 described in [Known limitations](#known-limitations)).
 
-**T2 — online text-only synthesis**:
+**T2 — online zero-shot synthesis**:
 
 ```bash
 vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
@@ -126,6 +126,65 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 The endpoint also supports raw streaming audio with `stream=true`,
 `stream_format="audio"`, and `response_format="pcm"`.
 
+The server issues a synthetic warmup request at startup, moving the side
+path's lazy initialization off the first real request. Measured on the
+RTX 5090 box below, the warmup request took **3.8 s** while the same
+request in steady state takes **1.24-1.40 s** (5 runs) — roughly 2.5 s
+moved off the first real request.
+
+**T3 — voice cloning**. Three conditioning modes:
+
+| Request fields | Conditioning |
+|---|---|
+| `input` | zero-shot |
+| `input`, `ref_audio` | CAM++ x-vector conditions the DiT (`g_cond`) |
+| `input`, `ref_audio`, `ref_text` | additionally prefills the reference's audio latents into the DiT history and the patch-encoder KV cache |
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello from a cloned voice.",
+        "ref_audio": "file:///path/to/reference.wav",
+        "ref_text": "transcript of reference.wav",
+        "response_format": "wav"
+    }' --output cloned.wav
+```
+
+Verified on 1 x RTX 5090 32GB by taking a zero-shot output as the reference
+and measuring CAM++ x-vector cosine similarity between the reference and
+each generated clip:
+
+| Conditioning | cosine similarity to reference |
+|---|---|
+| zero-shot (no reference) | 0.10 - 0.38 |
+| `ref_audio` only | 0.73 - 0.81 |
+| `ref_audio` + `ref_text` (prompt prefill) | 0.76 - 0.78 |
+
+Both conditioning modes move speaker identity decisively away from the
+unconditioned baseline. The two modes are not separable on this test: the
+reference is itself a zero-shot output of the same model, and the
+per-request DiT noise varies run to run, so the spread across repeats
+exceeds the gap between them. Measured over 3 offline and 6 online runs.
+
+Prompt prefill lengthens the DiT's flow-matching sequence by five slots per
+prompt patch, and the sampler rebuilds that whole sequence on every Euler
+step. It does not show up in wall clock at these sizes: with the decode-step
+count pinned at 40, three runs per arm measured 6.85-7.03 s zero-shot,
+6.83-6.96 s at 21 prompt patches (3.5 s reference), 6.87-7.02 s at 44, and
+6.95-7.28 s at 66 (10.7 s reference) — the per-step cost is dominated by the
+eager sampler's fixed work, not by sequence length.
+
+The x-vector and the reference latent distribution are cached process-wide
+by reference-audio identity, so a repeated voice re-runs neither encoder.
+For a 3.7 s reference that is **63 ms** of engine-blocking work per request
+(CAM++ 53 ms + AudioVAE 10 ms) elided on a cache hit — blocking for every
+request in the step, not just the one that supplied the reference.
+
+**T4 — concurrency**: 9 overlapping `/v1/audio/speech` requests mixing all
+three conditioning modes across two different references completed with no
+server errors, confirming per-request isolation of the prompt-prefill state.
+
 #### Notes
 
 - Output: 48 kHz mono WAV.
@@ -141,13 +200,87 @@ The endpoint also supports raw streaming audio with `stream=true`,
   single ~160 ms patch. Do not override `enable_prefix_caching` for this
   model until that framework-level gap is fixed.
 
+### Request controls
+
+Use the shared speech API's top-level `seed` and `language` fields. Language
+accepts codes/names such as `EN`, `ZH`, `english`, `Cantonese`, `auto` /
+`auto_detect`, or `none`. Auto detection uses Lingua; language names use
+langcodes. Cantonese maps to the upstream `[口音:粤语]` tag.
+
+Optional text processing and non-Euler solvers require:
+
+```bash
+pip install 'vllm-omni[dots-tts]'
+```
+
+Pass model-specific controls in `extra_params`:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `num_steps` | 10 | Positive integer ODE integration steps; fewer steps trade quality for latency |
+| `guidance_scale` | 1.2 | Nonnegative CFG strength |
+| `speaker_scale` | 1.5 | Nonnegative reference-speaker embedding scale, applied after cache lookup |
+| `eos_threshold` | 0.8 | Stop probability threshold in [0, 1]; 0 stops early, 1 relies on the token limit |
+| `ode_method` | `euler` | `euler`, `midpoint`, or `rk4`; the latter two use torchdiffeq |
+| `template_name` | `tts` | `tts`, `instruction_tts`, or `text_to_audio` |
+| `normalize_text` | false | WeTextProcessing normalization for detected Chinese/English target text |
+
+`num_steps` defaults to `DOTS_TTS_DIT_NUM_STEPS` when that existing environment
+override is set. The non-Euler methods perform multiple DiT evaluations per
+integration step. Generation length remains controlled by `max_new_tokens`;
+LLM `temperature` / `top_p` / `top_k` do not control continuous-latent sampling.
+Invalid controls are rejected before engine execution.
+
+```json
+{
+  "input": "I bought 12 apples today.",
+  "ref_audio": "file:///path/to/reference.wav",
+  "ref_text": "The exact reference transcript.",
+  "seed": 42,
+  "language": "EN",
+  "response_format": "wav",
+  "extra_params": {
+    "num_steps": 10,
+    "guidance_scale": 1.2,
+    "speaker_scale": 1.5,
+    "eos_threshold": 0.8,
+    "ode_method": "euler",
+    "template_name": "tts",
+    "normalize_text": true
+  }
+}
+```
+
+Templates use the upstream prefixes `[文本]`, `[带指令文本]`, and `[声音描述]`.
+For `instruction_tts`, put inline instructions in `input`; the separate
+`instructions` field is rejected rather than discarded. Template routing is
+supported, but style adherence and general sound-generation quality depend on
+the checkpoint and are not guaranteed by selecting a template.
+
+Offline inference uses the same prompt builder and controls:
+
+```bash
+python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
+    --model dots-studio/dots.tts-soar --seed 42 --language EN \
+    --text "I bought 12 apples today." \
+    --extra-params '{"num_steps":10,"normalize_text":true}'
+```
+
 ## Known limitations
 
-- **Voice cloning is not wired.** The CAM++ x-vector speaker encoder
-  weights load and are exercised by `load_weights()`, but nothing in the
-  prompt builder consumes reference audio or a precomputed speaker embedding
-  yet. Both offline and online generation are text-only; `ref_audio`,
-  `ref_text`, named voices, and speaker embeddings are not supported.
+- **Precomputed speaker embeddings are not supported.** Conditioning goes
+  through reference audio (`ref_audio`, optionally with `ref_text`); the
+  Qwen3-TTS-style `speaker_embedding` / `x_vector_only_mode` fields are
+  rejected.
+- **Reference audio is capped at 30 s** by the shared speech API. Prompt
+  prefill costs one prompt token per 160 ms of reference audio and shares
+  the talker's 1024-patch FM workspace with the generated audio, and the
+  CAM++ extractor crops to 10 s regardless.
+- **Reference encoding runs on the engine's critical path.** The CAM++ and
+  AudioVAE encoders run inside `preprocess()`, so a cache-missing reference
+  stalls the whole engine step. The cross-request cache makes this a
+  once-per-voice cost; a burst of distinct references still pays it per
+  request.
 - **`dots.tts-mf` (MeanFlow, 2-4 step) checkpoint is not supported.** Only
   the fixed 10-step Euler DiT sampler used by `dots.tts-soar` /
   `dots.tts-base` is implemented.
@@ -159,8 +292,8 @@ The endpoint also supports raw streaming audio with `stream=true`,
   unlike voxcpm2's `enable_batched_cfm`). A community review of this
   integration measured no throughput gain at `c=4` concurrent requests
   versus `c=1`.
-- **`SamplingParams.seed` does not control audio-generation randomness.**
-  The DiT's flow-matching noise is deterministically derived per-request
-  from a fixed internal seed (reproducible run-to-run, matching
-  voxcpm2's `deterministic_cfm_seed` convention) rather than from the
-  caller-supplied `seed` field — the same limitation voxcpm2 has today.
+- **Seed reproducibility depends on execution shape.** `seed` controls DiT
+  noise, reference-latent sampling, and the speaker encoder's random crop.
+  Identical serial requests reproduce on the same stack; different batch
+  compositions may change floating-point results. Unseeded requests retain
+  the existing request-ID-based noise behavior.

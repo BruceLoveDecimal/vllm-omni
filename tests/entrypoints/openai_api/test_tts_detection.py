@@ -186,6 +186,11 @@ _ARCHS = [
     "CovoAudioForConditionalGeneration",
     "MyCovoAudioThing",
     "Qwen3TTSForConditionalGeneration",
+    # dots.tts shares VoxCPM2's ``latent_generator`` stage and is told apart by
+    # architecture alone.  The frozen ladder predates it, so the stage/arch
+    # pairing itself is pinned in ``test_dots_tts_adapter.py``; listing the
+    # architecture here keeps it inside the registry-wide invariants below.
+    "DotsTTSForConditionalGeneration",
 ]
 
 #: Architectures that no adapter claims. Paired with any stage key these are
