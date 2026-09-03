@@ -211,18 +211,18 @@ class SeaCacheRootHook(ModelHook):
                 op=torch.distributed.ReduceOp.MAX,
                 group=group,
             )
-        try:
-            from vllm_omni.diffusion.distributed.parallel_state import (
-                get_sequence_parallel_world_size,
-                get_sp_group,
-            )
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sp_group,
+            get_ulysses_parallel_world_size,
+        )
 
-            if get_sequence_parallel_world_size() <= 1:
-                return bool(decision.item())
-            get_sp_group().all_reduce(decision, op=torch.distributed.ReduceOp.MAX)
-            return bool(decision.item())
-        except (AssertionError, RuntimeError):
-            return bool(decision.item())
+        if get_ulysses_parallel_world_size() > 1:
+            torch.distributed.all_reduce(
+                decision,
+                op=torch.distributed.ReduceOp.MAX,
+                group=get_sp_group().ulysses_group,
+            )
+        return bool(decision.item())
 
     @torch.compiler.disable
     def pre_forward(
