@@ -41,28 +41,17 @@ def paging_block_size(
 ) -> int:
     """Choose the paging unit, which is not the eviction unit.
 
-    AR-Diffusion evicts by frame; the attention kernel tiles by a fixed number
-    of tokens. Using the frame as the block binds every output resolution to
-    that kernel constraint, so the resolutions that run today do so by
-    arithmetic accident -- and the LingBot World v2 checkpoint's own default
-    832x480 is not one of them:
+    AR-Diffusion evicts by frame; the kernel tiles by a fixed number of
+    tokens. Binding the two makes every resolution a kernel question, and
+    832x480 -- 30 x 52 = 1560 tokens per frame, 1560 % 16 == 8 -- loses it.
 
-        (480/16) x (832/16) = 30 x 52 = 1560 tokens per frame, 1560 % 16 = 8
+    A frame that is already legal stays one block, so geometries that run
+    today keep their paging. Anything else pages at the finest legal unit.
 
-    A frame that is already a legal block stays one, so every resolution that
-    works today keeps precisely the paging it has now. Anything else pages at
-    the finest legal unit, which costs a longer block table and gives back the
-    rounding waste of a block one whole frame wide -- at 832x480 that block is
-    over a gigabyte.
-
-    What counts as legal is asked, not assumed. ``supported`` carries vLLM's
-    own vocabulary: a plain int is that exact size, ``MultipleOf(b)`` is any
-    positive multiple of ``b``. The kernels AR-Diffusion reaches agree on
-    multiples of 16, but others in the same tree do not -- ``hpc_attn`` takes
-    only 64, and FlashInfer offers pages of 128 and up on Blackwell alone. A
-    constant here would be a silently wrong block size on the first machine
-    whose kernel differs, and a wrong block size is not an error: it is a
-    kernel reading tokens that were never written.
+    ``supported`` uses vLLM's vocabulary: a plain int is that exact size,
+    ``MultipleOf(b)`` any positive multiple of ``b``. It is queried rather
+    than assumed because a wrong block size does not raise -- it is a kernel
+    reading tokens that were never written.
     """
     if supported is None:
         # Imported here, not at module scope: paged_attention registers a

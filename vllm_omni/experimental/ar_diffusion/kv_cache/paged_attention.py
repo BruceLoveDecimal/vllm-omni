@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import itertools
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
@@ -67,10 +65,6 @@ class ARDiffusionPagedForwardContext:
     seq_len: int
     commit_current: bool
     max_video_tokens: int
-    # Which scratch region this session's uncommitted chunk writes to. Sessions
-    # that may be coalesced into one forward must differ here or they overwrite
-    # each other's current K/V.
-    scratch_slot: int = 0
     current_video_block_ids: list[int] = field(default_factory=list)
     current_video_slot_mapping: torch.Tensor | None = None
     action_scratch_block_ids: list[int] = field(default_factory=list)
@@ -112,10 +106,8 @@ class ARDiffusionPagedForwardContext:
     def start_offset(self) -> int:
         """Where in its first block this forward's tokens begin.
 
-        Non-zero exactly when the committed history does not end on a block
-        boundary, which is the normal case once a frame is not a whole number
-        of blocks: 1560 tokens per frame against 16-token blocks leaves the
-        history 8 slots into its last block on every odd-numbered chunk.
+        Non-zero when the history does not end on a block boundary, the normal
+        case once a frame is not a whole number of blocks.
         """
         return int(self.adapter.num_computed_tokens) % self.block_size
 
@@ -133,12 +125,11 @@ class ARDiffusionPagedForwardContext:
     def recent_blocks(self) -> int:
         """Blocks the recent sliding tail spans.
 
-        The tail is a token count that ends wherever the current chunk ends,
-        which is an arbitrary offset once a frame is not a whole number of
-        blocks. Covering an interval of that length from an arbitrary start
-        takes one block more than its own ceiling, so the extra block is added
-        whenever the geometry can be unaligned at all. Without it the tail is
-        short by up to ``block_size`` tokens the window is supposed to keep.
+        The tail ends wherever the current chunk ends, an arbitrary offset
+        once a frame is not a whole number of blocks, and covering a fixed
+        length from an arbitrary start takes one block more than its ceiling.
+        Without the extra block the tail is short by up to ``block_size``
+        tokens the window is supposed to keep.
         """
         recent_tokens = max(self.max_video_tokens - self.sink_tokens, 0)
         blocks = -(-recent_tokens // self.block_size)
@@ -148,16 +139,13 @@ class ARDiffusionPagedForwardContext:
     def max_video_blocks(self) -> int:
         """Blocks the visible window spans.
 
-        The sink and the recent tail are rounded up *separately*. Deriving the
-        tail by subtracting the sink from a single rounded total makes the sink's
-        round-up come out of the tail's budget, so the tail silently loses real
-        tokens. Both ends must be supersets: a window that is a little wide
-        attends genuine neighbouring tokens, while a window that is a little
-        short drops context the model was trained to see.
+        Both ends round up *separately*. Subtracting a rounded sink from a
+        rounded total spends the sink's round-up out of the tail's budget, and
+        the tail then loses real tokens -- a window that is a little wide
+        attends genuine neighbouring tokens, one that is short drops context.
 
         When a frame is already a legal block both terms are exact and this is
-        ``sink_chunks + window_chunks`` -- precisely the width every geometry
-        that pages one frame per block has today.
+        ``sink_chunks + window_chunks``, unchanged.
         """
         return self.sink_blocks + self.recent_blocks
 
@@ -165,16 +153,10 @@ class ARDiffusionPagedForwardContext:
     def num_current_video_blocks(self) -> int:
         """Blocks this forward's tokens occupy, counted from where they start.
 
-        A chunk need not be a whole number of blocks, so the count depends on
-        the offset it begins at, not only on its length: thirty tokens
-        starting at position thirty span three sixteen-token blocks, not two.
-        Rounding up leaves the tail of the last block unwritten, which is only
-        safe because nothing reads past ``kv_len`` -- see
-        :meth:`video_block_table`.
-
-        Both paths count the same way. The committing path writes straight
-        after the history; the scratch path is made to line up with it by
-        :meth:`ensure_video_slots`.
+        The count depends on the starting offset, not only the length: thirty
+        tokens starting at position thirty span three sixteen-token blocks.
+        Rounding up leaves the last block's tail unwritten, which is safe only
+        because nothing reads past ``kv_len`` -- see :meth:`video_block_table`.
         """
         return -(-(self.start_offset + self.seq_len) // self.block_size)
 
@@ -211,7 +193,7 @@ class ARDiffusionPagedForwardContext:
             offset = self.start_offset if self.history_block_ids else 0
             self._scratch_blocks_used = n_blocks - (1 if offset else 0)
             scratch_ids = self.kv_cache.scratch_block_ids(
-                self.kv_branch, 0, self._scratch_blocks_used, slot=self.scratch_slot
+                self.kv_branch, 0, self._scratch_blocks_used
             )
             tail_block = [self.history_block_ids[-1]] if offset else []
             self.current_video_block_ids = tail_block + scratch_ids
@@ -243,7 +225,6 @@ class ARDiffusionPagedForwardContext:
             self.kv_branch,
             scratch_offset,
             action_blocks,
-            slot=self.scratch_slot,
         )
         positions = torch.arange(action_len, dtype=torch.long)
         self.action_slot_mapping = compute_slot_mapping(
@@ -256,27 +237,16 @@ class ARDiffusionPagedForwardContext:
     def video_block_table(self, device: torch.device) -> tuple[list[int], int]:
         """Blocks the attention may read, and how many of their tokens are live.
 
-        The window is expressed in tokens and converted to blocks here, rather
-        than assuming one block per frame. Both boundaries round *up*: a sink
-        of nine frames whose tokens do not fill a whole number of blocks keeps
-        the block that straddles the boundary, so the window can retain up to
-        ``block_size - 1`` tokens more than it strictly needs. That is
-        deliberate -- rounding down would drop tokens the window is supposed to
-        keep, and a slightly wider window is a far smaller error than a
-        truncated one.
-
-        The returned length is what the kernel treats as this sequence's KV
-        length, so it must never exceed the tokens actually written. The tail
-        of the final block is unwritten whenever a chunk is not a whole number
-        of blocks, and reading it would mix uninitialised memory into the
-        attention.
+        The window is a token count converted to blocks here, rounding up at
+        both ends, so it can retain up to ``block_size - 1`` tokens more than
+        it needs. The returned length is the kernel's ``kv_len``, so it must
+        never exceed the tokens actually written.
         """
         self.ensure_video_slots(device)
-        # Order-preserving union, not concatenation. When a chunk is not a
-        # whole number of blocks, the block holding the end of the history also
-        # holds the start of this chunk, so it appears in both lists. Reading
-        # it twice would feed those tokens to attention twice and drop the same
-        # number from the end -- silently, since the shapes stay right.
+        # Order-preserving union, not concatenation: the block holding the end
+        # of the history also holds the start of this chunk, so it appears in
+        # both lists. Listing it twice feeds those tokens to attention twice
+        # and drops as many from the end, with the shapes still right.
         all_video_blocks = list(dict.fromkeys(self.history_block_ids + self.current_video_block_ids))
         max_video_blocks = self.max_video_blocks
         sink_blocks = self.sink_blocks
@@ -294,13 +264,12 @@ class ARDiffusionPagedForwardContext:
                 visible_video_blocks += all_video_blocks[-tail_blocks:]
             live_tokens = min(resident_history + self.seq_len, len(visible_video_blocks) * self.block_size)
 
-        # Cap by what was actually WRITTEN, never by the run's capacity. Every
-        # visible block is full except the last, which holds this forward's own
-        # tail; when a chunk is not a whole number of blocks that tail leaves
-        # the rest of its block unwritten, and capacity would hand those dead
-        # slots to the kernel as though they were tokens. The failure is silent
-        # -- the shapes stay right and the frames stay plausible -- so this is
-        # the invariant the whole unaligned path rests on.
+        # Cap by what was WRITTEN, never by capacity. Every visible block is
+        # full except the last, which holds this forward's tail; a chunk that
+        # is not a whole number of blocks leaves the rest of that block
+        # unwritten, and capacity hands those dead slots to the kernel as
+        # tokens. Shapes stay right and frames stay plausible when this is
+        # wrong, so it is the invariant the unaligned path rests on.
         history_offset = self._history_tokens % self.block_size
         last_block_written = ((history_offset + self.seq_len - 1) % self.block_size) + 1
         written_extent = (len(visible_video_blocks) - 1) * self.block_size + last_block_written
@@ -455,223 +424,6 @@ class ARDiffusionPagedLayerContext:
         return self.forward_ctx.layer_inputs(self.layer_idx)
 
 
-@dataclass(frozen=True)
-class PagedSequenceMetadata:
-    """One sequence's contribution to a coalesced forward.
-
-    ``block_ids`` are the physical blocks holding its KV in visit order,
-    ``kv_len`` how many of those tokens are live, and ``query_len`` how many
-    query tokens it contributes to the batch.
-    """
-
-    block_ids: tuple[int, ...]
-    kv_len: int
-    query_len: int
-
-    def __post_init__(self) -> None:
-        if not self.block_ids:
-            raise ValueError("A paged sequence needs at least one block.")
-        if self.kv_len <= 0 or self.query_len <= 0:
-            raise ValueError("kv_len and query_len must be positive.")
-
-
-def batch_paged_metadata(
-    sequences: Sequence[PagedSequenceMetadata],
-    *,
-    block_size: int,
-    device: torch.device,
-    width: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Merge per-sequence tables into one varlen batch.
-
-    Returns the same five values ``build_block_table`` returns for a single
-    sequence, so a coalesced forward reaches the attention kernel through the
-    identical path -- the kernel already consumes ``block_table`` per row and
-    ``seq_lens`` per sequence.
-
-    Every row is padded to the widest member. Padding is never read: the
-    kernel dereferences only ``ceil(seq_lens / block_size)`` entries, which is
-    what keeps a short session from mixing in a neighbour's blocks. That is
-    asserted in ``tests/diffusion/ar_diffusion/test_paged_attention.py`` rather
-    than assumed, because the failure it prevents -- one session reading
-    another's KV -- produces a plausible but wrong result that no timing metric
-    can detect.
-    """
-    if not sequences:
-        raise ValueError("A coalesced batch needs at least one sequence.")
-    if block_size <= 0:
-        raise ValueError("block_size must be positive.")
-    for sequence in sequences:
-        needed = -(-sequence.kv_len // block_size)
-        if needed > len(sequence.block_ids):
-            raise ValueError(
-                f"kv_len={sequence.kv_len} needs {needed} blocks but only {len(sequence.block_ids)} were supplied."
-            )
-
-    resolved_width = max(len(sequence.block_ids) for sequence in sequences)
-    if width is not None:
-        if width < resolved_width:
-            raise ValueError(f"width={width} is narrower than the widest sequence ({resolved_width}).")
-        resolved_width = width
-
-    table = torch.tensor(
-        [list(s.block_ids) + [0] * (resolved_width - len(s.block_ids)) for s in sequences],
-        dtype=torch.int32,
-        device=device,
-    )
-    starts = [0]
-    for sequence in sequences:
-        starts.append(starts[-1] + sequence.query_len)
-    query_start_loc = torch.tensor(starts, dtype=torch.int32, device=device)
-    seq_lens = torch.tensor([s.kv_len for s in sequences], dtype=torch.int32, device=device)
-    max_query_len = max(s.query_len for s in sequences)
-    return table, query_start_loc, seq_lens, max_query_len, resolved_width * block_size
-
-
-def _reject_overlapping_writes(video_slots: torch.Tensor, action_slots: torch.Tensor, num_sessions: int) -> None:
-    """Refuse a batch whose sessions would write to the same pool slots.
-
-    Scratch blocks are handed out per KV branch, not per session
-    (``ARDiffusionKVCache.scratch_block_ids`` offsets by branch index only), so
-    two sessions preparing an uncommitted chunk on the same branch receive the
-    *same* scratch blocks. Coalescing them would make each overwrite the
-    other's current K/V and then attend over the survivor.
-
-    That failure is invisible downstream -- the shapes are right, the kernel
-    succeeds, and the output is a plausible tensor -- so it is checked here
-    rather than left to whoever reads the frames. Session-indexed scratch is
-    what makes such a batch legal; until then, refuse it.
-    """
-    if num_sessions < 2:
-        return
-    slots = torch.cat((video_slots, action_slots), dim=0)
-    if slots.numel() and torch.unique(slots).numel() != slots.numel():
-        raise ValueError(
-            "Coalesced sessions write to overlapping KV slots. Sessions preparing an uncommitted "
-            "chunk share their KV branch's scratch blocks, so they cannot be batched until scratch "
-            "is indexed per session as well as per branch."
-        )
-
-
-@dataclass(frozen=True)
-class CoalescedPagedForward:
-    """Several sessions' prepared contexts merged into one forward's metadata.
-
-    Mirrors :class:`ARDiffusionPagedForwardContext`: :meth:`merge` does the
-    host-side work once per forward and :meth:`layer_inputs` hands each layer a
-    payload that only swaps in that layer's pools. Merging inside
-    ``layer_inputs`` instead would repeat the concatenations and the overlap
-    check once per DiT block.
-
-    Sessions are laid out along the *sequence* dimension, not the batch
-    dimension, so a coalesced forward still runs at ``batch_size=1`` with
-    ``query_start_loc`` marking the boundaries. That is forced rather than
-    chosen: the rotary layer documents that "all batch elements share the same
-    rotary position encoding", so sessions sitting at different chunk indices
-    cannot be stacked along the batch dimension without changing it, while
-    concatenating along the sequence dimension needs no change at all -- each
-    session's own cos/sin table simply concatenates too.
-    """
-
-    kv_cache: Any
-    block_size: int
-    seq_len: int
-    video_slots: torch.Tensor
-    action_slots: torch.Tensor
-    block_table: torch.Tensor
-    query_start_loc: torch.Tensor
-    seq_lens: torch.Tensor
-    max_query_len: int
-    max_seq_len: int
-
-    @classmethod
-    def merge(cls, contexts: Sequence[ARDiffusionPagedForwardContext]) -> CoalescedPagedForward:
-        """Merge prepared contexts in batch order.
-
-        Slot mappings concatenate in that same order, which must be the order
-        the caller concatenates K/V rows in -- the fused write op indexes the
-        pool with one flat slot tensor.
-
-        The already-built per-session tables are merged rather than rebuilt
-        from block ids through :func:`batch_paged_metadata`. Rebuilding would
-        re-derive the padded width from the *live* blocks, so the table would
-        grow as each session's window fills and the compiled graph would see
-        changing shapes. Every context has already padded itself to a fixed
-        capacity; taking the widest of those keeps the shape stable for exactly
-        as long as the single-session path does.
-        """
-        if not contexts:
-            raise ValueError("A coalesced forward needs at least one session context.")
-        tables: list[torch.Tensor] = []
-        starts: list[torch.Tensor] = []
-        for context in contexts:
-            table, start = context.block_table, context.query_start_loc
-            if not getattr(context, "_prepared", False) or table is None or start is None:
-                raise RuntimeError("CoalescedPagedForward.merge() before prepare() on every context")
-            tables.append(table)
-            starts.append(start)
-
-        first = contexts[0]
-        block_size = int(first.kv_cache.block_size)
-        for context in contexts[1:]:
-            if context.kv_cache is not first.kv_cache:
-                raise ValueError("Coalesced sessions must share one KV pool; got two different allocations.")
-            if int(context.kv_cache.block_size) != block_size:
-                raise ValueError("Coalesced sessions must share one block_size.")
-
-        width = max(int(table.shape[1]) for table in tables)
-        block_table = torch.cat(
-            [torch.nn.functional.pad(table, (0, width - int(table.shape[1]))) for table in tables],
-            dim=0,
-        )
-
-        query_lens = [int(context.query_len) for context in contexts]
-        query_start_loc = torch.tensor(
-            [0, *itertools.accumulate(query_lens)],
-            dtype=starts[0].dtype,
-            device=starts[0].device,
-        )
-        max_seq_len = max(int(context.max_seq_len) for context in contexts)
-        if width * block_size < max_seq_len:
-            raise AssertionError(
-                f"Coalesced block table holds {width * block_size} tokens but max_seq_len is {max_seq_len}."
-            )
-
-        video_slots = torch.cat([context.current_video_slot_mapping for context in contexts], dim=0)
-        action_slots = torch.cat([context.action_slot_mapping for context in contexts], dim=0)
-        _reject_overlapping_writes(video_slots, action_slots, len(contexts))
-
-        return cls(
-            kv_cache=first.kv_cache,
-            block_size=block_size,
-            seq_len=sum(int(context.seq_len) for context in contexts),
-            video_slots=video_slots,
-            action_slots=action_slots,
-            block_table=block_table,
-            query_start_loc=query_start_loc,
-            seq_lens=torch.cat([context.seq_lens for context in contexts], dim=0),
-            max_query_len=max(query_lens),
-            max_seq_len=max_seq_len,
-        )
-
-    def layer_inputs(self, layer_idx: int) -> ARDiffusionPagedLayerInputs:
-        """Compiled-region payload for one layer of the coalesced forward."""
-        return ARDiffusionPagedLayerInputs(
-            layer_idx=_layer_idx_tensor(layer_idx),
-            key_pool=self.kv_cache._k_pools[layer_idx],
-            value_pool=self.kv_cache._v_pools[layer_idx],
-            block_size=self.block_size,
-            seq_len=self.seq_len,
-            video_slots=self.video_slots,
-            action_slots=self.action_slots,
-            block_table=self.block_table,
-            query_start_loc=self.query_start_loc,
-            seq_lens=self.seq_lens,
-            max_query_len=self.max_query_len,
-            max_seq_len=self.max_seq_len,
-        )
-
-
 def is_ar_diffusion_paged_context(value: object) -> bool:
     return isinstance(value, ARDiffusionPagedLayerContext)
 
@@ -729,31 +481,20 @@ def _resolve_fa_version(head_size: int) -> int:
 def supported_kernel_block_sizes(head_size: int | None = None) -> list[int | MultipleOf]:
     """Block sizes the kernel this module dispatches to will accept.
 
-    Same shape as vLLM's ``AttentionBackend.get_supported_kernel_block_sizes``
-    -- a plain int is that exact size, ``MultipleOf(b)`` is any positive
-    multiple of ``b`` -- but answered here rather than read off a backend,
-    because AR-Diffusion does not go through backend selection. It calls
-    ``flash_attn_varlen_func`` itself, choosing between vLLM's CUDA build and
-    ROCm's AITER a few lines below, and only this module knows which.
+    Answered here rather than read off a backend: AR-Diffusion skips backend
+    selection and calls ``flash_attn_varlen_func`` itself, choosing between
+    vLLM's CUDA build and ROCm's AITER a few lines below.
 
-    It lives next to that choice so there is one place to change, and it
-    answers per *dispatch target*, not with one constant:
+    * FA2 rejects a page that is not a multiple of 16 -- the check is in
+      ``csrc/flash_attn/flash_api.cpp``. Every non-Hopper CUDA card hits it.
+    * FA3 has no such check, so the frame stays the page on Hopper. A constant
+      16 would repage the one architecture that runs the default resolution
+      today, turning a 19-entry block table into a 1756-entry one.
+    * The ROCm branch packs pages into contiguous varlen K/V first, so no page
+      size reaches a kernel there.
 
-    * FA2 rejects a page that is not a multiple of 16. The check is in
-      ``csrc/flash_attn/flash_api.cpp`` -- "Paged KV cache block size must be
-      divisible by 16" -- and it is what every non-Hopper CUDA card hits,
-      because ``get_flash_attn_version`` resolves 2 everywhere FA3 has no
-      kernels.
-    * FA3 carries no such check, so the frame stays the page on Hopper. That
-      matters: answering 16 unconditionally would repage the one architecture
-      that runs the default resolution today, turning a 19-entry block table
-      into a 1756-entry one for no reason.
-    * The ROCm branch packs the visible pages into contiguous varlen K/V before
-      it calls anything, so no page size ever reaches a kernel there.
-
-    Note this is the constraint of the kernel, not of the card, and a caller
-    must treat the answer as data -- other backends in the same tree disagree
-    (``hpc_attn`` takes only 64), so never hard-code the number 16 against it.
+    Callers must treat the answer as data: other backends in the tree disagree
+    (``hpc_attn`` takes only 64), so never hard-code 16 against it.
     """
     from vllm.v1.attention.backend import MultipleOf
 
