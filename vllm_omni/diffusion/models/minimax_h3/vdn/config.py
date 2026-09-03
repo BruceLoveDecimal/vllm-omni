@@ -24,6 +24,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
+
 
 class VdnConfigError(ValueError):
     """A VDN checkpoint or request states something this server cannot serve."""
@@ -243,6 +245,53 @@ class MiniMaxH3HybridGeometry:
         """The half-open packed-row range of one latent frame."""
         start = self.video_start + frame * self.tokens_per_frame
         return start, start + self.tokens_per_frame
+
+    @classmethod
+    def from_video_layout(cls, layout: VideoTokenLayout | None, *, packed_total: int) -> MiniMaxH3HybridGeometry:
+        """Read the branch's geometry off the layout every attention receives.
+
+        Nothing new travels for the hybrid's sake: ``VideoTokenLayout`` already
+        states where the video sits and how long the content is, and
+        ``packed_total`` is the sequence length the layer is already given. The
+        one addition is ``text_len``, because "the prompt" and "everything the
+        softmax keeps dense" are different row sets and the branch needs the
+        former.
+        """
+        if layout is None:
+            raise VdnConfigError(
+                "the hybrid branch needs the packed video layout, and this attention was called without one"
+            )
+        if layout.text_len is None:
+            raise VdnConfigError(
+                "the hybrid branch seeds both of its scans from the prompt, and this layout does not say "
+                "which rows are the prompt (VideoTokenLayout.text_len is unset)"
+            )
+        if layout.video_spans:
+            target = next((span for span in reversed(layout.video_spans) if span.role == "target"), None)
+            if target is None:
+                raise VdnConfigError("the packed layout carries no target video span")
+            video_start = target.start
+            num_frames, height, width = target.latent_grid
+        elif layout.prefix_len is not None and layout.latent_grid is not None:
+            video_start = layout.prefix_len
+            num_frames, height, width = layout.latent_grid
+        else:
+            raise VdnConfigError("the packed layout states neither video spans nor a prefix and grid")
+        used_len = layout.used_len
+        if used_len is None:
+            # The one-tail contract: everything up to the end of the video is
+            # content, and the rest is alignment padding.
+            used_len = video_start + num_frames * height * width
+        return cls(
+            seq_len=packed_total,
+            used_len=used_len,
+            text_start=0,
+            text_len=layout.text_len,
+            video_start=video_start,
+            num_frames=num_frames,
+            frame_height=height,
+            frame_width=width,
+        )
 
 
 def _require(config: Mapping[str, Any], key: str, kind: type) -> Any:

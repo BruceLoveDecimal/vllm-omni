@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Where the hybrid meets the rest of the MiniMax-H3 serving path."""
+"""Where the hybrid meets the rest of the MiniMax-H3 serving path.
+
+The seam is deliberately one field wide: the branch reads its geometry off the
+``VideoTokenLayout`` every attention layer already receives, so no forward
+signature, no packed-metadata key and no cache mirror had to learn about it.
+These tests hold that seam in place.
+"""
 
 from __future__ import annotations
 
@@ -14,13 +20,13 @@ import torch
 from tests.diffusion.models.minimax_h3.vdn_release import HEAD_DIM, TRANSFORM_CONFIG, write_release
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
 from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence
-from vllm_omni.diffusion.models.minimax_h3.vdn.checkpoint import (
-    VDN_TURBO_DENOISE_STEPS,
-    VdnSpec,
-    resolve_vdn_checkpoint,
+from vllm_omni.diffusion.models.minimax_h3.vdn.checkpoint import VDN_TURBO_DENOISE_STEPS
+from vllm_omni.diffusion.models.minimax_h3.vdn.config import (
+    MiniMaxH3HybridAttentionConfig,
+    MiniMaxH3HybridGeometry,
+    VdnConfigError,
 )
-from vllm_omni.diffusion.models.minimax_h3.vdn.config import MiniMaxH3HybridAttentionConfig
-from vllm_omni.diffusion.models.minimax_h3.vdn.serving import VdnServingContract
+from vllm_omni.diffusion.models.minimax_h3.vdn.serving import resolve_vdn_serving
 from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -36,7 +42,7 @@ def _config() -> MiniMaxH3HybridAttentionConfig:
     return MiniMaxH3HybridAttentionConfig.from_transform_config(TRANSFORM_CONFIG, attention_head_dim=HEAD_DIM)
 
 
-def _branch(hybrid: bool):
+def _branch():
     packed = minimax_h3_packed_sequence(
         text_len=TEXT_LEN,
         latent_t=LATENT_T,
@@ -45,88 +51,161 @@ def _branch(hybrid: bool):
         audio_t=AUDIO_T,
         include_keyframe_cond=False,
     )
-    tags = packed["token_tags"].clone()
-    return MiniMaxH3DenoiseBranch(
+    branch = MiniMaxH3DenoiseBranch(
         packed=packed,
         text_embeddings=torch.zeros(TEXT_LEN, 5120),
-        token_tags=tags,
+        token_tags=packed["token_tags"].clone(),
         device=torch.device("cpu"),
-        hybrid_config=_config() if hybrid else None,
     )
+    return branch, packed
 
 
-def test_the_denoise_branch_publishes_the_geometry_beside_the_packed_metadata():
-    """It travels in ``packed_seq_params``, which every forward already reads."""
-    branch = _branch(hybrid=True)
+def test_the_packed_layout_states_where_the_prompt_is():
+    """The one thing the shared layout did not already say.
 
-    geometry = branch.static_kwargs["packed_seq_params"]["hybrid_geometry"]
+    "The prompt" and "everything the softmax keeps dense" are different row
+    sets - the latter also holds the soundtrack - and the branch is seeded from
+    the former.
+    """
+    branch, _ = _branch()
 
-    assert geometry.text_len == TEXT_LEN
+    layout = branch.static_kwargs["video_token_layout"]
+
+    assert layout.text_len == TEXT_LEN
+
+
+def test_the_branch_reads_its_geometry_off_that_layout():
+    """No new metadata travels: the geometry is derived from what is there."""
+    branch, packed = _branch()
+    layout = branch.static_kwargs["video_token_layout"]
+
+    geometry = MiniMaxH3HybridGeometry.from_video_layout(layout, packed_total=branch.seq_len)
+
     assert geometry.text_start == 0
-    # [text | audio | video | pad]: the audio rows are channel-major, two per
-    # latent step, and the target video is the last content block.
+    assert geometry.text_len == TEXT_LEN
+    # [text | audio | video | pad]: audio rows are channel-major, two per step.
+    assert geometry.video_start == int(packed["video_row_start"])
     assert geometry.video_start == TEXT_LEN + AUDIO_T * 2
     assert geometry.num_frames == LATENT_T
     assert geometry.frame_size == (LATENT_H // 2, LATENT_W // 2)
-    assert geometry.video_end == geometry.used_len
+    assert geometry.video_end == geometry.used_len == branch.used_len
+    assert geometry.seq_len == branch.seq_len
     assert geometry.used_len < geometry.seq_len, "this layout should carry alignment padding"
 
 
-def test_a_dense_checkpoint_publishes_no_geometry_at_all():
-    """The dense path must keep the request contract it has always had."""
-    branch = _branch(hybrid=False)
-
-    assert "hybrid_geometry" not in branch.static_kwargs["packed_seq_params"]
-
-
 def test_the_geometry_is_plain_ints_so_no_layer_syncs_on_it():
-    geometry = _branch(hybrid=True).static_kwargs["packed_seq_params"]["hybrid_geometry"]
+    branch, _ = _branch()
+    layout = branch.static_kwargs["video_token_layout"]
+
+    geometry = MiniMaxH3HybridGeometry.from_video_layout(layout, packed_total=branch.seq_len)
 
     for field in ("seq_len", "used_len", "text_len", "video_start", "num_frames"):
         assert isinstance(getattr(geometry, field), int)
 
 
-def test_the_forward_keyword_contract_is_unchanged():
-    """The geometry rides inside packed_seq_params rather than widening it.
+def test_a_layout_that_does_not_say_where_the_prompt_is_refused():
+    """Every other model leaves the field unset, and none of them come here."""
+    from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
 
-    ``MiniMaxH3DiTModel.forward`` refuses any kwarg it does not consume, and
-    TeaCache mirrors that set, so a new top-level keyword would have to be
-    added in two places to stay consistent. It is not a new keyword.
+    layout = VideoTokenLayout(prefix_len=8, latent_grid=(6, 2, 2))
+
+    with pytest.raises(VdnConfigError, match="which rows are the prompt"):
+        MiniMaxH3HybridGeometry.from_video_layout(layout, packed_total=64)
+    with pytest.raises(VdnConfigError, match="without one"):
+        MiniMaxH3HybridGeometry.from_video_layout(None, packed_total=64)
+
+
+def test_the_one_tail_layout_is_readable_too():
+    """The older ``prefix_len``/``latent_grid`` shape states the same geometry."""
+    from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
+
+    layout = VideoTokenLayout(prefix_len=8, latent_grid=(6, 2, 2), text_len=4)
+
+    geometry = MiniMaxH3HybridGeometry.from_video_layout(layout, packed_total=64)
+
+    assert (geometry.video_start, geometry.num_frames, geometry.frame_size) == (8, 6, (2, 2))
+    assert geometry.used_len == 8 + 6 * 4
+
+
+def test_the_forward_keyword_contract_is_unchanged():
+    """The hybrid added no keyword and no packed-metadata key.
+
+    ``MiniMaxH3DiTModel.forward`` refuses any kwarg it does not consume and
+    TeaCache mirrors that set, so a new one would have to be added in two
+    places to stay consistent. There is not one.
     """
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import _FORWARD_SUPPORTED_KWARGS
 
+    branch, _ = _branch()
+
     assert "hybrid_geometry" not in _FORWARD_SUPPORTED_KWARGS
+    assert set(branch.static_kwargs["packed_seq_params"]) == {
+        "cu_seqlens_q",
+        "max_seqlen_q",
+        "num_requests",
+        "vsa_prefix_segments",
+    }
 
 
-def test_the_teacache_extractor_forwards_the_geometry():
-    """A mirror that drops it would cache a dense residual for a hybrid model.
+def test_the_teacache_mirror_already_carries_what_the_branch_needs():
+    """The extractor reimplements the forward rather than calling it.
 
-    The extractor reimplements the forward rather than calling it, so this is
-    checked where the two are meant to agree: the block call itself.
+    It passed ``video_layout`` before the hybrid existed and still does, which
+    is why a VDN checkpoint caches the residual its own attention produced
+    rather than a dense one - and why this feature changed nothing there.
     """
     from vllm_omni.diffusion.cache.teacache.extractors import extract_minimax_h3_context
 
     source = inspect.getsource(extract_minimax_h3_context)
 
-    assert 'hybrid_geometry = module._psp_optional(psp, "hybrid_geometry", None)' in source
-    assert "hybrid_geometry=hybrid_geometry" in source
+    assert "video_layout=video_layout" in source
 
 
-def _pipeline(tmp_path, **overrides):
+def _od_config(model_config):
+    return SimpleNamespace(
+        model_config=model_config,
+        tf_model_config={"attention_head_dim": HEAD_DIM, "num_attention_heads": 2, "hidden_size": 8},
+    )
+
+
+def test_the_server_flag_claims_a_checkpoint(tmp_path):
+    root = write_release(tmp_path / "release")
+
+    contract = resolve_vdn_serving(_od_config({"vdn": {"checkpoint": str(root)}}), {}, tmp_path)
+
+    assert contract is not None
+    assert contract.checkpoint.has_turbo
+    assert (contract.config.chunk, contract.config.radius) == (5, 1)
+    assert contract.config.linear_head_dim == HEAD_DIM
+
+
+def test_a_packaged_release_may_declare_its_own_hybrid(tmp_path):
+    """``vllm-omni serve <dir>`` then needs no flags, and the path is its own."""
+    write_release(tmp_path / "vdn")
+
+    assert resolve_vdn_serving(_od_config({}), {"vdn": {"checkpoint": "vdn"}}, tmp_path) is not None
+
+
+def test_an_ordinary_h3_checkpoint_claims_nothing(tmp_path):
+    """The dense path must not so much as look at a VDN file."""
+    assert resolve_vdn_serving(_od_config({}), {}, tmp_path) is None
+    assert resolve_vdn_serving(SimpleNamespace(), {}, tmp_path) is None
+
+
+def _pipeline(tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    checkpoint = resolve_vdn_checkpoint(VdnSpec.from_mapping({"checkpoint": str(write_release(tmp_path / "release"))}))
     pipeline._fasth3 = None
-    pipeline._vdn = VdnServingContract(checkpoint, _config())
+    pipeline._vdn = resolve_vdn_serving(
+        _od_config({"vdn": {"checkpoint": str(write_release(tmp_path / "release"))}}), {}, tmp_path
+    )
     pipeline._vdn_fusion = None
     pipeline.partition = "fl2va"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va"})
     pipeline.default_video_shift = 12.0
     pipeline.default_audio_shift = 3.0
-    for name, value in overrides.items():
-        setattr(pipeline, name, value)
     return pipeline
 
 
@@ -174,56 +253,18 @@ def test_requests_do_not_share_a_forward_under_the_hybrid():
     assert MiniMaxH3Pipeline._packed_batch_supported(hybrid) is False
 
 
-def _od_config(model_config):
-    return SimpleNamespace(
-        model_config=model_config,
-        tf_model_config={
-            "num_layers": 2,
-            "token_refiner_num_layers": 1,
-            "hidden_size": 8,
-            "num_attention_heads": 2,
-            "attention_head_dim": HEAD_DIM,
-            "ffn_hidden_size": 6,
-        },
-    )
+def test_a_dense_server_never_imports_the_hybrid():
+    """``hybrid_config=None`` is the H3 this class has always been.
 
+    The import lives inside the constructor branch, so a server without a VDN
+    checkpoint loads none of the package - which is what makes the feature
+    something a checkpoint switches on rather than something every H3 carries.
+    """
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer
 
-def test_the_server_flag_claims_a_checkpoint(tmp_path):
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _resolve_minimax_h3_vdn
-
-    root = write_release(tmp_path / "release")
-
-    resolved = _resolve_minimax_h3_vdn(_od_config({"vdn": {"checkpoint": str(root)}}), {}, tmp_path)
-
-    assert resolved is not None
-    checkpoint, hybrid = resolved
-    assert checkpoint.has_turbo
-    assert (hybrid.chunk, hybrid.radius) == (5, 1)
-    assert hybrid.linear_head_dim == HEAD_DIM
-
-
-def test_a_packaged_release_may_declare_its_own_hybrid(tmp_path):
-    """``vllm-omni serve <dir>`` then needs no flags, and the path is its own."""
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _resolve_minimax_h3_vdn
-
-    write_release(tmp_path / "vdn")
-
-    resolved = _resolve_minimax_h3_vdn(_od_config({}), {"vdn": {"checkpoint": "vdn"}}, tmp_path)
-
-    assert resolved is not None
-
-
-def test_an_ordinary_h3_checkpoint_claims_nothing(tmp_path):
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _resolve_minimax_h3_vdn
-
-    assert _resolve_minimax_h3_vdn(_od_config({}), {}, tmp_path) is None
-    assert _resolve_minimax_h3_vdn(SimpleNamespace(), {}, tmp_path) is None
-
-
-def test_the_hybrid_attention_is_absent_from_a_dense_block():
-    """A server without a VDN checkpoint must build the parameter set it always did."""
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
-
-    signature = inspect.signature(MiniMaxH3Attention.__init__)
+    source = inspect.getsource(minimax_h3_transformer)
+    signature = inspect.signature(minimax_h3_transformer.MiniMaxH3Attention.__init__)
 
     assert signature.parameters["hybrid_config"].default is None
+    module_level = source.split("class MiniMaxH3Rope")[0]
+    assert "from .vdn.hybrid import" not in module_level

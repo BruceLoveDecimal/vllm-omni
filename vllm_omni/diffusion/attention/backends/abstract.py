@@ -160,6 +160,12 @@ class VideoTokenLayout:
     Ref2VA layout instead publishes ``used_len`` and every physical video
     span, so audio and image rows between videos remain dense.
 
+    ``text_len`` splits the prefix where a consumer needs the PROMPT rows
+    specifically rather than "everything that is not video" - a hybrid
+    attention whose recurrent branch is seeded from the prompt has to tell the
+    caption from the soundtrack. Optional because only such a consumer needs
+    it; a model that publishes no text run leaves it unset.
+
     Plain ints, so reading it never forces a device-to-host sync.
     """
 
@@ -167,6 +173,7 @@ class VideoTokenLayout:
     latent_grid: tuple[int, int, int] | None = None
     used_len: int | None = None
     video_spans: tuple[VideoTokenSpan, ...] = ()
+    text_len: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

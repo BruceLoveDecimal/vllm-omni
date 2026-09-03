@@ -30,12 +30,13 @@ import torch.distributed as dist
 from torch import nn
 from vllm.model_executor.layers.linear import RowParallelLinear
 
+from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 
 from .config import MiniMaxH3HybridAttentionConfig, MiniMaxH3HybridGeometry
-from .linear_branch import GATE_BOTTLENECK, MiniMaxH3LinearBranch, _shard_param_across_tp
-from .window import WindowPlan, build_window_plan, window_bounds, window_softmax
+from .linear_branch import MiniMaxH3LinearBranch, _shard_param_across_tp
+from .window import WindowPlan, build_window_plan, window_softmax
 
 #: The attention role the window runs under. Distinct from the dense ``self``
 #: role so an operator can point the window at a different backend without
@@ -136,15 +137,6 @@ class MiniMaxH3HybridAttention(nn.Module):
 
     # -- geometry -------------------------------------------------------------
 
-    def covers_all_frames(self, geometry: MiniMaxH3HybridGeometry) -> bool:
-        """Whether the window degenerates to full attention for this request.
-
-        A clip short enough that every frame sees every chunk has nothing
-        outside the window, so the dense path IS the hybrid and the branch would
-        double count. The caller then runs the block's ordinary attention.
-        """
-        return self.config.covers_all_frames(geometry.num_frames)
-
     def plan(self, geometry: MiniMaxH3HybridGeometry, device: torch.device) -> WindowPlan:
         """The decomposed window for this geometry, built once per request.
 
@@ -182,16 +174,24 @@ class MiniMaxH3HybridAttention(nn.Module):
         value: torch.Tensor,
         query_raw: torch.Tensor,
         key_raw: torch.Tensor,
-        geometry: MiniMaxH3HybridGeometry,
+        video_layout: VideoTokenLayout | None,
+        packed_total: int,
         out_proj: nn.Module,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         """Run both branches and return the block's attention output.
 
         ``x`` is the residual stream this rank owns; ``query``/``key`` are
         QK-normed and RoPE'd, ``query_raw``/``key_raw`` are not. ``out_proj`` is
         the block's own output projection, applied here so the softmax branch
         keeps the dense model's parameter, prefix and tensor-parallel split.
+
+        Returns ``None`` for a clip short enough that every frame sees every
+        chunk: the window is then full attention, the branch would double count,
+        and the caller runs the block's ordinary dense path instead.
         """
+        geometry = MiniMaxH3HybridGeometry.from_video_layout(video_layout, packed_total=packed_total)
+        if self.config.covers_all_frames(geometry.num_frames):
+            return None
         shard = self._sequence_shard(x.shape[0], geometry)
         plan = self.plan(geometry, x.device)
         bounds = list(plan.bounds)
@@ -430,16 +430,7 @@ class MiniMaxH3HybridAttention(nn.Module):
         return bool(supported)
 
 
-def hybrid_window_bounds(
-    geometry: MiniMaxH3HybridGeometry,
-    config: MiniMaxH3HybridAttentionConfig,
-) -> list[tuple[int, int]]:
-    return window_bounds(geometry.num_frames, chunk=config.chunk, radius=config.radius)
-
-
 __all__ = [
-    "GATE_BOTTLENECK",
     "VDN_WINDOW_ROLE",
     "MiniMaxH3HybridAttention",
-    "hybrid_window_bounds",
 ]

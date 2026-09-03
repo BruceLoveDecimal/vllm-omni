@@ -10,7 +10,6 @@ import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
 from itertools import groupby
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -122,7 +121,6 @@ from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
 from .lora import load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
-    MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTModel,
     _attention_isolates_packed_requests,
 )
@@ -150,10 +148,6 @@ from .time_request import (
     minimax_h3_time_shift_sigmas,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
-from .vdn.checkpoint import VdnSpec, resolve_vdn_checkpoint
-from .vdn.config import MiniMaxH3HybridAttentionConfig
-from .vdn.serving import VdnServingContract
-from .vdn.weight_fusion import VdnWeightFusion
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -331,46 +325,6 @@ def _minimax_h3_step_schedule(state: StepRequestState) -> dict[str, float]:
 def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
     """Read a partition's distilled schedule. An absent key means legacy uniform."""
     return DMD2SigmaSchedule.from_metadata(release)
-
-
-def _resolve_minimax_h3_vdn(
-    od_config: OmniDiffusionConfig,
-    release: Mapping[str, Any],
-    model_path: Path,
-) -> tuple[Any, MiniMaxH3HybridAttentionConfig] | None:
-    """Claim a VDN-H3 hybrid checkpoint, from the server flag or the release.
-
-    ``--model-config '{"vdn": {...}}'`` names one explicitly; a packaged release
-    can instead declare it in ``model_index.json`` under ``_minimax_h3.vdn``, so
-    ``vllm-omni serve <dir>`` needs no flags. The flag wins when both appear.
-    Returns ``None`` for an ordinary dense H3, which is every other checkpoint.
-    """
-    model_config = getattr(od_config, "model_config", None) or {}
-    raw = model_config.get("vdn") or release.get("vdn")
-    if not raw:
-        return None
-    if not isinstance(raw, Mapping):
-        raise ValueError("model_config['vdn'] must be an object naming a VDN-H3 checkpoint")
-    spec = VdnSpec.from_mapping(raw)
-    candidate = Path(spec.checkpoint)
-    if not candidate.is_absolute() and not candidate.is_dir():
-        # A release that declares its own hybrid names it relative to itself.
-        packaged = model_path / spec.checkpoint
-        if packaged.is_dir():
-            spec = replace(spec, checkpoint=str(packaged))
-    checkpoint = resolve_vdn_checkpoint(spec)
-
-    tf_config = od_config.tf_model_config
-    mapping = tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config)
-    arch = MiniMaxH3DiTArchConfig.from_mapping(mapping)
-    hybrid_config = MiniMaxH3HybridAttentionConfig.from_transform_config(
-        checkpoint.transform_config,
-        attention_head_dim=arch.attention_head_dim,
-        window_group_batch=spec.window_group_batch,
-        window_impl=spec.window_impl,
-        linear_attention_enabled=spec.linear_attention_enabled,
-    )
-    return checkpoint, hybrid_config
 
 
 def resolve_minimax_h3_diffusion_model_path(
@@ -735,9 +689,10 @@ class MiniMaxH3Pipeline(
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
     # Set from model_config['vdn'] (or the release's own declaration) during
-    # construction; absent means the dense H3 attention.
-    _vdn: VdnServingContract | None = None
-    _vdn_fusion: VdnWeightFusion | None = None
+    # construction; absent means the dense H3 attention, and then nothing in
+    # the vdn package is imported at all.
+    _vdn: Any = None
+    _vdn_fusion: Any = None
 
     def _load_diffusion_lora_adapter(
         self,
@@ -998,11 +953,12 @@ class MiniMaxH3Pipeline(
             od_config.quantization_config,
             "transformer",
         )
-        resolved_vdn = _resolve_minimax_h3_vdn(od_config, release, model_path)
+        from .vdn.serving import resolve_vdn_serving
+
+        self._vdn = resolve_vdn_serving(od_config, release, model_path)
         vdn_config = None
-        if resolved_vdn is not None:
-            vdn_checkpoint, vdn_config = resolved_vdn
-            self._vdn = VdnServingContract(vdn_checkpoint, vdn_config)
+        if self._vdn is not None:
+            vdn_config = self._vdn.config
             self._vdn.check_serving_contract(
                 partition=self.partition,
                 od_config=od_config,
@@ -1019,10 +975,7 @@ class MiniMaxH3Pipeline(
                 quant_config=transformer_quant_config,
             )
         if self._vdn is not None:
-            # Reads names and adapter factors now; the 4.3 GiB branch stays on
-            # disk until the weight stream reaches it.
-            self._vdn_fusion = VdnWeightFusion.from_checkpoint(
-                self._vdn.checkpoint,
+            self._vdn_fusion = self._vdn.build_fusion(
                 head_dim=self.transformer.arch.attention_head_dim,
                 num_blocks=self.transformer.arch.num_layers,
                 num_refiner_blocks=self.transformer.arch.token_refiner_num_layers,
@@ -2013,7 +1966,6 @@ class MiniMaxH3Pipeline(
             text_embeddings=text_embeddings,
             token_tags=tags,
             device=self.device,
-            hybrid_config=None if self._vdn is None else self._vdn.config,
         )
 
         visual_anchor = visual_condition

@@ -13,7 +13,10 @@ never saw, or a parallel or offload mode that would route around the branch.
 from __future__ import annotations
 
 import math
-from typing import Any
+from collections.abc import Mapping
+from dataclasses import replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -25,8 +28,13 @@ from .checkpoint import (
     VDN_TURBO_DENOISE_STEPS,
     VDN_VIDEO_SHIFT,
     VdnCheckpoint,
+    VdnSpec,
+    resolve_vdn_checkpoint,
 )
 from .config import MiniMaxH3HybridAttentionConfig
+
+if TYPE_CHECKING:
+    from .weight_fusion import VdnWeightFusion
 
 logger = init_logger(__name__)
 
@@ -47,6 +55,21 @@ class VdnServingContract:
     @property
     def base_schedule(self) -> tuple[float, ...] | None:
         return self.checkpoint.base_schedule
+
+    def build_fusion(self, *, head_dim: int, num_blocks: int, num_refiner_blocks: int) -> VdnWeightFusion:
+        """Read the release's tensors, ready to fold into the weight stream.
+
+        Names and adapter factors are read now; the branch's several gigabytes
+        stay on disk until the stream reaches them.
+        """
+        from .weight_fusion import VdnWeightFusion
+
+        return VdnWeightFusion.from_checkpoint(
+            self.checkpoint,
+            head_dim=head_dim,
+            num_blocks=num_blocks,
+            num_refiner_blocks=num_refiner_blocks,
+        )
 
     def check_serving_contract(self, *, partition: str, od_config: Any, lora_path: Any) -> None:
         """Hold a starting server to what this checkpoint can serve."""
@@ -126,4 +149,50 @@ class VdnServingContract:
                 raise OmniClientError(f"VDN-H3 requires {key}={expected:g}, got {requested:g}")
 
 
-__all__ = ["VdnServingContract"]
+def resolve_vdn_serving(
+    od_config: Any,
+    release: Mapping[str, Any],
+    model_path: Path,
+) -> VdnServingContract | None:
+    """Claim a VDN-H3 checkpoint, from the server flag or the release itself.
+
+    ``--model-config '{"vdn": {...}}'`` names one explicitly; a packaged release
+    can instead declare it in ``model_index.json`` under ``_minimax_h3.vdn``, so
+    ``vllm-omni serve <dir>`` needs no flags. The flag wins when both appear.
+
+    Returns ``None`` for an ordinary dense H3, which is every other checkpoint -
+    that is what keeps this whole package out of the dense path.
+    """
+    model_config = getattr(od_config, "model_config", None) or {}
+    raw = model_config.get("vdn") or release.get("vdn")
+    if not raw:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("model_config['vdn'] must be an object naming a VDN-H3 checkpoint")
+    spec = VdnSpec.from_mapping(raw)
+    candidate = Path(spec.checkpoint)
+    if not candidate.is_absolute() and not candidate.is_dir():
+        # A release that declares its own hybrid names it relative to itself.
+        packaged = model_path / spec.checkpoint
+        if packaged.is_dir():
+            spec = replace(spec, checkpoint=str(packaged))
+    checkpoint = resolve_vdn_checkpoint(spec)
+
+    # The head dim comes from the transformer config the server already read,
+    # so the architecture is checked against the model it will actually run.
+    tf_config = getattr(od_config, "tf_model_config", None) or {}
+    mapping = tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config)
+    head_dim = mapping.get("attention_head_dim")
+    if not isinstance(head_dim, int):
+        raise ValueError(f"the transformer config states no attention_head_dim, got {head_dim!r}")
+    config = MiniMaxH3HybridAttentionConfig.from_transform_config(
+        checkpoint.transform_config,
+        attention_head_dim=head_dim,
+        window_group_batch=spec.window_group_batch,
+        window_impl=spec.window_impl,
+        linear_attention_enabled=spec.linear_attention_enabled,
+    )
+    return VdnServingContract(checkpoint, config)
+
+
+__all__ = ["VdnServingContract", "resolve_vdn_serving"]
