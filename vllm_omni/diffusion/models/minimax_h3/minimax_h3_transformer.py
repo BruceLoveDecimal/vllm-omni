@@ -51,6 +51,9 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.platforms import current_omni_platform
 
+from .vdn.config import MiniMaxH3HybridAttentionConfig, MiniMaxH3HybridGeometry
+from .vdn.hybrid import MiniMaxH3HybridAttention
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
@@ -390,6 +393,8 @@ class MiniMaxH3Attention(nn.Module):
         role: str = "self",
         role_category: str | None = None,
         skip_sequence_parallel: bool = False,
+        hybrid_config: MiniMaxH3HybridAttentionConfig | None = None,
+        ulysses_degree: int = 1,
     ) -> None:
         super().__init__()
         self.total_num_heads = arch.num_attention_heads
@@ -442,6 +447,21 @@ class MiniMaxH3Attention(nn.Module):
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
         )
+        # VDN's hybrid branch, when a checkpoint asked for one. ``None`` is the
+        # dense H3 this class has always been, down to the parameter set: the
+        # branch adds submodules rather than changing any of the above.
+        self.hybrid: MiniMaxH3HybridAttention | None = None
+        if hybrid_config is not None:
+            self.hybrid = MiniMaxH3HybridAttention(
+                hybrid_config,
+                hidden_size=arch.hidden_size,
+                total_num_heads=self.total_num_heads,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                ulysses_degree=ulysses_degree,
+                quant_config=quant_config,
+                prefix=f"{prefix}.hybrid",
+            )
 
     def enable_vsa_gate(self) -> None:
         """Build the VSA compression gate this attention would otherwise lack.
@@ -600,6 +620,7 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        hybrid_geometry: MiniMaxH3HybridGeometry | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -620,6 +641,11 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
+        # VDN's linear branch reads the projections BEFORE QK-norm and RoPE and
+        # applies its own NoPE post-processing. Both the fused kernel and the
+        # eager norms below return fresh tensors, so holding these references
+        # costs nothing until the branch actually uses them.
+        q_raw, k_raw = q, k
         if rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -631,6 +657,25 @@ class MiniMaxH3Attention(nn.Module):
                 self.k_norm.weight,
                 rope_table,
                 self.q_norm.variance_epsilon,
+            )
+
+        if (
+            self.hybrid is not None
+            and hybrid_geometry is not None
+            and not self.hybrid.covers_all_frames(hybrid_geometry)
+        ):
+            # The hybrid owns the whole tail of this forward: it gates and
+            # projects the window's output through the block's own out_proj and
+            # adds the branch's contribution to the video rows.
+            return self.hybrid(
+                x=x,
+                query=q,
+                key=k,
+                value=v,
+                query_raw=q_raw,
+                key_raw=k_raw,
+                geometry=hybrid_geometry,
+                out_proj=self.out_proj,
             )
 
         # The gate is projected from the same local rows as Q. Pure Ulysses
@@ -839,6 +884,8 @@ class MiniMaxH3DiTBlock(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        hybrid_config: MiniMaxH3HybridAttentionConfig | None = None,
+        ulysses_degree: int = 1,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
@@ -849,6 +896,8 @@ class MiniMaxH3DiTBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            hybrid_config=hybrid_config,
+            ulysses_degree=ulysses_degree,
         )
         self.mlp = MiniMaxH3MLP(
             arch,
@@ -878,6 +927,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        hybrid_geometry: MiniMaxH3HybridGeometry | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -914,6 +964,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
+            hybrid_geometry=hybrid_geometry,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
@@ -1107,6 +1158,7 @@ class MiniMaxH3DiTModel(nn.Module):
         self,
         od_config: OmniDiffusionConfig,
         quant_config: QuantizationConfig | None = None,
+        hybrid_config: MiniMaxH3HybridAttentionConfig | None = None,
     ) -> None:
         super().__init__()
         tf_config = od_config.tf_model_config
@@ -1165,17 +1217,22 @@ class MiniMaxH3DiTModel(nn.Module):
             prefix="time_embedder",
         )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
+        # The token refiner is deliberately never hybrid: it attends over text
+        # only, where there is no frame axis to window and nothing outside it.
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
             quant_config,
             prefix="token_refiner",
         )
+        self.hybrid_config = hybrid_config
         self.blocks = nn.ModuleList(
             [
                 MiniMaxH3DiTBlock(
                     arch,
                     quant_config,
                     prefix=f"blocks.{i}",
+                    hybrid_config=hybrid_config,
+                    ulysses_degree=ulysses_degree,
                 )
                 for i in range(arch.num_layers)
             ]
@@ -1468,6 +1525,11 @@ class MiniMaxH3DiTModel(nn.Module):
         # that omits it is packing a single request.
         num_requests = int(self._psp_optional(psp, "num_requests", 1))
         vsa_prefix_segments = tuple(int(length) for length in self._psp_optional(psp, "vsa_prefix_segments", ()))
+        # Where this request's prompt, audio and video rows sit. Carried beside
+        # the packed metadata rather than in the shared ``VideoTokenLayout``
+        # because the linear branch needs the PROMPT rows specifically, which is
+        # not the same set as "everything the softmax keeps dense".
+        hybrid_geometry = self._psp_optional(psp, "hybrid_geometry", None)
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1550,6 +1612,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 num_requests=num_requests,
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
+                hybrid_geometry=hybrid_geometry,
             )
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)

@@ -27,6 +27,7 @@ from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
 )
+from .vdn.config import MiniMaxH3HybridAttentionConfig, MiniMaxH3HybridGeometry
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -67,6 +68,7 @@ class MiniMaxH3DenoiseBranch:
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
+        hybrid_config: MiniMaxH3HybridAttentionConfig | None = None,
     ) -> None:
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
@@ -158,6 +160,24 @@ class MiniMaxH3DenoiseBranch:
             self.static_kwargs["video_token_layout"] = VideoTokenLayout(
                 prefix_len=int(packed["video_row_start"]),
                 latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
+            )
+
+        if hybrid_config is not None:
+            # VDN's branch needs the prompt rows specifically, which the shared
+            # video layout does not distinguish from the soundtrack. Built once
+            # per request and carried as plain ints, so no attention layer ever
+            # syncs on it. A layout the branch cannot serve raises here, before
+            # the first forward, rather than producing a quietly wrong sample.
+            grid = packed["latent_grid"].tolist()
+            self.static_kwargs["packed_seq_params"]["hybrid_geometry"] = MiniMaxH3HybridGeometry(
+                seq_len=seq_len,
+                used_len=self.used_len,
+                text_start=0,
+                text_len=text_len,
+                video_start=int(packed["video_row_start"]),
+                num_frames=int(grid[0]),
+                frame_height=int(grid[1]),
+                frame_width=int(grid[2]),
             )
 
     def prepare_rope_table(self, model: Any) -> None:

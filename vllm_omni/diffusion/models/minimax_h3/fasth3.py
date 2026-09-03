@@ -25,16 +25,18 @@ directly, i.e. a scale of exactly 1.
 Two checkpoint spellings meet here. The adapter is written in the diffusers
 namespace (``transformer_blocks.0.attn.to_q``) while vLLM-Omni loads H3's native
 one (``blocks.0.attn.qkv_proj``), whose attention and MLP projections are fused.
-Every mapping and layout convention below was verified tensor by tensor against
-the released full checkpoint (``FastVideo-FastH3-4-step-Preview-v1-Dense-DataFree``):
-``W_base + delta`` reproduces it to bf16 rounding.
+Every mapping and layout convention in ``lowrank_fusion.py`` was verified tensor
+by tensor against the released full checkpoint
+(``FastVideo-FastH3-4-step-Preview-v1-Dense-DataFree``): ``W_base + delta``
+reproduces it to bf16 rounding. This module owns what is FastH3's alone - the
+release identity, the declared tensor counts, the four-step ladder and the
+serving contract; the fusion arithmetic is shared with VDN-H3.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -44,7 +46,14 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
-from vllm_omni.platforms import current_omni_platform
+
+from .lowrank_fusion import (
+    LowRankWeightFusion,
+    MiniMaxH3FusionError,
+    ParamPatch,
+    check_block_coverage,
+    resolve_native_target,
+)
 
 if TYPE_CHECKING:
     from .minimax_h3_transformer import MiniMaxH3DiTModel
@@ -90,48 +99,10 @@ _DIFF = ".diff"
 _DIFF_B = ".diff_b"
 _SET_WEIGHT = ".set_weight"
 
-# Adapter module prefix -> the native parameter it edits, minus the
-# ``.weight``/``.bias`` suffix.
-_MODEL_LEVEL_TARGETS = {
-    "proj_in": "video_patch_proj",
-    "proj_out": "final_layer.video_out",
-    "audio_proj_in": "audio_patch_proj",
-    "audio_proj_out": "final_layer.audio_out",
-    "context_embedder": "condition_proj",
-    "time_embedder.linear_1": "time_embedder.proj_in",
-    "time_embedder.linear_2": "time_embedder.proj_out",
-    "norm_out.linear": "final_layer.adaln_proj.linear",
-    "norm_out.norm": "final_layer.norm",
-}
-
-# Per-block adapter suffix -> (native suffix, how a delta enters the native
-# parameter). H3 stores attention as one grouped QKV matrix and the MLP as one
-# fused gate/up matrix, so those deltas need placing rather than adding.
-_PLAIN, _QKV_Q, _QKV_K, _QKV_V, _SWAP_HALVES = "plain", "q", "k", "v", "swap_halves"
-_QKV_SLOTS = (_QKV_Q, _QKV_K, _QKV_V)
-_BLOCK_TARGETS = {
-    "attn.to_q": ("attn.qkv_proj", _QKV_Q),
-    "attn.to_k": ("attn.qkv_proj", _QKV_K),
-    "attn.to_v": ("attn.qkv_proj", _QKV_V),
-    "attn.to_out.0": ("attn.out_proj", _PLAIN),
-    "attn.to_gate_compress": ("attn.to_gate_compress", _PLAIN),
-    "ff.net.0.proj": ("mlp.fc1", _SWAP_HALVES),
-    "ff.net.2": ("mlp.fc2", _PLAIN),
-    "adaln_proj.linear": ("adaln_proj.linear", _PLAIN),
-    "norm1": ("norm1", _PLAIN),
-    "norm2": ("norm2", _PLAIN),
-}
-
 # The attention role MiniMaxH3Attention gives its 50 DiT blocks. The
 # compression gates live on exactly these layers, so this is the role whose
 # resolved backend decides whether the artifact runs sparse.
 _H3_DIT_ATTENTION_ROLE = "self"
-
-# Adapter block prefix -> native block prefix.
-_BLOCK_PREFIXES = (
-    ("token_refiner.refiner_blocks.", "token_refiner.blocks."),
-    ("transformer_blocks.", "blocks."),
-)
 
 
 def _resolve_dit_attention_backend(od_config: Any) -> str:
@@ -154,81 +125,8 @@ def _resolve_dit_attention_backend(od_config: Any) -> str:
     return str(getattr(default_spec, "backend", "") or "").upper()
 
 
-class FastH3AdapterError(ValueError):
+class FastH3AdapterError(MiniMaxH3FusionError):
     """The artifact is a FastH3 adapter, but it cannot be applied as one."""
-
-
-@dataclass
-class _ParamPatch:
-    """Everything the adapter contributes to one native parameter."""
-
-    # layout -> (lora_A, lora_B). A grouped QKV parameter collects three.
-    low_rank: dict[str, tuple[torch.Tensor | None, torch.Tensor | None]] = field(default_factory=dict)
-    diff: torch.Tensor | None = None
-    layout: str = _PLAIN
-
-
-def _swap_halves(tensor: torch.Tensor) -> torch.Tensor:
-    """Exchange the two halves of a fused gate/up matrix.
-
-    The diffusers export stores the feed-forward projection value-first while
-    H3's native ``mlp.fc1`` is gate-first, so a delta computed in the diffusers
-    layout has to be swapped before it can be added to the native parameter.
-    """
-    if tensor.shape[0] % 2:
-        raise FastH3AdapterError(f"fused gate/up delta must split evenly, got {tuple(tensor.shape)}")
-    first, second = tensor.chunk(2, dim=0)
-    return torch.cat((second, first), dim=0)
-
-
-def _place_in_grouped_qkv(deltas: Mapping[str, torch.Tensor], *, head_dim: int) -> torch.Tensor:
-    """Interleave per-projection deltas into H3's grouped QKV layout.
-
-    The checkpoint stores one head group at a time as ``[q, k, v]``, which is
-    what :func:`_reorder_grouped_qkv_to_qkv` unpacks on the way in. A delta
-    built from the separate diffusers projections has to be folded back into
-    that order.
-    """
-    missing = sorted(set(_QKV_SLOTS) - set(deltas))
-    if missing:
-        raise FastH3AdapterError(f"grouped QKV delta is missing its {missing} projections")
-    parts = []
-    for slot in _QKV_SLOTS:
-        delta = deltas[slot]
-        if delta.shape[0] % head_dim:
-            raise FastH3AdapterError(
-                f"QKV {slot} delta rows {delta.shape[0]} are not a multiple of head_dim {head_dim}"
-            )
-        parts.append(delta.reshape(delta.shape[0] // head_dim, head_dim, *delta.shape[1:]))
-    groups = parts[0].shape[0]
-    if any(part.shape[0] != groups for part in parts):
-        raise FastH3AdapterError("QKV projections disagree on the number of head groups")
-    return torch.cat(parts, dim=1).reshape(groups * 3 * head_dim, *parts[0].shape[2:])
-
-
-def _resolve_native_target(module: str) -> tuple[str, str, tuple[str, int] | None] | None:
-    """Map an adapter module path to ``(native path, layout, block)``.
-
-    ``block`` is the ``(native block prefix, index)`` the module sits in, or
-    ``None`` for a model-level one. Coverage is checked per block, so the index
-    has to survive the mapping rather than being folded into the path.
-    """
-    native = _MODEL_LEVEL_TARGETS.get(module)
-    if native is not None:
-        return native, _PLAIN, None
-    for adapter_prefix, native_prefix in _BLOCK_PREFIXES:
-        if not module.startswith(adapter_prefix):
-            continue
-        remainder = module[len(adapter_prefix) :]
-        index, _, suffix = remainder.partition(".")
-        if not index.isdigit():
-            return None
-        target = _BLOCK_TARGETS.get(suffix)
-        if target is None:
-            return None
-        native_suffix, layout = target
-        return f"{native_prefix}{index}.{native_suffix}", layout, (native_prefix, int(index))
-    return None
 
 
 def _split_adapter_key(name: str) -> tuple[str, str] | None:
@@ -295,58 +193,29 @@ def _check_declared_counts(
             )
 
 
-def _check_block_coverage(
-    seen: Mapping[str, set[int]],
-    *,
-    expected: Mapping[str, int],
-    weights_path: Path,
-) -> None:
-    """Every block of the model this adapter is loaded against must be edited.
-
-    The release drops tensors training left unchanged, so per-parameter
-    coverage is legitimately sparse - but a distilled student touches every
-    block, so a block with no edits at all means the artifact does not match
-    this model.
-    """
-    for prefix, count in expected.items():
-        indices = seen.get(prefix, set())
-        wanted = set(range(count))
-        if indices == wanted:
-            continue
-        missing = sorted(wanted - indices)
-        extra = sorted(indices - wanted)
-        raise FastH3AdapterError(
-            f"{weights_path} edits {len(indices)} of the model's {count} {prefix}* blocks "
-            f"(missing={missing[:5]}, unknown={extra[:5]}); it is not an adapter for this checkpoint"
-        )
-
-
-class FastH3WeightFusion:
+class FastH3WeightFusion(LowRankWeightFusion):
     """Fuse a FastH3 adapter into the H3 checkpoint stream as it is loaded."""
+
+    error_cls = FastH3AdapterError
+    label = "FastH3 adapter"
 
     def __init__(
         self,
         *,
         source: Path,
-        patches: Mapping[str, _ParamPatch],
+        patches: Mapping[str, ParamPatch],
         head_dim: int,
         requires_vsa: bool,
         injections: Mapping[str, torch.Tensor] | None = None,
     ) -> None:
-        self._source = source
-        self._patches = dict(patches)
-        self._head_dim = head_dim
+        super().__init__(source=source, patches=patches, head_dim=head_dim, injections=injections)
         self.requires_vsa = requires_vsa
-        # Parameters the base checkpoint does not carry, assigned into the
-        # stream instead of fused onto an existing weight.
-        self._injections = dict(injections or {})
-        self._injected: set[str] = set()
-        self._applied: set[str] = set()
-        self._device: torch.device | None = None
 
     @property
     def source(self) -> Path:
-        return self._source
+        source = self._source
+        assert isinstance(source, Path)
+        return source
 
     @property
     def base_schedule(self) -> tuple[float, ...]:
@@ -381,7 +250,7 @@ class FastH3WeightFusion:
         if weights_path is None:
             return None
 
-        patches: dict[str, _ParamPatch] = {}
+        patches: dict[str, ParamPatch] = {}
         gate_tensors: list[str] = []
         injections: dict[str, torch.Tensor] = {}
         unmapped: list[str] = []
@@ -397,7 +266,7 @@ class FastH3WeightFusion:
                     unmapped.append(name)
                     continue
                 module, role = split
-                target = _resolve_native_target(module)
+                target = resolve_native_target(module)
                 if role == "set_weight":
                     # A VSA compression gate. The base transformer has no such
                     # parameter, so this is assigned into the stream rather than
@@ -419,15 +288,17 @@ class FastH3WeightFusion:
                     blocks_seen.setdefault(block[0], set()).add(block[1])
                 counted["diff_tensors" if role in ("diff", "diff_b") else "low_rank_tensors"] += 1
                 native_param = f"{native_module}.{'bias' if role == 'diff_b' else 'weight'}"
-                patch = patches.setdefault(native_param, _ParamPatch(layout=layout))
+                patch = patches.setdefault(native_param, ParamPatch(layout=layout))
                 tensor = checkpoint.get_tensor(name)
                 if role in ("diff", "diff_b"):
                     if patch.diff is not None:
                         raise FastH3AdapterError(f"duplicate {role} for {native_param}")
                     patch.diff = tensor
                 else:
-                    a, b = patch.low_rank.get(layout, (None, None))
-                    patch.low_rank[layout] = (tensor, b) if role == "lora_a" else (a, tensor)
+                    # The reconstruction adds ``lora_B @ lora_A`` directly, so
+                    # every pair carries a scale of exactly 1.
+                    factors = patch.factors(layout)
+                    setattr(factors, "a" if role == "lora_a" else "b", tensor)
 
         if unmapped:
             raise FastH3AdapterError(
@@ -439,23 +310,12 @@ class FastH3WeightFusion:
             {**counted, "set_weight_tensors": len(gate_tensors)},
             weights_path=weights_path,
         )
-        _check_block_coverage(
+        check_block_coverage(
             blocks_seen,
             expected={"blocks.": num_blocks, "token_refiner.blocks.": num_refiner_blocks},
-            weights_path=weights_path,
+            source=weights_path,
+            error_cls=FastH3AdapterError,
         )
-        for native_param, patch in patches.items():
-            for slot, (a, b) in patch.low_rank.items():
-                if a is None or b is None:
-                    raise FastH3AdapterError(f"FastH3 adapter has an unpaired factor for {native_param} slot {slot!r}")
-            # Only the low-rank factors are placed into H3's fused QKV and
-            # gate/up layouts; a full-rank delta is added as it comes, so one
-            # aimed at a fused parameter would silently land transposed.
-            if patch.diff is not None and patch.layout != _PLAIN:
-                raise FastH3AdapterError(
-                    f"FastH3 adapter carries a full-rank delta for {native_param}, which H3 stores in the "
-                    f"{patch.layout!r} fused layout; this loader can only place low-rank factors there"
-                )
 
         fusion = cls(
             source=weights_path,
@@ -464,6 +324,7 @@ class FastH3WeightFusion:
             requires_vsa=bool(gate_tensors),
             injections=injections,
         )
+        fusion.validate_pairs()
         logger.info(
             "FastH3 adapter %s: rank=%s, parameters patched=%d, low-rank=%s, diff=%s, set_weight=%d",
             weights_path,
@@ -474,125 +335,6 @@ class FastH3WeightFusion:
             len(gate_tensors),
         )
         return fusion
-
-    def _compute_device(self, weight: torch.Tensor) -> torch.device:
-        """Where to reconstruct a delta.
-
-        H3's per-block modulation projection is 96768x2688, so rebuilding all
-        343 patched parameters is a few TFLOP of rank-64 products. On CPU that
-        adds minutes to a load that already has a startup deadline, so the
-        accelerator does the arithmetic whenever there is one.
-        """
-        if weight.device.type != "cpu":
-            return weight.device
-        if self._device is None:
-            # Ask the platform rather than PyTorch's global accelerator
-            # registry, so an out-of-tree backend controls its own placement.
-            self._device = current_omni_platform.get_torch_device()
-        return self._device
-
-    @staticmethod
-    def _widen(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """Move to ``device``, then widen to float32.
-
-        Asking ``Tensor.to`` for a device and a dtype at once converts on the
-        host and ships twice the bytes; splitting it moves bfloat16 and widens
-        on the accelerator.
-        """
-        return tensor.to(device, non_blocking=True).to(torch.float32)
-
-    def fuse(self, name: str, weight: torch.Tensor) -> torch.Tensor:
-        """Return ``weight`` with this adapter's contribution added."""
-        patch = self._patches.get(name)
-        if patch is None:
-            return weight
-        self._applied.add(name)
-
-        device = self._compute_device(weight)
-
-        delta: torch.Tensor | None = None
-        if patch.low_rank:
-            if patch.layout in _QKV_SLOTS:
-                per_slot = {
-                    slot: self._widen(b, device) @ self._widen(a, device) for slot, (a, b) in patch.low_rank.items()
-                }
-                delta = _place_in_grouped_qkv(per_slot, head_dim=self._head_dim)
-            else:
-                a, b = patch.low_rank[patch.layout]
-                if patch.layout == _SWAP_HALVES:
-                    # Permuting the rows of B permutes the rows of the product,
-                    # so swap the rank-64 factor instead of the full delta.
-                    b = _swap_halves(b)
-                delta = self._widen(b, device) @ self._widen(a, device)
-        if patch.diff is not None:
-            diff = self._widen(patch.diff, device)
-            delta = diff if delta is None else delta + diff
-        if delta is None:
-            return weight
-        if delta.shape != weight.shape:
-            raise FastH3AdapterError(
-                f"FastH3 delta for {name} has shape {tuple(delta.shape)}, parameter is {tuple(weight.shape)}"
-            )
-        # Leave the result on the compute device. These weights are bound for
-        # the accelerator anyway, so returning them to host memory would pay a
-        # device-to-host copy of the whole checkpoint only for the loader to
-        # send it straight back: measured at 152s against 15s for 60 GiB of
-        # patched projections, against 17s for the unavoidable upload alone.
-        # Fold the base weight into the freshly built delta in place. Promoting
-        # the weight to float32 on its own would allocate two more buffers the
-        # size of the parameter, and H3's largest patched projection is 0.5 GiB.
-        return delta.add_(weight.to(device, non_blocking=True)).to(weight.dtype)
-
-    def apply(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
-        """Fuse every streamed checkpoint tensor on its way into the model."""
-        if self._applied:
-            # ``validate_fully_applied`` released the deltas, so a second stream
-            # would fuse nothing and then pass its own completeness check: the
-            # server would serve base H3 weights on the student's ladder.
-            raise FastH3AdapterError(f"{self._source} has already been fused into this checkpoint")
-        for name, weight in weights:
-            if name in self._injections:
-                raise FastH3AdapterError(
-                    f"the checkpoint already provides {name}, which this adapter assigns; "
-                    "assigning it would discard the checkpoint's own weight"
-                )
-            yield name, self.fuse(name, weight)
-        # The VSA gates have no counterpart in the base checkpoint, so they join
-        # the stream after it rather than being folded into one of its tensors.
-        for name, weight in self._injections.items():
-            self._injected.add(name)
-            yield name, weight
-
-    def validate_fully_applied(self, loaded: Iterable[str] | None = None) -> None:
-        """Close the fusion: every edit must have met its parameter.
-
-        A silently unapplied delta is the failure mode that matters here: the
-        model would load and generate, just not as the distilled student. The
-        weights are loaded once, so the mapped payloads are dropped afterwards
-        rather than held for the life of the process.
-
-        ``loaded`` is the set of parameter names ``load_weights`` actually
-        consumed. A gate is assigned rather than fused, so it lands on a module
-        the base transformer does not have; if that module was never built,
-        ``load_weights`` only logs a skip and the server would serve a
-        zero-initialized gate. Yielding a tensor is not evidence it arrived, so
-        the injections are closed against that set when it is available.
-        """
-        missing = sorted(set(self._patches) - self._applied)
-        if missing:
-            raise FastH3AdapterError(
-                f"FastH3 adapter edits {len(missing)} parameters the checkpoint never provided: {missing[:5]}"
-            )
-        arrived = self._injected if loaded is None else set(loaded)
-        uninjected = sorted(set(self._injections) - arrived)
-        if uninjected:
-            raise FastH3AdapterError(
-                f"FastH3 adapter assigns {len(uninjected)} parameters that never reached the model: {uninjected[:5]}"
-            )
-        for patch in self._patches.values():
-            patch.low_rank.clear()
-            patch.diff = None
-        self._injections.clear()
 
     def check_serving_contract(
         self,

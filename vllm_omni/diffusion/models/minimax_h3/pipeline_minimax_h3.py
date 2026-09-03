@@ -10,6 +10,7 @@ import os
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from itertools import groupby
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -121,6 +122,7 @@ from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
 from .lora import load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
+    MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTModel,
     _attention_isolates_packed_requests,
 )
@@ -148,6 +150,10 @@ from .time_request import (
     minimax_h3_time_shift_sigmas,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vdn.checkpoint import VdnSpec, resolve_vdn_checkpoint
+from .vdn.config import MiniMaxH3HybridAttentionConfig
+from .vdn.serving import VdnServingContract
+from .vdn.weight_fusion import VdnWeightFusion
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -325,6 +331,46 @@ def _minimax_h3_step_schedule(state: StepRequestState) -> dict[str, float]:
 def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
     """Read a partition's distilled schedule. An absent key means legacy uniform."""
     return DMD2SigmaSchedule.from_metadata(release)
+
+
+def _resolve_minimax_h3_vdn(
+    od_config: OmniDiffusionConfig,
+    release: Mapping[str, Any],
+    model_path: Path,
+) -> tuple[Any, MiniMaxH3HybridAttentionConfig] | None:
+    """Claim a VDN-H3 hybrid checkpoint, from the server flag or the release.
+
+    ``--model-config '{"vdn": {...}}'`` names one explicitly; a packaged release
+    can instead declare it in ``model_index.json`` under ``_minimax_h3.vdn``, so
+    ``vllm-omni serve <dir>`` needs no flags. The flag wins when both appear.
+    Returns ``None`` for an ordinary dense H3, which is every other checkpoint.
+    """
+    model_config = getattr(od_config, "model_config", None) or {}
+    raw = model_config.get("vdn") or release.get("vdn")
+    if not raw:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("model_config['vdn'] must be an object naming a VDN-H3 checkpoint")
+    spec = VdnSpec.from_mapping(raw)
+    candidate = Path(spec.checkpoint)
+    if not candidate.is_absolute() and not candidate.is_dir():
+        # A release that declares its own hybrid names it relative to itself.
+        packaged = model_path / spec.checkpoint
+        if packaged.is_dir():
+            spec = replace(spec, checkpoint=str(packaged))
+    checkpoint = resolve_vdn_checkpoint(spec)
+
+    tf_config = od_config.tf_model_config
+    mapping = tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config)
+    arch = MiniMaxH3DiTArchConfig.from_mapping(mapping)
+    hybrid_config = MiniMaxH3HybridAttentionConfig.from_transform_config(
+        checkpoint.transform_config,
+        attention_head_dim=arch.attention_head_dim,
+        window_group_batch=spec.window_group_batch,
+        window_impl=spec.window_impl,
+        linear_attention_enabled=spec.linear_attention_enabled,
+    )
+    return checkpoint, hybrid_config
 
 
 def resolve_minimax_h3_diffusion_model_path(
@@ -688,6 +734,10 @@ class MiniMaxH3Pipeline(
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
+    # Set from model_config['vdn'] (or the release's own declaration) during
+    # construction; absent means the dense H3 attention.
+    _vdn: VdnServingContract | None = None
+    _vdn_fusion: VdnWeightFusion | None = None
 
     def _load_diffusion_lora_adapter(
         self,
@@ -948,14 +998,34 @@ class MiniMaxH3Pipeline(
             od_config.quantization_config,
             "transformer",
         )
+        resolved_vdn = _resolve_minimax_h3_vdn(od_config, release, model_path)
+        vdn_config = None
+        if resolved_vdn is not None:
+            vdn_checkpoint, vdn_config = resolved_vdn
+            self._vdn = VdnServingContract(vdn_checkpoint, vdn_config)
+            self._vdn.check_serving_contract(
+                partition=self.partition,
+                od_config=od_config,
+                lora_path=getattr(od_config, "lora_path", None),
+            )
         self.transformer = MiniMaxH3DiTModel(
             od_config,
             quant_config=transformer_quant_config,
+            hybrid_config=vdn_config,
         )
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
                 od_config,
                 quant_config=transformer_quant_config,
+            )
+        if self._vdn is not None:
+            # Reads names and adapter factors now; the 4.3 GiB branch stays on
+            # disk until the weight stream reaches it.
+            self._vdn_fusion = VdnWeightFusion.from_checkpoint(
+                self._vdn.checkpoint,
+                head_dim=self.transformer.arch.attention_head_dim,
+                num_blocks=self.transformer.arch.num_layers,
+                num_refiner_blocks=self.transformer.arch.token_refiner_num_layers,
             )
 
         self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer)
@@ -1088,6 +1158,11 @@ class MiniMaxH3Pipeline(
                 # Fuse before the model shards anything, which is also the only
                 # point where the checkpoint's fused QKV/MLP layouts are intact.
                 stream = self._fasth3.apply(stream)
+            if prefix == "transformer." and self._vdn_fusion is not None:
+                # Same point, and for the same reason: VDN's adapters land in
+                # the grouped QKV and fused gate/up layouts, and its branch is
+                # assigned to parameters the base checkpoint does not carry.
+                stream = self._vdn_fusion.apply(stream)
             loaded = component.load_weights(stream)
             if prefix == "transformer.":
                 transformer_loaded = set(loaded)
@@ -1107,6 +1182,8 @@ class MiniMaxH3Pipeline(
             # load_weights only warns on a parameter the model does not have, so
             # close the adapter against what the DiT actually consumed.
             self._fasth3.validate_fully_applied(transformer_loaded)
+        if self._vdn_fusion is not None:
+            self._vdn_fusion.validate_fully_applied(transformer_loaded)
         return loaded_with_prefix
 
     @property
@@ -1134,6 +1211,20 @@ class MiniMaxH3Pipeline(
             # below and Cache-DiT all speak in.
             positions = self._fasth3.base_schedule
             return positions, len(positions) - 1
+        if self._vdn is not None and self._vdn.base_schedule is not None:
+            # The DMD variant is a distilled student, so it samples on the
+            # positions it was trained at rather than a ladder derived from the
+            # request. Its uniform 50-step sibling declares none and falls
+            # through to the request's own count.
+            positions = self._vdn.base_schedule
+            num_steps = len(positions) - 1
+            requested = sampling.num_inference_steps
+            if requested is not None and int(requested) != num_steps:
+                raise OmniClientError(
+                    f"this VDN-H3 checkpoint is a {num_steps}-step student; num_inference_steps must be "
+                    f"{num_steps} or omitted, got {int(requested)}"
+                )
+            return positions, num_steps
         sigma_schedule = self._sigma_schedule_for_request(sampling, task)
         if sigma_schedule is None:
             return None, int(sampling.num_inference_steps or 50)
@@ -1183,6 +1274,8 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
         if self._fasth3 is not None:
             self._fasth3.check_task(task)
+        if self._vdn is not None:
+            self._vdn.check_task(task)
         return task
 
     def _resolve_shape(
@@ -1920,6 +2013,7 @@ class MiniMaxH3Pipeline(
             text_embeddings=text_embeddings,
             token_tags=tags,
             device=self.device,
+            hybrid_config=None if self._vdn is None else self._vdn.config,
         )
 
         visual_anchor = visual_condition
@@ -2197,6 +2291,12 @@ class MiniMaxH3Pipeline(
             self._validate_native_sampling(sampling, task=task)
         if self._fasth3 is not None:
             self._fasth3.check_request(
+                sampling,
+                video_shift=self.default_video_shift,
+                audio_shift=self.default_audio_shift,
+            )
+        if self._vdn is not None:
+            self._vdn.check_request(
                 sampling,
                 video_shift=self.default_video_shift,
                 audio_shift=self.default_audio_shift,
@@ -2517,6 +2617,12 @@ class MiniMaxH3Pipeline(
         cu_seqlens outright — either would silently attend across request
         boundaries.
         """
+        if getattr(transformer, "hybrid_config", None) is not None:
+            # VDN's window and its frame recurrence are geometry over ONE packed
+            # sequence: a co-batched second request would extend the row range
+            # its window plan and its scans were built for. Requests still batch
+            # at the scheduler; they just take one forward each here.
+            return False
         attentions = [module for module in transformer.modules() if isinstance(module, MiniMaxH3Attention)]
         if not attentions:
             return False
@@ -2656,6 +2762,12 @@ class MiniMaxH3Pipeline(
                 logger.warning_once(
                     "MiniMax H3 step batch contains requests for different task-specific DiTs; "
                     "running %d requests one forward at a time.",
+                    len(batch_states),
+                )
+            elif getattr(transformers[0], "hybrid_config", None) is not None:
+                logger.warning_once(
+                    "MiniMax H3 VDN hybrid attention is geometry over one packed sequence, so requests "
+                    "cannot share a forward; running %d requests one forward at a time.",
                     len(batch_states),
                 )
             elif any(

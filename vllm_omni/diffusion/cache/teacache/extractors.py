@@ -1307,6 +1307,11 @@ def extract_minimax_h3_context(
     # Mirror forward()'s host-side scalar so the refiner sees the number of
     # packed requests without reading cu_seqlens off-device.
     num_requests = int(module._psp_optional(psp, "num_requests", 1))
+    # Mirrors ``MiniMaxH3DiTModel.forward``: without this a VDN checkpoint would
+    # run its blocks dense under TeaCache and cache the wrong residual, with
+    # nothing to signal it.
+    hybrid_geometry = module._psp_optional(psp, "hybrid_geometry", None)
+    vsa_prefix_segments = tuple(int(length) for length in module._psp_optional(psp, "vsa_prefix_segments", ()))
     refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
     refiner_cu = module._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
     refiner_max = int(module._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1410,7 +1415,10 @@ def extract_minimax_h3_context(
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 packed_total=seq_len,
+                num_requests=num_requests,
                 video_layout=video_layout,
+                vsa_prefix_segments=vsa_prefix_segments,
+                hybrid_geometry=hybrid_geometry,
             )
         # TeaCache stores residuals as block_output - decoder_input. Strict SP
         # must keep both tensors rank-local until postprocess projects local
