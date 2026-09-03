@@ -174,6 +174,52 @@ def test_requests_do_not_share_a_forward_under_the_hybrid():
     assert MiniMaxH3Pipeline._packed_batch_supported(hybrid) is False
 
 
+def _od_config(model_config):
+    return SimpleNamespace(
+        model_config=model_config,
+        tf_model_config={
+            "num_layers": 2,
+            "token_refiner_num_layers": 1,
+            "hidden_size": 8,
+            "num_attention_heads": 2,
+            "attention_head_dim": HEAD_DIM,
+            "ffn_hidden_size": 6,
+        },
+    )
+
+
+def test_the_server_flag_claims_a_checkpoint(tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _resolve_minimax_h3_vdn
+
+    root = write_release(tmp_path / "release")
+
+    resolved = _resolve_minimax_h3_vdn(_od_config({"vdn": {"checkpoint": str(root)}}), {}, tmp_path)
+
+    assert resolved is not None
+    checkpoint, hybrid = resolved
+    assert checkpoint.has_turbo
+    assert (hybrid.chunk, hybrid.radius) == (5, 1)
+    assert hybrid.linear_head_dim == HEAD_DIM
+
+
+def test_a_packaged_release_may_declare_its_own_hybrid(tmp_path):
+    """``vllm-omni serve <dir>`` then needs no flags, and the path is its own."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _resolve_minimax_h3_vdn
+
+    write_release(tmp_path / "vdn")
+
+    resolved = _resolve_minimax_h3_vdn(_od_config({}), {"vdn": {"checkpoint": "vdn"}}, tmp_path)
+
+    assert resolved is not None
+
+
+def test_an_ordinary_h3_checkpoint_claims_nothing(tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _resolve_minimax_h3_vdn
+
+    assert _resolve_minimax_h3_vdn(_od_config({}), {}, tmp_path) is None
+    assert _resolve_minimax_h3_vdn(SimpleNamespace(), {}, tmp_path) is None
+
+
 def test_the_hybrid_attention_is_absent_from_a_dense_block():
     """A server without a VDN checkpoint must build the parameter set it always did."""
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
