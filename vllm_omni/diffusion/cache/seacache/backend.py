@@ -9,13 +9,24 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.cache.seacache.config import SeaCacheConfig
+from vllm_omni.diffusion.cache.seacache.context_hook import apply_sea_cache_context_hook
 from vllm_omni.diffusion.cache.seacache.hook import (
     SeaCacheRootHook,
     apply_sea_cache_hook,
 )
+from vllm_omni.diffusion.cache.seacache.indicators import minimax_h3_indicator
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 logger = init_logger(__name__)
+
+
+def _sea_config(config: DiffusionCacheConfig) -> SeaCacheConfig:
+    return SeaCacheConfig(
+        threshold=config.sea_threshold,
+        residual_order=config.sea_residual_order,
+        max_consecutive_cached=config.sea_max_consecutive_cached,
+        power_exp=config.sea_power_exp,
+    )
 
 
 def enable_cosmos3_seacache(
@@ -28,12 +39,7 @@ def enable_cosmos3_seacache(
     if not callable(getattr(transformer, "_run_gen_layers", None)):
         raise ValueError("Pipeline transformer does not expose the block boundary required by SeaCache")
 
-    sea_config = SeaCacheConfig(
-        threshold=config.sea_threshold,
-        residual_order=config.sea_residual_order,
-        max_consecutive_cached=config.sea_max_consecutive_cached,
-        power_exp=config.sea_power_exp,
-    )
+    sea_config = _sea_config(config)
     hook = apply_sea_cache_hook(
         transformer,
         sea_config,
@@ -56,9 +62,39 @@ def enable_cosmos3_seacache(
     return hook
 
 
+def enable_minimax_h3_seacache(
+    pipeline: Any,
+    config: DiffusionCacheConfig,
+) -> SeaCacheRootHook:
+    """Enable SeaCache on every MiniMax-H3 partition.
+
+    The gate reads the packed video/audio latents straight from the DiT forward
+    kwargs and needs no calibrated coefficients, so FL2VA, Ref2VA, and combined
+    serving are all eligible; only the threshold is model-specific.
+    """
+    sea_config = _sea_config(config)
+    hook = apply_sea_cache_context_hook(
+        pipeline.transformer,
+        sea_config,
+        transformer_type="MiniMaxH3DiTModel",
+        indicator_fn=minimax_h3_indicator,
+    )
+    logger.info(
+        "SeaCache enabled for MiniMax-H3 partition=%s (threshold=%s, residual_order=%d, "
+        "max_consecutive_cached=%d, power_exp=%s)",
+        getattr(pipeline, "partition", None),
+        sea_config.threshold,
+        sea_config.residual_order,
+        sea_config.max_consecutive_cached,
+        sea_config.power_exp,
+    )
+    return hook
+
+
 CUSTOM_SEACACHE_ENABLERS = {
     "Cosmos3OmniDiffusersPipeline": enable_cosmos3_seacache,
     "Cosmos3OmniPipeline": enable_cosmos3_seacache,
+    "MiniMaxH3Pipeline": enable_minimax_h3_seacache,
 }
 
 
@@ -96,6 +132,12 @@ class SeaCacheBackend(CacheBackend):
         hook = registry.get_hook(SeaCacheRootHook._HOOK_NAME) if registry is not None else None
         if not isinstance(hook, SeaCacheRootHook):
             raise RuntimeError("SeaCache hook is not installed on the pipeline transformer")
+        if verbose and (hook.full_count or hook.skip_count):
+            logger.info(
+                "SeaCache summary for the previous request: %d full, %d cached transformer calls",
+                hook.full_count,
+                hook.skip_count,
+            )
         hook.refresh(transformer)
         pipeline._sea_cache_hook = hook
         if verbose:

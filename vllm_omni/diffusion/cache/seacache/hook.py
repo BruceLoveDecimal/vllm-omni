@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import inspect
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -47,6 +47,20 @@ def _is_parameter_sharded(module: torch.nn.Module) -> bool:
     return False
 
 
+def collect_offload_groups(blocks: Iterable[torch.nn.Module]) -> list[torch.distributed.ProcessGroup]:
+    """Process groups whose layerwise-offload prefetch collectives a skipped block would leave hanging."""
+    groups: list[torch.distributed.ProcessGroup] = []
+    seen_groups: set[int] = set()
+    for block in blocks:
+        registry = getattr(block, "_hook_registry", None)
+        dlo_hook = registry.get_hook("distributed_layerwise_offload") if registry is not None else None
+        group = getattr(dlo_hook, "dp_group", None)
+        if group is not None and int(getattr(dlo_hook, "dp_size", 1)) > 1 and id(group) not in seen_groups:
+            seen_groups.add(id(group))
+            groups.append(group)
+    return groups
+
+
 class SeaCacheRootHook(ModelHook):
     """Drive SeaCache gating and transformer forward control."""
 
@@ -75,14 +89,7 @@ class SeaCacheRootHook(ModelHook):
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         self._parameter_sharded = _is_parameter_sharded(module)
-        seen_groups: set[int] = set()
-        for block in getattr(module, "gen_layers", ()):
-            registry = getattr(block, "_hook_registry", None)
-            dlo_hook = registry.get_hook("distributed_layerwise_offload") if registry is not None else None
-            group = getattr(dlo_hook, "dp_group", None)
-            if group is not None and int(getattr(dlo_hook, "dp_size", 1)) > 1 and id(group) not in seen_groups:
-                seen_groups.add(id(group))
-                self._collective_skip_groups.append(group)
+        self._collective_skip_groups = collect_offload_groups(getattr(module, "gen_layers", ()))
         self._clear_forward_control(module)
         return module
 

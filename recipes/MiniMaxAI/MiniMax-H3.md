@@ -1101,6 +1101,67 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   --cache-config '{"rel_l1_thresh":0.17}'
 ```
 
+## SeaCache acceleration
+
+SeaCache ([paper](https://arxiv.org/abs/2602.18993)) reuses DiT block residuals
+like TeaCache, but decides from the spectral evolution of the packed video and
+audio latents themselves: each modality's target rows are Wiener-filtered at
+its own flow-matching noise level (video and audio schedules are shifted
+separately), and the accumulated relative change gates whether the blocks run
+or the residual is extrapolated from the last full steps. It needs no
+model-specific coefficient fit, so it is available on every MiniMax-H3
+partition, including Ref2VA and combined serving, where reference video and
+audio rows are excluded from the gate.
+
+SeaCache, TeaCache, and Cache-DiT are mutually exclusive; pick one cache
+backend per server. Like the other backends it is request-mode only.
+
+Thresholds are model-specific. The sweep below used the recipe's two-GPU
+serving configuration on 2x RTX PRO 6000 (TP=2, CUDNN_ATTN, 1344x768, 5 s,
+50 steps, T2VA, seed 1101) with `sea_residual_order=1`,
+`sea_max_consecutive_cached=2`, `sea_power_exp=3.0`; video metrics are
+frame-wise against the uncached output of the same build, audio metrics
+compare the decoded waveforms.
+
+| `sea_threshold` | E2E | DiT calls (full / cached) | SSIM | PSNR | Audio SNR / PCC |
+|---:|---:|---|---:|---:|---|
+| uncached | 303.2 s | 49 / 0 | - | - | - |
+| 0.15 | 152.5 s (1.99x) | 24 / 25 | 0.960 | 34.5 dB | 9.9 dB / 0.95 |
+| 0.25 (default) | 128.3 s (2.36x) | 20 / 29 | 0.917 | 30.4 dB | 12.0 dB / 0.97 |
+| 0.35 | 122.4 s (2.48x) | 19 / 30 | 0.806 | 20.8 dB | 3.7 dB / 0.78 |
+
+Fidelity falls off a cliff past the default, while the extra speed is marginal
+because `sea_max_consecutive_cached` already bounds the run length of cached
+steps. Use `0.15` when fidelity matters more than latency. Validate on
+representative prompts and generation settings before changing the threshold.
+
+### Offline (Python API)
+
+```python
+import os
+
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+omni = Omni(
+    model=os.path.join(os.environ["MODEL_ROOT"], "FL2VA"),
+    cache_backend="sea_cache",
+    cache_config={"sea_threshold": 0.25, "sea_residual_order": 1, "sea_max_consecutive_cached": 2},
+    trust_remote_code=True,
+    enable_cpu_offload=True,
+)
+```
+
+### Online serving
+
+```bash
+vllm serve "${MODEL_ROOT}/FL2VA" \
+  --omni \
+  --trust-remote-code \
+  --cache-backend sea_cache \
+  --cache-config '{"sea_threshold":0.25,"sea_residual_order":1,"sea_max_consecutive_cached":2}'
+```
+
 ## Known limitations
 
 - TeaCache is calibrated for FL2VA only; Ref2VA requests run uncached.
@@ -1129,7 +1190,7 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
 - Online FP8 with DLO AllGather temporarily materializes the complete FP8 model
   in host memory on every rank during startup before retaining only each rank's
   shard. Size startup host memory for that transient peak.
-- TeaCache and Cache-DiT cannot be enabled on the same server.
+- TeaCache, SeaCache, and Cache-DiT cannot be enabled on the same server.
 - Image+audio Ref2VA accepts exactly one image and one audio reference.
 - Video Ref2VA accepts one or more video files, but not an additional standalone
   audio reference.

@@ -10,11 +10,23 @@ import torch
 
 # SeaCache paper: "Spectral-Evolution-Aware Cache for Accelerating Diffusion Models"
 # https://arxiv.org/abs/2602.18993
-def apply_sea_filter(hidden_states: torch.Tensor, sigma: float, power_exp: float = 3.0) -> torch.Tensor:
-    """Apply the separable SEA Wiener filter over ``(T, H, W)``."""
+def apply_sea_filter(
+    hidden_states: torch.Tensor,
+    sigma: float,
+    power_exp: float = 3.0,
+    dims: tuple[int, ...] = (0, 1, 2),
+) -> torch.Tensor:
+    """Apply the separable SEA Wiener filter over ``dims``.
+
+    ``dims`` are the axes carrying physical structure: ``(0, 1, 2)`` for a
+    ``(T, H, W, C)`` video grid, ``(1,)`` for a ``(channels, T, C)`` audio
+    sequence. Any other axis is treated as a batch or feature axis.
+    """
     original_dtype = hidden_states.dtype
     hidden_states = hidden_states.contiguous().float()
-    dimensions = (0, 1, 2)
+    dimensions = tuple(int(axis) for axis in dims)
+    if not dimensions or len(set(dimensions)) != len(dimensions):
+        raise ValueError(f"dims must be non-empty and unique, got {dims!r}")
     spectrum = torch.fft.fftn(hidden_states, dim=dimensions)
 
     sigma = max(1e-6, min(1.0 - 1e-6, float(sigma)))
