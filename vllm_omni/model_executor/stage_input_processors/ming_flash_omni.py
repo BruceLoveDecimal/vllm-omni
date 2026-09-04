@@ -16,9 +16,7 @@ from vllm.inputs import TextPrompt
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     DEFAULT_MAX_TEXT_LENGTH,
-)
-from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
-    DEFAULT_PROMPT as MING_DEFAULT_PROMPT,
+    resolve_ming_prompt_fields,
 )
 from vllm_omni.model_executor.models.ming_flash_omni.text_processing import (
     segment_and_normalize,
@@ -182,15 +180,9 @@ def build_ming_talker_prompt_token_ids_for_info(
     if tokenizer is None:
         return None
 
-    ming_task = additional_info.get("ming_task", "instruct")
-    if ming_task == "omni":
-        prompt = MING_DEFAULT_PROMPT
-        instruction = None
-        use_zero_spk_emb = additional_info.get("spk_emb") is None
-    else:
-        prompt = additional_info.get("prompt", MING_DEFAULT_PROMPT)
-        instruction = additional_info.get("instruction", None)
-        use_zero_spk_emb = bool(additional_info.get("use_zero_spk_emb", False))
+    # Shared with the talker's _resolve_generation_params so the slot count
+    # and the prefill embeddings can never drift apart.
+    _, prompt, instruction, use_zero_spk_emb = resolve_ming_prompt_fields(additional_info)
 
     max_text_length = int(additional_info.get("max_text_length", DEFAULT_MAX_TEXT_LENGTH))
     segment = _first_tts_segment(str(text or ""), max_text_length)

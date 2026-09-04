@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import copy
 import glob as glob_module
 import os
 from collections.abc import Iterable
@@ -33,17 +32,18 @@ from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
-from vllm_omni.transformers_utils.configs.ming_flash_omni import MingFlashOmniTalkerConfig
+from vllm_omni.transformers_utils.configs.ming_flash_omni import (
+    MingFlashOmniTalkerConfig,
+    resolve_ming_talker_config,
+)
 
-from .prompt_utils import DEFAULT_MAX_TEXT_LENGTH
-from .prompt_utils import DEFAULT_PROMPT as MING_DEFAULT_PROMPT
+from .prompt_utils import DEFAULT_MAX_TEXT_LENGTH, resolve_ming_prompt_fields
 from .talker_module import (
     CFM,
     DiT,
     MingAudioGenerator,
     build_tts_input,
     resolve_audio_vae_config,
-    resolve_ming_talker_config,
 )
 from .talker_request_state import (
     MingTalkerRequestState,
@@ -91,8 +91,6 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
     AudioVAE decodes latents to waveforms.
     """
 
-    prefer_model_sampler = True
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
@@ -100,7 +98,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         self.vllm_config = vllm_config
         root_config = vllm_config.model_config.hf_config
         self.has_preprocess = True
-        self.has_postprocess = True
+        self.has_postprocess = False
         self.requires_full_prefix_cached_hidden_states = False
 
         model_path = vllm_config.model_config.model
@@ -177,7 +175,6 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         self._pending_prefill_done_updates: dict[str, bool] = {}
         self._results_queue: list[tuple[str, torch.Tensor | None]] = []
         self._audio_queue: list[tuple[str, dict[str, Any] | None]] = []
-        self._deferred_cleanup_ids: set[str] = set()
 
     @property
     def device(self) -> torch.device:
@@ -289,33 +286,11 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors | None:
-        make_empty = getattr(self.model, "make_empty_intermediate_tensors", None)
-        if callable(make_empty):
-            return make_empty(batch_size, dtype, device)
-        return None
+        return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
 
     def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
         info: dict[str, object] = {"text": "dummy", "use_zero_spk_emb": True, "max_steps": 1}
         return [info for _ in range(num_reqs)]
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        runtime_additional_information: list[dict] | None = None,
-        **kwargs,
-    ) -> torch.Tensor | IntermediateTensors | OmniOutput:
-        """Run one scheduler-driven native AR talker step."""
-        return self.forward_step(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            runtime_additional_information=runtime_additional_information,
-            **kwargs,
-        )
 
     # Scheduler-driven talker hooks: vLLM owns the Qwen2 paged KV cache, while
     # MingTalkerRequestState carries the non-KV audio-side state across steps.
@@ -325,7 +300,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         llm_vllm_config = _replace_hf_config(vllm_config, self.llm_config)
         return Qwen2Model(vllm_config=llm_vllm_config, prefix=maybe_prefix(prefix, "model"))
 
-    def forward_step(
+    def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -354,18 +329,14 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             self._abort_pending_preprocess_batch()
             raise
         if isinstance(model_output, IntermediateTensors):
-            self._pending_requests.clear()
-            self._pending_state_creations.clear()
-            self._pending_prefill_done_updates.clear()
+            self._commit_pending_step()
             return model_output
 
         hidden_states = model_output[0] if isinstance(model_output, tuple) else model_output
         try:
             self._validate_native_hidden_states(hidden_states)
         except Exception:
-            self._pending_requests.clear()
-            self._pending_state_creations.clear()
-            self._pending_prefill_done_updates.clear()
+            self._abort_pending_preprocess_batch()
             raise
         # Phase B (CFM audio stepping / stop detection / finalize) intentionally
         # does NOT run here. With CUDA graphs enabled the captured forward is
@@ -382,9 +353,9 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
 
         ``rows`` is the logits-index-gathered hidden state handed to
         ``compute_logits``: one row per scheduled request in batch order, each
-        already the last position of its span. Relocated from ``forward_step``
-        so it runs host-side even under CUDA graph replay; the talker stage
-        must therefore avoid FULL cudagraphs (PIECEWISE is fine) because FULL
+        already the last position of its span. Kept out of ``forward`` so it
+        runs host-side even under CUDA graph replay; the talker stage must
+        therefore avoid FULL cudagraphs (PIECEWISE is fine) because FULL
         capture records ``compute_logits`` GPU ops as well.
         """
         if not self._pending_requests:
@@ -409,9 +380,6 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 state = self.state_manager.get(req_id)
                 if state.finished:
                     stop_by_req[req_id] = self._make_stop_token_logits(req_hidden)
-                    continue
-                if req_hidden.numel() == 0:
-                    stop_by_req[req_id] = None
                     continue
 
                 # One CFM audio step per request (no cross-request batching:
@@ -442,26 +410,25 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             for req_id in result_req_ids:
                 self._results_queue.append((req_id, stop_by_req.get(req_id)))
         except Exception:
-            self._pending_requests.clear()
-            self._pending_state_creations.clear()
-            self._pending_prefill_done_updates.clear()
+            self._abort_pending_preprocess_batch()
             raise
 
+        self._commit_pending_step()
+
+    def _commit_pending_step(self) -> None:
+        """Drop per-step scheduler-row tracking once the step outcome is settled."""
         self._pending_requests.clear()
         self._pending_state_creations.clear()
         self._pending_prefill_done_updates.clear()
-        self._flush_deferred_cleanup()
 
     def _abort_pending_preprocess_batch(self) -> None:
-        """Drop scheduler rows prepared for a model step that will not run."""
+        """Roll back request state prepared for a model step that failed."""
         for req_id, prefill_done in self._pending_prefill_done_updates.items():
             if req_id in self.state_manager:
                 self.state_manager.get(req_id).prefill_done = prefill_done
-        self._pending_prefill_done_updates.clear()
         for req_id in self._pending_state_creations:
             self.state_manager.evict(req_id)
-        self._pending_state_creations.clear()
-        self._pending_requests.clear()
+        self._commit_pending_step()
 
     def _record_pending_prefill_done_update(self, state: MingTalkerRequestState) -> None:
         self._pending_prefill_done_updates.setdefault(state.req_id, bool(state.prefill_done))
@@ -549,23 +516,14 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                     voice=voice,
                     segments=segments,
                 )
-                if req_id in self.state_manager:
-                    if num_computed_tokens <= 0:
-                        self.state_manager.evict(req_id)
-                        state = self._prefill_request(
-                            req_id,
-                            embeds.reshape(1, span_len, -1),
-                            params,
-                            voice,
-                            max_steps=max_steps,
-                        )
-                        self._pending_state_creations.add(req_id)
-                        state.prefill_done = is_final_prefill
-                    else:
-                        state = self.state_manager.get(req_id)
-                        self._record_pending_prefill_done_update(state)
-                        state.prefill_done = is_final_prefill
+                if req_id in self.state_manager and num_computed_tokens > 0:
+                    # Later chunk of a chunked prefill: keep the existing state.
+                    state = self.state_manager.get(req_id)
+                    self._record_pending_prefill_done_update(state)
                 else:
+                    # First prefill chunk (or a restarted request): start fresh.
+                    if req_id in self.state_manager:
+                        self.state_manager.evict(req_id)
                     state = self._prefill_request(
                         req_id,
                         embeds.reshape(1, span_len, -1),
@@ -574,7 +532,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                         max_steps=max_steps,
                     )
                     self._pending_state_creations.add(req_id)
-                    state.prefill_done = is_final_prefill
+                state.prefill_done = is_final_prefill
             else:
                 try:
                     state = self.state_manager.get(req_id)
@@ -603,9 +561,6 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         self._pending_requests.append((req_id, (not is_prefill) or is_final_prefill, span_len))
         return input_ids_out, embeds.reshape(span_len, -1), {}
 
-    def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
-        return {}
-
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata=None) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
@@ -614,7 +569,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
 
         self._run_pending_audio_steps(hidden_states)
 
-        vocab_size = max(2, int(getattr(self.llm_config, "vocab_size", 2) or 2))
+        vocab_size = int(self.llm_config.vocab_size)
         logits = torch.full(
             (hidden_states.shape[0], vocab_size),
             float("-inf"),
@@ -703,19 +658,19 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         finished = {str(req_id) for req_id in finished_req_ids}
         if not finished:
             return
-        self._deferred_cleanup_ids.update(finished)
-        self._flush_deferred_cleanup()
+        # The runner reports finished requests before the next step's forward,
+        # and a finished request's audio already shipped one step before its
+        # stop token (see _run_pending_audio_steps), so state is safe to evict
+        # immediately. _audio_queue may still hold a payload for a request
+        # aborted between its finalize step and the next make_omni_output.
+        for req_id in finished:
+            self.state_manager.evict(req_id)
         self._pending_requests = [item for item in self._pending_requests if item[0] not in finished]
         self._pending_state_creations.difference_update(finished)
         for req_id in finished:
             self._pending_prefill_done_updates.pop(req_id, None)
         self._results_queue = [item for item in self._results_queue if item[0] not in finished]
         self._audio_queue = [item for item in self._audio_queue if item[0] not in finished]
-
-    def _flush_deferred_cleanup(self) -> None:
-        for req_id in self._deferred_cleanup_ids:
-            self.state_manager.evict(req_id)
-        self._deferred_cleanup_ids.clear()
 
     def _build_native_prefill_embeds(
         self,
@@ -819,10 +774,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             return params.max_steps
 
         segment = segments[0] if segments else text
-        duration_capped_steps = getattr(self.audio_generator, "duration_capped_steps", None)
-        if not callable(duration_capped_steps):
-            return params.max_steps
-        return int(duration_capped_steps(len(segment), params.max_steps))
+        return int(self.audio_generator.duration_capped_steps(len(segment), params.max_steps))
 
     def _prefill_request(
         self,
@@ -838,9 +790,6 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         Builds his_lat (from prompt_wav_lat or zeros), seeds the RNG, resolves
         cfg/sigma/temperature/max_steps, registers state in the manager.
         """
-        if not hasattr(self, "state_manager"):
-            self.state_manager = MingTalkerStateManager()
-
         device = inputs_embeds.device
         dtype = inputs_embeds.dtype
         his_lat = self.audio_generator._init_his_lat(voice.prompt_wav_lat, device, dtype)
@@ -875,8 +824,8 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         hidden = _normalize_last_hidden_for_step(last_hidden).to(device=state.his_lat.device, dtype=state.his_lat.dtype)
         randn_tensor, sde_rnd = _sample_request_noise(
             state,
-            steps=int(self.audio_generator._config.steps),
-            patch_size=int(self.audio_generator.patch_size),
+            steps=int(self.config.steps),
+            patch_size=int(self.patch_size),
             latent_dim=int(state.his_lat.shape[-1]),
             device=hidden.device,
             dtype=hidden.dtype,
@@ -923,23 +872,19 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         return {}
 
     def _resolve_generation_params(self, additional_info: dict[str, Any]) -> _GenerationParams:
+        # prompt/instruction/spk-emb fields are shared with the stage input
+        # processor (slot sizing); the sampling knobs below are talker-only.
         # "omni"    : thinker -> talker hand-off with hardcoded defaults
         # "instruct": standalone TTS with caller-supplied sampling knobs
-        ming_task = additional_info.get("ming_task", "instruct")
+        is_omni, prompt, instruction, use_zero_spk_emb = resolve_ming_prompt_fields(additional_info)
 
-        if ming_task == "omni":
-            prompt = MING_DEFAULT_PROMPT
-            instruction = None
-            use_zero_spk_emb = additional_info.get("spk_emb") is None
+        if is_omni:
             cfg = 2.0
             sigma = 0.25
             temperature = 0.0
             min_steps = 10
             max_steps = 200
         else:
-            prompt = additional_info.get("prompt", MING_DEFAULT_PROMPT)
-            instruction = additional_info.get("instruction", None)
-            use_zero_spk_emb = additional_info.get("use_zero_spk_emb", False)
             cfg = additional_info.get("cfg", self.cfg_strength)
             sigma = additional_info.get("sigma", 0.25)
             temperature = additional_info.get("temperature", 0.0)
@@ -978,12 +923,14 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         # only when the input processor signalled that it sized the slots for
         # one (non-native always injects); otherwise fall back to no preset.
         native_slots_reserved = additional_info.get("native_talker_prompt_wav_len") is not None
+        # Preset geometry is cross-checked against the processor-side derived
+        # metadata once at load time (VoicePresetRegistry._verify_derived_meta),
+        # so the stamped slot counts are trusted here.
         if voice_name and spk_emb is None and voice_name in self.voice_presets and native_slots_reserved:
             preset = self.voice_presets.get(voice_name) or {}
             prompt_wav_lat = preset.get("prompt_wav_lat")
             prompt_wav_emb = preset.get("prompt_wav_emb")
             spk_emb = preset.get("spk_emb")
-            self._check_reserved_preset_slots(voice_name, additional_info, prompt_wav_emb, spk_emb)
             already_projected = True
             if prompt_text is None:
                 prompt_text = preset.get("prompt_text")
@@ -995,38 +942,6 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             prompt_wav_emb=prompt_wav_emb,
             already_projected=already_projected,
         )
-
-    @staticmethod
-    def _check_reserved_preset_slots(
-        voice_name: str,
-        additional_info: dict[str, Any],
-        prompt_wav_emb: torch.Tensor | None,
-        spk_emb: Any,
-    ) -> None:
-        """Fail fast when a preset disagrees with the slots reserved for it.
-
-        The input processor sized prompt-KV slots from the config-derived
-        geometry. If the registered preset differs, the prefill embeds would be
-        silently truncated or padded (prompt_wav) or the speaker embeddings
-        would land in the wrong ``<|vision_start|>`` slots, so refuse instead.
-        """
-        stamped_wav = int(additional_info["native_talker_prompt_wav_len"])
-        actual_wav = int(prompt_wav_emb.size(1)) if prompt_wav_emb is not None else 0
-        if stamped_wav != actual_wav:
-            raise ValueError(
-                f"Voice preset '{voice_name}': the input processor reserved {stamped_wav} "
-                f"prompt-wav slots but the registered preset has {actual_wav} frames"
-            )
-
-        stamped_spk = additional_info.get("native_talker_spk_emb_count")
-        if stamped_spk is None:
-            return
-        actual_spk = len(spk_emb) if isinstance(spk_emb, list) else (0 if spk_emb is None else 1)
-        if int(stamped_spk) != actual_spk:
-            raise ValueError(
-                f"Voice preset '{voice_name}': the input processor reserved {int(stamped_spk)} "
-                f"speaker-embedding slots but the registered preset has {actual_spk}"
-            )
 
     def _input_embedder(self):
         if hasattr(self.model, "get_input_embeddings"):
@@ -1200,15 +1115,7 @@ def _strip_model_prefix(weights: Iterable[tuple[str, torch.Tensor]]) -> Iterable
 
 def _replace_hf_config(vllm_config: VllmConfig, hf_config: Any) -> VllmConfig:
     """Return a vLLM config whose model_config points at the talker Qwen2 config."""
-    with_hf_config = getattr(vllm_config, "with_hf_config", None)
-    if callable(with_hf_config):
-        cloned = with_hf_config(hf_config)
-    else:
-        cloned = copy.copy(vllm_config)
-        model_config = copy.copy(vllm_config.model_config)
-        model_config.hf_config = hf_config
-        cloned.model_config = model_config
-
+    cloned = vllm_config.with_hf_config(hf_config)
     model_config = getattr(cloned, "model_config", None)
     if hasattr(model_config, "hf_text_config"):
         model_config.hf_text_config = hf_config
@@ -1269,23 +1176,14 @@ def _randn_for_state(
 
 
 def _stop_decision_mask(stop_out: torch.Tensor) -> torch.Tensor:
-    if stop_out.shape[-1] < 2:
-        raise ValueError(f"stop_out last dimension must be at least 2, got shape={tuple(stop_out.shape)}")
+    """Per-row stop decision: the stop column (1) beats the continue column (0).
 
-    rows = stop_out.reshape(-1, stop_out.shape[-1])[:, :2]
-    sums = rows.sum(dim=-1)
-    prob_like = (
-        (rows >= 0).all(dim=-1)
-        & (rows <= 1).all(dim=-1)
-        & torch.isclose(
-            sums,
-            torch.ones_like(sums),
-            atol=1e-3,
-        )
-    )
-    prob_stop = rows[:, 1] > 0.5
-    logit_stop = rows[:, 1] > rows[:, 0]
-    return torch.where(prob_like, prob_stop, logit_stop)
+    ``stop_out`` is the softmaxed stop-head output; comparing the two columns
+    is equivalent to thresholding the stop probability at 0.5 and also handles
+    raw logits, so no probability-vs-logits detection is needed.
+    """
+    rows = stop_out.reshape(-1, stop_out.shape[-1])
+    return rows[:, 1] > rows[:, 0]
 
 
 def _optional_int(value: Any) -> int | None:

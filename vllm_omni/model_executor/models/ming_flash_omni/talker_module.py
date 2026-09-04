@@ -21,7 +21,6 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 import os
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -468,32 +467,6 @@ def ming_prompt_wav_len(
     return -(-int(num_samples) // samples_per_frame)  # ceil division
 
 
-def resolve_ming_talker_config(root_config: Any, talker_dir: str, model_path: str) -> Any | None:
-    """Resolve ``MingFlashOmniTalkerConfig``, or ``None`` when nothing loads.
-
-    Shared by the talker's own init and the prompt-wav geometry derivation so
-    the two probe the same locations in the same order. ``root_config`` is the
-    in-memory config to prefer when it already wraps a talker config; pass
-    ``None`` from callers that only have a model path.
-    """
-    from vllm_omni.transformers_utils.configs.ming_flash_omni import MingFlashOmniTalkerConfig
-
-    wrapped = getattr(root_config, "talker_config", None)
-    if isinstance(wrapped, MingFlashOmniTalkerConfig):
-        return wrapped
-
-    if os.path.isdir(talker_dir):
-        try:
-            return MingFlashOmniTalkerConfig.from_pretrained(talker_dir)
-        except Exception:
-            pass
-    try:
-        return MingFlashOmniTalkerConfig.from_pretrained(model_path, subfolder="talker", trust_remote_code=True)
-    except Exception as e:
-        logger.info("Could not resolve talker config from %s or %s/talker: %s", talker_dir, model_path, e)
-        return None
-
-
 def resolve_audio_vae_config(
     audio_vae_path: str | None, talker_dir: str, model_path: str
 ) -> tuple[AudioVAEConfig, str | tuple[str, str]] | None:
@@ -525,8 +498,9 @@ def resolve_audio_vae_config(
 
 
 class MingAudioGenerator:
-    """Generator driving prefill -> AR decode -> VAE decode
-    for a single TTS request. The generator is stateless across requests.
+    """Audio-side helpers for the scheduler-driven talker: per-step CFM
+    sampling, the duration cap, and VAE waveform decode. The AR loop itself
+    is owned by the vLLM scheduler; this class is stateless across requests.
     """
 
     def __init__(
