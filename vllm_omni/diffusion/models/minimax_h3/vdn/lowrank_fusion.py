@@ -1,27 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Fusing a low-rank adapter into the MiniMax-H3 checkpoint stream.
+"""Fusing VDN's low-rank adapters into the MiniMax-H3 checkpoint stream.
 
-Two releases need exactly the same arithmetic here and disagree only about
-which files carry it: FastVideo's FastH3 four-step student (``fasth3.py``) and
-OpenVDN's VDN-H3 hybrid-attention checkpoint (``vdn/weight_fusion.py``). Both
-are written in the diffusers namespace (``transformer_blocks.0.attn.to_q``)
-while vLLM-Omni loads H3's native one (``blocks.0.attn.qkv_proj``), whose
-attention and MLP projections are fused, so both have to place a delta into a
-grouped QKV matrix and swap the halves of a fused gate/up matrix rather than
-adding it as it comes.
+The VDN release is written in the diffusers namespace
+(``transformer_blocks.0.attn.to_q``) while vLLM-Omni loads H3's native one
+(``blocks.0.attn.qkv_proj``), whose attention and MLP projections are fused. So
+a delta cannot be added as it comes: it has to be placed into a grouped QKV
+matrix, or have the halves of a fused gate/up matrix swapped, depending on
+which parameter it lands in.
 
 That placement is the part that is easy to get wrong and impossible to notice
 afterwards - a transposed or mis-slotted delta still loads, still generates, and
-is simply not the model the release describes - so it lives here once. Every
-mapping below was verified tensor by tensor against the released FastH3 full
-checkpoint (see ``fasth3.py``); VDN reuses the same targets through its own
-``.attn.orig.`` rerooting.
+is simply not the model the release describes - so the layout knowledge is
+collected here, apart from the key translation that reads VDN's own files.
 
-A release-specific front end reads its own files, decides whether it claims
-them, and hands this module ``{native parameter: ParamPatch}``; the fusion then
-rebuilds each delta on the accelerator as the checkpoint streams past.
+``fasth3.py`` solves the same problem for a different release and arrives at the
+same targets independently. The duplication is deliberate: the two front ends
+share no files and no release identity, and a change made for one of them must
+not silently reach the other's already-validated fusion.
+
+``weight_fusion.py`` reads VDN's files, decides whether it claims them, and
+hands this module ``{native parameter: ParamPatch}``; the fusion then rebuilds
+each delta on the accelerator as the checkpoint streams past.
 """
 
 from __future__ import annotations

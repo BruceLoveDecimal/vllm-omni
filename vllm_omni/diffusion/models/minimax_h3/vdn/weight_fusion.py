@@ -16,8 +16,8 @@ VDN's own inference does (``merge_lora_state`` runs once per adapter over the
 same weights), and it is what "merge" means for LoRA: the composition happens in
 the activations, not in the factors.
 
-The diffusers-to-native placement is shared with FastH3 (``lowrank_fusion.py``);
-what is VDN's alone and lives here is the ``.attn.orig.`` rerooting its wrapper
+The diffusers-to-native placement lives next door in ``lowrank_fusion.py``;
+what this module adds is the ``.attn.orig.`` rerooting its wrapper
 introduced, the per-adapter ``lora_A.<name>.`` infix, and the branch's own key
 translation.
 """
@@ -31,14 +31,14 @@ import torch
 from safetensors import safe_open
 from vllm.logger import init_logger
 
-from ..lowrank_fusion import (
+from .checkpoint import VdnAdapter, VdnCheckpoint, VdnCheckpointError
+from .lowrank_fusion import (
     QKV_SLOTS,
     LowRankWeightFusion,
     ParamPatch,
     check_block_coverage,
     resolve_native_target,
 )
-from .checkpoint import VdnAdapter, VdnCheckpoint, VdnCheckpointError
 
 logger = init_logger(__name__)
 
