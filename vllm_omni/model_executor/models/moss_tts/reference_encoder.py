@@ -358,3 +358,84 @@ class MossReferenceEncoder:
             task.cancel()
         self._inflight.clear()
         await self._batcher.aclose()
+
+
+def build_reference_encoder(
+    processor: Any,
+    *,
+    variant: str,
+    speaker_cache: Any,
+) -> MossReferenceEncoder:
+    """Build the per-server encoder for a MOSS-TTS ``variant``.
+
+    Derives the encode geometry (``n_vq`` and the working sample rate) from the
+    upstream processor's ``model_config`` so the variant knowledge stays in the
+    model package rather than in ``serving_speech.py``.
+    """
+    n_vq = int(getattr(processor.model_config, "n_vq", 32))
+    # Local-v1.5 encodes reference audio at a fixed 24 kHz working rate
+    # regardless of its 48 kHz stereo *output* codec -- mirrors the offline
+    # example's hardcoded encode_audios_from_wav(sampling_rate=24000) for this
+    # variant; proc.model_config.sampling_rate there is the output rate
+    # (48000), the wrong value to resample the reference into.
+    sr_target = 24000 if variant == "local" else int(getattr(processor.model_config, "sampling_rate", 24000))
+    return MossReferenceEncoder(
+        processor,
+        variant=variant,
+        n_vq=n_vq,
+        sr_target=sr_target,
+        speaker_cache=speaker_cache,
+    )
+
+
+async def encode_request_references(
+    encoder: MossReferenceEncoder,
+    ref_audio: str,
+    ref_audio_2: str | None = None,
+    *,
+    resolve_ref_audio: Callable[[str], Awaitable[tuple[list, int, str]]],
+    get_artifact_key: Callable[[str], str | None],
+    voice_name: str | None = None,
+    voice_created_at: int = 0,
+) -> tuple[list[torch.Tensor], dict[int, str]]:
+    """Encode a request's reference clip(s) into MOSS RVQ code tensors.
+
+    ``ref_audio_2`` is the TTSD second speaker; pass ``None`` for the
+    single-speaker variants. The named-voice cache key is
+    ``(voice_name, created_at)`` and ignores the clip content, so only slot 0
+    (the reference that actually belongs to the uploaded voice) may use it —
+    speaker 2 is a different clip and stays content-addressed, or it would
+    silently reuse speaker 1's codes.
+
+    Returns ``(codes_per_speaker, resolve_keys)`` where ``resolve_keys`` maps
+    the reference slot (0 = ``ref_audio``, 1 = ``ref_audio_2``) to its
+    content-aware resolve key, for salting the KV prefix cache. A dict rather
+    than an append list because the two-speaker encodes run concurrently, so
+    completion order is not slot order.
+    """
+    resolve_keys: dict[int, str] = {}
+
+    async def encode_one(ref_str: str, *, named_voice: bool, slot: int) -> torch.Tensor:
+        codes, resolve_key = await encoder.encode(
+            ref_str,
+            resolve_ref_audio=resolve_ref_audio,
+            get_artifact_key=get_artifact_key,
+            voice_name=voice_name if named_voice else None,
+            voice_created_at=voice_created_at if named_voice else 0,
+        )
+        if resolve_key is not None:
+            resolve_keys[slot] = resolve_key
+        return codes
+
+    if ref_audio_2:
+        # Encode both speakers concurrently so they land in the same batch
+        # window / share single-flight instead of serializing.
+        refs = list(
+            await asyncio.gather(
+                encode_one(ref_audio, named_voice=True, slot=0),
+                encode_one(ref_audio_2, named_voice=False, slot=1),
+            )
+        )
+    else:
+        refs = [await encode_one(ref_audio, named_voice=True, slot=0)]
+    return refs, resolve_keys

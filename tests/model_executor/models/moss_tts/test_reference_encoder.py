@@ -13,6 +13,8 @@ import torch
 from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
     MossReferenceEncoder,
     _RefEncodeBatcher,
+    build_reference_encoder,
+    encode_request_references,
 )
 from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
@@ -449,3 +451,86 @@ async def test_model_type_namespaces_cache(make_encoder):
 
     assert proc.total_items == 2  # distinct model_type keys -> no cross-hit
     assert cache.stats()["entries"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Group E — serving-layer entry points moved into the model package            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected_sr"),
+    [
+        # Local-v1.5 encodes references at a fixed 24 kHz working rate even
+        # though its output codec is 48 kHz stereo.
+        ("local", 24000),
+        ("tts", 48000),
+        ("ttsd", 48000),
+    ],
+)
+def test_build_reference_encoder_derives_geometry(variant, expected_sr):
+    proc = _FakeProcessor(n_vq=24, sampling_rate=48000)
+    enc = build_reference_encoder(
+        proc,
+        variant=variant,
+        speaker_cache=SpeakerEmbeddingCache(max_bytes=8 * 1024**2),
+    )
+    assert enc._n_vq == 24
+    assert enc._sr_target == expected_sr
+
+
+def test_build_reference_encoder_falls_back_without_model_config_fields():
+    proc = _FakeProcessor()
+    proc.model_config = type("_Empty", (), {})()
+    enc = build_reference_encoder(
+        proc,
+        variant="tts",
+        speaker_cache=SpeakerEmbeddingCache(max_bytes=8 * 1024**2),
+    )
+    assert enc._n_vq == 32
+    assert enc._sr_target == 24000
+
+
+async def test_encode_request_references_single_speaker(make_encoder):
+    proc, audio = _FakeProcessor(), _FakeAudio()
+    audio.register("a", 1)
+    enc = make_encoder(proc)
+
+    refs, resolve_keys = await encode_request_references(
+        enc,
+        "a",
+        None,
+        resolve_ref_audio=audio.resolve,
+        get_artifact_key=audio.artifact_key,
+    )
+
+    assert len(refs) == 1
+    assert set(resolve_keys) == {0}
+
+
+async def test_encode_request_references_keys_second_speaker_by_slot(make_encoder):
+    """Two-speaker resolve keys must land in slot order, not completion order,
+    and speaker 2 must stay content-addressed even under a named voice."""
+    proc, audio = _FakeProcessor(), _FakeAudio()
+    audio.register("a", 1)
+    audio.register("b", 2)
+    enc = make_encoder(proc, variant="ttsd", window_ms=100.0)
+
+    refs, resolve_keys = await encode_request_references(
+        enc,
+        "a",
+        "b",
+        resolve_ref_audio=audio.resolve,
+        get_artifact_key=audio.artifact_key,
+        voice_name="alice",
+        voice_created_at=7,
+    )
+
+    assert len(refs) == 2
+    assert resolve_keys[0] == "rk:a"
+    assert resolve_keys[1] == "rk:b"
+    # Both speakers encoded; speaker 2 did not reuse the named-voice entry.
+    assert not torch.equal(refs[0], refs[1])
+    assert proc.total_items == 2
+    # Concurrent, so both clips shared one batch window.
+    assert proc.attempt_sizes == [2]
