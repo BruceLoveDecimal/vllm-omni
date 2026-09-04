@@ -14,6 +14,12 @@ changes - the projections, their names, their quantization prefixes and their
 tensor-parallel split are the block's own - which is why this is a submodule of
 ``MiniMaxH3Attention`` rather than an attention backend or a second model.
 
+The seam with the transformer is one attribute: ``MiniMaxH3Attention.hybrid``.
+When set, the layer's forward hands itself over (``hybrid(attn, x, ...)``) and
+this module runs the projections through ``attn``'s own modules, the way VDN's
+reference wraps the original attention as ``attn.orig``. The layer's dense
+forward is otherwise untouched.
+
 Under Ulysses this module runs its own two all-to-alls rather than the shared
 sequence-parallel strategy. It has to: the window needs whole frames and the
 branch is a recurrence over all of them, so a rank holding a slice of the rows
@@ -33,6 +39,7 @@ from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 
 from .config import MiniMaxH3HybridAttentionConfig, MiniMaxH3HybridGeometry
 from .linear_branch import MiniMaxH3LinearBranch, _shard_param_across_tp
@@ -135,6 +142,27 @@ class MiniMaxH3HybridAttention(nn.Module):
         )
         self._plans: dict[tuple, WindowPlan] = {}
 
+    @classmethod
+    def for_attention(
+        cls,
+        attn: nn.Module,
+        config: MiniMaxH3HybridAttentionConfig,
+        *,
+        ulysses_degree: int = 1,
+        prefix: str = "",
+    ) -> MiniMaxH3HybridAttention:
+        """Build the hybrid for one ``MiniMaxH3Attention``, sized off its projections."""
+        return cls(
+            config,
+            hidden_size=attn.qkv_proj.input_size,
+            total_num_heads=attn.total_num_heads,
+            num_heads=attn.num_heads,
+            head_dim=attn.head_dim,
+            ulysses_degree=ulysses_degree,
+            quant_config=attn.qkv_proj.quant_config,
+            prefix=prefix,
+        )
+
     # -- geometry -------------------------------------------------------------
 
     def plan(self, geometry: MiniMaxH3HybridGeometry, device: torch.device) -> WindowPlan:
@@ -167,6 +195,67 @@ class MiniMaxH3HybridAttention(nn.Module):
     @torch.compiler.disable
     def forward(
         self,
+        attn: nn.Module,
+        x: torch.Tensor,
+        *,
+        rope_table: torch.Tensor | None,
+        video_layout: VideoTokenLayout | None,
+        packed_total: int | None,
+    ) -> torch.Tensor | None:
+        """Run ``attn``'s layer as a hybrid, or decline.
+
+        ``attn`` is the ``MiniMaxH3Attention`` this module hangs off; its QKV
+        projection, QK norms and output projection are used as they are, so the
+        softmax branch keeps the dense model's parameters, prefixes and
+        tensor-parallel split. ``x`` is the residual stream this rank owns.
+
+        Returns ``None`` for a clip short enough that every frame sees every
+        chunk: the window is then full attention, the branch would double count,
+        and the layer runs its ordinary dense path instead. Decided before any
+        projection so the decline costs nothing.
+        """
+        total = x.shape[0]
+        geometry = MiniMaxH3HybridGeometry.from_video_layout(
+            video_layout, packed_total=packed_total if packed_total is not None else total
+        )
+        if self.config.covers_all_frames(geometry.num_frames):
+            return None
+
+        # The same prologue as the dense forward, run here so the linear branch
+        # can read the projections BEFORE QK-norm and RoPE; both the fused
+        # kernel and the eager norms return fresh tensors, so the raw views
+        # cost nothing to keep.
+        qkv, _ = attn.qkv_proj(x)
+        q_size = attn.num_heads * attn.head_dim
+        kv_size = attn.num_kv_heads * attn.head_dim
+        query_raw, key_raw, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        query_raw = query_raw.view(total, attn.num_heads, attn.head_dim)
+        key_raw = key_raw.view(total, attn.num_kv_heads, attn.head_dim)
+        value = value.view(total, attn.num_kv_heads, attn.head_dim)
+        if rope_table is None:
+            query, key = attn.q_norm(query_raw), attn.k_norm(key_raw)
+        else:
+            query, key = fused_qk_norm_rope(
+                query_raw,
+                key_raw,
+                attn.q_norm.weight,
+                attn.k_norm.weight,
+                rope_table,
+                attn.q_norm.variance_epsilon,
+            )
+        return self.run_branches(
+            x=x,
+            query=query,
+            key=key,
+            value=value,
+            query_raw=query_raw,
+            key_raw=key_raw,
+            geometry=geometry,
+            out_proj=attn.out_proj,
+        )
+
+    def run_branches(
+        self,
         *,
         x: torch.Tensor,
         query: torch.Tensor,
@@ -174,24 +263,14 @@ class MiniMaxH3HybridAttention(nn.Module):
         value: torch.Tensor,
         query_raw: torch.Tensor,
         key_raw: torch.Tensor,
-        video_layout: VideoTokenLayout | None,
-        packed_total: int,
+        geometry: MiniMaxH3HybridGeometry,
         out_proj: nn.Module,
-    ) -> torch.Tensor | None:
-        """Run both branches and return the block's attention output.
+    ) -> torch.Tensor:
+        """Run both branches on projected tensors and return the layer output.
 
-        ``x`` is the residual stream this rank owns; ``query``/``key`` are
-        QK-normed and RoPE'd, ``query_raw``/``key_raw`` are not. ``out_proj`` is
-        the block's own output projection, applied here so the softmax branch
-        keeps the dense model's parameter, prefix and tensor-parallel split.
-
-        Returns ``None`` for a clip short enough that every frame sees every
-        chunk: the window is then full attention, the branch would double count,
-        and the caller runs the block's ordinary dense path instead.
+        ``query``/``key`` are QK-normed and RoPE'd, ``query_raw``/``key_raw``
+        are not; ``out_proj`` is the layer's own output projection.
         """
-        geometry = MiniMaxH3HybridGeometry.from_video_layout(video_layout, packed_total=packed_total)
-        if self.config.covers_all_frames(geometry.num_frames):
-            return None
         shard = self._sequence_shard(x.shape[0], geometry)
         plan = self.plan(geometry, x.device)
         bounds = list(plan.bounds)

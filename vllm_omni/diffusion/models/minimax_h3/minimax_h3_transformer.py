@@ -392,8 +392,6 @@ class MiniMaxH3Attention(nn.Module):
         role: str = "self",
         role_category: str | None = None,
         skip_sequence_parallel: bool = False,
-        hybrid_config: MiniMaxH3HybridAttentionConfig | None = None,
-        ulysses_degree: int = 1,
     ) -> None:
         super().__init__()
         self.total_num_heads = arch.num_attention_heads
@@ -433,6 +431,10 @@ class MiniMaxH3Attention(nn.Module):
         self._gate_hidden_size = arch.hidden_size
         self._gate_quant_config = quant_config
         self._gate_prefix = f"{prefix}.to_gate_compress"
+        # VDN's hybrid attention, attached by ``MiniMaxH3DiTModel.
+        # enable_hybrid_attention`` when a checkpoint asks for one. It reuses
+        # this layer's projections and norms; ``None`` is the dense H3.
+        self.hybrid: nn.Module | None = None
         self.attention = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -446,25 +448,6 @@ class MiniMaxH3Attention(nn.Module):
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
         )
-        # VDN's hybrid branch, when a checkpoint asked for one. ``None`` is the
-        # dense H3 this class has always been, down to the parameter set: the
-        # branch adds submodules rather than changing any of the above.
-        self.hybrid: nn.Module | None = None
-        if hybrid_config is not None:
-            # Imported here rather than at module scope: a server without a
-            # hybrid checkpoint never loads any of it.
-            from .vdn.hybrid import MiniMaxH3HybridAttention
-
-            self.hybrid = MiniMaxH3HybridAttention(
-                hybrid_config,
-                hidden_size=arch.hidden_size,
-                total_num_heads=self.total_num_heads,
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
-                ulysses_degree=ulysses_degree,
-                quant_config=quant_config,
-                prefix=f"{prefix}.hybrid",
-            )
 
     def enable_vsa_gate(self) -> None:
         """Build the VSA compression gate this attention would otherwise lack.
@@ -635,6 +618,13 @@ class MiniMaxH3Attention(nn.Module):
         so cu_seqlens retains global packed-document semantics. The inverse
         all-to-all restores the row shard before the output projection.
         """
+        if self.hybrid is not None:
+            # The hybrid runs this layer's projections itself and declines
+            # (returns None) for a clip its window covers entirely.
+            out = self.hybrid(self, x, rope_table=rope_table, video_layout=video_layout, packed_total=packed_total)
+            if out is not None:
+                return out
+
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
@@ -643,11 +633,6 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
-        # VDN's linear branch reads the projections BEFORE QK-norm and RoPE and
-        # applies its own NoPE post-processing. Both the fused kernel and the
-        # eager norms below return fresh tensors, so holding these references
-        # costs nothing until the branch actually uses them.
-        q_raw, k_raw = q, k
         if rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -660,26 +645,6 @@ class MiniMaxH3Attention(nn.Module):
                 rope_table,
                 self.q_norm.variance_epsilon,
             )
-
-        if self.hybrid is not None:
-            # The hybrid owns the whole tail of this forward: it gates and
-            # projects the window's output through the block's own out_proj and
-            # adds the branch's contribution to the video rows. It reads its
-            # geometry off the layout this layer already receives, and declines
-            # (returns None) for a clip its window covers entirely.
-            hybrid_out = self.hybrid(
-                x=x,
-                query=q,
-                key=k,
-                value=v,
-                query_raw=q_raw,
-                key_raw=k_raw,
-                video_layout=video_layout,
-                packed_total=packed_total if packed_total is not None else total,
-                out_proj=self.out_proj,
-            )
-            if hybrid_out is not None:
-                return hybrid_out
 
         # The gate is projected from the same local rows as Q. Pure Ulysses
         # reshards it alongside Q/K/V in UlyssesParallelAttention so each VSA
@@ -887,8 +852,6 @@ class MiniMaxH3DiTBlock(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
-        hybrid_config: MiniMaxH3HybridAttentionConfig | None = None,
-        ulysses_degree: int = 1,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
@@ -899,8 +862,6 @@ class MiniMaxH3DiTBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
-            hybrid_config=hybrid_config,
-            ulysses_degree=ulysses_degree,
         )
         self.mlp = MiniMaxH3MLP(
             arch,
@@ -1159,7 +1120,6 @@ class MiniMaxH3DiTModel(nn.Module):
         self,
         od_config: OmniDiffusionConfig,
         quant_config: QuantizationConfig | None = None,
-        hybrid_config: MiniMaxH3HybridAttentionConfig | None = None,
     ) -> None:
         super().__init__()
         tf_config = od_config.tf_model_config
@@ -1218,22 +1178,17 @@ class MiniMaxH3DiTModel(nn.Module):
             prefix="time_embedder",
         )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
-        # The token refiner is deliberately never hybrid: it attends over text
-        # only, where there is no frame axis to window and nothing outside it.
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
             quant_config,
             prefix="token_refiner",
         )
-        self.hybrid_config = hybrid_config
         self.blocks = nn.ModuleList(
             [
                 MiniMaxH3DiTBlock(
                     arch,
                     quant_config,
                     prefix=f"blocks.{i}",
-                    hybrid_config=hybrid_config,
-                    ulysses_degree=ulysses_degree,
                 )
                 for i in range(arch.num_layers)
             ]
@@ -1242,6 +1197,8 @@ class MiniMaxH3DiTModel(nn.Module):
         self.local_sp_prepare = MiniMaxH3SPPrepare()
         self.sp_gather = MiniMaxH3SPGather()
         self.vsa_gates_enabled = False
+        # Set by ``enable_hybrid_attention``; ``None`` is the dense H3.
+        self.hybrid_config: MiniMaxH3HybridAttentionConfig | None = None
         self.final_layer = MiniMaxH3FinalLayer(
             arch,
             quant_config,
@@ -1262,6 +1219,30 @@ class MiniMaxH3DiTModel(nn.Module):
         for block in self.blocks:
             block.attn.enable_vsa_gate()
         self.vsa_gates_enabled = True
+
+    def enable_hybrid_attention(self, config: MiniMaxH3HybridAttentionConfig) -> None:
+        """Give every DiT block's attention VDN's hybrid branch.
+
+        A VDN checkpoint assigns the branch's parameters rather than adding to
+        existing ones, so they have to exist before the weight stream reaches
+        them. The token refiner is left alone: it attends over text only, where
+        there is no frame axis to window and nothing outside the window.
+        """
+        if self.hybrid_config is not None:
+            return
+        # Imported here rather than at module scope: a server without a hybrid
+        # checkpoint never loads any of the vdn package.
+        from .vdn.hybrid import MiniMaxH3HybridAttention
+
+        ulysses_degree = int(self.parallel_config.ulysses_degree)
+        for index, block in enumerate(self.blocks):
+            block.attn.hybrid = MiniMaxH3HybridAttention.for_attention(
+                block.attn,
+                config,
+                ulysses_degree=ulysses_degree,
+                prefix=f"blocks.{index}.attn.hybrid",
+            )
+        self.hybrid_config = config
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():

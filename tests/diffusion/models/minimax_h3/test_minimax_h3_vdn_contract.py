@@ -254,17 +254,21 @@ def test_requests_do_not_share_a_forward_under_the_hybrid():
 
 
 def test_a_dense_server_never_imports_the_hybrid():
-    """``hybrid_config=None`` is the H3 this class has always been.
+    """A dense server builds the H3 this class has always been.
 
-    The import lives inside the constructor branch, so a server without a VDN
-    checkpoint loads none of the package - which is what makes the feature
-    something a checkpoint switches on rather than something every H3 carries.
+    The hybrid is switched on after construction by
+    ``MiniMaxH3DiTModel.enable_hybrid_attention``, the way the FastH3 VSA gates
+    are, so no constructor learned a new keyword and the import lives inside
+    that method: a server without a VDN checkpoint loads none of the package.
     """
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer
 
     source = inspect.getsource(minimax_h3_transformer)
-    signature = inspect.signature(minimax_h3_transformer.MiniMaxH3Attention.__init__)
-
-    assert signature.parameters["hybrid_config"].default is None
+    for cls in (
+        minimax_h3_transformer.MiniMaxH3Attention,
+        minimax_h3_transformer.MiniMaxH3DiTBlock,
+        minimax_h3_transformer.MiniMaxH3DiTModel,
+    ):
+        assert "hybrid_config" not in inspect.signature(cls.__init__).parameters
     module_level = source.split("class MiniMaxH3Rope")[0]
     assert "from .vdn.hybrid import" not in module_level

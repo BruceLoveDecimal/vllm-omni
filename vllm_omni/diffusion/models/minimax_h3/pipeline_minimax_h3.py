@@ -956,9 +956,7 @@ class MiniMaxH3Pipeline(
         from .vdn.serving import resolve_vdn_serving
 
         self._vdn = resolve_vdn_serving(od_config, release, model_path)
-        vdn_config = None
         if self._vdn is not None:
-            vdn_config = self._vdn.config
             self._vdn.check_serving_contract(
                 partition=self.partition,
                 od_config=od_config,
@@ -967,7 +965,6 @@ class MiniMaxH3Pipeline(
         self.transformer = MiniMaxH3DiTModel(
             od_config,
             quant_config=transformer_quant_config,
-            hybrid_config=vdn_config,
         )
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
@@ -975,6 +972,10 @@ class MiniMaxH3Pipeline(
                 quant_config=transformer_quant_config,
             )
         if self._vdn is not None:
+            # The branch's parameters have to exist before load_weights streams
+            # them in, the same way the FastH3 VSA gates below do. Only the
+            # T2VA DiT gets it; the Ref2VA DiT serves a task VDN never trained.
+            self.transformer.enable_hybrid_attention(self._vdn.config)
             self._vdn_fusion = self._vdn.build_fusion(
                 head_dim=self.transformer.arch.attention_head_dim,
                 num_blocks=self.transformer.arch.num_layers,
@@ -2569,7 +2570,7 @@ class MiniMaxH3Pipeline(
         cu_seqlens outright — either would silently attend across request
         boundaries.
         """
-        if getattr(transformer, "hybrid_config", None) is not None:
+        if transformer.hybrid_config is not None:
             # VDN's window and its frame recurrence are geometry over ONE packed
             # sequence: a co-batched second request would extend the row range
             # its window plan and its scans were built for. Requests still batch
@@ -2716,7 +2717,7 @@ class MiniMaxH3Pipeline(
                     "running %d requests one forward at a time.",
                     len(batch_states),
                 )
-            elif getattr(transformers[0], "hybrid_config", None) is not None:
+            elif transformers[0].hybrid_config is not None:
                 logger.warning_once(
                     "MiniMax H3 VDN hybrid attention is geometry over one packed sequence, so requests "
                     "cannot share a forward; running %d requests one forward at a time.",
