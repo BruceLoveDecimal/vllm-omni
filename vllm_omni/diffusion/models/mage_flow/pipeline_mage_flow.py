@@ -123,6 +123,15 @@ def get_mage_flow_pre_process_func(
     od_config: OmniDiffusionConfig,
 ):
     """Validate the shared T2I/Edit prompt contract before batching."""
+    try:
+        model_index = get_hf_file_to_dict(
+            "model_index.json",
+            od_config.model,
+            od_config.revision,
+        )
+    except Exception:
+        model_index = None
+    variant_defaults = get_mage_flow_variant_defaults(od_config.model, model_index=model_index)
 
     def pre_process_func(request: OmniDiffusionRequest):
         prompt = request.prompt
@@ -131,7 +140,20 @@ def get_mage_flow_pre_process_func(
         multi_modal_data = prompt.get("multi_modal_data", {})
         images = multi_modal_data.get("image")
         if images is not None:
-            normalize_mage_flow_reference_images(images)
+            if variant_defaults.supports_reference_images:
+                normalize_mage_flow_reference_images(images)
+            elif request.is_dummy_run():
+                # The engine's warmup request attaches a dummy image to every
+                # multimodal pipeline. A T2I checkpoint cannot consume one, so
+                # drop it and let warmup exercise the T2I path; that also keeps
+                # the Qwen3-VL vision tower out of T2I startup entirely.
+                multi_modal_data.pop("image")
+            else:
+                raise ValueError(
+                    f"Mage-Flow checkpoint {od_config.model} is text-to-image and does not accept "
+                    "reference images; serve an Edit checkpoint (e.g. microsoft/Mage-Flow-Edit) "
+                    "for image-editing requests"
+                )
         if not isinstance(prompt.get("prompt"), str):
             raise ValueError("Mage-Flow prompt must contain a string 'prompt'")
         return request
@@ -754,6 +776,15 @@ class MageFlowPipeline(
             reference_images = normalize_mage_flow_reference_images(images)
         if not prompt:
             raise ValueError("Mage-Flow prompt must not be empty")
+        if reference_images and not defaults.supports_reference_images:
+            # pre_process_func rejects these requests upstream; this guards the
+            # paths that reach the pipeline directly. A T2I transformer's
+            # reference tokens were never trained, so running Edit on one would
+            # silently produce unconditioned output.
+            raise ValueError(
+                "Mage-Flow reference images require an Edit checkpoint; "
+                f"{self.od_config.model} is a text-to-image variant"
+            )
 
         height = sampling.height if sampling.height is not None else self.default_sample_size
         width = sampling.width if sampling.width is not None else self.default_sample_size

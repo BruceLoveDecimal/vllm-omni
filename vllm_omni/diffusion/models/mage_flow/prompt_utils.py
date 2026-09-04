@@ -51,6 +51,9 @@ MAGE_FLOW_MAX_ASPECT_RATIO = 4.0
 class MageFlowVariantDefaults:
     num_inference_steps: int
     guidance_scale: float
+    # Only Edit checkpoints are trained to consume reference-image tokens; the
+    # T2I variants must never see them, even though both share the pipeline.
+    supports_reference_images: bool = False
 
 
 def get_mage_flow_variant_defaults(
@@ -77,11 +80,12 @@ def get_mage_flow_variant_defaults(
     parts = [part for part in identity.replace("\\", "/").lower().split("/") if part]
     named = [part for part in parts if "mage-flow" in part or "mage_flow" in part]
     identity = named[-1] if named else (parts[-1] if parts else "")
+    is_edit = "edit" in identity
     if "turbo" in identity:
-        return MageFlowVariantDefaults(4, 1.0)
-    if "mage-flow" in identity and "edit" not in identity and "base" not in identity:
+        return MageFlowVariantDefaults(4, 1.0, is_edit)
+    if "mage-flow" in identity and not is_edit and "base" not in identity:
         return MageFlowVariantDefaults(20, 5.0)
-    return MageFlowVariantDefaults(30, 5.0)
+    return MageFlowVariantDefaults(30, 5.0, is_edit)
 
 
 def validate_mage_flow_size(height: int, width: int) -> None:
