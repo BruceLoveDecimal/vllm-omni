@@ -394,3 +394,8 @@ class UnspecifiedOmniPlatform(OmniPlatform):
     @classmethod
     def get_device_count(cls) -> int:
         return 0
+
+    @classmethod
+    def synchronize(cls) -> None:
+        """CPU execution is already synchronous, so there is nothing to wait on."""
+        return None

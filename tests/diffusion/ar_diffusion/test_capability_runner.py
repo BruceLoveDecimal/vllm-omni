@@ -435,12 +435,16 @@ def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
         ctx.ensure_video_slots(torch.device("cpu"))
         return object()
 
-    def synchronize_boom(device):
+    def synchronize_boom():
         raise RuntimeError("asynchronous kernel failed")
 
     monkeypatch.setattr(DiffusionModelRunner, "execute_model", return_after_allocation)
-    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize_boom)
-    runner.device = torch.device("cuda")
+    # The runner defers the device barrier to the platform, so the failure is
+    # injected there rather than on a device-specific torch entry point.
+    monkeypatch.setattr(
+        "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform",
+        SimpleNamespace(synchronize=synchronize_boom),
+    )
     request = SimpleNamespace(
         request_id="broken-request",
         sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}),

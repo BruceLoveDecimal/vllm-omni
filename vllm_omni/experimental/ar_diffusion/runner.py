@@ -26,6 +26,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVCon
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -248,10 +249,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             return tick.session_id, extra_args, tick
         return str(extra_args.get("session_id") or "default"), extra_args, None
 
-    def _synchronize_device(self) -> None:
-        if self.device is not None and torch.device(self.device).type == "cuda":
-            torch.accelerator.synchronize(self.device)
-
     @contextmanager
     def _bound_ar_session(
         self,
@@ -274,7 +271,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             with capability.bind_ar_diffusion_state(session_id, state):
                 yield
             if synchronize:
-                self._synchronize_device()
+                current_omni_platform.synchronize()
         except Exception:
             self._release_session(
                 session_id,
@@ -386,7 +383,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # One entry per emitted AR block keeps ``_perf_e2e_times`` comparable
         # with request mode, where one execute_model() is one block.
         if result is not None or finished or errored:
-            self._synchronize_device()
+            current_omni_platform.synchronize()
             self._perf_e2e_times.append(time.perf_counter() - chunk_started)
             self._stepwise_chunk_started.pop(request_id, None)
         if finished or errored:

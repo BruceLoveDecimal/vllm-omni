@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 import torch
+from vllm.assets.image import ImageAsset
 
 from tests.helpers.mark import hardware_test
 
@@ -23,7 +24,11 @@ MODEL = os.environ.get(
     "VLLM_OMNI_LINGBOT_WORLD_V2_CHECKPOINT_PATH",
     "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
 )
-_IMAGE_PATH = os.environ.get("VLLM_OMNI_LINGBOT_WORLD_V2_IMAGE_PATH")
+# The pipeline resizes the first frame to the requested geometry, so any real
+# photograph conditions the rollout; the shared vLLM asset keeps the test
+# runnable with no environment setup and adds no binary to this repository.
+_IMAGE_ASSET = "2560px-Gfp-wisconsin-madison-the-nature-boardwalk"
+_IMAGE_PATH_OVERRIDE = os.environ.get("VLLM_OMNI_LINGBOT_WORLD_V2_IMAGE_PATH")
 
 _HEIGHT = 480
 _WIDTH = 832
@@ -42,11 +47,13 @@ _NUM_FRAMES = (_NUM_CHUNKS * _FRAMES_PER_BLOCK - 1) * _TEMPORAL_COMPRESSION + 1
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.diffusion,
-    pytest.mark.skipif(
-        _IMAGE_PATH is None,
-        reason="VLLM_OMNI_LINGBOT_WORLD_V2_IMAGE_PATH is required",
-    ),
 ]
+
+
+def _first_frame() -> Path:
+    if _IMAGE_PATH_OVERRIDE:
+        return Path(_IMAGE_PATH_OVERRIDE).expanduser().resolve()
+    return Path(ImageAsset(_IMAGE_ASSET).get_path("jpg"))
 
 
 def _chunk_metadata(output: Any) -> dict[str, Any]:
@@ -109,8 +116,7 @@ async def _stream_chunks(image: Path) -> list[tuple[torch.Tensor, dict[str, Any]
 def test_lingbot_world_v2_stepwise_streams_one_chunk_per_block() -> None:
     """Load the real checkpoint and stream N chunks from a single request."""
 
-    assert _IMAGE_PATH is not None
-    chunks = asyncio.run(_stream_chunks(Path(_IMAGE_PATH).expanduser().resolve()))
+    chunks = asyncio.run(_stream_chunks(_first_frame()))
 
     assert len(chunks) == _NUM_CHUNKS
     expected_shape = (
