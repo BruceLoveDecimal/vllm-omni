@@ -211,7 +211,7 @@ require stepwise for load-time graph capture.
 | `tests/diffusion/ar_diffusion/test_capability_runner.py` | LingBot-like pipeline with `supports_step_execution` may load with `step_execution=True`. Incapable AR pipelines still raise. Inherited entrypoint tests cover the new wrapper. |
 | `tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py` | Fake-transformer stepwise contract: four probes then one commit per chunk; N chunks; camera tail continuity; metadata; failure does not leave a bound state. |
 | `tests/e2e/offline_inference/test_lingbot_world_v2.py` | Keep the existing request-mode one-block smoke. Add a separate stepwise-vs-tick GPU case only if it can share the same runner fixture without mixing engine modes. Prefer a dedicated test module if engine flags conflict. |
-| `examples/offline_inference/diffusion/lingbot_world_v2_realtime.py` | Leave the tick loop. Add a sibling example that issues **one** `generate()` with `step_execution` / `streaming_output` and writes per-chunk latents. |
+| `examples/offline_inference/diffusion/lingbot_world_v2_realtime.py` | Leave the tick loop. Add a `--mode stepwise` switch that issues **one** `generate()` with `step_execution` / `streaming_output` and writes per-chunk latents. No new model-specific example file. |
 | `recipes/Robbyant/LingBot-World-2.0.md` | Document the stepwise offline entry. Do not claim HTTP serving. |
 | `docs/design/feature/realtime_ar_diffusion.md` | Note that stepwise request identity is an additional mode, not a replacement of the tick contract yet. |
 

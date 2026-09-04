@@ -76,7 +76,8 @@ three-frame action list per chunk). Live mid-request WASD and public
 WebSocket serving are not part of this path.
 
 ```bash
-python examples/offline_inference/diffusion/lingbot_world_v2_stepwise.py \
+python examples/offline_inference/diffusion/lingbot_world_v2_realtime.py \
+  --mode stepwise \
   --image /path/to/first_frame.png \
   --prompt "A road through a forest" \
   --events /path/to/events.jsonl \
@@ -143,6 +144,6 @@ tested commit.
 - Checkpoint: <https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast-diffusers>
 - Official implementation: <https://github.com/robbyant/lingbot-world-v2>
 - Offline example: [`examples/offline_inference/diffusion/lingbot_world_v2.py`](../../examples/offline_inference/diffusion/lingbot_world_v2.py)
-- Stepwise example: [`examples/offline_inference/diffusion/lingbot_world_v2_stepwise.py`](../../examples/offline_inference/diffusion/lingbot_world_v2_stepwise.py)
+- Stepwise example: the realtime example above with `--mode stepwise`
 - Realtime design: [`docs/design/feature/realtime_ar_diffusion.md`](../../docs/design/feature/realtime_ar_diffusion.md)
 - Stepwise design: [`docs/design/feature/lingbot_world_stepwise.md`](../../docs/design/feature/lingbot_world_stepwise.md)
