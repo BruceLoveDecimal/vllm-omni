@@ -24,7 +24,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery, SupportsStepExecution
@@ -46,6 +45,7 @@ from vllm_omni.diffusion.models.lingbot_world.camera import (
     load_camera_trajectory,
     resolve_trusted_action_directory,
 )
+from vllm_omni.diffusion.models.lingbot_world.dmd_block import ARBlockContext, LingBotDMDBlockRunner
 from vllm_omni.diffusion.models.lingbot_world.transformer import (
     CausalLingBotWorldTransformer3DModel,
     LingBotAttentionCache,
@@ -994,170 +994,38 @@ class LingBotWorldCausalDMDPipeline(
             )
         ]
 
-    def _ar_transformer_cache(
+    # ── DMD block helpers ─────────────────────────────────────────────────
+    #
+    # The DMD math for one AR block lives in ``LingBotDMDBlockRunner`` so that
+    # request mode (``_generate_block`` in a loop) and stepwise execution
+    # (``denoise_step`` / ``step_scheduler`` / ``post_decode``) share one copy.
+    # The pipeline's only jobs here are building the runner and translating
+    # the bound AR session into an ``ARBlockContext``.
+
+    @property
+    def _dmd_blocks(self) -> LingBotDMDBlockRunner:
+        runner = getattr(self, "_dmd_block_runner", None)
+        if runner is None:
+            runner = LingBotDMDBlockRunner(
+                self.transformer,
+                device=self.device,
+                enforce_eager=bool(self.od_config.enforce_eager),
+            )
+            self._dmd_block_runner = runner
+        return runner
+
+    def _ar_block_context(
         self,
-        *,
-        condition: torch.Tensor,
-        cross_attention: list[LingBotAttentionCache],
-        commit_current: bool,
-    ) -> LingBotTransformerCache:
+        cross_attention: list[LingBotAttentionCache] | None,
+    ) -> ARBlockContext | None:
+        """Wrap the bound session for the block runner; ``None`` keeps
+        request-local KV."""
+        if cross_attention is None:
+            return None
         state = self._ar_diffusion_kv_state
         if state is None:
             raise RuntimeError("LingBot AR cache requested without a bound state.")
-        patch_frames, patch_height, patch_width = self.transformer.config.patch_size
-        frames = condition.shape[2] // patch_frames
-        height = condition.shape[3] // patch_height
-        width = condition.shape[4] // patch_width
-        seq_len = frames * height * width
-        return LingBotTransformerCache(
-            self_attention=state.get_kv_caches(
-                self._AR_BRANCH,
-                seq_len=seq_len,
-                commit_current=commit_current,
-            ),
-            cross_attention=cross_attention,
-        )
-
-    # ── DMD block helpers ─────────────────────────────────────────────────
-    #
-    # These four are ``_generate_block()`` split into its parts, not new logic.
-    # ``forward()`` still drives them in a loop, while the stepwise methods call
-    # the same pieces one denoise step at a time, so both modes share one copy
-    # of the math instead of two that can drift apart. One AR block is four
-    # probes that must not touch KV, then one clean-x0 commit that does.
-
-    def _block_cache(
-        self,
-        *,
-        condition: torch.Tensor,
-        cache: LingBotTransformerCache | None,
-        ar_cross_attention: list[LingBotAttentionCache] | None,
-        commit_current: bool,
-    ) -> LingBotTransformerCache:
-        """Pick the cache one transformer call sees: paged when a session is
-        bound, else the caller's request-local cache."""
-        if ar_cross_attention is not None:
-            return self._ar_transformer_cache(
-                condition=condition,
-                cross_attention=ar_cross_attention,
-                commit_current=commit_current,
-            )
-        return cast(LingBotTransformerCache, cache)
-
-    def _dmd_probe_step(
-        self,
-        *,
-        current_latents: torch.Tensor,
-        condition: torch.Tensor,
-        camera: torch.Tensor,
-        prompt_embeds: torch.Tensor,
-        cache: LingBotTransformerCache | None,
-        ar_cross_attention: list[LingBotAttentionCache] | None,
-        start_frame: int,
-        timestep_value: float,
-        step_index: int,
-    ) -> torch.Tensor:
-        """Predict flow for one denoise step.
-
-        A probe never writes KV: only the clean x0 of a finished block may
-        enter the cache, which is ``_commit_block_kv``'s job.
-        """
-        if not self.od_config.enforce_eager:
-            torch.compiler.cudagraph_mark_step_begin()
-        set_forward_context_denoise_step_idx(step_index)
-        timestep = torch.full((1,), float(timestep_value), device=self.device, dtype=torch.float32)
-        # Checkpoint channel contract:
-        # [noise/x_t(16), temporal_mask(4), image_latent(16)] -> 36.
-        model_input = torch.cat((current_latents.to(dtype=condition.dtype), condition), dim=1)
-        flow_prediction = self.transformer(
-            hidden_states=model_input,
-            timestep=timestep,
-            encoder_hidden_states=prompt_embeds,
-            camera_hidden_states=camera,
-            cache=self._block_cache(
-                condition=condition,
-                cache=cache,
-                ar_cross_attention=ar_cross_attention,
-                commit_current=False,
-            ),
-            start_frame=start_frame,
-            update_cache=False,
-        )
-        if flow_prediction.shape != current_latents.shape:
-            raise RuntimeError(
-                "transformer flow prediction shape must match the 16-channel noise latent, "
-                f"got {tuple(flow_prediction.shape)} and {tuple(current_latents.shape)}."
-            )
-        return flow_prediction
-
-    def _apply_dmd_transition(
-        self,
-        current_latents: torch.Tensor,
-        flow_prediction: torch.Tensor,
-        sigma: float,
-        *,
-        next_sigma: float | None,
-        generator: torch.Generator,
-    ) -> torch.Tensor:
-        """Invert the flow to x0, then re-noise at ``next_sigma``.
-
-        ``next_sigma=None`` marks the final step, so where the caller sits in
-        its own loop stays out of this function.
-        """
-        # The checkpoint's flow parameterization is inverted by
-        # x0 = x_t - sigma * flow. Intermediate steps re-noise that x0
-        # estimate at the next sigma; the final step keeps x0 as this
-        # block's generated latent.
-        x0 = current_latents - sigma * flow_prediction.float()
-        if next_sigma is None:
-            return x0
-        noise = randn_tensor(
-            current_latents.shape,
-            generator=generator,
-            device=self.device,
-            dtype=torch.float32,
-        )
-        return (1.0 - next_sigma) * x0 + next_sigma * noise
-
-    def _commit_block_kv(
-        self,
-        *,
-        latents: torch.Tensor,
-        condition: torch.Tensor,
-        camera: torch.Tensor,
-        prompt_embeds: torch.Tensor,
-        cache: LingBotTransformerCache | None,
-        ar_cross_attention: list[LingBotAttentionCache] | None,
-        start_frame: int,
-    ) -> None:
-        """Write the finished block's clean x0 into KV and commit its pages.
-
-        The fifth transformer call of a block, deliberately not a denoise step:
-        on the stepwise path it belongs to ``post_decode()``.
-        """
-        # Commit K/V only for the final clean block, never for noisy probes.
-        cache_input = torch.cat((latents.to(dtype=condition.dtype), condition), dim=1)
-        if not self.od_config.enforce_eager:
-            torch.compiler.cudagraph_mark_step_begin()
-        self.transformer(
-            hidden_states=cache_input,
-            timestep=torch.zeros(1, device=self.device, dtype=torch.float32),
-            encoder_hidden_states=prompt_embeds,
-            camera_hidden_states=camera,
-            cache=self._block_cache(
-                condition=condition,
-                cache=cache,
-                ar_cross_attention=ar_cross_attention,
-                commit_current=True,
-            ),
-            start_frame=start_frame,
-            update_cache=True,
-        )
-        if ar_cross_attention is not None:
-            state = self._ar_diffusion_kv_state
-            if state is None:
-                raise RuntimeError("LingBot AR state disappeared before KV commit.")
-            state.commit_paged_context(self._AR_BRANCH)
+        return ARBlockContext(state=state, cross_attention=cross_attention, branch=self._AR_BRANCH)
 
     def _generate_block(
         self,
@@ -1172,50 +1040,17 @@ class LingBotWorldCausalDMDPipeline(
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
     ) -> torch.Tensor:
-        block_shape = (
-            1,
-            self.transformer.config.out_channels,
-            condition.shape[2],
-            condition.shape[3],
-            condition.shape[4],
-        )
-        current_latents = randn_tensor(
-            block_shape,
-            generator=generator,
-            device=self.device,
-            dtype=torch.float32,
-        )
-        for step_index, (timestep_value, sigma) in enumerate(schedule):
-            flow_prediction = self._dmd_probe_step(
-                current_latents=current_latents,
-                condition=condition,
-                camera=camera,
-                prompt_embeds=prompt_embeds,
-                cache=cache,
-                ar_cross_attention=ar_cross_attention,
-                start_frame=start_frame,
-                timestep_value=timestep_value,
-                step_index=step_index,
-            )
-            next_sigma = schedule[step_index + 1][1] if step_index + 1 < len(schedule) else None
-            current_latents = self._apply_dmd_transition(
-                current_latents,
-                flow_prediction,
-                sigma,
-                next_sigma=next_sigma,
-                generator=generator,
-            )
-            progress_bar.update()
-        self._commit_block_kv(
-            latents=current_latents,
+        return self._dmd_blocks.generate_block(
             condition=condition,
             camera=camera,
             prompt_embeds=prompt_embeds,
             cache=cache,
-            ar_cross_attention=ar_cross_attention,
+            ar=self._ar_block_context(ar_cross_attention),
             start_frame=start_frame,
+            schedule=schedule,
+            generator=generator,
+            progress_bar=progress_bar,
         )
-        return current_latents
 
     def encode_prompt(
         self,
@@ -1664,13 +1499,13 @@ class LingBotWorldCausalDMDPipeline(
             raise RuntimeError("LingBot step execution requires a current timestep before denoise_step.")
         schedule = extra["schedule"]
         step_in_chunk = state.step_in_chunk
-        return self._dmd_probe_step(
+        return self._dmd_blocks.probe_step(
             current_latents=latents,
             condition=extra["condition"],
             camera=extra["camera"],
             prompt_embeds=cast(torch.Tensor, state.prompt_embeds),
             cache=None,
-            ar_cross_attention=extra["ar_cross_attention"],
+            ar=self._ar_block_context(extra["ar_cross_attention"]),
             start_frame=int(extra["start_frame"]),
             timestep_value=float(schedule[step_in_chunk][0]),
             step_index=step_in_chunk,
@@ -1688,7 +1523,7 @@ class LingBotWorldCausalDMDPipeline(
         schedule = extra["schedule"]
         step_in_chunk = state.step_in_chunk
         next_sigma = schedule[step_in_chunk + 1][1] if step_in_chunk + 1 < len(schedule) else None
-        state.latents = self._apply_dmd_transition(
+        state.latents = self._dmd_blocks.apply_transition(
             latents,
             noise_pred,
             schedule[step_in_chunk][1],
@@ -1705,13 +1540,13 @@ class LingBotWorldCausalDMDPipeline(
         latents = state.latents
         if latents is None:
             raise RuntimeError("LingBot step execution requires latents before post_decode.")
-        self._commit_block_kv(
+        self._dmd_blocks.commit_block_kv(
             latents=latents,
             condition=extra["condition"],
             camera=extra["camera"],
             prompt_embeds=cast(torch.Tensor, state.prompt_embeds),
             cache=None,
-            ar_cross_attention=extra["ar_cross_attention"],
+            ar=self._ar_block_context(extra["ar_cross_attention"]),
             start_frame=int(extra["start_frame"]),
         )
         completed_chunk_index = state.chunk_index

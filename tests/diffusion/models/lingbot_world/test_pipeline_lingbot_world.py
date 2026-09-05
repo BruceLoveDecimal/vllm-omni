@@ -15,6 +15,7 @@ from diffusers.utils.torch_utils import randn_tensor as _diffusers_randn_tensor
 from PIL import Image
 from torch import nn
 
+import vllm_omni.diffusion.models.lingbot_world.dmd_block as lingbot_dmd_block
 import vllm_omni.diffusion.models.lingbot_world.pipeline as lingbot_pipeline
 from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
 from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
@@ -349,7 +350,6 @@ def _stub_pipeline_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         "FlowUniPCMultistepScheduler": _FakeScheduler,
         "CausalLingBotWorldTransformer3DModel": _FakeTransformerFactory,
         "get_local_device": lambda: torch.device("cpu"),
-        "set_forward_context_denoise_step_idx": lambda index: None,
         "prefetch_subfolders": prefetch_subfolders,
         "from_pretrained_with_prefetch": from_pretrained_with_prefetch,
         "load_transformer_config": load_transformer_config,
@@ -362,6 +362,9 @@ def _stub_pipeline_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     }
     for name, value in replacements.items():
         monkeypatch.setattr(lingbot_pipeline, name, value)
+    # The DMD block math lives in its own module; stub the symbols it imports.
+    monkeypatch.setattr(lingbot_dmd_block, "set_forward_context_denoise_step_idx", lambda index: None)
+    monkeypatch.setattr(lingbot_dmd_block, "randn_tensor", _diffusers_randn_tensor)
     monkeypatch.setattr(lingbot_pipeline, "_loader_state", loader_state, raising=False)
 
 
@@ -778,6 +781,7 @@ def test_denoise_state_stays_fp32_while_transformer_inputs_use_model_dtype() -> 
         return torch.zeros(shape, device=device, dtype=dtype)
 
     module.randn_tensor = randn
+    lingbot_dmd_block.randn_tensor = randn
     result = pipeline(_request())
 
     assert requested_noise_dtypes == [torch.float32] * 4
@@ -1143,7 +1147,7 @@ def test_first_frame_condition_and_camera_fold_match_transformer_contract() -> N
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
-    module.randn_tensor = lambda shape, **kwargs: torch.full(
+    module.randn_tensor = lingbot_dmd_block.randn_tensor = lambda shape, **kwargs: torch.full(
         shape,
         -99.0,
         device=kwargs["device"],
