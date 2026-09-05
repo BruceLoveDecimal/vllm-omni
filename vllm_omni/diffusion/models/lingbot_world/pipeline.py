@@ -1522,6 +1522,7 @@ class LingBotWorldCausalDMDPipeline(
             dtype=dtype,
         )
         camera_trajectory_cache = None
+        camera_embedding_cache = None
         if inputs.camera_trajectory is not None:
             available_frames = int(inputs.camera_trajectory.poses.shape[0])
             if available_frames < inputs.num_frames:
@@ -1534,6 +1535,12 @@ class LingBotWorldCausalDMDPipeline(
                 intrinsics=inputs.camera_trajectory.intrinsics[: inputs.num_frames],
             )
             camera_trajectory_cache = interpolate_camera_trajectory(truncated, inputs.num_latent_frames)
+            # Embed the whole trajectory once, exactly as request mode does, and
+            # slice it per block in ``_prepare_next_chunk``. Embedding each chunk
+            # on its own would normalize that block's framewise translations by
+            # its own largest step, so a slow block would be conditioned as
+            # full-speed motion and drift from offline replay of the same path.
+            camera_embedding_cache, _ = self._prepare_camera(inputs, dtype=dtype)
         state.prompt_embeds = prompt_embeds
         state.chunk_index = 0
         state.step_index = 0
@@ -1550,6 +1557,7 @@ class LingBotWorldCausalDMDPipeline(
             "camera_tail": None,
             "camera_action_script": inputs.camera_action_script,
             "camera_trajectory_cache": camera_trajectory_cache,
+            "camera_embedding_cache": camera_embedding_cache,
         }
         self._ar_text_caches(prompt_embeds, invalidate=False)
         self._prepare_next_chunk(state)
@@ -1588,23 +1596,14 @@ class LingBotWorldCausalDMDPipeline(
                 dtype=extra["dtype"],
                 previous=previous,
             )
-        elif extra.get("camera_trajectory_cache") is not None:
+        elif extra.get("camera_embedding_cache") is not None:
+            # Same slice request mode takes from its one full-trajectory
+            # embedding, so both paths condition a block identically.
             trajectory = extra["camera_trajectory_cache"]
-            chunk_inputs = replace(
-                inputs,
-                camera_trajectory=CameraTrajectory(
-                    poses=trajectory.poses[start_frame:stop_frame],
-                    intrinsics=trajectory.intrinsics[start_frame:stop_frame],
-                ),
-                camera_actions=None,
-                num_frames=block_frames,
-                num_latent_frames=block_frames,
-            )
-            camera, camera_tail = self._prepare_camera(
-                chunk_inputs,
-                dtype=extra["dtype"],
-                previous=previous,
-                latent_aligned=True,
+            camera = extra["camera_embedding_cache"][:, :, start_frame:stop_frame]
+            camera_tail = CameraTrajectory(
+                poses=trajectory.poses[stop_frame - 1 : stop_frame].clone(),
+                intrinsics=trajectory.intrinsics[stop_frame - 1 : stop_frame].clone(),
             )
         else:
             raise RuntimeError("LingBot step execution is missing a camera trajectory or action script.")

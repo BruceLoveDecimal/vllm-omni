@@ -1934,6 +1934,53 @@ def test_stepwise_matches_tick_transformer_trace_and_latents() -> None:
         torch.testing.assert_close(output.output["payload"]["latents"], tick_latent)
 
 
+def test_stepwise_trajectory_camera_matches_request_mode_under_non_uniform_speed(monkeypatch) -> None:
+    """A trajectory that slows down between blocks must condition every stepwise
+    chunk exactly as request mode does. Request mode embeds the whole trajectory
+    once; embedding per chunk would re-normalize each block's framewise
+    translations by its own largest step and present a slow block as full-speed
+    motion."""
+    from vllm_omni.diffusion.models.lingbot_world import camera as camera_module
+
+    module = _load_pipeline_module()
+    # The fixture stubs the ray embedding with a pose-blind ramp; parity needs
+    # the real geometry so a scale mismatch actually shows up.
+    monkeypatch.setattr(module, "build_plucker_embedding", camera_module.build_plucker_embedding)
+    transformer = _RecordingTransformer()
+    pipeline = _pipeline(module, transformer=transformer)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+
+    # Six latent frames -> two 3-frame blocks. The first block moves at full
+    # speed and everything after it at a tenth of that, so a per-chunk
+    # normalization would rescale the second block by 10x.
+    steps = torch.tensor([1.0] * 3 + [0.1] * 18)
+    poses = torch.eye(4).repeat(21, 1, 1)
+    poses[:, 2, 3] = torch.cumsum(steps, dim=0) - steps[0]
+    trajectory = _CameraTrajectory(
+        poses=poses,
+        intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(21, 1),
+    )
+
+    sampling = _SamplingParams(num_frames=21)
+    sampling.extra_args["_lingbot_camera_trajectory"] = trajectory
+    pipeline(_request(sampling=sampling))
+    request_cameras = [call["camera_hidden_states"] for call in transformer.calls]
+    transformer.calls.clear()
+
+    state = _stepwise_state(num_frames=21)
+    state.sampling.extra_args["_lingbot_camera_trajectory"] = trajectory
+    state.sampling.extra_args.pop("_lingbot_camera_action_script")
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        _run_stepwise(pipeline, state)
+    stepwise_cameras = [call["camera_hidden_states"] for call in transformer.calls]
+
+    # Two blocks x (four probes + one commit), in the same order on both paths.
+    assert len(request_cameras) == len(stepwise_cameras) == 10
+    for stepwise, request in zip(stepwise_cameras, request_cameras, strict=True):
+        torch.testing.assert_close(stepwise, request)
+
+
 def test_stepwise_emits_latents_without_touching_the_vae() -> None:
     """Latent mode must stay latent: streaming decode is opt-in per request."""
     module = _load_pipeline_module()
