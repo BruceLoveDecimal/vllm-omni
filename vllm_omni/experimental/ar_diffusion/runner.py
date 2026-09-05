@@ -370,20 +370,22 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             # cost one synchronize per denoise step instead of per AR block.
             with self._bound_ar_session(session_id, description="stepwise", synchronize=False):
                 output = super().execute_stepwise(scheduler_output)
+            runner_output = output.get_request_output(request_id)
+            finished = bool(runner_output is not None and runner_output.finished)
+            result = None if runner_output is None else runner_output.result
+            errored = bool(result is not None and getattr(result, "error", None))
+            chunk_emitted = result is not None or finished or errored
+            if chunk_emitted:
+                # The barrier is where an asynchronous device error surfaces, so
+                # it must sit inside the same fail-closed scope as the step
+                # itself rather than leave cleanup to the scheduler's next cycle.
+                current_omni_platform.synchronize()
         except Exception:
-            self._stepwise_chunk_started.pop(request_id, None)
-            state_cache = getattr(self, "state_cache", None)
-            if isinstance(state_cache, dict):
-                state_cache.pop(request_id, None)
+            self._fail_closed_stepwise(request_id)
             raise
-        runner_output = output.get_request_output(request_id)
-        finished = bool(runner_output is not None and runner_output.finished)
-        result = None if runner_output is None else runner_output.result
-        errored = bool(result is not None and getattr(result, "error", None))
         # One entry per emitted AR block keeps ``_perf_e2e_times`` comparable
         # with request mode, where one execute_model() is one block.
-        if result is not None or finished or errored:
-            current_omni_platform.synchronize()
+        if chunk_emitted:
             self._perf_e2e_times.append(time.perf_counter() - chunk_started)
             self._stepwise_chunk_started.pop(request_id, None)
         if finished or errored:
@@ -394,6 +396,24 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 suppress_errors=True,
             )
         return output
+
+    def _fail_closed_stepwise(self, request_id: str) -> None:
+        """Drop everything a failed stepwise invocation left behind.
+
+        A failure inside the step is already released by ``_bound_ar_session``;
+        a failure at the chunk barrier happens after that context closed, so the
+        session is still present and is released here.
+        """
+        self._stepwise_chunk_started.pop(request_id, None)
+        state_cache = getattr(self, "state_cache", None)
+        if isinstance(state_cache, dict):
+            state_cache.pop(request_id, None)
+        if request_id in self._sessions:
+            self._release_session(request_id, reset_model=False, reason="forward_exception", suppress_errors=True)
+            logger.warning(
+                "AR-Diffusion stepwise chunk barrier failed for session=%s; KV and model state were released",
+                request_id,
+            )
 
     def _warmup_ar_rollout(self) -> None:
         """Run model-provided warmup requests, or safely skip when absent."""

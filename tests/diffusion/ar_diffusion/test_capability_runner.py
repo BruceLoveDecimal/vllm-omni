@@ -584,6 +584,40 @@ def test_execute_stepwise_times_once_per_chunk_not_once_per_step(monkeypatch):
     assert "req-1" not in runner._stepwise_chunk_started
 
 
+def test_execute_stepwise_synchronize_exception_fails_closed(monkeypatch):
+    """The chunk barrier is where an asynchronous device error surfaces. It must
+    clean up like an in-step failure instead of leaving the session, the cached
+    step state and the timing entry to the scheduler's next cycle."""
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    runner.state_cache = {"req-1": object()}
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        return BatchRunnerOutput.from_list([RunnerOutput(request_id="req-1", finished=False, result=object())])
+
+    def synchronize_boom():
+        raise RuntimeError("asynchronous kernel failed")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    monkeypatch.setattr(
+        "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform",
+        SimpleNamespace(synchronize=synchronize_boom),
+    )
+
+    with pytest.raises(RuntimeError, match="asynchronous kernel failed"):
+        runner.execute_stepwise(scheduler_output())
+
+    assert pipeline.bound_state is None
+    assert pipeline.closes == ["req-1"]
+    assert "req-1" not in runner._sessions
+    assert "req-1" not in runner.state_cache
+    assert "req-1" not in runner._stepwise_chunk_started
+    assert not runner._perf_e2e_times
+
+
 def test_model_specific_warmup_provider_is_consumed(monkeypatch):
     requests = [object(), object()]
     pipeline = WarmupPipeline(lingbot_like_spec(), requests)
