@@ -24,9 +24,10 @@ stages:
     # but both are stated here so the topology is readable on its own.
     step_execution: true
     streaming_output: true
-    # The causal-fast checkpoint has a fixed four-step DMD schedule, and the step
-    # scheduler needs the count before the pipeline is reached, so a served request
-    # does not have to carry it.
+    # num_inference_steps is for the step scheduler, not the pipeline: it sizes a
+    # request's step budget before the pipeline is reached, so a served request
+    # does not have to carry it. The pipeline itself pins the causal-fast
+    # checkpoint's four-step DMD schedule and rejects any other count.
     default_sampling_params:
       num_inference_steps: 4
       output_type: pil
