@@ -398,4 +398,6 @@ class UnspecifiedOmniPlatform(OmniPlatform):
     @classmethod
     def synchronize(cls) -> None:
         """CPU execution is already synchronous, so there is nothing to wait on."""
+        # Stated explicitly because callers are device-agnostic, and the base class
+        # keeps raising so a new accelerator cannot skip barriers by inheriting.
         return None
