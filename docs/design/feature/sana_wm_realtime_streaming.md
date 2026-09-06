@@ -1,11 +1,13 @@
 # SANA-WM Stage-1 realtime streaming (distilled, output-only)
 
-> **Status:** design spec, not yet implemented. Target branch `feat/sana_wm_realtime`.
+> **Status:** implemented (`SanaWmStreamingPipeline`, `sana_wm/streaming_cache.py`,
+> `sana_wm/self_forcing.py`, `SanaWmTransformer3DModel.forward_streaming`).
 > Scope is the union of what earlier discussion called "PR-1" (chunk-causal
 > Stage-1 model + self-forcing sampler) and "PR-3" (serving), delivered as one
 > PR in the shape of LingBot-World #6844: stepwise execution + the existing
 > `WS /v1/realtime/video` transport. No streaming VAE decoder, no interactive
-> input, no refiner.
+> input, no refiner. §16 records where the implementation deviates from the
+> text below and the outcome of the open decisions D1–D4.
 
 ## 1. Goals and non-goals
 
@@ -543,3 +545,107 @@ Decisions to record in the PR:
    `vllm_omni/entrypoints/`, or `vllm_omni/experimental/`.
 5. PR description lists the non-goals from §1 as follow-ups and the D1-D4
    outcomes.
+
+## 16. Implementation record
+
+Everything in §3 (reuse map) and §15 (acceptance criteria) holds except the
+byte-identity clause of criterion 3, which was deliberately traded for
+reference parity (see "Softmax camera branch" below): no file under
+`vllm_omni/diffusion/worker/`, `engine/`, `entrypoints/` or `experimental/`
+changed, and the bidirectional `SanaWmPipeline` latent output on the 9-frame /
+2-step / cfg 5 offline request differs from `main` only at the bf16 level
+(relL2 7.2e-3, cosine 0.99998, max abs 0.047; it was `np.array_equal` before
+that one change). The points below are where reading the upstream code
+(P1–P4) and the GPU parity runs changed the design.
+
+- **Softmax camera branch (shared with the bidirectional path):** the port
+  clamped the UCPE-transformed camera Q/K/V of the softmax hybrid blocks down
+  to their pre-transform RMS (`_downscale_to_reference_rms`). Current NVlabs
+  `_prepare_cam_qkv_softmax` has no such step. On the bidirectional
+  checkpoint the clamp barely acts (per-block parity vs NVlabs 1.2–3.6x
+  bf16eps either way, final 4.6x), but on the streaming checkpoint it moved
+  the first softmax block by 16x bf16eps and the GDN blocks behind it by
+  ~90x (final output 131x, cosine 0.87). With the clamp removed the same
+  forward lands at 20x (cosine 0.997) with every block inside 2–16x. The
+  three-way comparison (NVlabs bidirectional class / NVlabs cached class /
+  vLLM-Omni on identical inputs; NVlabs `FUSED_GDN_PRECISION=0` to rule out
+  its bf16 tensor-core dots; a cuDNN key-padding-mask micro test) is what
+  localised it. The step was removed for both pipelines.
+
+- **D1 (re-noise):** none. `SelfForcingFlowEulerCamCtrl` runs a plain
+  per-token flow-matching Euler step on the explicit sigmas
+  `1.0, 0.96, 0.889, 0.727 -> 0` (`FlowMatchEulerDiscreteScheduler(shift=1.0)`,
+  `step(-v, ...)`), so `x_{s+1} = x_s - (sigma_s - sigma_{s+1}) v` and the last
+  step yields `x0`; no fresh noise is mixed in. `self_forcing.py` implements
+  exactly that. The conditioning frame is held at `t = 0` (its per-token
+  `dt` is zero) and never touched.
+- **D2 (cache write):** a separate clean forward at `t = 0` with
+  `save_kv_cache=True` after the last step, as assumed. Denoising forwards never
+  write the cache (`test_denoise_pass_does_not_write_cache`).
+- **D3 (chunk 0):** `create_autoregressive_segments(latent_T)` gives
+  `[0, 4)` for chunk 0 (the remainder — the conditioning frame — is absorbed by
+  the first chunk) and 3-frame chunks afterwards. The pipeline keeps only the
+  generated frames in `state.latents` (constant `[1, 128, 3, h, w]` across
+  chunks, which also keeps the runner's batch buffer shape stable) and
+  prepends the clean conditioning latent inside `denoise_step` for chunk 0,
+  dropping its velocity row.
+- **D4 (default length):** 169 frames.
+- **Noise:** upstream draws one `randn` for the whole clip and slices it per
+  chunk; `prepare_encode` does the same (`extra["noise_full"]`, latent dtype),
+  so the RNG stream does not depend on the chunking.
+- **Window rule (§5.2 `trim`):** `_accumulate_softmax_kv_cache` keeps the last
+  `num_cached_blocks` chunks, and with `sink_token` it pins chunk 0 *in place
+  of* the oldest slot: the window for chunk `k` is `{0} ∪ [k-num_cached_blocks+1, k)`,
+  i.e. the sink plus the last `num_cached_blocks - 1` chunks (`{0, 2}` for
+  chunk 3 with the default 2). `num_cached_blocks <= 0` keeps everything.
+  GDN states, short-conv tails and the FFN tail always come from the most
+  recently committed chunk.
+- **FFN temporal conv (§5.7):** `CachedGLUMBConvTemp` keeps the symmetric
+  zero padding *inside* the chunk and only replaces the left context with the
+  previous chunk's tail (`t_conv(cat([tail, x]))[:, :, pad:]`); it is not a
+  purely left-padded causal conv. The vLLM-Omni FFN does the same when a block
+  cache is passed.
+- **Short convs (§5.4):** forward pass with the cached `K-1` input frames
+  prepended, backward pass chunk-local, centre tap subtracted once
+  (`_cached_temporal_short_conv`). Applies to `conv_k` and `conv_k_cam`
+  (`k_conv_only=True`; softmax blocks have no conv).
+- **Config (§5.1):** the model field is `chunk_size` (mirrors the upstream YAML
+  `chunk_size: 3`), not `num_frame_per_block`; `chunk_split_strategy`,
+  `num_cached_blocks`, `sink_token`, `denoising_step_list` (full list ending
+  in 0) and `streaming` are the other new fields. The converter writes them.
+- **Deploy YAML (§9):** dropped. `DiffusionStageConfig` has no
+  `streaming_output` field and `create_default_diffusion` ignores YAML
+  defaults, so a YAML could not switch streaming on without touching
+  `engine/`. `--diffusion-streaming-output` is the single documented entry
+  point; the generation defaults live in the pipeline.
+- **Checkpoint (§11):** the streaming release is a training checkpoint
+  (`generator` / `critic` / optimizers); the generator's keys are the
+  bidirectional keys with a `model.` prefix and map one-to-one (872 tensors,
+  bf16). The VAE of the bidirectional conversion is reused; the release's
+  causal LTX-2 VAE is the streaming-decoder follow-up.
+- **Cache object:** the 10-slot list became named fields per block
+  (`SanaWmBlockCache`) plus per-chunk softmax entries; softmax K/V are stored
+  in the attention layout `[B, N, H, D]` at the module dtype, GDN states in
+  fp32.
+- **Validation on 1x RTX PRO 6000 (this branch):** `tests/e2e/online_serving/test_sana_wm_streaming.py`
+  passes against the converted repo (49 frames: chunks of 25 + 24 frames,
+  first media chunk 1.65 s after `session.start`, 2.72 s total, 12.2 GiB
+  loaded); the CPU suite under `tests/diffusion/models/sana_wm/` covers the
+  cache window, the state-carry primitives, the first-chunk == bidirectional
+  identity and the stepwise contract with mocked components. On GPU,
+  `forward()` and `forward_streaming(empty cache)` on chunk 0 are bit-identical
+  (bf16, real weights).
+- **Parity vs NVlabs (`forward_long` + `SelfForcingFlowEulerCamCtrl`, same
+  noise / Gemma embeddings / VAE first-frame latent / camera tensors, 49
+  frames, solid-colour first frame):** first forward relL2 7.9e-2 (20x
+  bf16eps, cosine 0.997); clean latents chunk 0 relL2 0.17 (cosine 0.985),
+  chunk 1 0.29 (cosine 0.958); decoded with the same VAE, SSIM 0.876 mean
+  (chunk 0 0.921, chunk 1 0.829), PSNR 20.8 dB. With the reference's GDN
+  scans on IEEE fp32 dots (`FUSED_GDN_PRECISION=0`, i.e. the same arithmetic
+  as vLLM-Omni's fp32 recurrence) the same comparison gives chunk 0 relL2
+  0.15 (cosine 0.989), chunk 1 0.23 (cosine 0.972), SSIM 0.906 (chunk 0
+  0.937, chunk 1 0.872), PSNR 22.3 dB. The 4-step distilled solver compounds
+  the per-forward bf16-level differences, which is the same regime as the
+  bidirectional 161-frame parity recorded in the recipe (SSIM 0.906 /
+  23.6 dB). Per-chunk latency 0.9 s (24 pixel frames),
+  i.e. ~1.7x realtime at 16 fps, with the pure-PyTorch recurrence.

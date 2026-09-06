@@ -26,6 +26,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
 - [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
+- [SANA-WM Realtime Streaming (distilled Stage-1)](feature/sana_wm_realtime_streaming.md)
 
 ### Communication
 

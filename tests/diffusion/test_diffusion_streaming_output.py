@@ -503,6 +503,16 @@ class TestSupportedPipelines:
         assert supports_step_execution(pipeline) is True
         assert isinstance(pipeline, SupportsStepExecution) is True
 
+    def test_sana_wm_streaming_supports_step_execution_for_streaming_output(self) -> None:
+        from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
+        from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm_streaming import SanaWmStreamingPipeline
+
+        pipeline = object.__new__(SanaWmStreamingPipeline)
+
+        assert pipeline.supports_step_execution is True
+        assert supports_step_execution(pipeline) is True
+        assert isinstance(pipeline, SupportsStepExecution) is True
+
     def test_load_model_rejects_streaming_output_without_step_execution(self, monkeypatch) -> None:
         class _NoStepPipeline:
             def forward(self): ...

@@ -38,6 +38,11 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
+from vllm_omni.diffusion.models.sana_wm.streaming_cache import (
+    SanaWmBlockCache,
+    SanaWmSoftmaxChunk,
+    SanaWmStreamingCache,
+)
 from vllm_omni.diffusion.models.sana_wm.ucpe import (
     SanaWmCamGeometry,
     cam_prep_func,
@@ -45,6 +50,10 @@ from vllm_omni.diffusion.models.sana_wm.ucpe import (
 )
 
 SANA_WM_STAGE1_LATENT_CHANNELS = 128
+# ``(numerator, denominator)`` or, with ``return_state``, the same plus the
+# final forward-scan ``(state_kv, state_z)``.
+_DeltaScanState = tuple[torch.Tensor, torch.Tensor | None]
+_DeltaScanResult = tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, _DeltaScanState]
 SANA_WM_STAGE1_PROMPT_CHANNELS = 2304
 SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
 
@@ -138,7 +147,10 @@ def _delta_scan(
     key: torch.Tensor | None = None,
     skip_z: bool = False,
     flip_output: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    initial_state_kv: torch.Tensor | None = None,
+    initial_state_z: torch.Tensor | None = None,
+    return_state: bool = False,
+) -> _DeltaScanResult:
     """One-directional gated delta-rule recurrence over frames.
 
     The KV stream consumes only the rotary-embedded Q/K; the Z (denominator)
@@ -150,6 +162,13 @@ def _delta_scan(
     ``flip_output=True`` emits the frames in reverse of the order they were
     computed, which is what a caller running on flipped inputs wants; it costs a
     list reversal instead of a flip over the assembled result.
+
+    ``initial_state_kv`` / ``initial_state_z`` seed the recurrence instead of
+    the zero state, which is how the chunk-causal streaming model carries the
+    forward scan across chunks; ``return_state`` appends the final
+    ``(state_kv, state_z)`` so the caller can store it for the next chunk.
+    Seeding a scan of frames ``[a, T)`` with the final state of ``[0, a)`` is
+    exactly the scan over ``[0, T)``.
     """
     if not skip_z and (query is None or key is None):
         raise ValueError("Sana-WM delta scan needs non-rotary query/key unless skip_z is set.")
@@ -165,7 +184,12 @@ def _delta_scan(
     query_rot_f = to_frames(query_rot)
     key_rot_f = to_frames(key_rot)
     value_f = to_frames(value)
-    state_kv = torch.zeros(batch_size, num_heads, head_dim, head_dim, device=query_rot.device, dtype=query_rot.dtype)
+    if initial_state_kv is None:
+        state_kv = torch.zeros(
+            batch_size, num_heads, head_dim, head_dim, device=query_rot.device, dtype=query_rot.dtype
+        )
+    else:
+        state_kv = initial_state_kv.to(device=query_rot.device, dtype=query_rot.dtype)
     numerators: list[torch.Tensor] = []
 
     if skip_z:
@@ -175,7 +199,10 @@ def _delta_scan(
     else:
         query_f = to_frames(query)
         key_f = to_frames(key)
-        state_z = torch.zeros(batch_size, num_heads, head_dim, 1, device=query_rot.device, dtype=query_rot.dtype)
+        if initial_state_z is None:
+            state_z = torch.zeros(batch_size, num_heads, head_dim, 1, device=query_rot.device, dtype=query_rot.dtype)
+        else:
+            state_z = initial_state_z.to(device=query_rot.device, dtype=query_rot.dtype)
         denominators = []
 
     for frame_idx in range(frames):
@@ -205,7 +232,11 @@ def _delta_scan(
         stacked = torch.stack(tensors[::-1] if flip_output else tensors, dim=2)
         return stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, dim, token_count)
 
-    return restore(numerators, head_dim), (None if skip_z else restore(denominators, 1))
+    numerator = restore(numerators, head_dim)
+    denominator = None if skip_z else restore(denominators, 1)
+    if return_state:
+        return numerator, denominator, (state_kv, state_z)
+    return numerator, denominator
 
 
 def _bidirectional_delta_scan(
@@ -219,20 +250,28 @@ def _bidirectional_delta_scan(
     query: torch.Tensor | None = None,
     key: torch.Tensor | None = None,
     skip_z: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    initial_state: tuple[torch.Tensor | None, torch.Tensor | None] | None = None,
+    return_state: bool = False,
+) -> _DeltaScanResult:
     """Forward + backward delta scan, summed.
 
     The backward direction shifts K/V/beta by one frame (zero pad) and the decay
     by one frame (neutral 1.0 pad), matching the NVlabs ``flip_and_shift``
     convention. The backward scan also emits its frames in forward order, so the
     two directions add directly instead of flipping the assembled result back.
+
+    Chunk-causal streaming (``initial_state`` / ``return_state``): only the
+    forward direction is seeded from, and reports, the carried state. The
+    backward direction only ever sees the current chunk, so its zero / 1.0
+    padding at the chunk end is exactly the boundary isolation the NVlabs
+    ``ChunkCausalGDN`` applies (forward stateful, reverse per chunk).
     """
     frames = beta.shape[2]
 
     def reverse(tensor: torch.Tensor, *, shift_value: float | None = None) -> torch.Tensor:
         return _reverse_frames(tensor, frames=frames, spatial_tokens=spatial_tokens, shift_value=shift_value)
 
-    num_fwd, den_fwd = _delta_scan(
+    forward = _delta_scan(
         query_rot,
         key_rot,
         value,
@@ -242,7 +281,14 @@ def _bidirectional_delta_scan(
         query=query,
         key=key,
         skip_z=skip_z,
+        initial_state_kv=None if initial_state is None else initial_state[0],
+        initial_state_z=None if initial_state is None else initial_state[1],
+        return_state=return_state,
     )
+    if return_state:
+        num_fwd, den_fwd, final_state = forward
+    else:
+        num_fwd, den_fwd = forward
 
     bwd_kwargs: dict[str, torch.Tensor] = {}
     if not skip_z:
@@ -261,7 +307,11 @@ def _bidirectional_delta_scan(
         **bwd_kwargs,
     )
 
-    return num_fwd + num_bwd, (None if skip_z else den_fwd + den_bwd)
+    numerator = num_fwd + num_bwd
+    denominator = None if skip_z else den_fwd + den_bwd
+    if return_state:
+        return numerator, denominator, final_state
+    return numerator, denominator
 
 
 def _reverse_frames(
@@ -306,12 +356,17 @@ def reference_bidirectional_gated_delta_net(
     query_rot: torch.Tensor | None = None,
     key_rot: torch.Tensor | None = None,
     eps: float = 1e-8,
-) -> torch.Tensor:
+    initial_state: tuple[torch.Tensor | None, torch.Tensor | None] | None = None,
+    return_state: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor | None]]:
     """Run the SANA-WM bidirectional gated delta recurrence in PyTorch.
 
     Inputs follow the layout used by the official Stage-1 operator:
     ``query/key/value/query_rot/key_rot`` are ``[B, H, D, T*S]``, ``beta`` is
     ``[B, H, T, S]``, and ``decay`` is ``[B, H, T]``.
+
+    ``initial_state`` / ``return_state`` carry the forward-scan state across
+    chunks (see :func:`_bidirectional_delta_scan`); the states are fp32.
     """
 
     _validate_gdn_inputs(query, key, value, beta, decay, spatial_tokens)
@@ -323,7 +378,7 @@ def reference_bidirectional_gated_delta_net(
         raise ValueError("Sana-WM GDN rotary query/key shapes must match query/key.")
 
     dtype_orig = query.dtype
-    numerator, denominator = _bidirectional_delta_scan(
+    scan = _bidirectional_delta_scan(
         query_rot.float(),
         key_rot.float(),
         value.float(),
@@ -332,7 +387,13 @@ def reference_bidirectional_gated_delta_net(
         spatial_tokens=spatial_tokens,
         query=query.float(),
         key=key.float(),
+        initial_state=initial_state,
+        return_state=return_state,
     )
+    if return_state:
+        numerator, denominator, final_state = scan
+        return (numerator / (denominator + eps)).to(dtype_orig), final_state
+    numerator, denominator = scan
     return (numerator / (denominator + eps)).to(dtype_orig)
 
 
@@ -608,15 +669,44 @@ class SanaWmWanRotaryPosEmbed(nn.Module):
         )
         return torch.cat([self._build_1d_freq(dim, positions) for dim in dims], dim=1)
 
-    def forward(self, spatial_shape: tuple[int, int, int], device: torch.device) -> torch.Tensor:
+    def forward(
+        self,
+        spatial_shape: tuple[int, int, int],
+        device: torch.device,
+        *,
+        frame_index: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Build the ``(1, 1, F*H*W, D//2)`` complex table.
+
+        ``frame_index`` (1-D long tensor of absolute latent frame ids, length
+        ``F``) replaces the contiguous ``arange(F)`` temporal positions. The
+        chunk-causal streaming model uses it so every chunk is rotated at its
+        absolute position and cached post-RoPE keys stay valid (NVlabs
+        ``CausalWanRotaryPosEmbed``). The bidirectional path passes nothing.
+        """
         frames, height, width = spatial_shape
-        if max(spatial_shape) > self.freqs.shape[0]:
-            self.freqs = self._build_freqs(max(spatial_shape)).to(self.freqs.device)
+        if frame_index is not None:
+            frame_index = frame_index.to(dtype=torch.long)
+            if frame_index.ndim != 1 or frame_index.numel() != frames:
+                raise ValueError(
+                    f"Sana-WM RoPE frame_index must be 1-D with {frames} entries, got {tuple(frame_index.shape)}."
+                )
+            if frame_index.numel() > 0 and int(frame_index.min()) < 0:
+                raise ValueError("Sana-WM RoPE frame_index must be non-negative.")
+            needed = max(int(frame_index.max()) + 1 if frame_index.numel() > 0 else 0, height, width)
+        else:
+            needed = max(spatial_shape)
+        if needed > self.freqs.shape[0]:
+            self.freqs = self._build_freqs(needed).to(self.freqs.device)
         freqs = self.freqs.to(device=device)
         freqs_f, freqs_h, freqs_w = freqs.split(self._split_sizes, dim=1)
         f_dim, h_dim, w_dim = self._split_sizes
+        if frame_index is not None:
+            freqs_f_sel = freqs_f.index_select(0, frame_index.to(device=device))
+        else:
+            freqs_f_sel = freqs_f[:frames]
         parts = [
-            freqs_f[:frames].view(frames, 1, 1, f_dim).expand(frames, height, width, f_dim),
+            freqs_f_sel.view(frames, 1, 1, f_dim).expand(frames, height, width, f_dim),
             freqs_h[:height].view(1, height, 1, h_dim).expand(frames, height, width, h_dim),
             freqs_w[:width].view(1, 1, width, w_dim).expand(frames, height, width, w_dim),
         ]
@@ -894,14 +984,41 @@ class SanaWmSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         conv: nn.Conv1d,
         spatial_shape: tuple[int, int, int],
-    ) -> torch.Tensor:
+        *,
+        tail: torch.Tensor | None = None,
+        return_tail: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Symmetric temporal short conv: forward causal + backward causal - center.
+
+        Chunk-causal streaming (``tail`` / ``return_tail``): ``tail`` is the
+        last ``K-1`` input frames of the previous chunk (``[B*S, K-1, C]``)
+        and is prepended to the forward pass only, so later chunks receive
+        temporal context from earlier ones while the backward pass stays
+        chunk-local — the NVlabs ``_cached_temporal_short_conv`` split. The
+        returned tail is the new left context for the next chunk.
+        """
         hidden_states, batch_size, spatial_tokens, frames = self._reshape_to_temporal(hidden_states, spatial_shape)
-        forward_states = self._causal_conv_1d(hidden_states, conv)
+        kernel_size = int(conv.kernel_size[0])
+        if tail is None:
+            forward_states = self._causal_conv_1d(hidden_states, conv)
+        else:
+            context = tail.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            forward_states = self._causal_conv_1d(torch.cat([context, hidden_states], dim=1), conv)
+            forward_states = forward_states[:, context.shape[1] :]
         backward_states = self._causal_conv_1d(hidden_states.flip(1), conv).flip(1)
         center_weight = conv.weight[:, 0, -1].to(hidden_states.dtype)
         center_states = hidden_states * center_weight.view(1, 1, -1)
         output = forward_states + backward_states - center_states
-        return self._reshape_from_temporal(output, batch_size, spatial_tokens, frames)
+        result = self._reshape_from_temporal(output, batch_size, spatial_tokens, frames)
+        if not return_tail:
+            return result
+        context_len = kernel_size - 1
+        if tail is not None and frames < context_len:
+            history = torch.cat([tail.to(device=hidden_states.device, dtype=hidden_states.dtype), hidden_states], dim=1)
+        else:
+            history = hidden_states
+        new_tail = history[:, history.shape[1] - context_len :].detach().clone()
+        return result, new_tail
 
     def _compute_frame_gates(
         self,
@@ -929,6 +1046,8 @@ class SanaWmSelfAttention(nn.Module):
         rotary_emb: torch.Tensor | None,
         *,
         precomputed_gates: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache: SanaWmBlockCache | None = None,
+        save_cache: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Run main-branch bidirectional GDN and return the (B, N, q_size)
         raw output BEFORE ``output_gate`` and ``proj`` are applied.
@@ -936,6 +1055,10 @@ class SanaWmSelfAttention(nn.Module):
         Returns ``(raw_output, (beta, decay))`` so the caller can share the
         beta/decay gates with the camera branch (matches NVlabs' shared
         ``precomputed_gates`` plumbing).
+
+        With ``cache`` the block runs chunk-causally: the K short conv reads
+        the previous chunk's tail and the forward scan is seeded from the
+        cached state; ``save_cache`` writes the new tail / state back.
         """
         batch_size, token_count, _hidden_size = hidden_states.shape
         frames, height, width = spatial_shape
@@ -948,7 +1071,14 @@ class SanaWmSelfAttention(nn.Module):
         kv_size = self.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
         if self.conv_k is not None:
-            key = self._bidirectional_temporal_short_conv(key, self.conv_k, spatial_shape)
+            if cache is None:
+                key = self._bidirectional_temporal_short_conv(key, self.conv_k, spatial_shape)
+            else:
+                key, conv_tail = self._bidirectional_temporal_short_conv(
+                    key, self.conv_k, spatial_shape, tail=cache.conv_k_tail, return_tail=True
+                )
+                if save_cache:
+                    cache.conv_k_tail = conv_tail
         if precomputed_gates is None:
             beta, decay = self._compute_frame_gates(hidden_states, spatial_shape)
         else:
@@ -970,17 +1100,36 @@ class SanaWmSelfAttention(nn.Module):
             query_rot = query
             key_rot = key
 
-        output = reference_bidirectional_gated_delta_net(
-            query,
-            key,
-            value,
-            beta=beta,
-            decay=decay,
-            spatial_tokens=spatial_tokens,
-            query_rot=query_rot,
-            key_rot=key_rot,
-            eps=self.eps,
-        )
+        if cache is None:
+            output = reference_bidirectional_gated_delta_net(
+                query,
+                key,
+                value,
+                beta=beta,
+                decay=decay,
+                spatial_tokens=spatial_tokens,
+                query_rot=query_rot,
+                key_rot=key_rot,
+                eps=self.eps,
+            )
+        else:
+            initial_state = (cache.gdn_state_kv, cache.gdn_state_z)
+            output, (state_kv, state_z) = reference_bidirectional_gated_delta_net(
+                query,
+                key,
+                value,
+                beta=beta,
+                decay=decay,
+                spatial_tokens=spatial_tokens,
+                query_rot=query_rot,
+                key_rot=key_rot,
+                eps=self.eps,
+                initial_state=initial_state,
+                return_state=True,
+            )
+            if save_cache:
+                cache.gdn_state_kv = state_kv.detach().clone()
+                cache.gdn_state_z = None if state_z is None else state_z.detach().clone()
         output = output.permute(0, 3, 1, 2).reshape(batch_size, token_count, q_size)
         return output, (beta, decay)
 
@@ -1067,23 +1216,6 @@ class SanaWmSelfAttention(nn.Module):
         return self._apply_output_gate_and_proj(raw, hidden_states)
 
     @staticmethod
-    def _downscale_to_reference_rms(
-        ref: torch.Tensor,
-        transformed: torch.Tensor,
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        """Downscale ``transformed`` so its per-token channel RMS does not
-        exceed ``ref``'s. Mirrors NVlabs ``_downscale_to_reference_rms``.
-
-        Inputs are ``(B, H, N, D)`` (channel dim last). The RMS-scale is
-        clamped at 1.0 — the function only ever shrinks, never amplifies.
-        """
-        ref_rms = ref.square().mean(dim=-1, keepdim=True).add(eps).sqrt()
-        tr_rms = transformed.square().mean(dim=-1, keepdim=True).add(eps).sqrt()
-        scale = (ref_rms / tr_rms.clamp_min(eps)).clamp(max=1.0)
-        return transformed * scale
-
-    @staticmethod
     def _ucpe_rotary_freqs(rotary_emb: torch.Tensor | None) -> torch.Tensor | None:
         # SanaWmRope emits (1, 1, N, D//2) complex; the cam path wants (N, D//2).
         if rotary_emb is None:
@@ -1095,12 +1227,22 @@ class SanaWmSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         spatial_shape: tuple[int, int, int],
         rotary_emb: torch.Tensor | None,
-    ) -> torch.Tensor:
+        *,
+        cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        return_kv: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Softmax self-attention raw output before output_gate/proj.
 
         Mirrors NVlabs ``_forward_softmax_attn(..., apply_output_gate=False)``
         for every-N-th hybrid blocks. GDN-specific gates are intentionally not
         used here.
+
+        Chunk-causal streaming: ``cached_kv`` holds the post-RoPE K/V of the
+        cached chunks (attention layout ``[B, N, H, D]``); they are prepended
+        to the current chunk's K/V and the queries attend over the union with
+        the same non-causal attention (the cache is what enforces causality —
+        NVlabs ``CachedChunkCausalSoftmaxAttn``). ``return_kv`` also returns
+        the current chunk's post-RoPE K/V so the caller can cache them.
         """
         batch_size, token_count, hidden_size = hidden_states.shape
         frames, height, width = spatial_shape
@@ -1127,8 +1269,18 @@ class SanaWmSelfAttention(nn.Module):
         # that promoted to fp32 does not silently change the kernel. See
         # ``sana_gdn_camctrl_blocks.py::_forward_softmax_attn_sdpa``.
         dtype_orig = hidden_states.dtype
-        attn = self.softmax_attn(query.to(dtype_orig), key.to(dtype_orig), value.to(dtype_orig))
-        return attn.reshape(batch_size, token_count, q_size)
+        query = query.to(dtype_orig)
+        key = key.to(dtype_orig)
+        value = value.to(dtype_orig)
+        current_kv = (key, value)
+        if cached_kv:
+            key = torch.cat([*(cached_key.to(dtype_orig) for cached_key, _ in cached_kv), key], dim=1)
+            value = torch.cat([*(cached_value.to(dtype_orig) for _, cached_value in cached_kv), value], dim=1)
+        attn = self.softmax_attn(query, key, value)
+        attn = attn.reshape(batch_size, token_count, q_size)
+        if return_kv:
+            return attn, current_kv
+        return attn
 
     def _forward_softmax_cam_branch(
         self,
@@ -1136,12 +1288,20 @@ class SanaWmSelfAttention(nn.Module):
         spatial_shape: tuple[int, int, int],
         cam_geometry: SanaWmCamGeometry,
         rotary_emb: torch.Tensor | None,
-    ) -> torch.Tensor:
+        *,
+        cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        return_kv: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """UCPE camera branch for softmax hybrid blocks.
 
         Matches NVlabs ``_forward_cam_branch_softmax``: camera Q/K/V are
         projected from the same hidden stream, transformed by UCPE, run through
         SDPA, inverse-transformed, then returned as raw ``cam_dim`` features.
+
+        Chunk-causal streaming: ``cached_kv`` are the post-UCPE camera K/V of
+        the cached chunks (already in the canonical frame, attention layout
+        ``[B, N, H, D]``), prepended to the current chunk's K/V; ``return_kv``
+        returns the current chunk's post-UCPE K/V for caching.
         """
         batch_size, token_count, _ = hidden_states.shape
         frames, height, width = spatial_shape
@@ -1168,26 +1328,34 @@ class SanaWmSelfAttention(nn.Module):
         k_cam = k_cam.transpose(1, 2).contiguous()
         v_cam = v_cam.transpose(1, 2).contiguous()
 
+        # The UCPE-transformed tensors go straight to attention, as in NVlabs
+        # ``_prepare_cam_qkv_softmax``. An earlier port clamped their RMS down
+        # to the pre-transform RMS; upstream has no such step, and on the
+        # chunk-causal checkpoint that clamp bites (it moved the first softmax
+        # block by ~16x bf16eps and the GDN blocks after it by ~90x against
+        # the reference), so it was removed.
         q_cam_trans = cam_geometry.apply_q(q_cam)
         kv_cam_trans = cam_geometry.apply_kv(torch.cat([k_cam, v_cam], dim=1))
         k_cam_trans, v_cam_trans = torch.chunk(kv_cam_trans, chunks=2, dim=1)
-
-        q_cam_trans = self._downscale_to_reference_rms(q_cam, q_cam_trans)
-        k_cam_trans = self._downscale_to_reference_rms(k_cam, k_cam_trans)
-        v_cam_trans = self._downscale_to_reference_rms(v_cam, v_cam_trans)
 
         # The shared Attention takes BSND and selects a backend that supports
         # ``cam_head_dim`` directly, so odd head dims need no padding up to an
         # SDPA-friendly size. Q/K/V stay at the module dtype for the same
         # reason as the main softmax path above.
         dtype_orig = hidden_states.dtype
-        out = self.softmax_attn_cam(
-            q_cam_trans.transpose(1, 2).to(dtype_orig),
-            k_cam_trans.transpose(1, 2).to(dtype_orig),
-            v_cam_trans.transpose(1, 2).to(dtype_orig),
-        )
+        q_attn = q_cam_trans.transpose(1, 2).to(dtype_orig)
+        k_attn = k_cam_trans.transpose(1, 2).to(dtype_orig)
+        v_attn = v_cam_trans.transpose(1, 2).to(dtype_orig)
+        current_kv = (k_attn, v_attn)
+        if cached_kv:
+            k_attn = torch.cat([*(cached_key.to(dtype_orig) for cached_key, _ in cached_kv), k_attn], dim=1)
+            v_attn = torch.cat([*(cached_value.to(dtype_orig) for _, cached_value in cached_kv), v_attn], dim=1)
+        out = self.softmax_attn_cam(q_attn, k_attn, v_attn)
         out = cam_geometry.apply_output(out.transpose(1, 2))
-        return out.transpose(1, 2).reshape(batch_size, token_count, self.cam_dim)
+        out = out.transpose(1, 2).reshape(batch_size, token_count, self.cam_dim)
+        if return_kv:
+            return out, current_kv
+        return out
 
     def _forward_cam_branch(
         self,
@@ -1197,10 +1365,16 @@ class SanaWmSelfAttention(nn.Module):
         rotary_emb: torch.Tensor | None,
         *,
         precomputed_gates: tuple[torch.Tensor, torch.Tensor],
+        cache: SanaWmBlockCache | None = None,
+        save_cache: bool = False,
     ) -> torch.Tensor:
         """UCPE camera branch — matches the NVlabs production
         ``BidirectionalGDNUCPESinglePathLiteLABothTriton`` variant declared
         in the SANA-WM 1600M release config.
+
+        ``cache`` / ``save_cache`` carry the camera K short-conv tail and the
+        numerator-only scan state across chunks (NVlabs
+        ``_cached_cam_branch``: ``_SLOT_CAM_AUX`` / ``_SLOT_CAM``).
 
         Two things differ from the main GDN branch and are easy to get wrong:
         Q/K/V all come from ``hidden_states`` (UCPE is not cross-attention —
@@ -1222,7 +1396,14 @@ class SanaWmSelfAttention(nn.Module):
         v_cam = self.v_proj_cam(hidden_states)
 
         if self.conv_k_cam is not None:
-            k_cam = self._bidirectional_temporal_short_conv(k_cam, self.conv_k_cam, spatial_shape)
+            if cache is None:
+                k_cam = self._bidirectional_temporal_short_conv(k_cam, self.conv_k_cam, spatial_shape)
+            else:
+                k_cam, cam_conv_tail = self._bidirectional_temporal_short_conv(
+                    k_cam, self.conv_k_cam, spatial_shape, tail=cache.conv_k_cam_tail, return_tail=True
+                )
+                if save_cache:
+                    cache.conv_k_cam_tail = cam_conv_tail
         if self.conv_q_cam is not None:
             q_cam = self._bidirectional_temporal_short_conv(q_cam, self.conv_q_cam, spatial_shape)
         if self.conv_v_cam is not None:
@@ -1271,15 +1452,30 @@ class SanaWmSelfAttention(nn.Module):
         beta_cam = beta / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
         decay_cam = decay
 
-        cam_out_bhdn, _ = _bidirectional_delta_scan(
-            q_rot_bhdn.float(),
-            k_rot_bhdn.float(),
-            v_bhdn.float(),
-            beta_cam.float(),
-            decay_cam.float(),
-            spatial_tokens=spatial_tokens,
-            skip_z=True,
-        )
+        if cache is None:
+            cam_out_bhdn, _ = _bidirectional_delta_scan(
+                q_rot_bhdn.float(),
+                k_rot_bhdn.float(),
+                v_bhdn.float(),
+                beta_cam.float(),
+                decay_cam.float(),
+                spatial_tokens=spatial_tokens,
+                skip_z=True,
+            )
+        else:
+            cam_out_bhdn, _, (cam_state_kv, _) = _bidirectional_delta_scan(
+                q_rot_bhdn.float(),
+                k_rot_bhdn.float(),
+                v_bhdn.float(),
+                beta_cam.float(),
+                decay_cam.float(),
+                spatial_tokens=spatial_tokens,
+                skip_z=True,
+                initial_state=(cache.cam_state_kv, None),
+                return_state=True,
+            )
+            if save_cache:
+                cache.cam_state_kv = cam_state_kv.detach().clone()
         cam_out_bhdn = cam_out_bhdn.to(q_rot_bhdn.dtype)
 
         # ``apply_output`` expects (B, H, N, D); the scan emits (B, H, D, N).
@@ -1302,6 +1498,10 @@ class SanaWmSelfAttention(nn.Module):
         spatial_shape: tuple[int, int, int],
         rotary_emb: torch.Tensor | None = None,
         cam_geometry: SanaWmCamGeometry | None = None,
+        *,
+        cache: SanaWmBlockCache | None = None,
+        save_cache: bool = False,
+        chunk_index: int = 0,
     ) -> torch.Tensor:
         """Forward with dual-branch GDN+UCPE when ``cam_geometry`` is
         provided, otherwise main-branch-only GDN or softmax fallback.
@@ -1310,10 +1510,20 @@ class SanaWmSelfAttention(nn.Module):
         transformer forward from the raw ``(B, T_latent, 20)`` raymap. The cam
         branch consumes ``hidden_states`` as its sole Q/K/V source and applies
         those transforms to the Q/K/V channels via UCPE.
+
+        ``cache`` switches the block to the chunk-causal streaming contract
+        (state carried across chunks, see ``streaming_cache.py``);
+        ``save_cache`` commits this chunk's state, ``chunk_index`` labels the
+        softmax K/V entry it writes.
         """
         if self.use_gdn:
             if cam_geometry is None:
                 # No camera conditioning on this request — main branch only.
+                if cache is not None:
+                    raw, _ = self._forward_gdn_raw(
+                        hidden_states, spatial_shape, rotary_emb, cache=cache, save_cache=save_cache
+                    )
+                    return self._apply_output_gate_and_proj(raw, hidden_states)
                 return self._forward_gdn(hidden_states, spatial_shape, rotary_emb)
             # β/decay are computed here rather than inside each branch: NVlabs
             # drives both recurrences from one set of gates, and the camera
@@ -1324,6 +1534,8 @@ class SanaWmSelfAttention(nn.Module):
                 spatial_shape,
                 rotary_emb,
                 precomputed_gates=(beta, decay),
+                cache=cache,
+                save_cache=save_cache,
             )
             cam_raw = self._forward_cam_branch(
                 hidden_states,
@@ -1331,6 +1543,8 @@ class SanaWmSelfAttention(nn.Module):
                 cam_geometry,
                 rotary_emb,
                 precomputed_gates=(beta, decay),
+                cache=cache,
+                save_cache=save_cache,
             )
             cam_contrib = self.out_proj_cam(cam_raw)
             cam_contrib = self._reduce_scatter_cam_contrib(cam_contrib, main_raw)
@@ -1338,17 +1552,51 @@ class SanaWmSelfAttention(nn.Module):
             attn_out = self._apply_output_gate_and_proj(combined, hidden_states)
             return attn_out
 
-        main_raw = self._forward_softmax_raw(hidden_states, spatial_shape, rotary_emb)
+        if cache is None:
+            main_raw = self._forward_softmax_raw(hidden_states, spatial_shape, rotary_emb)
+            if cam_geometry is not None:
+                cam_raw = self._forward_softmax_cam_branch(
+                    hidden_states,
+                    spatial_shape,
+                    cam_geometry,
+                    rotary_emb,
+                )
+                cam_contrib = self.out_proj_cam(cam_raw)
+                cam_contrib = self._reduce_scatter_cam_contrib(cam_contrib, main_raw)
+                main_raw = main_raw + cam_contrib.to(main_raw.dtype)
+            return self._apply_output_gate_and_proj(main_raw, hidden_states)
+
+        main_raw, (k_main, v_main) = self._forward_softmax_raw(
+            hidden_states,
+            spatial_shape,
+            rotary_emb,
+            cached_kv=cache.cached_main_kv(),
+            return_kv=True,
+        )
+        k_cam = v_cam = None
         if cam_geometry is not None:
-            cam_raw = self._forward_softmax_cam_branch(
+            cam_raw, (k_cam, v_cam) = self._forward_softmax_cam_branch(
                 hidden_states,
                 spatial_shape,
                 cam_geometry,
                 rotary_emb,
+                cached_kv=cache.cached_cam_kv(),
+                return_kv=True,
             )
             cam_contrib = self.out_proj_cam(cam_raw)
             cam_contrib = self._reduce_scatter_cam_contrib(cam_contrib, main_raw)
             main_raw = main_raw + cam_contrib.to(main_raw.dtype)
+        if save_cache:
+            cache.softmax_chunks.append(
+                SanaWmSoftmaxChunk(
+                    chunk_index=chunk_index,
+                    frames=spatial_shape[0],
+                    k_main=k_main.detach().clone(),
+                    v_main=v_main.detach().clone(),
+                    k_cam=None if k_cam is None else k_cam.detach().clone(),
+                    v_cam=None if v_cam is None else v_cam.detach().clone(),
+                )
+            )
         return self._apply_output_gate_and_proj(main_raw, hidden_states)
 
 
@@ -1478,7 +1726,14 @@ class SanaWmMbConvFfn(nn.Module):
             bias=False,
         )
 
-    def forward(self, hidden_states: torch.Tensor, spatial_shape: tuple[int, int, int]) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        spatial_shape: tuple[int, int, int],
+        *,
+        cache: SanaWmBlockCache | None = None,
+        save_cache: bool = False,
+    ) -> torch.Tensor:
         """Match NVlabs ``GLUMBConvTemp.forward`` exactly:
 
         1. Reshape ``(B, N=F*H*W, C) → (B*F, H, W, C) → (B*F, C, H, W)`` so the
@@ -1489,6 +1744,12 @@ class SanaWmMbConvFfn(nn.Module):
         3. Temporal aggregation: reshape back to ``(B, C, F, H*W)``
            and add ``t_conv`` (kernel ``(3, 1)``) along the F axis.
         4. Reshape to ``(B, N, C)``.
+
+        Chunk-causal streaming (``cache`` / ``save_cache``, NVlabs
+        ``CachedGLUMBConvTemp``): the temporal conv keeps its symmetric zero
+        padding inside the chunk, but its left context comes from the tail of
+        the previous chunk's conv input (zeros for chunk 0). The same weights
+        serve both paths; only the padding source differs.
         """
         batch, _, hidden_size = hidden_states.shape
         frames, height, width = spatial_shape
@@ -1514,7 +1775,21 @@ class SanaWmMbConvFfn(nn.Module):
         x = x_pt
         # Temporal aggregation: (B*F, C, H, W) → (B, F, C, H*W) → (B, C, F, H*W)
         x_temporal = x.reshape(batch, frames, hidden_size, spatial_tokens).permute(0, 2, 1, 3)
-        t_conv_out = self.t_conv(x_temporal)
+        if cache is None:
+            t_conv_out = self.t_conv(x_temporal)
+        else:
+            context_len = int(self.t_conv.padding[0])
+            if cache.ffn_tconv_tail is not None and context_len > 0:
+                context = cache.ffn_tconv_tail[:, :, -context_len:].to(device=x_temporal.device, dtype=x_temporal.dtype)
+                t_conv_out = self.t_conv(torch.cat([context, x_temporal], dim=2))[:, :, context.shape[2] :]
+            else:
+                t_conv_out = self.t_conv(x_temporal)
+            if save_cache and context_len > 0:
+                if cache.ffn_tconv_tail is not None and frames < context_len:
+                    history = torch.cat([cache.ffn_tconv_tail.to(x_temporal.dtype), x_temporal], dim=2)
+                else:
+                    history = x_temporal
+                cache.ffn_tconv_tail = history[:, :, history.shape[2] - context_len :].detach().clone()
         x_temporal = x_temporal + t_conv_out
         # → (B, F, H*W, C) → (B, N, C)
         final = x_temporal.permute(0, 2, 3, 1).reshape(batch, frames * spatial_tokens, hidden_size).contiguous()
@@ -1574,6 +1849,10 @@ class SanaWmBlock(nn.Module):
         camera_hidden_states: torch.Tensor | None = None,
         cam_geometry: SanaWmCamGeometry | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
+        *,
+        cache: SanaWmBlockCache | None = None,
+        save_cache: bool = False,
+        chunk_index: int = 0,
     ) -> torch.Tensor:
         # Per-frame timestep contract (see SanaWmTransformer3DModel.forward).
         if timestep_modulation.ndim > 2:
@@ -1586,7 +1865,12 @@ class SanaWmBlock(nn.Module):
                 camera_hidden_states,
                 cam_geometry,
                 encoder_attention_mask,
+                cache=cache,
+                save_cache=save_cache,
+                chunk_index=chunk_index,
             )
+        if cache is not None:
+            raise ValueError("Sana-WM streaming blocks require per-frame timesteps (timestep shaped (B, 1, F)).")
         batch_size = hidden_states.shape[0]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.scale_shift_table[None] + timestep_modulation.reshape(batch_size, 6, -1)
@@ -1615,6 +1899,10 @@ class SanaWmBlock(nn.Module):
         camera_hidden_states: torch.Tensor | None,
         cam_geometry: SanaWmCamGeometry | None,
         encoder_attention_mask: torch.Tensor | None = None,
+        *,
+        cache: SanaWmBlockCache | None = None,
+        save_cache: bool = False,
+        chunk_index: int = 0,
     ) -> torch.Tensor:
         """Per-frame timestep modulation path matching NVlabs
         ``SanaVideoMSCamCtrlBlock.forward_frame_aware``.
@@ -1647,7 +1935,18 @@ class SanaWmBlock(nn.Module):
         # unaffected, and the modulation then broadcasts as written.
         x_4d = hidden_states.reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_msa_in = self.norm1(x_4d, scale_msa, shift_msa).reshape(batch_size, token_count, hidden_size)
-        attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, cam_geometry)
+        if cache is None:
+            attn_output = self.attn(x_msa_in, spatial_shape, rotary_emb, cam_geometry)
+        else:
+            attn_output = self.attn(
+                x_msa_in,
+                spatial_shape,
+                rotary_emb,
+                cam_geometry,
+                cache=cache,
+                save_cache=save_cache,
+                chunk_index=chunk_index,
+            )
         if camera_hidden_states is not None and self.plucker_proj is not None:
             attn_output = attn_output + self.plucker_proj(camera_hidden_states)
         attn_output_4d = attn_output.reshape(batch_size, frames, spatial_tokens, hidden_size)
@@ -1661,7 +1960,10 @@ class SanaWmBlock(nn.Module):
 
         x_4d = hidden_states.reshape(batch_size, frames, spatial_tokens, hidden_size)
         x_mlp_in = self.norm2(x_4d, scale_mlp, shift_mlp).reshape(batch_size, token_count, hidden_size)
-        mlp_out = self.mlp(x_mlp_in, spatial_shape)
+        if cache is None:
+            mlp_out = self.mlp(x_mlp_in, spatial_shape)
+        else:
+            mlp_out = self.mlp(x_mlp_in, spatial_shape, cache=cache, save_cache=save_cache)
         mlp_out_4d = mlp_out.reshape(batch_size, frames, spatial_tokens, hidden_size)
         hidden_states = hidden_states + (gate_mlp * mlp_out_4d).reshape(batch_size, token_count, hidden_size)
         return hidden_states
@@ -1895,6 +2197,111 @@ class SanaWmTransformer3DModel(nn.Module):
             width * patch_width,
         )
 
+    def _embed_text(
+        self,
+        encoder_hidden_states: torch.Tensor | None,
+        encoder_attention_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        encoder_hidden_states = self.y_embedder(
+            encoder_hidden_states.to(device=device) if encoder_hidden_states is not None else None,
+            batch_size=batch_size,
+            dtype=dtype,
+        )
+        encoder_hidden_states = self.attention_y_norm(encoder_hidden_states)
+        # No mask means "attend to every prompt token"; keep it ``None`` so
+        # cross-attention takes the mask-free attention path rather than
+        # building an all-ones mask the backend would have to reshape per block.
+        if encoder_attention_mask is not None:
+            encoder_attention_mask = encoder_attention_mask.to(device=device)
+            if encoder_attention_mask.shape != encoder_hidden_states.shape[:2]:
+                raise ValueError(
+                    "Sana-WM encoder_attention_mask must match text tokens "
+                    f"{tuple(encoder_hidden_states.shape[:2])}, got {tuple(encoder_attention_mask.shape)}."
+                )
+        return encoder_hidden_states, encoder_attention_mask
+
+    def _embed_timestep(
+        self,
+        timestep: torch.Tensor | float | int,
+        *,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], device=device, dtype=torch.float32)
+        timestep = timestep.to(device=device)
+        if timestep.ndim == 0:
+            timestep = timestep.expand(batch_size)
+        elif timestep.ndim == 1 and timestep.shape[0] == 1 and batch_size > 1:
+            timestep = timestep.expand(batch_size)
+        # Per-frame timestep contract: a rank > 1 ``timestep`` (``(B, 1, F)``
+        # from the LTX flow-matching sampler) embeds on the flattened token axis
+        # and unflattens back, giving ``(B, 1, F, D)`` / ``(B, 1, F, 6*D)``.
+        # SanaWmBlock and SanaWmFinalLayer dispatch on ``ndim > 2`` to the
+        # frame-aware paths that broadcast modulation over spatial tokens.
+        timestep_shape = tuple(timestep.shape)
+        time_embed = self.t_embedder(timestep)  # (numel, D)
+        _t_silu = self.t_block[0](time_embed)
+        timestep_modulation = self.t_block[1](_t_silu).to(dtype)
+        if len(timestep_shape) > 1:
+            time_embed = time_embed.unflatten(0, timestep_shape)
+            timestep_modulation = timestep_modulation.unflatten(0, timestep_shape)
+        return time_embed, timestep_modulation
+
+    def _build_cam_geometry(
+        self,
+        raymap: torch.Tensor | None,
+        *,
+        batch_size: int,
+        spatial_shape: tuple[int, int, int],
+        rotary_emb: torch.Tensor | None,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> SanaWmCamGeometry | None:
+        # Build (B, T_latent, 20) camera_conditions from the raw raymap, then
+        # derive the UCPE geometry ONCE for the whole forward. The ray grid,
+        # its SE(3) inverse and the camera RoPE tables are identical in every
+        # block, so building them per block cost ~2400 rebuilds per request
+        # (20 blocks x 60 steps x 2 CFG branches). When the caller passes
+        # pre-embedded camera_hidden_states without raymap, the cam branch
+        # becomes a no-op (main-branch only).
+        if raymap is None:
+            return None
+        # ``_pack_camera_conditions`` emits an unbatched (T_latent, 20).
+        camera_conditions = raymap.unsqueeze(0)
+        if batch_size > 1:
+            camera_conditions = camera_conditions.expand(batch_size, -1, -1)
+        camera_conditions = camera_conditions.to(device=device, dtype=dtype)
+        # cam_head_dim comes from the attention module rather than being
+        # re-derived here: __init__ already asserts it equals the main
+        # head_dim and is consistent across blocks.
+        attn = self.blocks[0].attn
+        return prepare_cam_geometry(
+            camera_conditions=camera_conditions,
+            spatial_shape=spatial_shape,
+            patch_size=self.patch_size,
+            head_dim=attn.cam_head_dim,
+            rotary_emb=attn._ucpe_rotary_freqs(rotary_emb),
+        )
+
+    def _finalize(
+        self,
+        hidden_states: torch.Tensor,
+        time_embed: torch.Tensor,
+        spatial_shape: tuple[int, int, int],
+        latent_shape: torch.Size,
+    ) -> torch.Tensor:
+        hidden_states = self.final_layer(hidden_states, time_embed.to(hidden_states.dtype), spatial_shape)
+        hidden_states = self._unpatchify(hidden_states, spatial_shape)
+        if hidden_states.shape[2:] != latent_shape:
+            hidden_states = F.interpolate(hidden_states, size=latent_shape, mode="trilinear", align_corners=False)
+        return hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1913,49 +2320,26 @@ class SanaWmTransformer3DModel(nn.Module):
         latent_shape = hidden_states.shape[2:]
         hidden_states, spatial_shape = self.x_embedder.project_with_shape(hidden_states)
         rotary_emb = None
-        if self.config.pos_embed_type == "wan_rope":
+        if self.config.pos_embed_type in ("wan_rope", "casual_wan_rope"):
             rotary_emb = self.rope(spatial_shape, hidden_states.device)
         else:
             hidden_states = hidden_states + self._positional_embedding(
                 hidden_states.shape[1], hidden_states.dtype, hidden_states.device
             )
 
-        encoder_hidden_states = self.y_embedder(
-            encoder_hidden_states.to(device=hidden_states.device) if encoder_hidden_states is not None else None,
+        encoder_hidden_states, encoder_attention_mask = self._embed_text(
+            encoder_hidden_states,
+            encoder_attention_mask,
             batch_size=batch_size,
             dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
-        encoder_hidden_states = self.attention_y_norm(encoder_hidden_states)
-        # No mask means "attend to every prompt token"; keep it ``None`` so
-        # cross-attention takes the mask-free attention path rather than
-        # building an all-ones mask the backend would have to reshape per block.
-        if encoder_attention_mask is not None:
-            encoder_attention_mask = encoder_attention_mask.to(device=hidden_states.device)
-            if encoder_attention_mask.shape != encoder_hidden_states.shape[:2]:
-                raise ValueError(
-                    "Sana-WM encoder_attention_mask must match text tokens "
-                    f"{tuple(encoder_hidden_states.shape[:2])}, got {tuple(encoder_attention_mask.shape)}."
-                )
-
-        if not torch.is_tensor(timestep):
-            timestep = torch.tensor([timestep], device=hidden_states.device, dtype=torch.float32)
-        timestep = timestep.to(device=hidden_states.device)
-        if timestep.ndim == 0:
-            timestep = timestep.expand(batch_size)
-        elif timestep.ndim == 1 and timestep.shape[0] == 1 and batch_size > 1:
-            timestep = timestep.expand(batch_size)
-        # Per-frame timestep contract: a rank > 1 ``timestep`` (``(B, 1, F)``
-        # from the LTX flow-matching sampler) embeds on the flattened token axis
-        # and unflattens back, giving ``(B, 1, F, D)`` / ``(B, 1, F, 6*D)``.
-        # SanaWmBlock and SanaWmFinalLayer dispatch on ``ndim > 2`` to the
-        # frame-aware paths that broadcast modulation over spatial tokens.
-        timestep_shape = tuple(timestep.shape)
-        time_embed = self.t_embedder(timestep)  # (numel, D)
-        _t_silu = self.t_block[0](time_embed)
-        timestep_modulation = self.t_block[1](_t_silu).to(hidden_states.dtype)
-        if len(timestep_shape) > 1:
-            time_embed = time_embed.unflatten(0, timestep_shape)
-            timestep_modulation = timestep_modulation.unflatten(0, timestep_shape)
+        time_embed, timestep_modulation = self._embed_timestep(
+            timestep,
+            batch_size=batch_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
         if camera_hidden_states is None:
             camera_hidden_states = self._camera_hidden_states_from_conditions(
@@ -1967,31 +2351,14 @@ class SanaWmTransformer3DModel(nn.Module):
                 device=hidden_states.device,
             )
 
-        # Build (B, T_latent, 20) camera_conditions from the raw raymap, then
-        # derive the UCPE geometry ONCE for the whole forward. The ray grid,
-        # its SE(3) inverse and the camera RoPE tables are identical in every
-        # block, so building them per block cost ~2400 rebuilds per request
-        # (20 blocks x 60 steps x 2 CFG branches). When the caller passes
-        # pre-embedded camera_hidden_states without raymap, the cam branch
-        # becomes a no-op (main-branch only).
-        cam_geometry: SanaWmCamGeometry | None = None
-        if raymap is not None:
-            # ``_pack_camera_conditions`` emits an unbatched (T_latent, 20).
-            camera_conditions = raymap.unsqueeze(0)
-            if batch_size > 1:
-                camera_conditions = camera_conditions.expand(batch_size, -1, -1)
-            camera_conditions = camera_conditions.to(device=hidden_states.device, dtype=hidden_states.dtype)
-            # cam_head_dim comes from the attention module rather than being
-            # re-derived here: __init__ already asserts it equals the main
-            # head_dim and is consistent across blocks.
-            attn = self.blocks[0].attn
-            cam_geometry = prepare_cam_geometry(
-                camera_conditions=camera_conditions,
-                spatial_shape=spatial_shape,
-                patch_size=self.patch_size,
-                head_dim=attn.cam_head_dim,
-                rotary_emb=attn._ucpe_rotary_freqs(rotary_emb),
-            )
+        cam_geometry = self._build_cam_geometry(
+            raymap,
+            batch_size=batch_size,
+            spatial_shape=spatial_shape,
+            rotary_emb=rotary_emb,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
         for block in self.blocks:
             hidden_states = block(
@@ -2005,11 +2372,105 @@ class SanaWmTransformer3DModel(nn.Module):
                 encoder_attention_mask,
             )
 
-        hidden_states = self.final_layer(hidden_states, time_embed.to(hidden_states.dtype), spatial_shape)
-        hidden_states = self._unpatchify(hidden_states, spatial_shape)
-        if hidden_states.shape[2:] != latent_shape:
-            hidden_states = F.interpolate(hidden_states, size=latent_shape, mode="trilinear", align_corners=False)
-        return hidden_states
+        return self._finalize(hidden_states, time_embed, spatial_shape, latent_shape)
+
+    def forward_streaming(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        *,
+        frame_index: torch.Tensor,
+        cache: SanaWmStreamingCache,
+        save_cache: bool,
+        encoder_hidden_states: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+        plucker: torch.Tensor | None = None,
+        raymap: torch.Tensor | None = None,
+        spatial_raymap: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Chunk-causal forward over one chunk of latent frames.
+
+        Mirrors NVlabs ``SanaMSVideoCamCtrlStreaming.forward_long``: identical
+        to :meth:`forward` except that RoPE is built for the chunk's absolute
+        ``frame_index`` and every block reads its slot of ``cache`` (and
+        writes it back when ``save_cache``). The camera tensors must already
+        be sliced to this chunk. ``timestep`` is the per-frame ``(B, 1, F)``
+        table — the streaming blocks only implement the frame-aware path.
+
+        The sampler drives this with ``save_cache=False`` for the denoising
+        steps and once more on the clean chunk at ``t = 0`` with
+        ``save_cache=True``; the chunk index recorded in the softmax K/V
+        entries is ``cache.chunks_committed``.
+        """
+        if hidden_states.ndim != 5:
+            raise ValueError("Sana-WM transformer expects latent input shaped [B, C, F, H, W].")
+        if self.config.pos_embed_type not in ("wan_rope", "casual_wan_rope"):
+            raise ValueError(
+                "Sana-WM streaming requires a RoPE checkpoint (pos_embed_type wan_rope / casual_wan_rope), "
+                f"got {self.config.pos_embed_type!r}."
+            )
+        if len(cache.blocks) != len(self.blocks):
+            raise ValueError(
+                f"Sana-WM streaming cache has {len(cache.blocks)} block slots, model has {len(self.blocks)} blocks."
+            )
+        if not torch.is_tensor(timestep) or timestep.ndim != 3:
+            raise ValueError("Sana-WM streaming requires a per-frame timestep shaped (B, 1, F).")
+        batch_size = hidden_states.shape[0]
+        latent_shape = hidden_states.shape[2:]
+        hidden_states, spatial_shape = self.x_embedder.project_with_shape(hidden_states)
+        if timestep.shape[2] != spatial_shape[0]:
+            raise ValueError(
+                f"Sana-WM streaming timestep covers {timestep.shape[2]} frames, chunk has {spatial_shape[0]}."
+            )
+        rotary_emb = self.rope(spatial_shape, hidden_states.device, frame_index=frame_index)
+
+        encoder_hidden_states, encoder_attention_mask = self._embed_text(
+            encoder_hidden_states,
+            encoder_attention_mask,
+            batch_size=batch_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        time_embed, timestep_modulation = self._embed_timestep(
+            timestep,
+            batch_size=batch_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        camera_hidden_states = self._camera_hidden_states_from_conditions(
+            plucker=plucker,
+            spatial_raymap=spatial_raymap,
+            spatial_shape=spatial_shape,
+            batch_size=batch_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        cam_geometry = self._build_cam_geometry(
+            raymap,
+            batch_size=batch_size,
+            spatial_shape=spatial_shape,
+            rotary_emb=rotary_emb,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        chunk_index = cache.chunks_committed
+        for block, block_cache in zip(self.blocks, cache.blocks):
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_modulation,
+                spatial_shape,
+                rotary_emb,
+                camera_hidden_states,
+                cam_geometry,
+                encoder_attention_mask,
+                cache=block_cache,
+                save_cache=save_cache,
+                chunk_index=chunk_index,
+            )
+
+        return self._finalize(hidden_states, time_embed, spatial_shape, latent_shape)
 
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
         """Stream checkpoint tensors into the eagerly-built modules.

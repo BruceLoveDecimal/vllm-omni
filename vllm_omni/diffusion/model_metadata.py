@@ -99,6 +99,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=1,
         final_output_type="video",
     ),
+    "SanaWmStreamingPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
 }
 
 _DIFFUSION_MODEL_METADATA_ALIASES = {

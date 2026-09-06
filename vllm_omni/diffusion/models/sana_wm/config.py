@@ -71,6 +71,19 @@ class SanaWmConfig:
     scheduler_type: str = "flow_dpm-solver"
     chi_prompt: list[str] = field(default_factory=list)
     model_max_length: int = 300
+    # --- Chunk-causal streaming (distilled Stage-1 release) ---------------
+    # ``streaming`` marks a checkpoint trained chunk-causally; only
+    # ``SanaWmStreamingPipeline`` consumes it, the bidirectional pipeline
+    # ignores it. The remaining names mirror the NVlabs streaming YAML
+    # (``chunk_size`` / ``chunk_split_strategy``) and the streaming inference
+    # CLI defaults (``num_cached_blocks`` / ``sink_token`` /
+    # ``denoising_step_list``), so the converted config is a rename-free copy.
+    streaming: bool = False
+    chunk_size: int = 3
+    chunk_split_strategy: str = "uniform"
+    num_cached_blocks: int = 2
+    sink_token: bool = True
+    denoising_step_list: tuple[int, ...] = (1000, 960, 889, 727, 0)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SanaWmConfig:
@@ -84,6 +97,8 @@ class SanaWmConfig:
         known = {k: v for k, v in data.items() if k in field_names}
         if "patch_size" in known:
             known["patch_size"] = _as_tuple3(known["patch_size"], cls.patch_size)
+        if "denoising_step_list" in known and known["denoising_step_list"] is not None:
+            known["denoising_step_list"] = tuple(int(step) for step in known["denoising_step_list"])
         return cls(**known)
 
     @classmethod

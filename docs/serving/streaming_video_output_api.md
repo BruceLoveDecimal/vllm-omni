@@ -68,6 +68,40 @@ Only `m4s` output is currently accepted. Concatenate the binary frames in
 receive order, then remux the fragmented stream if the target player requires
 a progressive MP4 file.
 
+## Supported models
+
+| Pipeline | Model | Notes |
+| --- | --- | --- |
+| `HeliosPipeline` | `BestWishYsh/Helios-Distilled` | Text-to-video; supports `session.interaction` prompt updates |
+| `SanaWmStreamingPipeline` | `BBBBruce/SANA-WM_streaming-stage1-diffusers` | First-frame image-to-video with camera control (`image_reference` + `extra_params.sana_wm`); `session.interaction` is rejected |
+
+SANA-WM streaming takes the same `sana_wm` block as the video API
+([recipe](../../recipes/NVIDIA/SANA-WM.md)), for example:
+
+```json
+{
+  "type": "session.start",
+  "model": "BBBBruce/SANA-WM_streaming-stage1-diffusers",
+  "prompt": "A slow forward camera move through a quiet city street.",
+  "image_reference": {"image_url": "data:image/png;base64,..."},
+  "width": 1280, "height": 704, "num_frames": 169, "fps": 16,
+  "num_inference_steps": 4, "guidance_scale": 1.0, "seed": 42,
+  "format": "m4s",
+  "extra_params": {
+    "sana_wm": {
+      "action": "w-168",
+      "translation_speed": 0.055,
+      "rotation_speed_deg": 1.2,
+      "intrinsics": {"fx": 640, "fy": 640, "cx": 640, "cy": 352}
+    }
+  }
+}
+```
+
+`num_frames` must be `24k + 1`; each media chunk carries one generated latent
+block (25 pixel frames for the first chunk, 24 afterwards) and
+`generation_chunk_index` counts them from 0.
+
 ## Mid-Generation Interaction
 
 Models that implement interaction updates can change the active prompt:
