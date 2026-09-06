@@ -102,6 +102,12 @@ For full request-shape documentation (all parameters, response formats, error co
 
 ## dots.tts
 
+The endpoint supports request-level `seed`, `language`, and model controls via
+`extra_params` (`num_steps`, `guidance_scale`, `speaker_scale`, `eos_threshold`,
+`ode_method`, `template_name`, `normalize_text`). See the
+[dots.tts request controls](../../../recipes/rednote-hilab/dots.tts.md#request-controls)
+for accepted values, optional dependencies, and reproducibility limits.
+
 Single-stage TTS at 48 kHz. Three conditioning modes: zero-shot,
 reference audio alone (CAM++ x-vector), and reference audio plus its
 transcript (which additionally prefills the reference into the AR loop).

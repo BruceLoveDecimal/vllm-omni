@@ -71,6 +71,7 @@ from vllm_omni.model_executor.models.dots_tts.dots_tts_vocoder import (
     AudioVAE,
     AudioVAEConfig,
 )
+from vllm_omni.model_executor.models.dots_tts.request_config import DotsTTSRequestConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -113,7 +114,6 @@ _DIT_NUM_STEPS = int(
 _DIT_GUIDANCE_SCALE = 1.2  # upstream default guidance_scale for soar
 _DIT_NOISE_SEED = 20260601  # base seed for per-request FM noise (voxcpm2 parity)
 _PATCH_ENCODER_OUT_DS_RATE = 2  # patch_size / in_ds_rate = 4 / 2 (VAESemanticEncoder hardcodes in_ds_rate=2)
-_SPEAKER_SCALE = 1.5  # upstream default speaker_scale (runtime.py:341/695)
 # Conditioning artifacts (CAM++ x-vector, AudioVAE latent distribution) are
 # cached in the process-wide speaker cache under this model type, so a
 # repeated reference voice pays the encoders once instead of once per
@@ -169,6 +169,8 @@ class _IOHelper:
 @dataclass
 class _RequestState:
     request_id: str
+    seed: int | None = None
+    generation_config: DotsTTSRequestConfig = dataclasses.field(default_factory=DotsTTSRequestConfig)
     # AR loopback: patch_encoder's previous decode output, fed to the LM
     # as next-step inputs_embeds.  Shape: [1, llm_hidden] = [1, 1536].
     # (patch_encoder collapses its internal _PATCH_ENCODER_OUT_DS_RATE
@@ -182,7 +184,7 @@ class _RequestState:
     is_stopping: bool = False
     prefill_completed: bool = False
     # Per-request FM noise counter: draw #n of this request hashes to a
-    # deterministic Generator seed (see _run_dit_n_step_euler), so outputs
+    # deterministic Generator seed (see _run_dit_solver), so outputs
     # are reproducible run-to-run and concurrent requests cannot perturb
     # each other's noise streams (voxcpm2 _fill_deterministic_cfm_noise).
     noise_step: int = 0
@@ -649,6 +651,8 @@ class DotsTTSForConditionalGeneration(nn.Module):
             state.precomputed_stop_logits = None
             state.is_stopping = False
             state.prefill_completed = False
+            state.generation_config = DotsTTSRequestConfig.model_validate(info_dict.get("dots_tts_config") or {})
+            state.seed = info_dict.get("_omni_seed")
             state.noise_step = 0
             # Reset AR-loop state on every prefill.
             state.patch_encoder_state = None
@@ -745,13 +749,15 @@ class DotsTTSForConditionalGeneration(nn.Module):
         can_cache_speaker = self._can_cache_speaker_embedding(target_samples)
         if speaker_embedding is None or not can_cache_speaker:
             self._align_speaker_encoder_device(device)
-            speaker_embedding = self._speaker_encoder(_waveform().squeeze(1))
+            speaker_embedding = self._speaker_encoder(_waveform().squeeze(1), seed=state.seed)
             if can_cache_speaker:
                 cached["speaker_embedding"] = speaker_embedding.detach().cpu()
         else:
             speaker_embedding = speaker_embedding.to(device=device)
         xvec_dtype = next(self._xvec_proj.parameters()).dtype
-        state.g_cond = self._xvec_proj(speaker_embedding.to(dtype=xvec_dtype) * _SPEAKER_SCALE).detach()
+        state.g_cond = self._xvec_proj(
+            speaker_embedding.to(dtype=xvec_dtype) * state.generation_config.speaker_scale
+        ).detach()
 
         if not use_prompt_prefill:
             if cache_key is not None and cached:
@@ -767,7 +773,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
         if cache_key is not None:
             self._prompt_feature_cache.put(cache_key, cached)
 
-        prompt_latents = self._sample_prompt_latents(latent_distribution, cache_key)
+        prompt_latents = self._sample_prompt_latents(latent_distribution, cache_key, seed=state.seed)
         # Drop the reference's final patch: the model regenerates it as its
         # first sampled patch (upstream model.py:924 + :1459).
         prompt_latents = prompt_latents[:, : prompt_patch_count * _LATENT_PATCH_SIZE]
@@ -874,16 +880,22 @@ class DotsTTSForConditionalGeneration(nn.Module):
         self,
         latent_distribution: torch.Tensor,
         cache_key: tuple[str, str, int] | None,
+        *,
+        seed: int | None = None,
     ) -> torch.Tensor:
         """Draw ``[1, T, _LATENT_DIM]`` latents from the AudioVAE posterior.
 
         Upstream ``IOHelper.sample_from_latent`` (core.py:742) draws from
         the global RNG.  We seed a private Generator from the reference's
-        cache key so a voice sounds the same whether the distribution came
-        from the cache or was just computed, and across runs.
+        request seed when provided, independent of the reference cache key.
+        Otherwise retain the existing reference-keyed draw. Only the posterior
+        distribution is cached, so cache hits do not freeze seed-dependent samples.
         """
         mean, log_std = latent_distribution.chunk(2, dim=1)
-        seed_source = f"{_PROMPT_LATENT_SEED}:{cache_key[0] if cache_key else ''}".encode()
+        # Explicit seeds must not depend on the URL/cache identity.
+        seed_source = (
+            f"{seed}:prompt" if seed is not None else f"{_PROMPT_LATENT_SEED}:{cache_key[0] if cache_key else ''}"
+        ).encode()
         digest = hashlib.blake2b(seed_source, digest_size=8).digest()
         gen = torch.Generator(device=mean.device)
         gen.manual_seed(int.from_bytes(digest, "little") & 0x7FFF_FFFF_FFFF_FFFF)
@@ -1018,7 +1030,12 @@ class DotsTTSForConditionalGeneration(nn.Module):
         self._append_hidden_chunk(state, last_hidden)
 
         # 2. DiT N-step Euler → audio latent patch [1, 4, 128] (normalized).
-        audio_patch = self._run_dit_n_step_euler(state)
+        audio_patch = self._run_dit_solver(
+            state,
+            num_steps=state.generation_config.num_steps,
+            guidance_scale=state.generation_config.guidance_scale,
+            ode_method=state.generation_config.ode_method,
+        )
 
         # 3. Append latent to fm_sequence (+4 positions).  Stays in
         #    normalized space — DiT's KV cache lives in that space.
@@ -1078,7 +1095,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
         eos_logits = self._eos_proj(last_hidden.detach()).softmax(dim=-1)
         stop_logits = eos_logits.squeeze(0)
         state.precomputed_stop_logits = stop_logits
-        if eos_logits[0, -1, 1].item() > 0.8:
+        if eos_logits[0, -1, 1].item() > state.generation_config.eos_threshold:
             state.is_stopping = True
             # Upstream flushes after its decode loop (model.py:1898); our
             # request ends when vLLM sees this step's stop token, so drain
@@ -1275,14 +1292,15 @@ class DotsTTSForConditionalGeneration(nn.Module):
         )
         return pos_ids
 
-    def _run_dit_n_step_euler(
+    def _run_dit_solver(
         self,
         state: _RequestState,
         *,
         num_steps: int = _DIT_NUM_STEPS,
         guidance_scale: float = _DIT_GUIDANCE_SCALE,
+        ode_method: str = "euler",
     ) -> torch.Tensor:
-        """DiT N-step Euler integration → audio latent patch [1, 4, 128].
+        """DiT flow integration → audio latent patch [1, 4, 128].
 
         Manual Euler loop (upstream uses torchdyn.odeint; we manualize to
         avoid the dep and keep control flow explicit).  Each step:
@@ -1293,7 +1311,8 @@ class DotsTTSForConditionalGeneration(nn.Module):
           4. Euler: z += v * dt.
 
         Mirrors upstream fm_solver_step (core.py:295) + _flow_matching_step_fm
-        (core.py:463), reduced to a fixed-step Euler integrator.
+        (core.py:463). Euler preserves the original path; midpoint/rk4 use
+        torchdiffeq, as in the Covo-Audio integration.
         """
         assert state.fm_sequence is not None
         assert state.fm_cfg_sequence is not None
@@ -1332,7 +1351,11 @@ class DotsTTSForConditionalGeneration(nn.Module):
         request_key = state.request_id.split("_", 1)[0]
         if not request_key.isdigit():
             request_key = state.request_id
-        noise_key = f"{_DIT_NOISE_SEED}:{request_key}:{state.noise_step}".encode()
+        noise_key = (
+            f"{state.seed}:dit:{state.noise_step}"
+            if state.seed is not None
+            else f"{_DIT_NOISE_SEED}:{request_key}:{state.noise_step}"
+        ).encode()
         digest = hashlib.blake2b(noise_key, digest_size=8).digest()
         gen = torch.Generator(device=device)
         gen.manual_seed(int.from_bytes(digest, "little") & 0x7FFF_FFFF_FFFF_FFFF)
@@ -1352,29 +1375,32 @@ class DotsTTSForConditionalGeneration(nn.Module):
             dtype=dtype if use_amp else torch.float32,
             enabled=use_amp,
         ):
-            for step in range(num_steps):
-                t = times[step].reshape(1)
-                z_proj = self._coordinate_proj(z)
+
+            def velocity(t, sample):
+                z_proj = self._coordinate_proj(sample)
                 z_c = input_sequence.clone()
                 z_c[:, latent_start:] = z_proj
                 z_u = cfg_sequence.clone()
                 z_u[:, latent_start:] = z_proj
-                z_batched = torch.cat([z_c, z_u], dim=0)
-                t_batched = t.repeat(2)
                 vt = self._head(
-                    x=z_batched,
-                    timesteps=t_batched,
+                    x=torch.cat([z_c, z_u], dim=0),
+                    timesteps=t.reshape(1).repeat(2),
                     attn_mask=attn_mask,
                     pos_ids=pos_ids,
                     g_cond=g_cond_batched,
-                )
-                # Upcast DiT output before CFG blend + Euler update so the
-                # accumulation arithmetic stays fp32 (autocast only affects
-                # matmuls; these pointwise ops keep their input dtype).
-                vt = vt[:, latent_start:].float()
+                )[:, latent_start:].float()
                 vt_c, vt_u = vt[0:1], vt[1:2]
-                velocity = vt_c + guidance_scale * (vt_c - vt_u)
-                z = z + velocity * dt
+                return vt_c + guidance_scale * (vt_c - vt_u)
+
+            if ode_method == "euler":
+                for step in range(num_steps):
+                    z = z + velocity(times[step], z) * dt
+            else:
+                # Reuse the ODE package already used by Covo-Audio. Keep the
+                # default Euler path dependency-free and numerically unchanged.
+                from torchdiffeq import odeint
+
+                z = odeint(velocity, z, times, method=ode_method)[-1]
         return z.to(dtype)
 
     def _run_patch_encoder_loopback(

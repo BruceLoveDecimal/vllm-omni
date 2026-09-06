@@ -200,6 +200,72 @@ server errors, confirming per-request isolation of the prompt-prefill state.
   single ~160 ms patch. Do not override `enable_prefix_caching` for this
   model until that framework-level gap is fixed.
 
+### Request controls
+
+Use the shared speech API's top-level `seed` and `language` fields. Language
+accepts codes/names such as `EN`, `ZH`, `english`, `Cantonese`, `auto` /
+`auto_detect`, or `none`. Auto detection uses Lingua; language names use
+langcodes. Cantonese maps to the upstream `[口音:粤语]` tag.
+
+Optional text processing and non-Euler solvers require:
+
+```bash
+pip install 'vllm-omni[dots-tts]'
+```
+
+Pass model-specific controls in `extra_params`:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `num_steps` | 10 | Positive integer ODE integration steps; fewer steps trade quality for latency |
+| `guidance_scale` | 1.2 | Nonnegative CFG strength |
+| `speaker_scale` | 1.5 | Nonnegative reference-speaker embedding scale, applied after cache lookup |
+| `eos_threshold` | 0.8 | Stop probability threshold in [0, 1]; 0 stops early, 1 relies on the token limit |
+| `ode_method` | `euler` | `euler`, `midpoint`, or `rk4`; the latter two use torchdiffeq |
+| `template_name` | `tts` | `tts`, `instruction_tts`, or `text_to_audio` |
+| `normalize_text` | false | WeTextProcessing normalization for detected Chinese/English target text |
+
+`num_steps` defaults to `DOTS_TTS_DIT_NUM_STEPS` when that existing environment
+override is set. The non-Euler methods perform multiple DiT evaluations per
+integration step. Generation length remains controlled by `max_new_tokens`;
+LLM `temperature` / `top_p` / `top_k` do not control continuous-latent sampling.
+Invalid controls are rejected before engine execution.
+
+```json
+{
+  "input": "I bought 12 apples today.",
+  "ref_audio": "file:///path/to/reference.wav",
+  "ref_text": "The exact reference transcript.",
+  "seed": 42,
+  "language": "EN",
+  "response_format": "wav",
+  "extra_params": {
+    "num_steps": 10,
+    "guidance_scale": 1.2,
+    "speaker_scale": 1.5,
+    "eos_threshold": 0.8,
+    "ode_method": "euler",
+    "template_name": "tts",
+    "normalize_text": true
+  }
+}
+```
+
+Templates use the upstream prefixes `[文本]`, `[带指令文本]`, and `[声音描述]`.
+For `instruction_tts`, put inline instructions in `input`; the separate
+`instructions` field is rejected rather than discarded. Template routing is
+supported, but style adherence and general sound-generation quality depend on
+the checkpoint and are not guaranteed by selecting a template.
+
+Offline inference uses the same prompt builder and controls:
+
+```bash
+python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
+    --model dots-studio/dots.tts-soar --seed 42 --language EN \
+    --text "I bought 12 apples today." \
+    --extra-params '{"num_steps":10,"normalize_text":true}'
+```
+
 ## Known limitations
 
 - **Precomputed speaker embeddings are not supported.** Conditioning goes
@@ -226,8 +292,8 @@ server errors, confirming per-request isolation of the prompt-prefill state.
   unlike voxcpm2's `enable_batched_cfm`). A community review of this
   integration measured no throughput gain at `c=4` concurrent requests
   versus `c=1`.
-- **`SamplingParams.seed` does not control audio-generation randomness.**
-  The DiT's flow-matching noise is deterministically derived per-request
-  from a fixed internal seed (reproducible run-to-run, matching
-  voxcpm2's `deterministic_cfm_seed` convention) rather than from the
-  caller-supplied `seed` field — the same limitation voxcpm2 has today.
+- **Seed reproducibility depends on execution shape.** `seed` controls DiT
+  noise, reference-latent sampling, and the speaker encoder's random crop.
+  Identical serial requests reproduce on the same stack; different batch
+  compositions may change floating-point results. Unseeded requests retain
+  the existing request-ID-based noise behavior.

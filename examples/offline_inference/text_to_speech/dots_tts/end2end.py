@@ -6,6 +6,8 @@ Reference checkpoint: dots-studio/dots.tts-soar.
 
 from __future__ import annotations
 
+import copy
+import json
 import math
 import os
 import time
@@ -60,6 +62,15 @@ def parse_args():
         default=None,
         help="Override the deploy config path. If unset, auto-loads "
         "vllm_omni/deploy/dots_tts.yaml based on the HF model_type.",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="Per-request acoustic sampling seed.")
+    parser.add_argument("--language", default=None, help="Language code/name, auto_detect, or none.")
+    parser.add_argument(
+        "--extra-params",
+        type=json.loads,
+        default=None,
+        help="JSON dots.tts controls, same fields as serving extra_params: num_steps, guidance_scale, "
+        "speaker_scale, eos_threshold, ode_method, template_name, normalize_text.",
     )
     return parser.parse_args()
 
@@ -132,6 +143,8 @@ def main():
         prompt_patch_count=prompt_patch_count,
         prompt_audio_samples=prompt_audio_samples,
         ref_audio_key=args.ref_audio,
+        generation_config=args.extra_params,
+        language=args.language,
     )
 
     print(f"Model       : {args.model}")
@@ -141,7 +154,10 @@ def main():
     print(f"Prompt len  : {len(prompt['prompt_token_ids'])} tokens")
 
     t_start = time.perf_counter()
-    outputs = engine.generate([prompt])
+    sampling_params = copy.deepcopy(engine.default_sampling_params_list)
+    if args.seed is not None:
+        sampling_params[0].seed = args.seed
+    outputs = engine.generate([prompt], sampling_params_list=sampling_params)
     elapsed = time.perf_counter() - t_start
 
     request_output = outputs[0]

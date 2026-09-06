@@ -4,6 +4,7 @@
 import math
 import time
 
+from pydantic import ValidationError
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.utils.async_utils import make_async
@@ -12,6 +13,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechReques
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 from vllm_omni.model_executor.models.dots_tts.dots_tts_prompt import MAX_AUDIO_PATCHES
+from vllm_omni.model_executor.models.dots_tts.request_config import DotsTTSRequestConfig
 
 logger = init_logger(__name__)
 
@@ -64,6 +66,8 @@ class DotsTTSAdapter(ARTTSAdapter):
         prompt_patch_count: int = 0,
         prompt_audio_samples: int = 0,
         ref_audio_key: str | None = None,
+        generation_config: dict | None = None,
+        language: str | None = None,
     ) -> dict:
         from vllm_omni.model_executor.models.dots_tts.dots_tts_prompt import build_dots_tts_prompt
 
@@ -81,10 +85,21 @@ class DotsTTSAdapter(ARTTSAdapter):
             prompt_patch_count=prompt_patch_count,
             prompt_audio_samples=prompt_audio_samples,
             ref_audio_key=ref_audio_key,
+            generation_config=generation_config,
+            language=language,
         )
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         server = self.ctx.server
+        try:
+            DotsTTSRequestConfig.model_validate(request.extra_params or {})
+        except ValidationError as exc:
+            return str(exc)
+        if request.instructions:
+            return (
+                "dots.tts takes inline instructions in input; select "
+                "extra_params.template_name=instruction_tts instead of the separate instructions field"
+            )
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
@@ -175,6 +190,8 @@ class DotsTTSAdapter(ARTTSAdapter):
             prompt_patch_count=prompt_patch_count,
             prompt_audio_samples=prompt_audio_samples,
             ref_audio_key=ref_audio_key,
+            generation_config=request.extra_params,
+            language=request.language,
         )
         return PreparedRequest(
             prompt=prompt,

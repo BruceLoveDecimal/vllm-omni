@@ -575,7 +575,7 @@ class SpeakerXVectorFeatures(nn.Module):
             max=max_length,
         )
 
-    def _crop_audio(self, audio, audio_lengths=None):
+    def _crop_audio(self, audio, audio_lengths=None, *, seed=None):
         original_lengths = self._normalize_lengths(
             audio_lengths,
             audio.size(0),
@@ -591,10 +591,11 @@ class SpeakerXVectorFeatures(nn.Module):
         cropped_lengths = []
         starts = []
 
+        rng = random.Random(seed) if seed is not None else random
         for index, total_length_tensor in enumerate(original_lengths):
             total_length = int(total_length_tensor.item())
             cropped_length = min(total_length, max_input_length)
-            start = random.randint(0, total_length - cropped_length) if total_length > cropped_length else 0
+            start = rng.randint(0, total_length - cropped_length) if total_length > cropped_length else 0
             cropped_audio.append(audio[index, start : start + cropped_length])
             cropped_lengths.append(cropped_length)
             starts.append(start)
@@ -694,7 +695,7 @@ class SpeakerXVectorFeatures(nn.Module):
 
     @torch.no_grad()
     @torch.autocast(enabled=False, device_type="cuda")
-    def forward(self, audio, audio_lengths=None, fbank=None, fbank_lengths=None, **_kwargs):
+    def forward(self, audio, audio_lengths=None, fbank=None, fbank_lengths=None, *, seed=None, **_kwargs):
         self.model.eval()
         audio = audio.float()
         if audio.dim() == 3:
@@ -707,6 +708,7 @@ class SpeakerXVectorFeatures(nn.Module):
         audio, original_audio_lengths, cropped_audio_lengths, starts = self._crop_audio(
             audio,
             audio_lengths=audio_lengths,
+            seed=seed,
         )
 
         if fbank is None:

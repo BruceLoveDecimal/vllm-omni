@@ -100,6 +100,13 @@ indextts2 = [
     "WeTextProcessing; sys_platform == 'linux'",
 ]
 
+dots-tts = [
+    "langcodes[data]",
+    "lingua-language-detector",
+    "WeTextProcessing",
+    "torchdiffeq==0.2.5",
+]
+
 # Local-test-only extras
 local = [
     "FlagEmbedding",

@@ -32,10 +32,16 @@ from typing import Any
 
 from vllm.inputs import tokens_input
 
+from vllm_omni.model_executor.models.dots_tts.request_config import DotsTTSRequestConfig
+from vllm_omni.model_executor.models.dots_tts.text_frontend import prepare_text
+
 # Upstream rednote-hilab/dots.tts @ a393d2e
 # data/pipelines/tts_pipeline.py:17-18
-_TTS_TEXT_PREFIX = "[文本]"
-_TTS_AUDIO_PREFIX = "[文本对应语音]"
+_TEMPLATES = {
+    "tts": ("[文本]", "[文本对应语音]"),
+    "instruction_tts": ("[带指令文本]", "[文本对应语音]"),
+    "text_to_audio": ("[声音描述]", "[描述对应声音]"),
+}
 _AUDIO_GEN_START_TOKEN = "<|audio_gen_start|>"
 _AUDIO_GEN_SPAN_TOKEN = "<|audio_gen_span|>"
 
@@ -85,6 +91,8 @@ def build_dots_tts_prompt(
     prompt_patch_count: int = 0,
     prompt_audio_samples: int = 0,
     ref_audio_key: str | None = None,
+    generation_config: dict[str, Any] | None = None,
+    language: str | None = None,
 ) -> dict[str, Any]:
     """Build a dots.tts prefill prompt dict for ``Omni.generate()``.
 
@@ -114,11 +122,17 @@ def build_dots_tts_prompt(
     # Upstream concatenates prompt_text and text into a single template
     # slot (runtime.py:558 `text=f"{prompt_text}{text}"`), so the LM reads
     # the reference transcript and the target text as one utterance.
-    body = f"{ref_text}{text}" if use_prompt_prefill else text
-    text_ids = tokenizer.encode(f"{_TTS_TEXT_PREFIX}{body}{_TTS_AUDIO_PREFIX}", add_special_tokens=False)
+    config = DotsTTSRequestConfig.model_validate(generation_config or {})
+    body = prepare_text(
+        text, ref_text if use_prompt_prefill else None, language=language, normalize=config.normalize_text
+    )
+    text_prefix, audio_prefix = _TEMPLATES[config.template_name]
+    text_ids = tokenizer.encode(f"{text_prefix}{body}{audio_prefix}", add_special_tokens=False)
     prompt_token_ids = list(text_ids) + [_require_token_id(tokenizer, _AUDIO_GEN_START_TOKEN)]
 
     additional: dict[str, Any] = {}
+    if generation_config:
+        additional["dots_tts_config"] = config.model_dump()
     if ref_audio is not None:
         if use_prompt_prefill:
             prompt_token_ids += [_require_token_id(tokenizer, _AUDIO_GEN_SPAN_TOKEN)] * prompt_patch_count

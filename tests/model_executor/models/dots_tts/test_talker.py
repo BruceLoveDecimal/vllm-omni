@@ -206,7 +206,7 @@ class TestPromptTailPatchIsDropped:
         talker._initialize_request_fm_state = lambda state, *, device, dtype: None
         talker._append_hidden_chunk = lambda *_args: None
         talker._append_history_chunk = lambda *_args: None
-        talker._run_dit_n_step_euler = lambda _state: torch.zeros(1, 4, 128)
+        talker._run_dit_solver = lambda _state, **_kwargs: torch.zeros(1, 4, 128)
         talker._io_helper = SimpleNamespace(denormalize=lambda x: x)
         talker._run_patch_encoder_loopback = lambda _state, _patch: torch.zeros(1, 1, 1536)
 
@@ -267,3 +267,64 @@ class TestReferenceAudioUnwrapping:
 
         with pytest.raises(ValueError):
             _unwrap_reference_audio(ref)
+
+
+@pytest.mark.parametrize("seed", [0, 42, -1])
+def test_prompt_seed_is_independent_of_cache_key(seed):
+    talker = _make_bare_talker()
+    distribution = torch.zeros(1, 256, 8)
+    a = talker._sample_prompt_latents(distribution, None, seed=seed)
+    b = talker._sample_prompt_latents(distribution, ("another-url", "dots_tts", 0), seed=seed)
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+    c = talker._sample_prompt_latents(distribution, None, seed=seed + 1)
+    assert not torch.equal(a, c)
+
+
+def test_seeded_speaker_crop_does_not_modify_global_rng():
+    import random
+
+    from vllm_omni.model_executor.models.dots_tts.dots_tts_speaker_encoder import SpeakerXVectorFeatures
+
+    encoder = SpeakerXVectorFeatures.__new__(SpeakerXVectorFeatures)
+    encoder.sample_rate = 10
+    encoder.max_audio_seconds = 1
+    audio = torch.arange(100).reshape(1, 100)
+    before = random.getstate()
+    a = encoder._crop_audio(audio, seed=42)
+    b = encoder._crop_audio(audio, seed=42)
+    assert random.getstate() == before
+    torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
+    assert not torch.equal(a[0], encoder._crop_audio(audio, seed=43)[0])
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))],
+)
+def test_dit_seed_ignores_request_id_and_other_requests(device):
+    talker = _make_bare_talker()
+    _, state_type = _dots_tts_talker_mod()
+    # Zero velocity exposes the actual sampler's initial noise unchanged.
+    talker._coordinate_proj = lambda z: torch.zeros(1, 4, 1024, device=device)
+    talker._head = lambda **kw: torch.zeros(2, 5, 128, device=device)
+    talker._build_fm_attn_mask = lambda *args: None
+    talker._build_fm_pos_ids = lambda *args: None
+
+    def state(request_id, seed):
+        return state_type(
+            request_id=request_id,
+            seed=seed,
+            fm_sequence=torch.zeros(1, 5, 1024, device=device),
+            fm_cfg_sequence=torch.zeros(1, 5, 1024, device=device),
+            fm_null_g_cond=torch.zeros(1, 1024, device=device),
+            fm_seq_len=1,
+        )
+
+    a, b = state("request-a", 42), state("request-b", 42)
+    first = talker._run_dit_solver(a, num_steps=1)
+    other = talker._run_dit_solver(state("other", 43), num_steps=1)
+    assert not torch.equal(first, other)
+    torch.testing.assert_close(first, talker._run_dit_solver(b, num_steps=1), rtol=0, atol=0)
+    torch.testing.assert_close(
+        talker._run_dit_solver(a, num_steps=1), talker._run_dit_solver(b, num_steps=1), rtol=0, atol=0
+    )

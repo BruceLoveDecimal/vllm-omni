@@ -212,6 +212,9 @@ def _make_adapter(ref_audio_samples=None, ref_sr=_SAMPLE_RATE):
 def _request(**overrides):
     fields = {
         "input": "hello",
+        "extra_params": None,
+        "language": None,
+        "instructions": None,
         "voice": None,
         "ref_audio": None,
         "ref_text": None,
@@ -295,3 +298,108 @@ def test_adapter_rejects_precomputed_speaker_embeddings():
     adapter = _make_adapter()
     assert "speaker_embedding" in adapter.validate(_request(speaker_embedding=[1.0, 2.0]))
     assert "x_vector_only_mode" in adapter.validate(_request(x_vector_only_mode=True))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"num_steps": 0},
+        {"num_steps": 1.5},
+        {"num_steps": True},
+        {"guidance_scale": float("nan")},
+        {"speaker_scale": -1},
+        {"eos_threshold": 1.1},
+        {"ode_method": "invalid"},
+        {"typo": 1},
+    ],
+)
+def test_invalid_generation_controls_are_rejected(extra):
+    assert _make_adapter().validate(_request(extra_params=extra))
+
+
+def test_generation_controls_reach_the_engine_prompt():
+    options = {"num_steps": 2, "guidance_scale": 0, "speaker_scale": 2, "eos_threshold": 0.5, "ode_method": "midpoint"}
+    adapter = _make_adapter()
+    request = _request(extra_params=options)
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], has_inline_ref_audio=False))
+    assert prepared.prompt["additional_information"]["dots_tts_config"] == {
+        "template_name": "tts",
+        "normalize_text": False,
+        **options,
+    }
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("tts", "[文本]hello[文本对应语音]"),
+        ("instruction_tts", "[带指令文本]hello[文本对应语音]"),
+        ("text_to_audio", "[声音描述]hello[描述对应声音]"),
+    ],
+)
+def test_template_matches_upstream_prefixes(template, expected):
+    tok = _StubTokenizer()
+    prompt = build_dots_tts_prompt(tok, "hello", generation_config={"template_name": template})
+    assert prompt["prompt_token_ids"] == tok.encode(expected) + [_AUDIO_GEN_START_ID]
+
+
+@pytest.mark.parametrize(
+    ("language", "tag"), [("EN", "EN"), ("english", "EN"), ("ZH", "ZH"), ("Cantonese", "口音:粤语")]
+)
+def test_language_tag_is_applied_before_reference_text(language, tag):
+    pytest.importorskip("langcodes")
+    pytest.importorskip("language_data")
+    tok = _StubTokenizer()
+    prompt = build_dots_tts_prompt(
+        tok,
+        "target",
+        ref_audio=[0.0] * 15360,
+        ref_sr=48000,
+        ref_text="reference",
+        prompt_patch_count=1,
+        language=language,
+    )
+    expected = tok.encode(f"[文本][{tag}]referencetarget[文本对应语音]")
+    assert prompt["prompt_token_ids"] == expected + [_AUDIO_GEN_START_ID, _AUDIO_GEN_SPAN_ID]
+
+
+def test_invalid_language_is_rejected():
+    pytest.importorskip("langcodes")
+    pytest.importorskip("language_data")
+    with pytest.raises(ValueError, match="Unsupported dots.tts language"):
+        build_dots_tts_prompt(_StubTokenizer(), "hello", language="!!!")
+
+
+@pytest.mark.parametrize(
+    ("text", "normalized_number"),
+    [
+        ("I bought 12 apples in the supermarket today.", "twelve"),
+        ("今天我去超市买了12个苹果。", "十二"),
+    ],
+)
+def test_normalization_and_language_detection(text, normalized_number):
+    pytest.importorskip("tn")
+    pytest.importorskip("lingua")
+    from vllm_omni.model_executor.models.dots_tts.text_frontend import prepare_text
+
+    result = prepare_text(text, None, language="auto", normalize=True)
+    assert "12" not in result
+    assert normalized_number in result
+    assert result.startswith("[EN]" if text.startswith("I") else "[ZH]")
+
+
+def test_explicit_language_tag_is_not_duplicated():
+    pytest.importorskip("langcodes")
+    tok = _StubTokenizer()
+    prompt = build_dots_tts_prompt(tok, "[EN]Hello", language="EN")
+    assert prompt["prompt_token_ids"] == tok.encode("[文本][EN]Hello[文本对应语音]") + [_AUDIO_GEN_START_ID]
+
+
+def test_separate_instructions_are_not_silently_ignored():
+    assert "inline instructions" in _make_adapter().validate(_request(instructions="Happy"))
+
+
+@pytest.mark.parametrize("extra", [{"template_name": "unknown"}, {"normalize_text": "false"}])
+def test_invalid_text_controls_are_rejected(extra):
+    assert _make_adapter().validate(_request(extra_params=extra))
