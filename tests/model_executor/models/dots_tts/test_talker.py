@@ -301,12 +301,14 @@ def test_seeded_speaker_crop_does_not_modify_global_rng():
     "device",
     ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))],
 )
-def test_dit_seed_ignores_request_id_and_other_requests(device):
+@pytest.mark.parametrize("meanflow", [False, True])
+def test_dit_seed_ignores_request_id_and_other_requests(device, meanflow):
     talker = _make_bare_talker()
     _, state_type = _dots_tts_talker_mod()
+    talker.config.meanflow = {"enabled": meanflow}
     # Zero velocity exposes the actual sampler's initial noise unchanged.
     talker._coordinate_proj = lambda z: torch.zeros(1, 4, 1024, device=device)
-    talker._head = lambda **kw: torch.zeros(2, 5, 128, device=device)
+    talker._head = lambda **kw: torch.zeros(kw["x"].shape[0], 5, 128, device=device)
     talker._build_fm_attn_mask = lambda *args: None
     talker._build_fm_pos_ids = lambda *args: None
 
@@ -328,3 +330,48 @@ def test_dit_seed_ignores_request_id_and_other_requests(device):
     torch.testing.assert_close(
         talker._run_dit_solver(a, num_steps=1), talker._run_dit_solver(b, num_steps=1), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("num_steps", [1, 2, 4])
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))],
+)
+def test_meanflow_integrates_time_and_duration_without_cfg(num_steps, device):
+    talker = _make_bare_talker()
+    talker.config.meanflow = {"enabled": True}
+    _, state_type = _dots_tts_talker_mod()
+    talker._coordinate_proj = lambda z: torch.nn.functional.pad(z, (0, 896))
+    talker._build_fm_attn_mask = lambda *args: None
+    talker._build_fm_pos_ids = lambda *args: None
+    calls = []
+
+    def head(**kw):
+        assert kw["x"].shape[0] == 1
+        torch.testing.assert_close(kw["g_cond"], torch.ones(1, 1024, device=device))
+        calls.append((kw["timesteps"].item(), kw["duration"].item()))
+        # Depend on the current latent as well as both time inputs, so wrong
+        # integration order, missing duration, or extra CFG changes the result.
+        return kw["x"][..., :128] + kw["timesteps"] + kw["duration"]
+
+    talker._head = head
+    state = state_type(
+        request_id="mf",
+        seed=42,
+        fm_seq_len=1,
+        fm_sequence=torch.zeros(1, 5, 1024, device=device),
+        fm_cfg_sequence=torch.zeros(1, 5, 1024, device=device),
+        fm_null_g_cond=torch.zeros(1, 1024, device=device),
+        g_cond=torch.ones(1, 1024, device=device),
+    )
+    import hashlib
+
+    generator = torch.Generator(device=device).manual_seed(
+        int.from_bytes(hashlib.blake2b(b"42:dit:0", digest_size=8).digest(), "little") & 0x7FFF_FFFF_FFFF_FFFF
+    )
+    expected = torch.randn(1, 4, 128, generator=generator, device=device)
+    for step in range(num_steps):
+        expected = expected + (expected + step / num_steps + 1 / num_steps) / num_steps
+    actual = talker._run_dit_solver(state, num_steps=num_steps, guidance_scale=123)
+    torch.testing.assert_close(actual, expected)
+    assert calls == [(step / num_steps, 1 / num_steps) for step in range(num_steps)]

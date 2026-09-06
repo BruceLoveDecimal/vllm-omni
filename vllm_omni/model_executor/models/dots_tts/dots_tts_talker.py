@@ -71,7 +71,7 @@ from vllm_omni.model_executor.models.dots_tts.dots_tts_vocoder import (
     AudioVAE,
     AudioVAEConfig,
 )
-from vllm_omni.model_executor.models.dots_tts.request_config import DotsTTSRequestConfig
+from vllm_omni.model_executor.models.dots_tts.request_config import DotsTTSRequestConfig, is_meanflow
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -390,16 +390,24 @@ class DotsTTSForConditionalGeneration(nn.Module):
         # bf16 dtype via vLLM's auto-cast and dtype-mismatch under
         # stream_step (input .float() vs bf16 weights).
 
-        # DiT flow-matching head.  Dimensions per upstream core.py:101-104:
+        # Shared DiT head. Dimensions per upstream core.py:101-104:
         #   in_dim  = config.DiT.hidden_size  (DiT internal space)
         #   out_dim = config.latent_dim       (AudioVAE input space)
-        # mode is "flow_matching" for soar/base; "meanflow" only for the mf
-        # checkpoint (handled by a separate factory in a later step).
+        # MeanFlow sampling and duration conditioning are separate switches:
+        # upstream also permits MF checkpoints without duration embeddings.
+        meanflow_config = getattr(self.config, "meanflow", None) or {}
+        dit_mode = (
+            "meanflow"
+            if is_meanflow(self.config) and meanflow_config.get("use_duration_embedding", True)
+            else "flow_matching"
+        )
+        if getattr(self.config, "sampling", None):
+            raise ValueError("dots.tts fixed-step sampling checkpoints are not supported; use base, soar, or mf")
         self._head = DiT(
             in_dim=fm_hidden,
             out_dim=latent_dim,
             transformer_config=dit_config,
-            mode="flow_matching",
+            mode=dit_mode,
         )
 
         # Patch encoder: closes the AR loop by mapping each DiT-emitted audio
@@ -516,12 +524,13 @@ class DotsTTSForConditionalGeneration(nn.Module):
             "audio_vae=AudioVAE, dit=DiT[18L,16H,1024d], "
             "patch_encoder=VAESemanticEncoder[24L,16H,1024d], "
             "5 projectors, speaker_encoder=CAM++[7.2M], "
-            "io_helper=%s, model=%s, dit_steps=%d); "
+            "io_helper=%s, model=%s, meanflow=%s, dit_steps=%d); "
             "_finish_decode: DiT → denormalize → patch_encoder AR + "
             "streaming AudioVAE decode → wav + eos_proj → stop signal.",
             "loaded" if self._io_helper.global_mean is not None else "identity",
             vllm_config.model_config.model,
-            _DIT_NUM_STEPS,
+            is_meanflow(self.config),
+            DotsTTSRequestConfig.for_model(None, self.config).num_steps,
         )
 
     def forward(
@@ -651,7 +660,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             state.precomputed_stop_logits = None
             state.is_stopping = False
             state.prefill_completed = False
-            state.generation_config = DotsTTSRequestConfig.model_validate(info_dict.get("dots_tts_config") or {})
+            state.generation_config = DotsTTSRequestConfig.for_model(info_dict.get("dots_tts_config"), self.config)
             state.seed = info_dict.get("_omni_seed")
             state.noise_step = 0
             # Reset AR-loop state on every prefill.
@@ -1300,7 +1309,11 @@ class DotsTTSForConditionalGeneration(nn.Module):
         guidance_scale: float = _DIT_GUIDANCE_SCALE,
         ode_method: str = "euler",
     ) -> torch.Tensor:
-        """DiT flow integration → audio latent patch [1, 4, 128].
+        """Shared FM/MeanFlow integration → audio latent patch [1, 4, 128].
+
+        MeanFlow uses one conditional prediction with time and interval inputs;
+        its learned field already includes guidance. FM uses external CFG.
+        Both share history, seeded noise, masks, and fp32 accumulation.
 
         Manual Euler loop (upstream uses torchdyn.odeint; we manualize to
         avoid the dep and keep control flow explicit).  Each step:
@@ -1314,6 +1327,9 @@ class DotsTTSForConditionalGeneration(nn.Module):
         (core.py:463). Euler preserves the original path; midpoint/rk4 use
         torchdiffeq, as in the Covo-Audio integration.
         """
+        meanflow = is_meanflow(self.config)
+        if meanflow and ode_method != "euler":
+            raise ValueError("dots.tts MeanFlow supports only ode_method=euler")
         assert state.fm_sequence is not None
         assert state.fm_cfg_sequence is not None
         assert state.fm_null_g_cond is not None
@@ -1324,15 +1340,17 @@ class DotsTTSForConditionalGeneration(nn.Module):
         # Workspace: committed history + 4 noise slots (overwritten per step).
         input_sequence = torch.zeros((1, total_len, _FM_HIDDEN), device=device, dtype=dtype)
         input_sequence[:, : state.fm_seq_len] = state.fm_sequence[:, : state.fm_seq_len]
-        cfg_sequence = torch.zeros((1, total_len, _FM_HIDDEN), device=device, dtype=dtype)
-        cfg_sequence[:, : state.fm_seq_len] = state.fm_cfg_sequence[:, : state.fm_seq_len]
+        cfg_sequence = None
+        if not meanflow:
+            cfg_sequence = torch.zeros_like(input_sequence)
+            cfg_sequence[:, : state.fm_seq_len] = state.fm_cfg_sequence[:, : state.fm_seq_len]
 
         attn_mask = self._build_fm_attn_mask(state, total_len, device)
         pos_ids = self._build_fm_pos_ids(state, total_len, device)
 
         g_cond = state.g_cond if state.g_cond is not None else state.fm_null_g_cond
         g_cond = g_cond.to(device=device, dtype=dtype)
-        g_cond_batched = torch.cat([g_cond, torch.zeros_like(g_cond)], dim=0)
+        g_cond_batched = g_cond if meanflow else torch.cat([g_cond, torch.zeros_like(g_cond)], dim=0)
 
         latent_start = total_len - _LATENT_PATCH_SIZE
         # fp32 ODE integration (same fix as Ming's CFM sampler, PR #4341):
@@ -1376,10 +1394,19 @@ class DotsTTSForConditionalGeneration(nn.Module):
             enabled=use_amp,
         ):
 
-            def velocity(t, sample):
+            def velocity(t, sample, duration=None):
                 z_proj = self._coordinate_proj(sample)
                 z_c = input_sequence.clone()
                 z_c[:, latent_start:] = z_proj
+                if meanflow:
+                    return self._head(
+                        x=z_c,
+                        timesteps=t.reshape(1),
+                        duration=duration.reshape(1),
+                        attn_mask=attn_mask,
+                        pos_ids=pos_ids,
+                        g_cond=g_cond_batched,
+                    )[:, latent_start:].float()
                 z_u = cfg_sequence.clone()
                 z_u[:, latent_start:] = z_proj
                 vt = self._head(
@@ -1394,7 +1421,8 @@ class DotsTTSForConditionalGeneration(nn.Module):
 
             if ode_method == "euler":
                 for step in range(num_steps):
-                    z = z + velocity(times[step], z) * dt
+                    step_dt = times[step + 1] - times[step] if meanflow else times.new_tensor(dt)
+                    z = z + velocity(times[step], z, step_dt) * step_dt
             else:
                 # Reuse the ODE package already used by Covo-Audio. Keep the
                 # default Euler path dependency-free and numerically unchanged.

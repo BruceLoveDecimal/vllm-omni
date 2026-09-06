@@ -4,7 +4,6 @@
 import math
 import time
 
-from pydantic import ValidationError
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.utils.async_utils import make_async
@@ -92,8 +91,8 @@ class DotsTTSAdapter(ARTTSAdapter):
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         server = self.ctx.server
         try:
-            DotsTTSRequestConfig.model_validate(request.extra_params or {})
-        except ValidationError as exc:
+            DotsTTSRequestConfig.for_model(request.extra_params, self.ctx.engine_client.model_config.hf_config)
+        except ValueError as exc:
             return str(exc)
         if request.instructions:
             return (

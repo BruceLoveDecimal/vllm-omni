@@ -4,9 +4,13 @@
 
 import importlib.util
 import os
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def is_meanflow(hf_config: Any) -> bool:
+    return bool((getattr(hf_config, "meanflow", None) or {}).get("enabled", False))
 
 
 class DotsTTSRequestConfig(BaseModel):
@@ -27,3 +31,15 @@ class DotsTTSRequestConfig(BaseModel):
         if value != "euler" and importlib.util.find_spec("torchdiffeq") is None:
             raise ValueError("midpoint/rk4 require torchdiffeq; install with: pip install torchdiffeq==0.2.5")
         return value
+
+    @classmethod
+    def for_model(cls, values: dict | None, hf_config: Any) -> "DotsTTSRequestConfig":
+        """Resolve checkpoint defaults without baking FM defaults into prompts."""
+        meanflow = is_meanflow(hf_config)
+        defaults = {"num_steps": int(os.environ.get("DOTS_TTS_DIT_NUM_STEPS", "4" if meanflow else "10"))}
+        config = cls.model_validate(defaults | (values or {}))
+        if meanflow and config.ode_method != "euler":
+            raise ValueError("dots.tts MeanFlow supports only ode_method=euler")
+        # MeanFlow checkpoints bake guidance into their learned field. Like
+        # upstream, accept guidance_scale but do not apply an external CFG pass.
+        return config

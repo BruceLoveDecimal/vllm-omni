@@ -323,11 +323,7 @@ def test_generation_controls_reach_the_engine_prompt():
     request = _request(extra_params=options)
     assert adapter.validate(request) is None
     prepared = asyncio.run(adapter.build(request, [], has_inline_ref_audio=False))
-    assert prepared.prompt["additional_information"]["dots_tts_config"] == {
-        "template_name": "tts",
-        "normalize_text": False,
-        **options,
-    }
+    assert prepared.prompt["additional_information"]["dots_tts_config"] == options
 
 
 @pytest.mark.parametrize(
@@ -403,3 +399,24 @@ def test_separate_instructions_are_not_silently_ignored():
 @pytest.mark.parametrize("extra", [{"template_name": "unknown"}, {"normalize_text": "false"}])
 def test_invalid_text_controls_are_rejected(extra):
     assert _make_adapter().validate(_request(extra_params=extra))
+
+
+@pytest.mark.parametrize("meanflow,expected", [(False, 10), (True, 4)])
+@pytest.mark.parametrize("extra", [None, {"speaker_scale": 2.0}, {"num_steps": 2}])
+def test_checkpoint_defaults_survive_prompt_serialization(meanflow, expected, extra, monkeypatch):
+    from vllm_omni.model_executor.models.dots_tts.request_config import DotsTTSRequestConfig
+
+    monkeypatch.delenv("DOTS_TTS_DIT_NUM_STEPS", raising=False)
+    prompt = build_dots_tts_prompt(_StubTokenizer(), "Hello", generation_config=extra)
+    config = DotsTTSRequestConfig.for_model(
+        prompt["additional_information"].get("dots_tts_config"),
+        SimpleNamespace(meanflow={"enabled": meanflow}),
+    )
+    assert config.num_steps == (2 if extra and "num_steps" in extra else expected)
+
+
+@pytest.mark.parametrize("method", ["midpoint", "rk4"])
+def test_meanflow_rejects_non_euler_before_generation(method):
+    adapter = _make_adapter()
+    adapter.ctx.engine_client.model_config.hf_config.meanflow = {"enabled": True}
+    assert adapter.validate(_request(extra_params={"ode_method": method}))

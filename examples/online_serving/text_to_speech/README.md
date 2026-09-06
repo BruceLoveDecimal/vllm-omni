@@ -24,7 +24,7 @@ For the full list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
-| dots.tts | `dots-studio/dots.tts-soar` | ✓ | ✓ (PCM stream) | ✓ (`/v1/audio/voices` upload) | — |
+| dots.tts | `dots-studio/dots.tts-soar`, `dots-studio/dots.tts-mf` | ✓ | ✓ (PCM stream) | ✓ (`/v1/audio/voices` upload) | — |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
@@ -122,6 +122,11 @@ request does not pay the side path's lazy initialization.
 ```bash
 vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
 ```
+
+Use `dots-studio/dots.tts-mf` with the same command for MeanFlow. It defaults
+to 4 Euler steps and supports per-request `num_steps`; SOAR defaults to 10.
+MeanFlow accepts `guidance_scale` for compatibility but does not apply external
+CFG. See the [MeanFlow recipe](../../../recipes/rednote-hilab/dots.tts.md#meanflow).
 
 ### Sending requests
 

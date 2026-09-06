@@ -5,7 +5,7 @@
 ## Summary
 
 - Vendor: rednote-hilab
-- Model: `dots-studio/dots.tts-soar`
+- Models: `dots-studio/dots.tts-soar`, `dots-studio/dots.tts-mf`
 - Task: Text-to-speech, zero-shot synthesis and voice cloning
 - Mode: Offline inference and OpenAI-compatible online serving
 - Maintainer: Community
@@ -13,12 +13,12 @@
 ## When to use this recipe
 
 Use this recipe as a known-good starting point for running
-`dots-studio/dots.tts-soar` on vLLM-Omni on consumer-class GPUs.
+`dots-studio/dots.tts-soar` or `dots-studio/dots.tts-mf` on vLLM-Omni on consumer-class GPUs.
 dots.tts is a ~1.7B-parameter continuous-AR TTS model (Qwen2.5-1.5B base LM
 + 344M DiT flow-matching head + 180M AudioVAE) that emits 48 kHz mono audio.
 It follows the same "vLLM-native base LM + side-path computation" pattern as
 VoxCPM2 — single-stage pipeline
-`Qwen2.5-1.5B base LM → DiT (10-step Euler flow matching) → patch_encoder AR
+`Qwen2.5-1.5B base LM → DiT (FM or MeanFlow) → patch_encoder AR
 loopback → AudioVAE (streaming decode)` — with a plain Qwen2 backbone
 instead of MiniCPM4, and no FSQ / residual-LM stage.
 
@@ -190,8 +190,9 @@ server errors, confirming per-request isolation of the prompt-prefill state.
 - Output: 48 kHz mono WAV.
 - Checkpoints: `dots-studio/dots.tts-soar` is the validated default
   used throughout this recipe. `rednote-hilab/dots.tts-base` shares the
-  same architecture but is unvalidated in this repo. `rednote-hilab/dots.tts-mf`
-  (MeanFlow, 2-4 step) is not supported — see below.
+  same architecture but is unvalidated in this repo. `dots-studio/dots.tts-mf`
+  is supported through the shared pipeline — see [MeanFlow](#meanflow).
+  The historical measurements above use SOAR.
 - `enforce_eager: true` and `enable_prefix_caching: false` in the deploy
   config are load-bearing, not just conservative defaults: with prefix
   caching enabled, vLLM-Omni's prefix-cache multimodal-output merge path
@@ -217,11 +218,11 @@ Pass model-specific controls in `extra_params`:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `num_steps` | 10 | Positive integer ODE integration steps; fewer steps trade quality for latency |
-| `guidance_scale` | 1.2 | Nonnegative CFG strength |
+| `num_steps` | 10 (FM), 4 (MF) | Positive integer ODE integration steps; fewer steps trade quality for latency |
+| `guidance_scale` | 1.2 | Nonnegative external CFG strength for FM; unused by MF |
 | `speaker_scale` | 1.5 | Nonnegative reference-speaker embedding scale, applied after cache lookup |
 | `eos_threshold` | 0.8 | Stop probability threshold in [0, 1]; 0 stops early, 1 relies on the token limit |
-| `ode_method` | `euler` | `euler`, `midpoint`, or `rk4`; the latter two use torchdiffeq |
+| `ode_method` | `euler` | FM: `euler`, `midpoint`, or `rk4` (the latter two use torchdiffeq); MF: `euler` only |
 | `template_name` | `tts` | `tts`, `instruction_tts`, or `text_to_audio` |
 | `normalize_text` | false | WeTextProcessing normalization for detected Chinese/English target text |
 
@@ -266,6 +267,50 @@ python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
     --extra-params '{"num_steps":10,"normalize_text":true}'
 ```
 
+## MeanFlow
+
+The same deployment and request API also support `dots-studio/dots.tts-mf`:
+
+```bash
+vllm serve dots-studio/dots.tts-mf --omni
+```
+
+The checkpoint's `meanflow.enabled` selects MeanFlow sampling, and
+`use_duration_embedding` determines whether the DiT uses an interval embedding.
+The backbone, reference encoders, patch encoder, and streaming vocoder are shared
+with SOAR. No additional dependency is needed for MeanFlow.
+
+MeanFlow defaults to **4 Euler steps**; SOAR/base retain **10 steps**.
+`extra_params.num_steps` overrides this per request, and the existing
+`DOTS_TTS_DIT_NUM_STEPS` environment variable overrides either default.
+MeanFlow accepts only `ode_method="euler"`. Its learned field already incorporates
+guidance, so `guidance_scale` is accepted for API compatibility but has no effect
+on MeanFlow output, matching upstream. `speaker_scale`, `eos_threshold`, `seed`,
+language, normalization, and templates continue to work through the shared path.
+
+```bash
+python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
+    --model dots-studio/dots.tts-mf --seed 42 \
+    --text "Hello, this is MeanFlow speech synthesis." \
+    --extra-params '{"num_steps":4}'
+```
+
+### MeanFlow validation
+
+Validated on one RTX 5090 (32 GB), using checkpoint revision
+`c28105adc8228143392b4e346994ff613ee48a06` and bfloat16 serving:
+
+- 32 speech requests covered seeded replay, all three conditioning modes,
+  concurrent requests, 1/2/4 steps, language/normalization/templates, and PCM streaming.
+- Unsupported MF solvers were rejected with HTTP 400.
+- 198 focused tests passed, including CUDA sampler tests.
+- With identical weights and initial noise, six fp32 GPU solver comparisons
+  against upstream `32407a55228630475c48ecdb2c4e2c0f9c09e030` had maximum
+  absolute error below `1.4e-5` (1/2/4 steps, with and without prior patches).
+
+These are functional and numerical checks, not speech-quality or throughput
+benchmarks. Fixed-step derivatives and STTS are outside this validation.
+
 ## Known limitations
 
 - **Precomputed speaker embeddings are not supported.** Conditioning goes
@@ -281,13 +326,14 @@ python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
   stalls the whole engine step. The cross-request cache makes this a
   once-per-voice cost; a burst of distinct references still pays it per
   request.
-- **`dots.tts-mf` (MeanFlow, 2-4 step) checkpoint is not supported.** Only
-  the fixed 10-step Euler DiT sampler used by `dots.tts-soar` /
-  `dots.tts-base` is implemented.
+- **Fixed-step and task-specific artifacts are not supported.**
+  `dots.tts-mf-1step`, `dots.tts-mf-2steps`, STTS, and editing checkpoints
+  require separate sampling/task contracts; ordinary MeanFlow support does
+  not imply support for these artifacts.
 - **No CUDA graph capture.** The talker runs fully eager. voxcpm2's three
   captured graphs (base LM decode, CFM solver, VAE decode) have no
   dots.tts equivalent yet.
-- **Concurrent requests do not scale.** Each request's 10-step DiT Euler
+- **Concurrent requests do not scale.** Each request's DiT
   integration runs serially in the side path (no cross-request batching,
   unlike voxcpm2's `enable_batched_cfm`). A community review of this
   integration measured no throughput gain at `c=4` concurrent requests

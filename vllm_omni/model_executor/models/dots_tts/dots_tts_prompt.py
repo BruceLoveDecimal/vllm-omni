@@ -132,7 +132,7 @@ def build_dots_tts_prompt(
 
     additional: dict[str, Any] = {}
     if generation_config:
-        additional["dots_tts_config"] = config.model_dump()
+        additional["dots_tts_config"] = config.model_dump(exclude_unset=True)
     if ref_audio is not None:
         if use_prompt_prefill:
             prompt_token_ids += [_require_token_id(tokenizer, _AUDIO_GEN_SPAN_TOKEN)] * prompt_patch_count
