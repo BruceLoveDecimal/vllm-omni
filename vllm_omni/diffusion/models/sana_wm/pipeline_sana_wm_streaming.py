@@ -44,6 +44,7 @@ from vllm_omni.diffusion.models.sana_wm.self_forcing import (
     SanaWmSelfForcingSchedule,
     create_autoregressive_segments,
     self_forcing_euler_step,
+    validate_chunk_split_strategy,
 )
 from vllm_omni.diffusion.models.sana_wm.streaming_cache import SanaWmStreamingCache
 from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -56,7 +57,7 @@ __all__ = [
     "SANA_WM_STREAMING_DEFAULT_NUM_FRAMES",
     "SANA_WM_STREAMING_MODEL_ID",
     "SanaWmStreamingPipeline",
-    "get_sana_wm_pre_process_func",
+    "get_sana_wm_streaming_pre_process_func",
 ]
 
 # Diffusers-layout conversion of ``Efficient-Large-Model/SANA-WM_streaming``
@@ -76,6 +77,16 @@ _EXTRA_KEYS_TO_FREE = (
     "noise_full",
     "first_latent",
 )
+
+
+def get_sana_wm_streaming_pre_process_func(od_config: OmniDiffusionConfig):
+    """The shared Sana-WM request normaliser with the chunk-aligned default length.
+
+    A ``session.start`` that omits ``num_frames`` must land on the ``24k + 1``
+    grid, so the streaming pipeline fills it with
+    ``SANA_WM_STREAMING_DEFAULT_NUM_FRAMES`` instead of the bidirectional 161.
+    """
+    return get_sana_wm_pre_process_func(od_config, default_num_frames=SANA_WM_STREAMING_DEFAULT_NUM_FRAMES)
 
 
 def _valid_num_frames_hint(num_frames: int, chunk_size: int) -> str:
@@ -128,9 +139,10 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
                     "SanaWmStreamingPipeline serves the distilled student at guidance_scale=1.0 and does not "
                     f"support cfg_parallel_size > 1 (got {cfg_parallel_size})."
                 )
-        # Validate the schedule at startup so a bad config fails before the
-        # first request.
+        # Validate the schedule and chunking rule at startup so a bad config
+        # fails before the first request.
         self.self_forcing_schedule = SanaWmSelfForcingSchedule.from_config(self.sana_wm_config)
+        validate_chunk_split_strategy(self.sana_wm_config.chunk_split_strategy)
 
     # ------------------------------------------------------------------
     # Request mode is not supported: the causal checkpoint must not run
@@ -154,8 +166,9 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
         if prompt is None or isinstance(prompt, str):
             raise ValueError("Sana-WM requires a mapping prompt with first-frame image and camera/action metadata.")
         # The registered pre-process hook already normalised the payload; the
-        # call is idempotent and covers offline callers that bypass it.
-        prompt = normalize_sana_wm_payload(prompt)
+        # call is idempotent and covers offline callers that bypass it. The
+        # streaming default keeps an omitted num_frames on the chunk grid.
+        prompt = normalize_sana_wm_payload(prompt, default_num_frames=SANA_WM_STREAMING_DEFAULT_NUM_FRAMES)
         state.prompt = prompt
         payload = prompt["additional_information"]["sana_wm"]
         sampling = state.sampling
@@ -193,7 +206,7 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
                 f"num_frames must be {SANA_WM_VAE_TEMPORAL_COMPRESSION * chunk_size}k+1 with k >= 1 "
                 f"(e.g. {_valid_num_frames_hint(num_frames, chunk_size)}); got {num_frames}."
             )
-        boundaries = create_autoregressive_segments(latent_frames, chunk_size)
+        boundaries = create_autoregressive_segments(latent_frames, chunk_size, strategy=config.chunk_split_strategy)
         total_chunks = len(boundaries) - 1
         token_count = latent_frames * latent_height * latent_width
         max_tokens = int(extra_args.get("sana_wm_native_max_tokens", SANA_WM_NATIVE_MAX_TOKENS))

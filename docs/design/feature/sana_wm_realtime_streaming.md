@@ -92,7 +92,7 @@ client ──session.start──▶ OmniStreamingVideoOutputHandler
         │  _build_prompt_and_sampling_params  (unchanged)
         ▼
 AsyncOmni.generate ──▶ DiffusionEngine.step_streaming
-        │  get_sana_wm_pre_process_func  (unchanged; normalises payload)
+        │  get_sana_wm_streaming_pre_process_func  (shared normaliser, 169-frame default)
         ▼
 DiffusionModelRunner (step mode, streaming_output=True)
    prepare_encode(state)                       once
@@ -397,10 +397,10 @@ inputs only spatial tiling is exercised and peak memory drops well below the
 
 ## 9. Registry, metadata, deploy, CLI
 
-- `diffusion/registry.py`: add `"SanaWmStreamingPipeline": ("sana_wm", "pipeline_sana_wm_streaming", "SanaWmStreamingPipeline")` and the same pre-process func as `SanaWmPipeline`.
+- `diffusion/registry.py`: add `"SanaWmStreamingPipeline": ("sana_wm", "pipeline_sana_wm_streaming", "SanaWmStreamingPipeline")` and `get_sana_wm_streaming_pre_process_func`, the `SanaWmPipeline` normaliser with `SANA_WM_STREAMING_DEFAULT_NUM_FRAMES` (169) as the fallback for an omitted `num_frames` (the bidirectional 161 is not on the `24k + 1` grid).
 - `diffusion/model_metadata.py`: `"SanaWmStreamingPipeline": DiffusionModelMetadata(final_output_type="video", supports_multimodal_inputs=True, max_multimodal_image_inputs=1)`. **`final_output_type="video"` is required**: `is_video_generation_pipeline` (`entrypoints/openai/utils.py:23`) gates the WS handler and the current `SanaWmPipeline` entry lacks it (`model_metadata.py:92`); fix that entry too.
 - `model_index.json` of the converted streaming repo names `SanaWmStreamingPipeline` so class resolution needs no flag.
-- `vllm_omni/deploy/sana_wm_streaming.yaml`: single stage, `max_num_seqs: 1`, `model_class_name: SanaWmStreamingPipeline`, `engine_args.streaming_output: true`, `default_sampling_params: {num_inference_steps: 4, guidance_scale: 1.0, num_frames: 169, height: 704, width: 1280, fps: 16}`. Single-stage models resolved through `create_default_diffusion` do not read YAML defaults (comment at `pipeline_sana_wm.py:91`), so the pipeline also carries these as class constants and the YAML is the documented CLI entry point. `--diffusion-streaming-output` on the CLI is equivalent.
+- No deploy YAML (see §16): `DiffusionStageConfig` has no `streaming_output` field and single-stage models resolved through `create_default_diffusion` do not read YAML defaults (comment at `pipeline_sana_wm.py:91`). `--diffusion-streaming-output` on the CLI is the single entry point; the generation defaults (`num_frames` 169, the 4-step schedule, `guidance_scale` 1.0) live in the pipeline and the request normaliser.
 - Startup validation in `SanaWmStreamingPipeline.__init__`: `config.streaming` must be true, else raise naming the expected repo.
 
 ## 10. Serving contract (no new endpoint)

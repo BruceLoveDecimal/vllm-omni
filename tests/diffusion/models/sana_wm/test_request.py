@@ -62,6 +62,16 @@ def test_rejects_unaligned_resolution(height, width):
         normalize_sana_wm_payload(_prompt(height=height, width=width))
 
 
+def test_default_num_frames_override_applies_only_when_omitted():
+    prompt = _prompt(num_frames=169)
+    prompt["sana_wm"].pop("num_frames")
+    payload = normalize_sana_wm_payload(prompt, default_num_frames=169)["additional_information"]["sana_wm"]
+    assert payload["num_frames"] == 169
+    # An explicit value wins over the override.
+    explicit = normalize_sana_wm_payload(_prompt(num_frames=33), default_num_frames=169)
+    assert explicit["additional_information"]["sana_wm"]["num_frames"] == 33
+
+
 def test_normalization_is_idempotent():
     once = normalize_sana_wm_payload(_prompt(num_frames=33))
     twice = normalize_sana_wm_payload(once)

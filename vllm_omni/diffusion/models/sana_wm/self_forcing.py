@@ -97,14 +97,38 @@ class SanaWmSelfForcingSchedule:
             )
 
 
-def create_autoregressive_segments(total_frames: int, chunk_size: int) -> list[int]:
+SANA_WM_CHUNK_SPLIT_STRATEGY = "first_chunk_plus_one"
+
+
+def validate_chunk_split_strategy(strategy: str) -> None:
+    """Reject a ``chunk_split_strategy`` other than the implemented one.
+
+    Only the NVlabs ``first_chunk_plus_one`` rule (chunk 0 absorbs the
+    remainder) is implemented; a checkpoint declaring another strategy would
+    otherwise be chunked silently with the wrong rule.
+    """
+    if strategy != SANA_WM_CHUNK_SPLIT_STRATEGY:
+        raise ValueError(
+            f"Sana-WM streaming only implements chunk_split_strategy={SANA_WM_CHUNK_SPLIT_STRATEGY!r}, "
+            f"got {strategy!r}."
+        )
+
+
+def create_autoregressive_segments(
+    total_frames: int,
+    chunk_size: int,
+    *,
+    strategy: str = SANA_WM_CHUNK_SPLIT_STRATEGY,
+) -> list[int]:
     """Chunk boundaries ``[0, c1, ..., total_frames]`` (NVlabs semantics).
 
     ``chunk_size``-frame chunks left to right; the first chunk absorbs the
     remainder, so with ``total_frames = 1 + chunk_size * k`` chunk 0 covers the
     conditioning frame plus one generated block and every later chunk is one
-    block.
+    block. ``strategy`` must name that rule (see
+    :func:`validate_chunk_split_strategy`).
     """
+    validate_chunk_split_strategy(strategy)
     if chunk_size <= 0:
         raise ValueError(f"Sana-WM chunk_size must be positive, got {chunk_size}.")
     if total_frames <= chunk_size:

@@ -10,6 +10,7 @@ from vllm_omni.diffusion.models.sana_wm.self_forcing import (
     SanaWmSelfForcingSchedule,
     create_autoregressive_segments,
     self_forcing_euler_step,
+    validate_chunk_split_strategy,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -67,6 +68,14 @@ def test_create_autoregressive_segments_first_chunk_absorbs_remainder() -> None:
         create_autoregressive_segments(3, 3)
     with pytest.raises(ValueError):
         create_autoregressive_segments(10, 0)
+
+
+def test_chunk_split_strategy_must_be_the_implemented_rule() -> None:
+    validate_chunk_split_strategy("first_chunk_plus_one")
+    with pytest.raises(ValueError, match="chunk_split_strategy"):
+        validate_chunk_split_strategy("uniform")
+    with pytest.raises(ValueError, match="chunk_split_strategy"):
+        create_autoregressive_segments(22, 3, strategy="uniform")
 
 
 def test_euler_step_matches_per_token_flow_scheduler_convention() -> None:

@@ -21,6 +21,7 @@ from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm_streaming import (
     SANA_WM_STREAMING_DEFAULT_NUM_FRAMES,
     SanaWmStreamingPipeline,
+    get_sana_wm_streaming_pre_process_func,
 )
 from vllm_omni.diffusion.models.sana_wm.self_forcing import SanaWmSelfForcingSchedule
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -273,6 +274,37 @@ def test_request_mode_forward_is_refused(monkeypatch) -> None:
 
 def test_default_num_frames_is_on_the_grid() -> None:
     assert (SANA_WM_STREAMING_DEFAULT_NUM_FRAMES - 1) % (8 * 3) == 0
+
+
+def test_omitted_num_frames_falls_back_to_streaming_default(monkeypatch) -> None:
+    """A request without num_frames must not inherit the off-grid bidirectional 161."""
+    pipeline = _pipeline(monkeypatch)
+    default = SANA_WM_STREAMING_DEFAULT_NUM_FRAMES
+    prompt = _prompt(default)
+    prompt["sana_wm"].pop("num_frames")
+    # ``OmniDiffusionSamplingParams.num_frames`` defaults to 1 when the request omits it.
+    state = pipeline.prepare_encode(_state(prompt, _sampling(num_frames=1)))
+    assert state.extra["num_frames"] == default
+    assert state.total_chunks == (default - 1) // (8 * 3)
+
+
+def test_streaming_pre_process_hook_fills_streaming_default() -> None:
+    """The registered hook normalises an omitted num_frames to the chunk grid."""
+    default = SANA_WM_STREAMING_DEFAULT_NUM_FRAMES
+    prompt = _prompt(default)
+    prompt["sana_wm"].pop("num_frames")
+    sampling = _sampling(num_frames=1)
+    request = SimpleNamespace(prompt=prompt, sampling_params=sampling)
+    get_sana_wm_streaming_pre_process_func(None)(request)
+    assert request.prompt["additional_information"]["sana_wm"]["num_frames"] == default
+    assert sampling.num_frames == default
+
+
+def test_rejects_unimplemented_chunk_split_strategy(monkeypatch) -> None:
+    config = SanaWmConfig(streaming=True, chunk_size=3, chunk_split_strategy="uniform")
+    pipeline = _pipeline(monkeypatch, config=config)
+    with pytest.raises(ValueError, match="chunk_split_strategy"):
+        pipeline.prepare_encode(_state(_prompt(49), _sampling(num_frames=49)))
 
 
 def test_seeded_noise_is_reproducible(monkeypatch) -> None:

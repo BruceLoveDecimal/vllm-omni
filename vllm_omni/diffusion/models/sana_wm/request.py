@@ -162,13 +162,21 @@ def _validate_latent_geometry(*, num_frames: int, height: int, width: int) -> No
         )
 
 
-def normalize_sana_wm_payload(prompt: Mapping[str, Any]) -> dict[str, Any]:
+def normalize_sana_wm_payload(
+    prompt: Mapping[str, Any],
+    *,
+    default_num_frames: int = SANA_WM_DEFAULT_NUM_FRAMES,
+) -> dict[str, Any]:
     """Return a prompt copy with canonical Sana-WM request metadata.
 
     The ``sana_wm`` block is read from the top-level ``sana_wm`` key, falling
     back to ``additional_information["sana_wm"]`` so the function is idempotent
     when called again on its own output. The first-frame image is read from
     ``multi_modal_data["image"]``.
+
+    ``default_num_frames`` is used only when neither the block nor the prompt
+    carries ``num_frames``; the streaming pipeline passes its own chunk-aligned
+    default because the bidirectional 161 is not on its ``24k + 1`` grid.
     """
 
     if not isinstance(prompt, Mapping):
@@ -189,7 +197,7 @@ def normalize_sana_wm_payload(prompt: Mapping[str, Any]) -> dict[str, Any]:
     raw = _as_dict(raw, name=SANA_WM_CANONICAL_KEY)
 
     num_frames = _as_positive_int(
-        _first_present(raw.get("num_frames"), result.get("num_frames"), SANA_WM_DEFAULT_NUM_FRAMES),
+        _first_present(raw.get("num_frames"), result.get("num_frames"), default_num_frames),
         name="num_frames",
     )
     height = _as_positive_int(

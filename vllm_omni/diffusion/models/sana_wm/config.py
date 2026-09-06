@@ -80,7 +80,9 @@ class SanaWmConfig:
     # ``denoising_step_list``), so the converted config is a rename-free copy.
     streaming: bool = False
     chunk_size: int = 3
-    chunk_split_strategy: str = "uniform"
+    # Only ``first_chunk_plus_one`` is implemented; the streaming pipeline
+    # rejects anything else at startup.
+    chunk_split_strategy: str = "first_chunk_plus_one"
     num_cached_blocks: int = 2
     sink_token: bool = True
     denoising_step_list: tuple[int, ...] = (1000, 960, 889, 727, 0)

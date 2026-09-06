@@ -14,6 +14,7 @@ from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm_streaming import (
     SANA_WM_STREAMING_DEFAULT_NUM_FRAMES,
     SANA_WM_STREAMING_MODEL_ID,
     SanaWmStreamingPipeline,
+    get_sana_wm_streaming_pre_process_func,
 )
 from vllm_omni.diffusion.models.sana_wm.request import normalize_sana_wm_payload
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import SanaWmTransformer3DModel
@@ -29,5 +30,6 @@ __all__ = [
     "SanaWmStreamingPipeline",
     "SanaWmTransformer3DModel",
     "get_sana_wm_pre_process_func",
+    "get_sana_wm_streaming_pre_process_func",
     "normalize_sana_wm_payload",
 ]

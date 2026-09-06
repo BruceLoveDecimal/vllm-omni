@@ -44,7 +44,7 @@ from vllm_omni.diffusion.models.sana_wm.config import (
     SANA_WM_VAE_TEMPORAL_COMPRESSION,
     SanaWmConfig,
 )
-from vllm_omni.diffusion.models.sana_wm.request import normalize_sana_wm_payload
+from vllm_omni.diffusion.models.sana_wm.request import SANA_WM_DEFAULT_NUM_FRAMES, normalize_sana_wm_payload
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
     SanaWmTransformer3DModel,
@@ -210,7 +210,12 @@ def build_sana_wm_output_envelope(
     return {"payload": {payload_key: output}, "metadata": {"sana_wm": metadata}}
 
 
-def get_sana_wm_pre_process_func(od_config: OmniDiffusionConfig):
+def get_sana_wm_pre_process_func(
+    od_config: OmniDiffusionConfig,
+    *,
+    default_num_frames: int = SANA_WM_DEFAULT_NUM_FRAMES,
+):
+    """Build the request normaliser; ``default_num_frames`` fills an omitted length."""
     del od_config
 
     def pre_process_func(request: Any) -> Any:
@@ -238,7 +243,7 @@ def get_sana_wm_pre_process_func(od_config: OmniDiffusionConfig):
                 if value is not None and not (field == "num_frames" and value == 1):
                     prompt_mapping[field] = value
 
-        request.prompt = normalize_sana_wm_payload(prompt_mapping)
+        request.prompt = normalize_sana_wm_payload(prompt_mapping, default_num_frames=default_num_frames)
 
         # Preprocess is the only place the request is normalised, so publish the
         # canonical geometry back onto sampling_params for the rest of the stack.
