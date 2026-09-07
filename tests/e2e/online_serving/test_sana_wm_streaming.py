@@ -15,6 +15,11 @@ frame counts add up to ``num_frames``.
 From ``tests/``::
 
     pytest -s -v e2e/online_serving/test_sana_wm_streaming.py -m "advanced_model and diffusion" --run-level=advanced_model
+
+``test_realtime_streaming_two_stage_001`` boots the two-stage conversion
+(``SanaWmStreamingTwoStagePipeline``, Stage-1 + chunk-causal LTX-2 refiner;
+``SANA_WM_STREAMING_TWO_STAGE_E2E_MODEL`` overrides the repo) and checks the
+same cadence on the refined stream.
 """
 
 from __future__ import annotations
@@ -35,11 +40,14 @@ from vllm_omni.diffusion.models.sana_wm import (
     SANA_WM_OUTPUT_HEIGHT,
     SANA_WM_OUTPUT_WIDTH,
     SANA_WM_STREAMING_MODEL_ID,
+    SANA_WM_STREAMING_TWO_STAGE_MODEL_ID,
 )
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = os.environ.get("SANA_WM_STREAMING_E2E_MODEL", SANA_WM_STREAMING_MODEL_ID)
+# Stage-1 + chunk-causal LTX-2 refiner; needs the two-stage conversion (refiner/ tree).
+TWO_STAGE_MODEL = os.environ.get("SANA_WM_STREAMING_TWO_STAGE_E2E_MODEL", SANA_WM_STREAMING_TWO_STAGE_MODEL_ID)
 PROMPT = "A slow forward camera move through a quiet city street."
 
 # Two generated latent blocks: 8 * 3 * 2 + 1 pixel frames -> chunks of 25 + 24.
@@ -129,14 +137,26 @@ async def _stream_session(url: str, payload: dict[str, Any], *, timeout_seconds:
     }
 
 
-def _get_diffusion_feature_cases(model: str):
+def _get_diffusion_feature_cases(model: str, case_id: str = "streaming"):
     return [
         pytest.param(
             OmniServerParams(model=model, server_args=["--diffusion-streaming-output"]),
-            id="streaming",
+            id=case_id,
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
     ]
+
+
+def _assert_chunk_cadence(result: dict[str, Any]) -> list[dict[str, Any]]:
+    media = [chunk for chunk in result["chunks"] if chunk.get("kind") == "media"]
+    assert result["done"] is not None
+    assert result["binary_bytes"] > 0
+    assert [chunk.get("generation_chunk_index") for chunk in media] == list(range(SMOKE_TOTAL_CHUNKS))
+    frame_counts = [int(chunk.get("num_frames") or 0) for chunk in media]
+    assert frame_counts[0] == 1 + 8 * SMOKE_CHUNK_SIZE
+    assert all(count == 8 * SMOKE_CHUNK_SIZE for count in frame_counts[1:])
+    assert sum(frame_counts) == SMOKE_NUM_FRAMES
+    return media
 
 
 @pytest.mark.advanced_model
@@ -159,15 +179,35 @@ def test_realtime_streaming_001(omni_server: OmniServer, openai_client: OpenAICl
     # Second session: inspect the chunk cadence and metadata directly.
     url = openai_client._build_ws_url("/v1/realtime/video")
     result = asyncio.run(_stream_session(url, _session_start_payload(omni_server.model), timeout_seconds=900.0))
-    media = [chunk for chunk in result["chunks"] if chunk.get("kind") == "media"]
-    assert result["done"] is not None
-    assert result["binary_bytes"] > 0
-    assert [chunk.get("generation_chunk_index") for chunk in media] == list(range(SMOKE_TOTAL_CHUNKS))
+    media = _assert_chunk_cadence(result)
     frame_counts = [int(chunk.get("num_frames") or 0) for chunk in media]
-    assert frame_counts[0] == 1 + 8 * SMOKE_CHUNK_SIZE
-    assert all(count == 8 * SMOKE_CHUNK_SIZE for count in frame_counts[1:])
-    assert sum(frame_counts) == SMOKE_NUM_FRAMES
     print(
         f"[sana_wm.stream] chunks={len(media)} frames={frame_counts} "
+        f"first_media={result['first_media_seconds']:.2f}s total={result['total_seconds']:.2f}s"
+    )
+
+
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(TWO_STAGE_MODEL, "two_stage"), indirect=True)
+def test_realtime_streaming_two_stage_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+    """Stage-1 + LTX-2 refiner: same chunk cadence and frame counts, refined chunks decode to a valid MP4."""
+    request_config = {
+        "model": omni_server.model,
+        "form_data": {
+            key: value
+            for key, value in _session_start_payload(omni_server.model).items()
+            if key not in ("type", "model")
+        },
+    }
+    responses = openai_client.send_streaming_video_diffusion_request(request_config, timeout_seconds=1800.0)
+    assert responses and responses[0].success
+
+    url = openai_client._build_ws_url("/v1/realtime/video")
+    result = asyncio.run(_stream_session(url, _session_start_payload(omni_server.model), timeout_seconds=1800.0))
+    media = _assert_chunk_cadence(result)
+    frame_counts = [int(chunk.get("num_frames") or 0) for chunk in media]
+    print(
+        f"[sana_wm.stream.two_stage] chunks={len(media)} frames={frame_counts} "
         f"first_media={result['first_media_seconds']:.2f}s total={result['total_seconds']:.2f}s"
     )

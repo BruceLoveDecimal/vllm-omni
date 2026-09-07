@@ -74,6 +74,7 @@ a progressive MP4 file.
 | --- | --- | --- |
 | `HeliosPipeline` | `BestWishYsh/Helios-Distilled` | Text-to-video; supports `session.interaction` prompt updates |
 | `SanaWmStreamingPipeline` | `BBBBruce/SANA-WM_streaming-stage1-diffusers` | First-frame image-to-video with camera control (`image_reference` + `extra_params.sana_wm`); `session.interaction` is rejected |
+| `SanaWmStreamingTwoStagePipeline` | `BBBBruce/SANA-WM_streaming-two-stage-diffusers` | Same request as `SanaWmStreamingPipeline`; every chunk additionally passes through the chunk-causal LTX-2 refiner (Stage-2) before decode. Optional `extra_params.sana_wm_refiner_seed` |
 
 SANA-WM streaming takes the same `sana_wm` block as the video API
 ([recipe](../../recipes/NVIDIA/SANA-WM.md)), for example:
@@ -101,6 +102,11 @@ SANA-WM streaming takes the same `sana_wm` block as the video API
 `num_frames` must be `24k + 1`; each media chunk carries one generated latent
 block (25 pixel frames for the first chunk, 24 afterwards) and
 `generation_chunk_index` counts them from 0.
+
+The two-stage pipeline keeps the same wire contract and chunk cadence; the
+refiner runs inside the chunk's post-processing, so each chunk arrives later
+by one refiner block (three refiner forwards plus one K/V-capture forward on
+three latent frames).
 
 ## Mid-Generation Interaction
 

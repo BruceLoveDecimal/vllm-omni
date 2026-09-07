@@ -21,10 +21,19 @@ Output tree::
       transformer/config.json              -> bidirectional config + streaming fields
       transformer/diffusion_pytorch_model.safetensors
       vae/                                 -> copied (or symlinked) from --vae-dir
+      refiner/transformer                  -> (two-stage only) release refiner_diffusers/transformer
+      refiner/connectors                   -> (two-stage only) release refiner_diffusers/connectors
+      refiner/text_encoder                 -> (two-stage only) release gemma3_12b
 
 The VAE is the Stage-1 LTX-2 VAE of the bidirectional conversion: the
 streaming release's causal VAE decoder is a follow-up (chunks are decoded
 with a one-latent-frame overlap, see the design doc).
+
+With ``--refiner-dir`` (the release's ``refiner_diffusers/``) and
+``--refiner-text-encoder-dir`` (the release's ``gemma3_12b/``) the tree also
+carries the chunk-causal LTX-2 refiner and ``model_index.json`` names
+``SanaWmStreamingTwoStagePipeline``. Both are standard diffusers /
+transformers layouts and are copied (or symlinked) verbatim.
 
 Example::
 
@@ -32,6 +41,14 @@ Example::
         --checkpoint /models/SANA-WM_streaming/sana_dit/model.pt \\
         --reference /models/SANA-WM_bidirectional-stage1-diffusers \\
         --output /models/SANA-WM_streaming-stage1-diffusers
+
+    python tools/convert_sana_wm_streaming_to_diffusers.py \\
+        --checkpoint /models/SANA-WM_streaming/sana_dit/model.pt \\
+        --reference /models/SANA-WM_bidirectional-stage1-diffusers \\
+        --refiner-dir /models/SANA-WM_streaming/refiner_diffusers \\
+        --refiner-text-encoder-dir /models/SANA-WM_streaming/gemma3_12b \\
+        --symlink-refiner \\
+        --output /models/SANA-WM_streaming-two-stage-diffusers
 """
 
 from __future__ import annotations
@@ -116,6 +133,48 @@ def _copy_or_link(source: Path, target: Path, *, symlink: bool) -> None:
         shutil.copytree(source, target)
 
 
+REFINER_REQUIRED_FILES = (
+    ("transformer", "config.json"),
+    ("transformer", "diffusion_pytorch_model.safetensors"),
+    ("connectors", "config.json"),
+    ("connectors", "diffusion_pytorch_model.safetensors"),
+)
+
+
+def _check_refiner_tree(refiner_dir: Path, text_encoder_dir: Path) -> None:
+    missing = [
+        str(refiner_dir / sub / name)
+        for sub, name in REFINER_REQUIRED_FILES
+        if not (refiner_dir / sub / name).is_file()
+    ]
+    for name in ("config.json", "tokenizer_config.json"):
+        if not (text_encoder_dir / name).is_file():
+            missing.append(str(text_encoder_dir / name))
+    if missing:
+        raise FileNotFoundError("Refiner tree is incomplete: " + ", ".join(missing))
+    transformer_config = json.loads((refiner_dir / "transformer" / "config.json").read_text(encoding="utf-8"))
+    if transformer_config.get("_class_name") != "LTX2VideoTransformer3DModel":
+        raise ValueError(
+            f"{refiner_dir / 'transformer' / 'config.json'} names {transformer_config.get('_class_name')!r}, "
+            "expected LTX2VideoTransformer3DModel."
+        )
+    connectors_config = json.loads((refiner_dir / "connectors" / "config.json").read_text(encoding="utf-8"))
+    if connectors_config.get("_class_name") != "LTX2TextConnectors":
+        raise ValueError(
+            f"{refiner_dir / 'connectors' / 'config.json'} names {connectors_config.get('_class_name')!r}, "
+            "expected LTX2TextConnectors."
+        )
+    text_encoder_config = json.loads((text_encoder_dir / "config.json").read_text(encoding="utf-8"))
+    text_hidden = (text_encoder_config.get("text_config") or {}).get("hidden_size") or text_encoder_config.get(
+        "hidden_size"
+    )
+    if text_hidden is not None and int(text_hidden) != int(connectors_config.get("caption_channels", 3840)):
+        raise ValueError(
+            f"Refiner text encoder hidden size {text_hidden} does not match connectors caption_channels "
+            f"{connectors_config.get('caption_channels')}."
+        )
+
+
 def convert(
     *,
     checkpoint: Path,
@@ -123,6 +182,9 @@ def convert(
     output: Path,
     dtype: torch.dtype,
     symlink_vae: bool,
+    refiner_dir: Path | None = None,
+    refiner_text_encoder_dir: Path | None = None,
+    symlink_refiner: bool = False,
 ) -> None:
     reference_transformer = reference / "transformer" / "diffusion_pytorch_model.safetensors"
     reference_config = reference / "transformer" / "config.json"
@@ -130,6 +192,11 @@ def convert(
     for path in (checkpoint, reference_transformer, reference_config, reference_vae):
         if not path.exists():
             raise FileNotFoundError(path)
+    if (refiner_dir is None) != (refiner_text_encoder_dir is None):
+        raise ValueError("--refiner-dir and --refiner-text-encoder-dir must be given together.")
+    if refiner_dir is not None:
+        assert refiner_text_encoder_dir is not None
+        _check_refiner_tree(refiner_dir, refiner_text_encoder_dir)
 
     output.mkdir(parents=True, exist_ok=True)
     transformer_dir = output / "transformer"
@@ -152,8 +219,22 @@ def convert(
         "transformer": ["vllm_omni.diffusion.models.sana_wm.sana_wm_transformer", "SanaWmTransformer3DModel"],
         "vae": ["diffusers", "AutoencoderKLLTX2Video"],
     }
+    if refiner_dir is not None:
+        assert refiner_text_encoder_dir is not None
+        refiner_out = output / "refiner"
+        refiner_out.mkdir(exist_ok=True)
+        _copy_or_link(refiner_dir / "transformer", refiner_out / "transformer", symlink=symlink_refiner)
+        _copy_or_link(refiner_dir / "connectors", refiner_out / "connectors", symlink=symlink_refiner)
+        _copy_or_link(refiner_text_encoder_dir, refiner_out / "text_encoder", symlink=symlink_refiner)
+        model_index["_class_name"] = "SanaWmStreamingTwoStagePipeline"
+        model_index["refiner_transformer"] = [
+            "vllm_omni.diffusion.models.ltx2.ltx2_transformer",
+            "LTX2VideoTransformer3DModel",
+        ]
+        model_index["refiner_connectors"] = ["diffusers", "LTX2TextConnectors"]
+        model_index["refiner_text_encoder"] = ["transformers", "Gemma3ForConditionalGeneration"]
     (output / "model_index.json").write_text(json.dumps(model_index, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {len(tensors)} tensors ({dtype}) to {output}")
+    print(f"wrote {len(tensors)} tensors ({dtype}) to {output} ({model_index['_class_name']})")
 
 
 def main() -> None:
@@ -168,6 +249,21 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
     parser.add_argument("--symlink-vae", action="store_true", help="Symlink vae/ instead of copying it")
+    parser.add_argument(
+        "--refiner-dir",
+        type=Path,
+        default=None,
+        help="refiner_diffusers/ of the streaming release (transformer/ + connectors/); enables the two-stage layout",
+    )
+    parser.add_argument(
+        "--refiner-text-encoder-dir",
+        type=Path,
+        default=None,
+        help="gemma3_12b/ of the streaming release (the refiner's Gemma-3-12B text encoder + tokenizer)",
+    )
+    parser.add_argument(
+        "--symlink-refiner", action="store_true", help="Symlink the refiner trees instead of copying ~65 GB"
+    )
     args = parser.parse_args()
     convert(
         checkpoint=args.checkpoint,
@@ -175,6 +271,9 @@ def main() -> None:
         output=args.output,
         dtype=DTYPES[args.dtype],
         symlink_vae=args.symlink_vae,
+        refiner_dir=args.refiner_dir,
+        refiner_text_encoder_dir=args.refiner_text_encoder_dir,
+        symlink_refiner=args.symlink_refiner,
     )
 
 

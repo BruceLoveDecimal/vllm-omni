@@ -441,16 +441,27 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
             history = torch.cat([extra["history_latents"], clean_latents], dim=2)
             extra["history_latents"] = history
 
+            # Stage-2 hook: a refiner subclass returns the refined block and
+            # keeps its own decode history; the Stage-1-only pipeline decodes
+            # the clean Stage-1 latents.
+            refined = self._apply_stage2(state, clean_latents)
+            if refined is None:
+                emitted, decode_history = clean_latents, history
+            else:
+                emitted = refined
+                decode_history = torch.cat([extra["refined_history"], refined], dim=2)
+                extra["refined_history"] = decode_history
+
             output_type = extra["output_type"]
             chunk_size = extra["chunk_size"]
             if output_type == "latent":
-                output = clean_latents
+                output = emitted
                 num_pixel_frames = None
             else:
                 # Overlap decode (design §8): the previous chunk's last latent
                 # frame gives the decoder temporal context; its pixel frame is
                 # dropped so the counts add up to num_frames.
-                decode_latents = history[:, :, -(chunk_size + 1) :]
+                decode_latents = decode_history[:, :, -(chunk_size + 1) :]
                 output = self._decode_native_latents(
                     decode_latents, output_type=output_type, device=device, dtype=dtype
                 )
@@ -475,6 +486,7 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
                 "height": extra["height"],
                 "width": extra["width"],
                 "sampling_steps": extra["schedule"].num_steps,
+                **self._stage2_metadata(state),
             },
         )
 
@@ -492,6 +504,25 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else {},
         )
 
+    # ------------------------------------------------------------------
+    # Stage-2 hooks (no-ops for the Stage-1-only pipeline)
+    # ------------------------------------------------------------------
+
+    def _apply_stage2(self, state: StepRequestState, clean_latents: torch.Tensor) -> torch.Tensor | None:
+        """Return the refined block for ``clean_latents`` or ``None`` when there is no Stage-2.
+
+        A subclass that returns a tensor must initialise
+        ``state.extra["refined_history"]`` (the conditioning latent) in
+        ``prepare_encode``; ``post_decode`` appends every refined block to it
+        and decodes from that history instead of the Stage-1 one.
+        """
+        del state, clean_latents
+        return None
+
+    def _stage2_metadata(self, state: StepRequestState) -> dict[str, Any]:
+        del state
+        return {}
+
     @staticmethod
     def _count_pixel_frames(output: Any) -> int | None:
         if hasattr(output, "shape") and len(output.shape) >= 2:
@@ -500,8 +531,10 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
             return len(output[0])
         return None
 
-    @staticmethod
-    def _release_request_state(state: StepRequestState) -> None:
-        for key in _EXTRA_KEYS_TO_FREE:
+    _extra_keys_to_free: ClassVar[tuple[str, ...]] = _EXTRA_KEYS_TO_FREE
+
+    @classmethod
+    def _release_request_state(cls, state: StepRequestState) -> None:
+        for key in cls._extra_keys_to_free:
             state.extra.pop(key, None)
         state.extra.pop("frame_index", None)

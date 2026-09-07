@@ -137,10 +137,15 @@ class SanaWmNativeParams:
     cfg_scale: float = SANA_WM_DEFAULT_GUIDANCE_SCALE
 
 
-def build_sana_wm_download_patterns() -> tuple[str, ...]:
-    """Return the minimal HF allow-patterns needed for SANA-WM."""
+def build_sana_wm_download_patterns(extra_patterns: Iterable[str] = ()) -> tuple[str, ...]:
+    """Return the minimal HF allow-patterns needed for SANA-WM.
 
-    return tuple(SANA_WM_STAGE1_PATTERNS)
+    ``extra_patterns`` lets a pipeline that serves more than the Stage-1
+    transformer and VAE (the streaming two-stage pipeline pulls the
+    ``refiner/`` tree) extend the list without changing the Stage-1 default.
+    """
+
+    return tuple(dict.fromkeys((*SANA_WM_STAGE1_PATTERNS, *extra_patterns)))
 
 
 def resolve_sana_wm_local_paths(snapshot_dir: str | Path) -> SanaWmLocalPaths:
@@ -172,6 +177,7 @@ def resolve_or_download_sana_wm_checkpoint(
     *,
     revision: str | None = None,
     cache_dir: str | None = None,
+    extra_patterns: Iterable[str] = (),
 ) -> SanaWmLocalPaths:
     """Resolve a local SANA-WM tree or download the required HF files."""
 
@@ -183,7 +189,7 @@ def resolve_or_download_sana_wm_checkpoint(
             download_weights_from_hf_specific(
                 model,
                 cache_dir,
-                list(build_sana_wm_download_patterns()),
+                list(build_sana_wm_download_patterns(extra_patterns)),
                 revision=revision,
                 require_all=True,
             )
@@ -317,6 +323,9 @@ class SanaWmPipeline(
         if od_config is not None and od_config.model is not None:
             self._build_aux_components()
 
+    # Extra HF allow-patterns a subclass needs beyond the Stage-1 files.
+    _extra_download_patterns: ClassVar[tuple[str, ...]] = ()
+
     def resolve_checkpoint(self) -> SanaWmLocalPaths:
         if self.release_paths is not None:
             return self.release_paths
@@ -325,6 +334,7 @@ class SanaWmPipeline(
         self.release_paths = resolve_or_download_sana_wm_checkpoint(
             self.od_config.model,
             revision=self.od_config.revision,
+            extra_patterns=self._extra_download_patterns,
         )
         self.sana_wm_config = SanaWmConfig.from_json(self.release_paths.config)
         return self.release_paths

@@ -6,8 +6,10 @@
 > Stage-1 model + self-forcing sampler) and "PR-3" (serving), delivered as one
 > PR in the shape of LingBot-World #6844: stepwise execution + the existing
 > `WS /v1/realtime/video` transport. No streaming VAE decoder, no interactive
-> input, no refiner. §16 records where the implementation deviates from the
-> text below and the outcome of the open decisions D1–D4.
+> input. §16 records where the implementation deviates from the text below and
+> the outcome of the open decisions D1–D4. §17 adds the Stage-2 LTX-2 refiner
+> (`SanaWmStreamingTwoStagePipeline`, `sana_wm/refiner.py`), which was a
+> non-goal of the first PR.
 
 ## 1. Goals and non-goals
 
@@ -29,7 +31,7 @@
   independently with a one-latent-frame overlap; see §8.
 - Mid-request camera interaction. The camera trajectory is fixed at
   `session.start`. `session.interaction` (prompt update) is rejected in v1.
-- LTX-2 refiner stage.
+- LTX-2 refiner stage (delivered as a follow-up, §17).
 - `experimental/ar_diffusion` tick protocol, cross-request sessions, paged KV,
   session capacity planning. One request is one session; all causal state
   lives in `StepRequestState.extra`.
@@ -649,3 +651,132 @@ that one change). The points below are where reading the upstream code
   bidirectional 161-frame parity recorded in the recipe (SSIM 0.906 /
   23.6 dB). Per-chunk latency 0.9 s (24 pixel frames),
   i.e. ~1.7x realtime at 16 fps, with the pure-PyTorch recurrence.
+
+## 17. Stage-2: chunk-causal LTX-2 refiner
+
+### 17.1 Upstream facts
+
+Read from NVlabs/Sana `diffusion/refiner/diffusers_ltx2_refiner.py`
+(`DiffusersLTX2Refiner`, `RefinerChunkRunner`, `_streaming_self_attention`),
+`inference_video_scripts/wm/streaming_pipeline.py` and
+`inference_sana_wm_streaming.py`:
+
+| Fact | Source |
+| --- | --- |
+| The refiner is a stock LTX-2 video transformer (`LTX2VideoTransformer3DModel`, 48 layers, 32x128 heads, `rope_type=split`, `patch_size=(1,1,1)`, `caption_channels=3840`) plus `LTX2TextConnectors`; text comes from Gemma-3-12B (`gemma3_12b/`, bf16) with `max_length=1024`, left padding, per-layer hidden states stacked (49 layers). | `refiner_diffusers/{transformer,connectors}/config.json`, `_encode_prompt` |
+| Only the video stream runs: self-attention, text cross-attention, FFN of every block; the audio stream and the a2v/v2a cross-attention are skipped (`_forward_video_block`). | `diffusers_ltx2_refiner.py` |
+| Recipe `distilled-3step + source-sink-1`: sigmas `0.909375, 0.725, 0.421875, 0.0`; `block_size=3`, `sink_size=1`, `kv_max_frames=11`; refiner block `k` refines the clean Stage-1 frames `[1+3k, 4+3k)` as soon as Stage-1 chunk `k` is done. | `STAGE_2_DISTILLED_SIGMA_VALUES`, `StreamingPipelineConfig`, `run_streaming_inference` |
+| Per block: `x_t = (1-σ0)·clean + σ0·ε` with one `randn` per block from a dedicated generator (`--refiner_seed 42`); per step `x0 = x_t - σ·v`, `x_t ← (σ_next/σ)·x_t + (1-σ_next/σ)·x0`; timestep is uniform over the block (`σ·1000`). | `RefinerChunkRunner.refine_block`, `_predict_x0_active_block` |
+| Attention window `[sink | history | current]`: the sink is the *raw* Stage-1 conditioning latent, its **pre-RoPE** K/V captured once at `σ=0`, positions `[0,1)`, and re-rotated per block to `block_start - history_frames - sink_size` (`rf_shifted_sink`); the history is the **post-RoPE** K/V of the refined blocks at their absolute positions, trimmed to `kv_max_frames - sink_size = 10` frames. Queries are the current block only; full (non-causal) SDPA over the concatenation. | `_streaming_self_attention`, `_build_rotary_emb_for_absolute_positions` |
+| After the last step a clean forward at `σ=0` on the refined block, under the same prefix, captures its post-RoPE K/V (`_capture_block_kv`, `capture_mode="post_rope"`); the sink itself is never refined and sits unchanged in the output. | `refine_block` step 4 |
+| The decode input for chunk 0 is `[raw sink | refined block 0]`, later chunks the refined block; upstream drops the sink pixel frame (`drop_first_pixel`). | `streaming_pipeline.py` |
+
+### 17.2 Design
+
+`SanaWmStreamingTwoStagePipeline(SanaWmStreamingPipeline)` in
+`sana_wm/pipeline_sana_wm_streaming_two_stage.py`; the refiner math in
+`sana_wm/refiner.py`. Nothing under `worker/`, `engine/`, `entrypoints/` or
+`experimental/` changes, and `SanaWmStreamingPipeline` gains only two no-op
+hooks (`_apply_stage2`, `_stage2_metadata`) that the two-stage class fills.
+
+- **Components.** `refiner_transformer` is vLLM-Omni's native
+  `LTX2VideoTransformer3DModel` (`ltx2_transformer.py`: TP-sharded QKV, Omni
+  attention backend) built from `refiner/transformer/config.json` and
+  weight-loaded through a second `ComponentSource` (prefix
+  `refiner_transformer.`), so the strict coverage check covers it. After the
+  load the audio-only modules (`audio_*`, `*_to_*_attn`, the a2v/v2a
+  modulation tables; about 11 GB of the 37.7 GB) are parked on the host unless
+  an offload backend or HSDP owns placement. `refiner_text_encoder`
+  (Gemma-3-12B, `Gemma3ForConditionalGeneration`) and `refiner_connectors`
+  (`LTX2TextConnectors` with the Omni connector attention) come from
+  `refiner/text_encoder` and `refiner/connectors`, are built on CPU and placed
+  by the shared `_place_aux_components`. `_dit_modules` lists both DiTs,
+  `_encoder_modules` all three encoders, so sequential / layerwise offload see
+  them.
+- **Checkpoint.** The converter gains `--refiner-dir` (the release's
+  `refiner_diffusers/`) and `--refiner-text-encoder-dir` (`gemma3_12b/`) and
+  copies or symlinks them to `refiner/{transformer,connectors,text_encoder}`
+  with `model_index.json` naming the two-stage class. The download patterns
+  of the two-stage class include `refiner/*`. `VLLM_OMNI_SANA_WM_REFINER_ROOT`
+  / `VLLM_OMNI_SANA_WM_REFINER_TEXT_ENCODER` redirect the refiner to another
+  local tree.
+- **Prompt.** `prepare_encode` encodes the raw user prompt once per request
+  (Gemma-3 backbone only, `output_hidden_states=True`, stacked → connectors,
+  which do the masked per-layer normalisation in diffusers 0.40) and stores
+  the connector video context + mask in `state.extra`.
+- **State.** `SanaWmRefinerKvCache` (per request, in
+  `extra["refiner_cache"]`): per-layer `sink_kv_pre`, per-layer
+  `history_kv_post`, `history_frames`, `blocks_refined`; `append_history`
+  trims to `kv_max_frames - sink_frames` frames. Plus
+  `extra["refined_history"]` (raw conditioning latent + refined blocks), a
+  refiner generator seeded by `extra_params.sana_wm_refiner_seed` (default:
+  the request seed, so one seed reproduces the clip; upstream's fixed 42 is
+  reachable through the extra arg), and the connector prompt tensors. All of
+  it is freed with the Stage-1 state on the last chunk.
+- **Per chunk** (`post_decode`): Stage-1 cache write → `refine_block(clean
+  block, block_start=gen_start)` (sink captured from `first_latent` on the
+  first call) → the refined block is appended to `refined_history` → overlap
+  decode of `refined_history[-(chunk_size+1):]`. `output_type="latent"`
+  returns the refined block. Metadata adds `refiner_backend`,
+  `refiner_sigmas`, `refiner_blocks_refined`, `refiner_cached_latent_frames`,
+  `refiner_cache_bytes`, `refiner_seed`; `backend` becomes
+  `native_gdn_streaming+ltx2_refiner`.
+- **Forward.** `SanaWmRefinerRunner.forward_video` is the video-only pass
+  over the native modules (`proj_in`, `time_embed` with per-token uniform
+  sigma, `caption_projection`, per block `norm1/attn1/norm2/attn2/norm3/ff`
+  with `get_mod_params`, `norm_out`/`scale_shift_table`/`proj_out`). The
+  self-attention takes an explicit per-layer prefix (`sink_k_pre`, `sink_v`,
+  shifted sink RoPE, `history_k/v`) and a capture mode instead of upstream's
+  module attributes; a capture pass stops after the last layer's K/V
+  projection. RoPE for absolute positions (`refiner_rotary_emb`) rebuilds the
+  pixel-coordinate grid of `prepare_video_coords` for an explicit frame list
+  (fp32 tables, as upstream). TP: K/V are captured per rank from the sharded
+  `to_qkv`, RoPE is sliced with the processor's `_slice_rope_for_tp`.
+- **Frame contract.** Unchanged from §8: chunk 0 emits `8·chunk_size + 1`
+  frames including the conditioning frame decoded from its raw latent (the
+  sink of both stages), later chunks `8·chunk_size`; upstream's
+  `drop_first_pixel` is not applied so the counts still sum to `num_frames`.
+- **Not done (follow-ups).** Three-stream overlap of Stage-1 / refiner /
+  decode (the step-execution contract is one stream per request, so the three
+  run serially inside `post_decode`); the release's causal LTX-2 VAE; NVFP4 /
+  FP8 refiner quantisation and the cross-attention K/V cache of the upstream
+  runner; sequence parallelism (rejected at init).
+
+### 17.3 Tests
+
+- `tests/diffusion/models/sana_wm/test_refiner.py` (CPU, tiny native LTX-2):
+  schedule / window validation; the prefix path equals an independent
+  block-causal joint forward over `[sink | block]` and
+  `[sink | history | block]` at absolute positions (sink and history rows at
+  `σ=0`, block rows at `σ`), for both RoPE layouts; the capture pass returns
+  the K/V of a plain forward in every layer; `refine_block` reproduces the
+  hand-computed Euler trajectory, hands the sink over once and keeps the
+  window at `kv_max_frames - sink`; absolute-position RoPE equals the slice of
+  the contiguous table.
+- `tests/diffusion/models/sana_wm/test_streaming_two_stage_pipeline_stepwise.py`
+  (CPU, fakes): one `refine_block` per chunk at `block_start = 1, 4, 7`, the
+  sink passed on the first call only, the refined history feeding the decode
+  (frame counts 25 / 24 / 24), refined latents for `output_type="latent"`,
+  the metadata, seed / step overrides, path resolution with env overrides,
+  and the refiner state freed on the last chunk.
+- `tests/e2e/online_serving/test_sana_wm_streaming.py::test_realtime_streaming_two_stage_001`
+  (GPU): the WS session against the two-stage repo with the same cadence
+  assertions.
+
+### 17.4 Implementation record
+
+- CPU: `test_refiner.py` (9 cases) and
+  `test_streaming_two_stage_pipeline_stepwise.py` (4 cases) pass together
+  with the Stage-1 stepwise / cache / schedule suites (41 passed).
+- GPU (1x RTX PRO 6000, streaming Stage-1 conversion + the bidirectional
+  two-stage conversion's `refiner/` tree via `VLLM_OMNI_SANA_WM_REFINER_ROOT`,
+  because the streaming release's `refiner_diffusers/` was not on the box):
+  the native LTX-2 refiner loads through the diffusers loader with the strict
+  coverage check (3318 tensors), the audio stream is parked (5.83 B params,
+  35.2 -> 24.3 GiB), `refine_block` takes 1.1-1.25 s per 3-frame block at
+  704x1280 with the window growing to 7.1 GiB, and a WS session of 73 frames
+  streams 25 + 24 + 24 refined frames (warm: first chunk 3.0 s, 2.3 s per
+  later chunk, peak 80.7 GiB). Parity against NVlabs `RefinerChunkRunner` on
+  the streaming refiner weights is the open item; it needs the 38 GB
+  `refiner_diffusers/` download, for which the validation box has no disk
+  left.

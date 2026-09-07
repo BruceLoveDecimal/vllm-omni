@@ -301,6 +301,91 @@ is the reference invocation.
   is a follow-up.
 - The camera trajectory is fixed at `session.start`; `session.interaction`
   (prompt update) is rejected.
-- The LTX-2 refiner stage is not served.
+- The Stage-1-only pipeline does not run the LTX-2 refiner; see the two-stage
+  section below for the refined stream.
 - One request per session; `cfg_parallel_size > 1` is rejected and tensor
   parallelism is not validated for the streaming pipeline.
+
+### Streaming two-stage (chunk-causal Stage-1 + LTX-2 refiner)
+
+`SanaWmStreamingTwoStagePipeline` adds the streaming release's Stage-2 to the
+same session: after every Stage-1 chunk the three clean latent frames pass
+through the chunk-causal LTX-2 refiner (`refiner_diffusers/` of
+`Efficient-Large-Model/SANA-WM_streaming`) before the overlap decode, so the
+WS client receives refined chunks with the same cadence and frame counts as
+the Stage-1 stream. The refiner follows NVlabs `RefinerChunkRunner`
+(`distilled-3step + source-sink-1`): sigmas `0.909375, 0.725, 0.421875 -> 0`,
+one noise draw per block, the raw conditioning latent as a re-rotated
+attention sink, and a sliding window of the last 10 refined latent frames'
+post-RoPE K/V (`kv_max_frames=11`).
+
+- Model: `BBBBruce/SANA-WM_streaming-two-stage-diffusers` = the Stage-1 tree
+  above plus `refiner/{transformer,connectors,text_encoder}` (LTX-2 19B
+  transformer 37.8 GB, connectors 2.9 GB, Gemma-3-12B 24 GB, all bf16),
+  produced by the same converter with `--refiner-dir` and
+  `--refiner-text-encoder-dir`. `model_index.json` names
+  `SanaWmStreamingTwoStagePipeline`. `VLLM_OMNI_SANA_WM_REFINER_ROOT` /
+  `VLLM_OMNI_SANA_WM_REFINER_TEXT_ENCODER` point the refiner at another local
+  tree (e.g. the raw release's `refiner_diffusers/` and `gemma3_12b/`).
+- Memory: Stage-1 stack 12 GiB + refiner transformer (video stream 27 GB
+  resident, the 11 GB audio stream is parked on the host after loading) +
+  connectors + Gemma-3-12B: about 65 GiB of weights, i.e. an 80 GB or larger
+  GPU. The refiner K/V window costs a further ~7 GB at 1280x704
+  (48 layers x 10 frames x 880 tokens x 4096 x 2 x bf16).
+- Request: identical to the Stage-1 stream. `extra_params.sana_wm_refiner_seed`
+  seeds the refiner noise (default: the request `seed`; NVlabs uses a fixed
+  `--refiner_seed 42`); `extra_params.sana_wm_refiner_steps` must be 3 if given.
+- Output: chunk 0 still carries the conditioning frame decoded from its raw
+  latent (25 frames), later chunks 24 refined frames; the decode reads the
+  refined history with the same one-latent-frame overlap. Chunk metadata
+  additionally reports `refiner_blocks_refined`, `refiner_cached_latent_frames`
+  and `refiner_cache_bytes`.
+
+#### Command
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+vllm serve BBBBruce/SANA-WM_streaming-two-stage-diffusers \
+  --omni \
+  --diffusion-streaming-output \
+  --host 0.0.0.0 \
+  --port 8091
+```
+
+The `session.start` payload of the Stage-1 section applies unchanged (set
+`"model"` to the two-stage repo). Run the e2e with
+`SANA_WM_STREAMING_TWO_STAGE_E2E_MODEL=<repo or local path> pytest -s -v
+e2e/online_serving/test_sana_wm_streaming.py -k two_stage --run-level=advanced_model`.
+
+#### Measured (1x RTX PRO 6000 Blackwell 96GB, 1280x704, seed 42)
+
+Measured with the streaming Stage-1 conversion and the refiner tree of the
+bidirectional two-stage conversion (`BBBBruce/SANA-WM_bidirectional-diffusers`,
+same LTX-2 architecture and connectors; the streaming release's own
+`refiner_diffusers/` weights were not on the box), pointed at through
+`VLLM_OMNI_SANA_WM_REFINER_ROOT`. The numbers therefore describe the serving
+path and its cost, not the quality of the streaming refiner weights.
+
+- Model load 64.9 GiB (Stage-1 stack, refiner video stream, connectors,
+  Gemma-3-12B; the 5.83 B audio-stream parameters are parked on the host),
+  refiner weights loaded in 41 s. Peak device memory 80.7 GiB during a
+  73-frame session (the refiner K/V window reaches 7.1 GiB at 11 cached
+  frames).
+- Refiner alone (`refine_block`, 3 latent frames, 880 tokens per frame, bf16,
+  cuDNN attention): 1.1-1.25 s per block including the K/V-capture forward.
+- WS session, 49 frames, first request after startup: first media chunk
+  (25 frames) 9.95 s, both chunks 12.4 s. Warm 73-frame session: first chunk
+  3.0 s, then 2.3 s per 24-frame chunk (0.65x of the 16 fps playback rate;
+  Stage-1 about 0.9 s + refiner about 1.2 s + decode), 7.6 s total. The
+  refined stream decodes to 73 frames of 1280x704 with PyAV.
+
+#### Known limitations
+
+- Stage-1, refiner and decode run serially inside each chunk's
+  `post_decode` (one CUDA stream per request); NVlabs overlaps the three
+  stages on separate streams. Per-chunk latency is therefore the sum of the
+  three.
+- Decode still uses the bidirectional Stage-1 LTX-2 VAE with the one-frame
+  overlap; the release's causal VAE decoder remains a follow-up.
+- Sequence parallelism is rejected; tensor parallelism of the refiner is not
+  validated in v1.

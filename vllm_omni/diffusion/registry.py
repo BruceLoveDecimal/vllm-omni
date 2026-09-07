@@ -186,6 +186,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sana_wm_streaming",
         "SanaWmStreamingPipeline",
     ),
+    "SanaWmStreamingTwoStagePipeline": (
+        "sana_wm",
+        "pipeline_sana_wm_streaming_two_stage",
+        "SanaWmStreamingTwoStagePipeline",
+    ),
     "InternVLAA1Pipeline": (
         "internvla_a1",
         "pipeline_internvla_a1",
@@ -647,6 +652,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "SanaWmPipeline": "get_sana_wm_pre_process_func",
     "SanaWmStreamingPipeline": "get_sana_wm_pre_process_func",
+    "SanaWmStreamingTwoStagePipeline": "get_sana_wm_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
 }
