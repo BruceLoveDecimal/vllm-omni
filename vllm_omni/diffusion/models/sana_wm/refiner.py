@@ -38,6 +38,7 @@ from typing import Any, Literal
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.models.ltx2.ltx2_guidance import euler_step_from_velocity
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import pack_latents, unpack_latents
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import (
     LTX2AudioVideoAttnProcessor,
@@ -647,8 +648,12 @@ class SanaWmRefinerRunner:
         eps = torch.randn(clean_block.shape, generator=generator, device=noise_device, dtype=dtype).to(device=device)
         x_t = ((1.0 - sigma_max) * clean_block.float() + sigma_max * eps.float()).to(dtype)
 
-        for sigma_cur, sigma_next in self.schedule.pairs():
-            tokens = self._pack(x_t)
+        # Step on packed tokens: pack/unpack are pure rearrangements, so the
+        # shared LTX Euler update in token space matches the official
+        # latent-space update exactly.
+        tokens = self._pack(x_t)
+        sigmas = torch.tensor(self.schedule.sigmas, dtype=torch.float32, device=device)
+        for step_index, sigma_cur in enumerate(self.schedule.sigmas[:-1]):
             velocity, _ = self.forward_video(
                 tokens,
                 sigma=sigma_cur,
@@ -657,14 +662,12 @@ class SanaWmRefinerRunner:
                 rotary_emb=rotary_emb,
                 prefixes=prefixes,
             )
-            x0_tokens = tokens.float() - velocity.float() * sigma_cur
-            x0 = self._unpack(x0_tokens, like=x_t)
-            ratio = sigma_next / sigma_cur
-            x_t = (ratio * x_t.float() + (1.0 - ratio) * x0).to(dtype)
+            tokens = euler_step_from_velocity(tokens, velocity, sigmas, step_index)
+        x_t = self._unpack(tokens, like=clean_block)
 
         # Cache write: the refined block's post-RoPE K/V under the same prefix.
         _, captured = self.forward_video(
-            self._pack(x_t),
+            tokens,
             sigma=0.0,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
