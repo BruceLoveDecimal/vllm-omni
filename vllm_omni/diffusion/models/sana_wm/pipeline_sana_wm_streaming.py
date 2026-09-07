@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, ClassVar
 
+import numpy as np
 import torch
 from vllm.logger import init_logger
 
@@ -49,6 +50,7 @@ from vllm_omni.diffusion.models.sana_wm.streaming_cache import SanaWmStreamingCa
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
 
@@ -72,10 +74,16 @@ _EXTRA_KEYS_TO_FREE = (
     "cache",
     "camera_full",
     "chunk_camera",
+    "frame_index",
     "history_latents",
     "noise_full",
     "first_latent",
 )
+
+# What ``VideoProcessor.postprocess_video`` hands back: an ``np``/``pt`` batch
+# with the frame axis at index 1, or a list of per-video frame lists for
+# ``pil``. ``output_type="latent"`` short-circuits to the latent tensor.
+DecodedVideo = torch.Tensor | np.ndarray | list
 
 
 def _valid_num_frames_hint(num_frames: int, chunk_size: int) -> str:
@@ -85,18 +93,61 @@ def _valid_num_frames_hint(num_frames: int, chunk_size: int) -> str:
     return ", ".join(str(candidate) for candidate in candidates)
 
 
-def _drop_first_frame(video: Any) -> Any:
+def _drop_first_frame(video: DecodedVideo) -> DecodedVideo:
     """Drop the leading pixel frame of a post-processed chunk.
 
-    ``VideoProcessor.postprocess_video`` puts the frame axis at index 1 for
-    ``np``/``pt`` batches and returns a list of per-video frame lists for
-    ``pil``; all three keep the batch axis outermost.
+    All ``DecodedVideo`` layouts keep the batch axis outermost, so the frame
+    axis is index 1 of the batch (``np``/``pt``) or index 0 of each per-video
+    frame list (``pil``).
     """
-    if isinstance(video, (torch.Tensor,)) or hasattr(video, "shape"):
+    if isinstance(video, (torch.Tensor, np.ndarray)):
         return video[:, 1:]
     if isinstance(video, list):
-        return [item[1:] if isinstance(item, (list, tuple)) or hasattr(item, "shape") else item for item in video]
+        return [frames[1:] for frames in video]
     raise TypeError(f"Sana-WM streaming cannot drop the overlap frame from output type {type(video).__name__}.")
+
+
+def _count_pixel_frames(video: DecodedVideo) -> int | None:
+    if isinstance(video, (torch.Tensor, np.ndarray)):
+        return int(video.shape[1])
+    if isinstance(video, list) and video:
+        return len(video[0])
+    return None
+
+
+def _to_optional(tensor: torch.Tensor | None, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return tensor.to(device=device, dtype=dtype)
+
+
+def _resolve_guidance_scale(sampling: OmniDiffusionSamplingParams) -> None:
+    """The distilled student runs without CFG; reject an explicit scale above 1."""
+    if not sampling.guidance_scale_provided:
+        return
+    guidance_scale = float(sampling.guidance_scale or 1.0)
+    if guidance_scale > 1.0:
+        raise ValueError(
+            "Sana-WM streaming serves the distilled self-forcing student without classifier-free "
+            f"guidance; guidance_scale must be <= 1.0, got {guidance_scale}."
+        )
+
+
+def _resolve_generator(
+    sampling: OmniDiffusionSamplingParams,
+    extra_args: dict[str, Any],
+    device: torch.device,
+) -> torch.Generator:
+    """Reuse the runner's generator or seed a fresh one on the worker device."""
+    generator = sampling.generator
+    if isinstance(generator, torch.Generator):
+        return generator
+    if isinstance(generator, list):
+        raise ValueError("Sana-WM streaming serves one request per session and accepts a single generator.")
+    seed = int(sampling.seed or extra_args.get("seed", 0) or 0)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    sampling.generator = generator
+    return generator
 
 
 class SanaWmStreamingPipeline(SanaWmPipeline):
@@ -163,21 +214,16 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
         config = self.sana_wm_config
         device, dtype = self._runtime_device_dtype()
 
-        height = int(getattr(sampling, "height", None) or payload["height"])
-        width = int(getattr(sampling, "width", None) or payload["width"])
-        num_frames = int(getattr(sampling, "num_frames", None) or payload["num_frames"])
+        height = int(sampling.height or payload["height"])
+        width = int(sampling.width or payload["width"])
+        # ``num_frames`` defaults to 1 (image models), so 1 also means "unset".
+        num_frames = int(sampling.num_frames)
         if num_frames <= 1:
             num_frames = int(payload["num_frames"])
 
-        if getattr(sampling, "guidance_scale_provided", False):
-            guidance_scale = float(getattr(sampling, "guidance_scale", 1.0) or 1.0)
-            if guidance_scale > 1.0:
-                raise ValueError(
-                    "Sana-WM streaming serves the distilled self-forcing student without classifier-free "
-                    f"guidance; guidance_scale must be <= 1.0, got {guidance_scale}."
-                )
+        _resolve_guidance_scale(sampling)
         schedule = self.self_forcing_schedule
-        schedule.check_num_inference_steps(getattr(sampling, "num_inference_steps", None))
+        schedule.check_num_inference_steps(sampling.num_inference_steps)
 
         latent_frames, latent_height, latent_width = resolve_video_latent_shape(
             height,
@@ -205,9 +251,8 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
             )
 
         first_frame_image = (prompt.get("multi_modal_data") or {}).get("image")
-        import numpy as _np
-
-        if not (hasattr(first_frame_image, "convert") or isinstance(first_frame_image, (_np.ndarray, torch.Tensor))):
+        is_pil_image = hasattr(first_frame_image, "convert")
+        if not is_pil_image and not isinstance(first_frame_image, (np.ndarray, torch.Tensor)):
             raise TypeError(
                 "Sana-WM first-frame image must be a PIL Image, numpy ndarray, or "
                 f"torch.Tensor; got {type(first_frame_image).__name__}."
@@ -225,9 +270,12 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
             dtype=dtype,
         )
 
-        camera = payload.get("camera") or {}
+        camera = payload.get("camera")
+        poses = None
+        if isinstance(camera, dict):
+            poses = camera.get("poses")
         condition = SanaWmCameraCondition(
-            poses=camera.get("poses") if isinstance(camera, dict) else None,
+            poses=poses,
             intrinsics=payload.get("intrinsics"),
             action=payload.get("action"),
             num_frames=num_frames,
@@ -240,11 +288,7 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
         camera_full = {
             "plucker": camera_tensors["chunk_plucker"].to(device=device, dtype=dtype),
             "raymap": camera_tensors["raymap"].to(device=device, dtype=dtype),
-            "spatial_raymap": (
-                camera_tensors["spatial_raymap"].to(device=device, dtype=dtype)
-                if camera_tensors.get("spatial_raymap") is not None
-                else None
-            ),
+            "spatial_raymap": _to_optional(camera_tensors.get("spatial_raymap"), device=device, dtype=dtype),
         }
         if camera_full["raymap"].shape[0] != latent_frames:
             raise ValueError(
@@ -252,23 +296,14 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
                 f"the request needs {latent_frames}."
             )
 
-        generator = getattr(sampling, "generator", None)
-        if generator is None:
-            seed = int(getattr(sampling, "seed", None) or extra_args.get("seed", 0) or 0)
-            generator = torch.Generator(device=device).manual_seed(seed)
-            if sampling is not None:
-                try:
-                    sampling.generator = generator
-                except AttributeError:
-                    pass
+        generator = _resolve_generator(sampling, extra_args, device)
         # NVlabs draws the noise for the whole clip once; each chunk then
         # takes its slice, so the RNG stream is independent of the chunking.
-        # The runner hands out a generator on the worker device; a caller that
-        # asked for another generator_device gets its noise drawn there.
-        noise_device = generator.device if isinstance(generator, torch.Generator) else device
+        # The noise is drawn on the generator's device (a caller may ask for
+        # another generator_device) and moved to the worker device.
         noise_full = torch.randn(
             (1, first_latent.shape[1], latent_frames, latent_height, latent_width),
-            device=noise_device,
+            device=generator.device,
             dtype=dtype,
             generator=generator,
         ).to(device=device)
@@ -300,13 +335,15 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
                 "first_latent": first_latent.to(dtype=dtype),
                 "generator": generator,
                 "height": height,
-                "history_latents": first_latent.to(dtype=dtype).clone(),
+                # Only ever extended with ``torch.cat`` (a fresh tensor), so it
+                # can share storage with ``first_latent``.
+                "history_latents": first_latent.to(dtype=dtype),
                 "latent_frames": latent_frames,
                 "latent_height": latent_height,
                 "latent_width": latent_width,
                 "noise_full": noise_full,
                 "num_frames": num_frames,
-                "output_type": getattr(sampling, "output_type", None) or "np",
+                "output_type": sampling.output_type or "np",
                 "schedule": schedule,
                 "width": width,
             }
@@ -321,20 +358,23 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
         chunk_start, chunk_end = boundaries[chunk_index], boundaries[chunk_index + 1]
         # Chunk 0 carries the clean conditioning frame inside the forward
         # (frame 0 at t = 0); only the frames after it are generated.
-        gen_start = chunk_start + 1 if chunk_index == 0 else chunk_start
+        gen_start = chunk_start
+        if chunk_index == 0:
+            gen_start = chunk_start + 1
         extra["chunk_range"] = (chunk_start, chunk_end)
         extra["gen_range"] = (gen_start, chunk_end)
         extra["frame_index"] = torch.arange(chunk_start, chunk_end, dtype=torch.long, device=extra["device"])
         camera_full = extra["camera_full"]
+        spatial_raymap = camera_full["spatial_raymap"]
+        if spatial_raymap is not None:
+            spatial_raymap = spatial_raymap[:, chunk_start:chunk_end]
         extra["chunk_camera"] = {
             "plucker": camera_full["plucker"][:, chunk_start:chunk_end],
             "raymap": camera_full["raymap"][chunk_start:chunk_end],
-            "spatial_raymap": (
-                camera_full["spatial_raymap"][:, chunk_start:chunk_end]
-                if camera_full["spatial_raymap"] is not None
-                else None
-            ),
+            "spatial_raymap": spatial_raymap,
         }
+        # Copy the chunk's noise slice so the Euler updates never alias the
+        # whole-clip noise buffer later chunks still read from.
         state.latents = extra["noise_full"][:, :, gen_start:chunk_end].clone()
         schedule: SanaWmSelfForcingSchedule = extra["schedule"]
         state.timesteps = schedule.timesteps_tensor(extra["device"])
@@ -358,6 +398,7 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
             latents = torch.cat([extra["first_latent"].to(latents.dtype), latents], dim=2)
         frames = latents.shape[2]
         timestep = timestep_value.to(device=latents.device, dtype=torch.float32).reshape(1, 1, 1)
+        # ``expand`` is a stride-0 view; materialise it before writing frame 0.
         timestep = timestep.expand(latents.shape[0], 1, frames).clone()
         if state.chunk_index == 0:
             timestep[:, :, 0] = 0.0
@@ -456,7 +497,7 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
                 )
                 if completed_chunk > 0:
                     output = _drop_first_frame(output)
-                num_pixel_frames = self._count_pixel_frames(output)
+                num_pixel_frames = _count_pixel_frames(output)
 
         envelope = build_sana_wm_output_envelope(
             output=output,
@@ -489,19 +530,10 @@ class SanaWmStreamingPipeline(SanaWmPipeline):
             chunk_index=completed_chunk,
             total_chunks=state.total_chunks,
             finished=finished,
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else {},
+            stage_durations=getattr(self, "stage_durations", {}),
         )
-
-    @staticmethod
-    def _count_pixel_frames(output: Any) -> int | None:
-        if hasattr(output, "shape") and len(output.shape) >= 2:
-            return int(output.shape[1])
-        if isinstance(output, list) and output and isinstance(output[0], (list, tuple)):
-            return len(output[0])
-        return None
 
     @staticmethod
     def _release_request_state(state: StepRequestState) -> None:
         for key in _EXTRA_KEYS_TO_FREE:
             state.extra.pop(key, None)
-        state.extra.pop("frame_index", None)

@@ -59,7 +59,9 @@ class SanaWmSelfForcingSchedule:
         config: SanaWmConfig,
         override: Sequence[int] | None = None,
     ) -> SanaWmSelfForcingSchedule:
-        return cls.from_step_list(override if override is not None else config.denoising_step_list)
+        if override is not None:
+            return cls.from_step_list(override)
+        return cls.from_step_list(config.denoising_step_list)
 
     @property
     def num_steps(self) -> int:
@@ -73,9 +75,9 @@ class SanaWmSelfForcingSchedule:
         """``(sigma_step, sigma_next)``; the last step lands on ``sigma = 0``."""
         if step < 0 or step >= self.num_steps:
             raise IndexError(f"Sana-WM self-forcing step {step} outside [0, {self.num_steps}).")
-        sigmas = self.sigmas
-        sigma_next = sigmas[step + 1] if step + 1 < self.num_steps else 0.0
-        return sigmas[step], sigma_next
+        # Append the terminal sigma so the last step lands on clean x0.
+        sigmas = (*self.sigmas, 0.0)
+        return sigmas[step], sigmas[step + 1]
 
     def timesteps_tensor(self, device: torch.device | str | None = None) -> torch.Tensor:
         return torch.tensor(self.timesteps, dtype=torch.float32, device=device)

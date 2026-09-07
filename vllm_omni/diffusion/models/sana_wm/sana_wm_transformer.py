@@ -58,6 +58,19 @@ SANA_WM_STAGE1_PROMPT_CHANNELS = 2304
 SANA_WM_STAGE1_TIMESTEP_CHANNELS = 256
 
 
+def _cache_copy(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    """Detached copy of an optional tensor for the streaming cache."""
+    if tensor is None:
+        return None
+    return tensor.detach().clone()
+
+
+def _to_device_optional(tensor: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return tensor.to(device=device)
+
+
 def _shard_param_across_tp(param: torch.Tensor | None, dim: int = 0) -> None:
     """Attach vLLM's TP shard loader to a plain (non-parallel-layer) parameter.
 
@@ -233,7 +246,9 @@ def _delta_scan(
         return stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, dim, token_count)
 
     numerator = restore(numerators, head_dim)
-    denominator = None if skip_z else restore(denominators, 1)
+    denominator = None
+    if not skip_z:
+        denominator = restore(denominators, 1)
     if return_state:
         return numerator, denominator, (state_kv, state_z)
     return numerator, denominator
@@ -271,6 +286,10 @@ def _bidirectional_delta_scan(
     def reverse(tensor: torch.Tensor, *, shift_value: float | None = None) -> torch.Tensor:
         return _reverse_frames(tensor, frames=frames, spatial_tokens=spatial_tokens, shift_value=shift_value)
 
+    initial_state_kv = None
+    initial_state_z = None
+    if initial_state is not None:
+        initial_state_kv, initial_state_z = initial_state
     forward = _delta_scan(
         query_rot,
         key_rot,
@@ -281,8 +300,8 @@ def _bidirectional_delta_scan(
         query=query,
         key=key,
         skip_z=skip_z,
-        initial_state_kv=None if initial_state is None else initial_state[0],
-        initial_state_z=None if initial_state is None else initial_state[1],
+        initial_state_kv=initial_state_kv,
+        initial_state_z=initial_state_z,
         return_state=return_state,
     )
     if return_state:
@@ -308,7 +327,9 @@ def _bidirectional_delta_scan(
     )
 
     numerator = num_fwd + num_bwd
-    denominator = None if skip_z else den_fwd + den_bwd
+    denominator = None
+    if not skip_z:
+        denominator = den_fwd + den_bwd
     if return_state:
         return numerator, denominator, final_state
     return numerator, denominator
@@ -691,9 +712,12 @@ class SanaWmWanRotaryPosEmbed(nn.Module):
                 raise ValueError(
                     f"Sana-WM RoPE frame_index must be 1-D with {frames} entries, got {tuple(frame_index.shape)}."
                 )
-            if frame_index.numel() > 0 and int(frame_index.min()) < 0:
-                raise ValueError("Sana-WM RoPE frame_index must be non-negative.")
-            needed = max(int(frame_index.max()) + 1 if frame_index.numel() > 0 else 0, height, width)
+            max_frame = 0
+            if frame_index.numel() > 0:
+                if int(frame_index.min()) < 0:
+                    raise ValueError("Sana-WM RoPE frame_index must be non-negative.")
+                max_frame = int(frame_index.max()) + 1
+            needed = max(max_frame, height, width)
         else:
             needed = max(spatial_shape)
         if needed > self.freqs.shape[0]:
@@ -1129,7 +1153,7 @@ class SanaWmSelfAttention(nn.Module):
             )
             if save_cache:
                 cache.gdn_state_kv = state_kv.detach().clone()
-                cache.gdn_state_z = None if state_z is None else state_z.detach().clone()
+                cache.gdn_state_z = _cache_copy(state_z)
         output = output.permute(0, 3, 1, 2).reshape(batch_size, token_count, q_size)
         return output, (beta, decay)
 
@@ -1593,8 +1617,8 @@ class SanaWmSelfAttention(nn.Module):
                     frames=spatial_shape[0],
                     k_main=k_main.detach().clone(),
                     v_main=v_main.detach().clone(),
-                    k_cam=None if k_cam is None else k_cam.detach().clone(),
-                    v_cam=None if v_cam is None else v_cam.detach().clone(),
+                    k_cam=_cache_copy(k_cam),
+                    v_cam=_cache_copy(v_cam),
                 )
             )
         return self._apply_output_gate_and_proj(main_raw, hidden_states)
@@ -2207,7 +2231,7 @@ class SanaWmTransformer3DModel(nn.Module):
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         encoder_hidden_states = self.y_embedder(
-            encoder_hidden_states.to(device=device) if encoder_hidden_states is not None else None,
+            _to_device_optional(encoder_hidden_states, device),
             batch_size=batch_size,
             dtype=dtype,
         )

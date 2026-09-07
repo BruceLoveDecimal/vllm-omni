@@ -104,6 +104,9 @@ def _force_default_gemm(monkeypatch):
 
 
 def _tiny_config(*, num_blocks: int, softmax_every_n: int, streaming: bool = True) -> SanaWmConfig:
+    pos_embed_type = "wan_rope"
+    if streaming:
+        pos_embed_type = "casual_wan_rope"
     return SanaWmConfig(
         architecture_name="tiny",
         num_blocks=num_blocks,
@@ -114,7 +117,7 @@ def _tiny_config(*, num_blocks: int, softmax_every_n: int, streaming: bool = Tru
         linear_head_dim=HEAD_DIM,
         conv_kernel_size=4,
         t_kernel_size=3,
-        pos_embed_type="casual_wan_rope" if streaming else "wan_rope",
+        pos_embed_type=pos_embed_type,
         chunk_plucker_channels=48,
         chunk_plucker_post_attn_blocks=num_blocks,
         model_max_length=TEXT_LEN,

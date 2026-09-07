@@ -11,8 +11,6 @@ overlap-decode frame counts and the request-validation errors.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 import torch
@@ -23,7 +21,12 @@ from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm_streaming import (
     SanaWmStreamingPipeline,
 )
 from vllm_omni.diffusion.models.sana_wm.self_forcing import SanaWmSelfForcingSchedule
+from vllm_omni.diffusion.models.sana_wm.streaming_cache import SanaWmStreamingCache
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -41,7 +44,23 @@ class _FakeTransformer:
         self.blocks = [object() for _ in range(NUM_BLOCKS)]
         self.calls: list[dict] = []
 
-    def forward_streaming(self, hidden_states, timestep, *, frame_index, cache, save_cache, **kwargs):
+    def forward_streaming(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        *,
+        frame_index: torch.Tensor,
+        cache: SanaWmStreamingCache,
+        save_cache: bool,
+        encoder_hidden_states: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+        plucker: torch.Tensor | None = None,
+        raymap: torch.Tensor | None = None,
+        spatial_raymap: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del encoder_attention_mask, spatial_raymap
+        assert encoder_hidden_states is not None
+        assert raymap is not None and plucker is not None
         self.calls.append(
             {
                 "frames": int(hidden_states.shape[2]),
@@ -49,11 +68,10 @@ class _FakeTransformer:
                 "frame_index": frame_index.detach().cpu().tolist(),
                 "save_cache": save_cache,
                 "chunk_index": cache.chunks_committed,
-                "raymap_frames": int(kwargs["raymap"].shape[0]),
-                "plucker_frames": int(kwargs["plucker"].shape[1]),
+                "raymap_frames": int(raymap.shape[0]),
+                "plucker_frames": int(plucker.shape[1]),
             }
         )
-        assert kwargs["encoder_hidden_states"] is not None
         # v = 0.5 * x keeps the Euler trajectory easy to reproduce by hand.
         return hidden_states * 0.5
 
@@ -78,22 +96,10 @@ def _prompt(num_frames: int, action: str | None = None):
     }
 
 
-def _sampling(**overrides):
-    params = SimpleNamespace(
-        height=HEIGHT,
-        width=WIDTH,
-        num_frames=overrides.pop("num_frames", 49),
-        num_inference_steps=None,
-        guidance_scale=None,
-        guidance_scale_provided=False,
-        seed=7,
-        generator=None,
-        output_type="np",
-        extra_args={},
-    )
-    for key, value in overrides.items():
-        setattr(params, key, value)
-    return params
+def _sampling(**overrides) -> OmniDiffusionSamplingParams:
+    params = dict(height=HEIGHT, width=WIDTH, num_frames=49, seed=7, output_type="np")
+    params.update(overrides)
+    return OmniDiffusionSamplingParams(**params)
 
 
 def _pipeline(monkeypatch, *, config: SanaWmConfig | None = None) -> SanaWmStreamingPipeline:
@@ -133,15 +139,32 @@ def _pipeline(monkeypatch, *, config: SanaWmConfig | None = None) -> SanaWmStrea
     return pipeline
 
 
-def _state(prompt, sampling) -> StepRequestState:
+def _state(prompt, sampling: OmniDiffusionSamplingParams) -> StepRequestState:
     return StepRequestState(request_id="req-0", sampling=sampling, prompt=prompt)
 
 
-def _drive_chunk(pipeline, state):
+def _input_batch(state: StepRequestState) -> InputBatch:
+    """Single-request step batch, shaped the way the runner assembles it."""
+    return InputBatch(
+        request_ids=[state.request_id],
+        num_reqs=1,
+        num_reqs_after_padding=1,
+        idx_mapping=torch.tensor([0]),
+        idx_mapping_np=np.array([0]),
+        latents=state.latents,
+        timesteps=state.timesteps,
+        prompt_embeds=state.prompt_embeds,
+        prompt_embeds_mask=state.prompt_embeds_mask,
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        states=(state,),
+    )
+
+
+def _drive_chunk(pipeline: SanaWmStreamingPipeline, state: StepRequestState):
     """Run one chunk exactly like the runner's streaming loop."""
-    batch = SimpleNamespace(states=[state])
     while not state.chunk_denoise_completed:
-        noise_pred = pipeline.denoise_step(batch, states=[state])
+        noise_pred = pipeline.denoise_step(_input_batch(state), states=[state])
         pipeline.step_scheduler(state, noise_pred)
     return pipeline.post_decode(state)
 
@@ -218,10 +241,9 @@ def test_euler_trajectory_matches_hand_computation(monkeypatch) -> None:
     assert state.total_chunks == 1
     x = state.latents.clone()
     schedule = pipeline.self_forcing_schedule
-    batch = SimpleNamespace(states=[state])
     for step in range(schedule.num_steps):
         sigma, sigma_next = schedule.sigma_pair(step)
-        noise_pred = pipeline.denoise_step(batch, states=[state])
+        noise_pred = pipeline.denoise_step(_input_batch(state), states=[state])
         torch.testing.assert_close(noise_pred, x * 0.5)
         pipeline.step_scheduler(state, noise_pred)
         x = x - (sigma - sigma_next) * (x * 0.5)
@@ -267,8 +289,9 @@ def test_rejects_guidance_and_step_count_mismatch(monkeypatch) -> None:
 
 def test_request_mode_forward_is_refused(monkeypatch) -> None:
     pipeline = _pipeline(monkeypatch)
+    request = OmniDiffusionRequest(prompt=_prompt(49), sampling_params=_sampling(), request_id="req-0")
     with pytest.raises(NotImplementedError, match="diffusion-streaming-output"):
-        pipeline.forward(SimpleNamespace(prompts=[_prompt(49)], sampling_params=_sampling()))
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
 
 
 def test_default_num_frames_is_on_the_grid() -> None:

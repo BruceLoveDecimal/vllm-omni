@@ -82,7 +82,7 @@ def _load_generator(checkpoint: Path) -> dict[str, torch.Tensor]:
     for name, tensor in state.items():
         if not isinstance(tensor, torch.Tensor):
             raise ValueError(f"Non-tensor entry {name!r} in generator state dict.")
-        target = name[len(GENERATOR_PREFIX) :] if name.startswith(GENERATOR_PREFIX) else name
+        target = name.removeprefix(GENERATOR_PREFIX)
         if target in converted:
             raise ValueError(f"Duplicate parameter after prefix strip: {target!r}")
         converted[target] = tensor
