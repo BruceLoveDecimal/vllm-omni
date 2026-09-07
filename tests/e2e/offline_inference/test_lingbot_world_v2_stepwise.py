@@ -12,13 +12,16 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
 from vllm.assets.image import ImageAsset
 
 from tests.helpers.mark import hardware_test
+
+if TYPE_CHECKING:
+    from vllm_omni.outputs import OmniRequestOutput
 
 MODEL = os.environ.get(
     "VLLM_OMNI_LINGBOT_WORLD_V2_CHECKPOINT_PATH",
@@ -56,7 +59,7 @@ def _first_frame() -> Path:
     return Path(ImageAsset(_IMAGE_ASSET).get_path("jpg"))
 
 
-def _chunk_metadata(output: Any) -> dict[str, Any]:
+def _chunk_metadata(output: OmniRequestOutput) -> dict[str, Any]:
     multimodal = getattr(output, "multimodal_output", None) or {}
     metadata = multimodal.get("metadata") if isinstance(multimodal, dict) else None
     assert isinstance(metadata, dict), "streamed chunk is missing its metadata envelope"

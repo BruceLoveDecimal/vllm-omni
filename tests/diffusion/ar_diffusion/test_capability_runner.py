@@ -29,6 +29,22 @@ NEG = "negative"
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.fixture(autouse=True)
+def platform_synchronize_calls(monkeypatch) -> list[None]:
+    """Stub the platform barrier the runner takes at every chunk boundary.
+
+    These tests run on a CPU host, where the resolved platform is
+    ``UnspecifiedOmniPlatform`` and ``synchronize()`` raises. Tests that need
+    a failing barrier override this with their own fake.
+    """
+    calls: list[None] = []
+    monkeypatch.setattr(
+        "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform",
+        SimpleNamespace(synchronize=lambda: calls.append(None)),
+    )
+    return calls
+
+
 def lingbot_like_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
     """Single-kv_branch causal DMD: 3 latent frames/block + sink/window + text KV."""
     return ARDiffusionKVCacheSpec(
@@ -562,7 +578,7 @@ def test_execute_stepwise_closes_session_for_scheduler_aborted_request(monkeypat
     assert pipeline.closes == ["req-1"]
 
 
-def test_execute_stepwise_times_once_per_chunk_not_once_per_step(monkeypatch):
+def test_execute_stepwise_times_once_per_chunk_not_once_per_step(monkeypatch, platform_synchronize_calls):
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
@@ -581,6 +597,7 @@ def test_execute_stepwise_times_once_per_chunk_not_once_per_step(monkeypatch):
     # Four denoise steps, one emitted AR block: one timing sample, matching the
     # one-sample-per-block meaning request mode already has.
     assert len(runner._perf_e2e_times) == 1
+    assert len(platform_synchronize_calls) == 1
     assert "req-1" not in runner._stepwise_chunk_started
 
 

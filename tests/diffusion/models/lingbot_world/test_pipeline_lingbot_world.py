@@ -26,6 +26,7 @@ from vllm_omni.diffusion.models.lingbot_world.camera import CameraTrajectory as 
 from vllm_omni.diffusion.models.lingbot_world.camera import (
     build_plucker_embedding as _real_build_plucker_embedding,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionControlInput,
@@ -1827,7 +1828,7 @@ def test_preprocess_materializes_camera_action_script_without_action_path() -> N
     module = _load_pipeline_module()
     sampling = _SamplingParams(include_action=False)
     sampling.extra_args["camera_action_script"] = [[["w"], ["w"], ["w"]], [["a"], [], []]]
-    request = SimpleNamespace(prompt=_prompt(), sampling_params=sampling)
+    request = OmniDiffusionRequest(prompt=_prompt(), sampling_params=sampling, request_id="req-1")
 
     result = module.get_lingbot_world_pre_process_func(_od_config())(request)
 
@@ -2045,7 +2046,7 @@ def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> No
     assert resolved is module.LingBotWorldCausalDMDPipeline
     assert cache_acceleration_disabled
     assert preprocess_name == "get_lingbot_world_pre_process_func"
-    request = SimpleNamespace(prompt=_prompt(), sampling_params=_SamplingParams())
+    request = OmniDiffusionRequest(prompt=_prompt(), sampling_params=_SamplingParams(), request_id="req-1")
     assert preprocess(request) is request
     assert isinstance(request.sampling_params.extra_args["_lingbot_camera_trajectory"], _CameraTrajectory)
     assert module.LingBotWorldCausalDMDPipeline.__name__ == "LingBotWorldCausalDMDPipeline"

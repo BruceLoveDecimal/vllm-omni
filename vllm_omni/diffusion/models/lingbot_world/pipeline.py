@@ -69,6 +69,7 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
 )
 
 if TYPE_CHECKING:
+    from diffusers.video_processor import VideoProcessor
     from tqdm.std import tqdm as TqdmProgressBar
 
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -1272,7 +1273,9 @@ class LingBotWorldCausalDMDPipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
-    def _decode_chunk_to_pixels(self, latents: torch.Tensor, *, output_type: str) -> Any:
+    def _decode_chunk_to_pixels(
+        self, latents: torch.Tensor, *, output_type: str
+    ) -> torch.Tensor | np.ndarray | list[list[PIL.Image.Image]]:
         """Decode one AR block so streaming consumers receive pixels, not latents.
 
         Blocks are decoded independently, which keeps the shared VAE stateless
@@ -1289,7 +1292,7 @@ class LingBotWorldCausalDMDPipeline(
         video = self.vae.decode(vae_latents, return_dict=False)[0]
         return self._video_processor().postprocess_video(video, output_type=output_type)
 
-    def _video_processor(self) -> Any:
+    def _video_processor(self) -> VideoProcessor:
         processor = getattr(self, "_cached_video_processor", None)
         if processor is None:
             from diffusers.video_processor import VideoProcessor
