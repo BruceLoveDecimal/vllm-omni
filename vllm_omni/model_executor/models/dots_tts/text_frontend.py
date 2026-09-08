@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """dots.tts language tags and optional text normalization.
 
 Uses the upstream language libraries and the same WeTextProcessing normalizers

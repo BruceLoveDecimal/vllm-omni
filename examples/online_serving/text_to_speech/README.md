@@ -120,8 +120,13 @@ request does not pay the side path's lazy initialization.
 ### Launch
 
 ```bash
-vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
+vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091 \
+    --allowed-local-media-path /path/to
 ```
+
+Replace `/path/to` with the server-side directory containing your reference
+audio. The option is required for the `file://` cloning example below; omit
+it when using only text, data URIs, or uploaded voices.
 
 ### Sending requests
 

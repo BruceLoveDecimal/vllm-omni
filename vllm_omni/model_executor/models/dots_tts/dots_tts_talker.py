@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """dots.tts talker — vLLM-native AR base LM + audio side path.
 
 Mirrors upstream rednote-hilab/dots.tts (pinned @ a393d2e):

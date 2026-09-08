@@ -1,26 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """dots.tts prompt builder for vllm-omni's Omni engine + serving layer.
 
 Mirrors upstream ``build_generation_schedule`` (rednote-hilab/dots.tts @
-a393d2e data/pipelines/tokenizing.py:169) for the audio-placeholder
-template, covering all three conditioning modes:
+a393d2e, data/pipelines/tokenizing.py:169) and its audio-placeholder
+template.  Three conditioning modes:
 
-* **zero-shot** — ``[文本]<text>[文本对应语音]<audio_gen_start>``.
-* **reference audio only** (``ref_audio``, no ``ref_text``) — identical
-  token sequence; the reference waveform rides in
-  ``additional_information`` and the talker turns it into a CAM++
+* **zero-shot** — token sequence::
+
+      [文本]<text>[文本对应语音]<audio_gen_start>
+
+* **reference audio only** (``ref_audio``, no ``ref_text``) — same token
+  sequence as zero-shot.  The reference waveform rides in
+  ``additional_information``, and the talker turns it into a CAM++
   x-vector that conditions the DiT (``g_cond``).  Upstream calls this
   ``use_prompt_prefill=False`` (model.py:1403).
-* **prompt prefill / voice clone** (``ref_audio`` + ``ref_text``) —
-  reference text is prepended to the target text and the sequence is
-  extended by ``prompt_patch_count`` ``<audio_gen_span>`` slots, whose
-  embeddings the talker overwrites with patch-encoder outputs of the
-  reference latents (upstream ``_build_prefill_inputs_embeds``,
-  model.py:1116).
 
-The token IDs are real Qwen2 IDs (not placeholders ``[1] * N`` like
-voxcpm2's builder): the talker's preprocess() runs
+* **voice clone / prompt prefill** (``ref_audio`` + ``ref_text``) — the
+  reference text is prepended and ``prompt_patch_count`` span slots are
+  appended::
+
+      [文本]<ref_text><text>[文本对应语音]<audio_gen_start><audio_gen_span>*N
+
+  The talker overwrites the span slots' embeddings with patch-encoder
+  outputs of the reference latents (upstream
+  ``_build_prefill_inputs_embeds``, model.py:1116).
+
+The token IDs are real Qwen2 IDs (not ``[1] * N`` placeholders like
+voxcpm2's builder): the talker's ``preprocess()`` runs
 ``self.model.embed_tokens(input_ids)`` directly, then patches only the
 prompt-span rows, so real IDs flow through naturally.
 """

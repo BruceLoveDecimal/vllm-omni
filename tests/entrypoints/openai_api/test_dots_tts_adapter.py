@@ -10,17 +10,20 @@ to the talker — ``prompt_token_ids`` must carry exactly as many
 """
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
+from dataclasses import dataclass, field
 
 import pytest
+from vllm import SamplingParams
 
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters import detect_tts_model_type, resolve_adapter
+from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
 from vllm_omni.entrypoints.openai.tts_adapters.dots_tts import DotsTTSAdapter
 from vllm_omni.model_executor.models.dots_tts.dots_tts_prompt import (
     build_dots_tts_prompt,
     prompt_audio_plan,
 )
+from vllm_omni.transformers_utils.configs.dots_tts import DotsTTSConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -182,48 +185,50 @@ def test_voice_clone_needs_at_least_one_prompt_patch():
 # ── adapter ──
 
 
-def _make_adapter(ref_audio_samples=None, ref_sr=_SAMPLE_RATE):
-    async def _resolve_ref_audio(_locator):
-        return list(ref_audio_samples or []), ref_sr, "ref-cache-key"
-
-    server = SimpleNamespace(
-        engine_client=SimpleNamespace(
-            model_config=SimpleNamespace(
-                model="dots-studio/dots.tts-soar",
-                hf_config=SimpleNamespace(
-                    patch_size=4,
-                    vocoder={"downsample_rates": [2, 2, 2, 4, 6, 10], "sample_rate": _SAMPLE_RATE},
-                ),
-            )
-        ),
-        # build() offloads the blocking prompt build onto the serving layer's
-        # single-worker tokenizer executor.
-        _tts_executor=ThreadPoolExecutor(max_workers=1),
-        _resolve_ref_audio=_resolve_ref_audio,
-        _apply_uploaded_speaker=lambda _request: None,
-        _validate_ref_audio_format=lambda _ref: None,
-        _get_available_speakers=lambda: {"default"},
+@dataclass
+class _FakeModelConfig:
+    model: str = "dots-studio/dots.tts-soar"
+    hf_config: DotsTTSConfig = field(
+        default_factory=lambda: DotsTTSConfig(
+            patch_size=4,
+            vocoder={"downsample_rates": [2, 2, 2, 4, 6, 10], "sample_rate": _SAMPLE_RATE},
+        )
     )
-    adapter = DotsTTSAdapter(SimpleNamespace(server=server, engine_client=server.engine_client))
+
+
+@dataclass
+class _FakeEngineClient:
+    model_config: _FakeModelConfig = field(default_factory=_FakeModelConfig)
+
+
+@dataclass
+class _FakeServer:
+    """Only the serving dependencies used by adapter tests; no model execution."""
+
+    ref_audio_samples: list[float] = field(default_factory=list)
+    ref_sr: int = _SAMPLE_RATE
+    engine_client: _FakeEngineClient = field(default_factory=_FakeEngineClient)
+    # asyncio.run owns and closes the default executor used by make_async.
+    _tts_executor: None = None
+
+    async def _resolve_ref_audio(self, locator: str) -> tuple[list[float], int, str]:
+        return list(self.ref_audio_samples), self.ref_sr, "ref-cache-key"
+
+    def _apply_uploaded_speaker(self, request: OpenAICreateSpeechRequest) -> str | None:
+        return None
+
+    def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
+        return None
+
+    def _get_available_speakers(self) -> set[str]:
+        return {"default"}
+
+
+def _make_adapter(ref_audio_samples: list[float] | None = None, ref_sr: int = _SAMPLE_RATE) -> DotsTTSAdapter:
+    server = _FakeServer(ref_audio_samples=ref_audio_samples or [], ref_sr=ref_sr)
+    adapter = DotsTTSAdapter(SpeechServingContext(server=server, engine_client=server.engine_client))
     adapter.tokenizer = _StubTokenizer()
     return adapter
-
-
-def _request(**overrides):
-    fields = {
-        "input": "hello",
-        "extra_params": None,
-        "language": None,
-        "instructions": None,
-        "voice": None,
-        "ref_audio": None,
-        "ref_text": None,
-        "max_new_tokens": None,
-        "speaker_embedding": None,
-        "x_vector_only_mode": None,
-    }
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
 
 
 def test_adapter_patch_geometry_matches_the_checkpoint():
@@ -234,7 +239,7 @@ def test_adapter_patch_geometry_matches_the_checkpoint():
 def test_adapter_build_sizes_spans_from_the_resolved_reference():
     ref = [0.0] * (5 * _SAMPLES_PER_PATCH)
     adapter = _make_adapter(ref_audio_samples=ref)
-    request = _request(ref_audio="file:///ref.wav", ref_text="transcript")
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio="file:///ref.wav", ref_text="transcript")
     prepared = asyncio.run(adapter.build(request, [], has_inline_ref_audio=True))
     expected_patches, _ = _plan(len(ref))
     assert prepared.model_type == "dots_tts"
@@ -244,35 +249,41 @@ def test_adapter_build_sizes_spans_from_the_resolved_reference():
 
 def test_adapter_build_without_ref_text_stays_reference_only():
     adapter = _make_adapter(ref_audio_samples=[0.0] * (5 * _SAMPLES_PER_PATCH))
-    prepared = asyncio.run(adapter.build(_request(ref_audio="file:///ref.wav"), [], has_inline_ref_audio=True))
+    prepared = asyncio.run(
+        adapter.build(
+            OpenAICreateSpeechRequest(input="hello", ref_audio="file:///ref.wav"), [], has_inline_ref_audio=True
+        )
+    )
     assert _AUDIO_GEN_SPAN_ID not in prepared.prompt["prompt_token_ids"]
     assert "reference_audio" in prepared.prompt["additional_information"]
 
 
 def test_adapter_rejects_ref_text_without_ref_audio():
     adapter = _make_adapter()
-    assert "ref_text requires ref_audio" in adapter.validate(_request(ref_text="transcript"))
+    assert "ref_text requires ref_audio" in adapter.validate(
+        OpenAICreateSpeechRequest(input="hello", ref_text="transcript")
+    )
 
 
 def test_adapter_rejects_empty_input():
-    assert _make_adapter().validate(_request(input="   ")) == "Input text cannot be empty"
+    assert _make_adapter().validate(OpenAICreateSpeechRequest(input="   ")) == "Input text cannot be empty"
 
 
 def test_adapter_rejects_unknown_voice():
-    error = _make_adapter().validate(_request(voice="nonexistent"))
+    error = _make_adapter().validate(OpenAICreateSpeechRequest(input="hello", voice="nonexistent"))
     assert "Invalid voice" in error
 
 
 def test_adapter_accepts_the_zero_shot_default_voice():
-    assert _make_adapter().validate(_request(voice="DEFAULT")) is None
+    assert _make_adapter().validate(OpenAICreateSpeechRequest(input="hello", voice="DEFAULT")) is None
 
 
 def test_max_tokens_budget_shrinks_by_the_prompt_patches():
     """Prompt patches and generated patches share the talker's FM buffer."""
     adapter = _make_adapter()
-    params = [SimpleNamespace(max_tokens=4096)]
+    params = [SamplingParams(max_tokens=4096)]
     prompt = {"additional_information": {"prompt_patch_count": 100}}
-    updated = adapter.apply_sampling_overrides(params, _request(), prompt=prompt)
+    updated = adapter.apply_sampling_overrides(params, OpenAICreateSpeechRequest(input="hello"), prompt=prompt)
     assert updated[0].max_tokens == 1024 - 100
     assert params[0].max_tokens == 4096  # caller's list untouched
 
@@ -280,18 +291,84 @@ def test_max_tokens_budget_shrinks_by_the_prompt_patches():
 def test_max_tokens_honours_a_smaller_request_limit():
     adapter = _make_adapter()
     updated = adapter.apply_sampling_overrides(
-        [SimpleNamespace(max_tokens=4096)],
-        _request(max_new_tokens=64),
+        [SamplingParams(max_tokens=4096)],
+        OpenAICreateSpeechRequest(input="hello", max_new_tokens=64),
         prompt={"additional_information": {"prompt_patch_count": 10}},
     )
     assert updated[0].max_tokens == 64
 
 
+@pytest.mark.parametrize("ref_text", [None, "   ", "transcript"])
+@pytest.mark.parametrize("max_tokens", [1, 2])
+def test_clone_token_minimum_preserves_reference_only_requests(ref_text, max_tokens):
+    request = OpenAICreateSpeechRequest(
+        input="hello", ref_audio="file:///ref.wav", ref_text=ref_text, max_new_tokens=max_tokens
+    )
+    error = _make_adapter().validate(request)
+    if ref_text == "transcript" and max_tokens == 1:
+        assert error is not None and "max_new_tokens >= 2" in error
+    else:
+        assert error is None
+
+
+@pytest.mark.parametrize("requested", [None, 1])
+def test_clone_rejects_effective_one_token_budget(requested):
+    with pytest.raises(ValueError, match="at least 2 generation tokens"):
+        _make_adapter().apply_sampling_overrides(
+            [SamplingParams(max_tokens=1)],
+            OpenAICreateSpeechRequest(input="hello", max_new_tokens=requested),
+            prompt={"additional_information": {"prompt_patch_count": 10}},
+        )
+
+
+def test_uploaded_voice_is_resolved_before_checking_clone_token_minimum(monkeypatch):
+    def resolve_upload(self: _FakeServer, request: OpenAICreateSpeechRequest) -> str | None:
+        request.ref_audio = "file:///ref.wav"
+        request.ref_text = "transcript"
+        return None
+
+    monkeypatch.setattr(_FakeServer, "_apply_uploaded_speaker", resolve_upload)
+    monkeypatch.setattr(_FakeServer, "_get_available_speakers", lambda self: {"uploaded"})
+    error = _make_adapter().validate(OpenAICreateSpeechRequest(input="hello", voice="uploaded", max_new_tokens=1))
+    assert error is not None and "max_new_tokens >= 2" in error
+
+
+def test_clone_rejects_workspace_with_no_room_for_payload():
+    with pytest.raises(ValueError, match="at least 2 generation tokens"):
+        _make_adapter().apply_sampling_overrides(
+            [SamplingParams(max_tokens=4096)],
+            OpenAICreateSpeechRequest(input="hello"),
+            prompt={"additional_information": {"prompt_patch_count": 1023}},
+        )
+
+
+@pytest.mark.parametrize(("prompt_patches", "limit"), [(0, 1), (10, 2)])
+def test_sampling_override_preserves_other_settings_and_original(prompt_patches, limit):
+    original = SamplingParams(max_tokens=4096, seed=42, stop_token_ids=[1], extra_args={"setting": [1, 2]})
+    untouched_stage = SamplingParams(max_tokens=128)
+    params = [original, untouched_stage]
+    updated = _make_adapter().apply_sampling_overrides(
+        params,
+        OpenAICreateSpeechRequest(input="hello", max_new_tokens=limit),
+        prompt={"additional_information": {"prompt_patch_count": prompt_patches}},
+    )
+    assert updated is not params
+    assert updated[0] is not original
+    assert updated[0].max_tokens == limit
+    assert original.max_tokens == 4096
+    assert updated[0].seed == 42
+    assert updated[0].stop_token_ids == [1]
+    assert updated[0].extra_args is original.extra_args
+    assert updated[1] is untouched_stage
+
+
 def test_adapter_rejects_precomputed_speaker_embeddings():
     """dots.tts conditions on audio, never on a precomputed embedding."""
     adapter = _make_adapter()
-    assert "speaker_embedding" in adapter.validate(_request(speaker_embedding=[1.0, 2.0]))
-    assert "x_vector_only_mode" in adapter.validate(_request(x_vector_only_mode=True))
+    assert "speaker_embedding" in adapter.validate(
+        OpenAICreateSpeechRequest(input="hello", speaker_embedding=[1.0, 2.0])
+    )
+    assert "x_vector_only_mode" in adapter.validate(OpenAICreateSpeechRequest(input="hello", x_vector_only_mode=True))
 
 
 @pytest.mark.parametrize(
@@ -308,13 +385,13 @@ def test_adapter_rejects_precomputed_speaker_embeddings():
     ],
 )
 def test_invalid_generation_controls_are_rejected(extra):
-    assert _make_adapter().validate(_request(extra_params=extra))
+    assert _make_adapter().validate(OpenAICreateSpeechRequest(input="hello", extra_params=extra))
 
 
 def test_generation_controls_reach_the_engine_prompt():
     options = {"num_steps": 2, "guidance_scale": 0, "speaker_scale": 2, "eos_threshold": 0.5, "ode_method": "midpoint"}
     adapter = _make_adapter()
-    request = _request(extra_params=options)
+    request = OpenAICreateSpeechRequest(input="hello", extra_params=options)
     assert adapter.validate(request) is None
     prepared = asyncio.run(adapter.build(request, [], has_inline_ref_audio=False))
     assert prepared.prompt["additional_information"]["dots_tts_config"] == {
@@ -391,9 +468,11 @@ def test_explicit_language_tag_is_not_duplicated():
 
 
 def test_separate_instructions_are_not_silently_ignored():
-    assert "inline instructions" in _make_adapter().validate(_request(instructions="Happy"))
+    assert "inline instructions" in _make_adapter().validate(
+        OpenAICreateSpeechRequest(input="hello", instructions="Happy")
+    )
 
 
 @pytest.mark.parametrize("extra", [{"template_name": "unknown"}, {"normalize_text": "false"}])
 def test_invalid_text_controls_are_rejected(extra):
-    assert _make_adapter().validate(_request(extra_params=extra))
+    assert _make_adapter().validate(OpenAICreateSpeechRequest(input="hello", extra_params=extra))

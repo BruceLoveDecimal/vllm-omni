@@ -14,8 +14,8 @@
 
 Use this recipe as a known-good starting point for running
 `dots-studio/dots.tts-soar` on vLLM-Omni on consumer-class GPUs.
-dots.tts is a ~1.7B-parameter continuous-AR TTS model (Qwen2.5-1.5B base LM
-+ 344M DiT flow-matching head + 180M AudioVAE) that emits 48 kHz mono audio.
+dots.tts is a ~1.7B-parameter continuous-AR TTS model (Qwen2.5-1.5B base LM,
+344M DiT flow-matching head, and 180M AudioVAE) that emits 48 kHz mono audio.
 It follows the same "vLLM-native base LM + side-path computation" pattern as
 VoxCPM2 — single-stage pipeline
 `Qwen2.5-1.5B base LM → DiT (10-step Euler flow matching) → patch_encoder AR
@@ -110,8 +110,13 @@ described in [Known limitations](#known-limitations)).
 **T2 — online zero-shot synthesis**:
 
 ```bash
-vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
+vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091 \
+    --allowed-local-media-path /path/to
 ```
+
+Replace `/path/to` with the server-side directory containing your reference
+audio. This permits the `file:///path/to/reference.wav` examples below;
+omit the option when using only text, data URIs, or uploaded voices.
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -135,7 +140,7 @@ moved off the first real request.
 **T3 — voice cloning**. Three conditioning modes:
 
 | Request fields | Conditioning |
-|---|---|
+| --- | --- |
 | `input` | zero-shot |
 | `input`, `ref_audio` | CAM++ x-vector conditions the DiT (`g_cond`) |
 | `input`, `ref_audio`, `ref_text` | additionally prefills the reference's audio latents into the DiT history and the patch-encoder KV cache |
@@ -156,7 +161,7 @@ and measuring CAM++ x-vector cosine similarity between the reference and
 each generated clip:
 
 | Conditioning | cosine similarity to reference |
-|---|---|
+| --- | --- |
 | zero-shot (no reference) | 0.10 - 0.38 |
 | `ref_audio` only | 0.73 - 0.81 |
 | `ref_audio` + `ref_text` (prompt prefill) | 0.76 - 0.78 |
@@ -216,7 +221,7 @@ pip install 'vllm-omni[dots-tts]'
 Pass model-specific controls in `extra_params`:
 
 | Field | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `num_steps` | 10 | Positive integer ODE integration steps; fewer steps trade quality for latency |
 | `guidance_scale` | 1.2 | Nonnegative CFG strength |
 | `speaker_scale` | 1.5 | Nonnegative reference-speaker embedding scale, applied after cache lookup |
@@ -230,6 +235,11 @@ override is set. The non-Euler methods perform multiple DiT evaluations per
 integration step. Generation length remains controlled by `max_new_tokens`;
 LLM `temperature` / `top_p` / `top_k` do not control continuous-latent sampling.
 Invalid controls are rejected before engine execution.
+
+Voice cloning with both `ref_audio` and `ref_text` requires an effective
+generation budget of at least 2 tokens: the first patch regenerates the
+reference tail and is discarded. This also applies to the server's default
+token limit. Zero-shot and reference-audio-only requests still allow 1 token.
 
 ```json
 {

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2026 The vLLM-Omni team.
 # Copyright (c) rednote-hilab. All rights reserved.
 # Portions Copyright 3D-Speaker

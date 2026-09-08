@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the dots.tts talker's stop-signal pairing and
 per-request state lifecycle.
 
@@ -202,12 +202,14 @@ class TestPromptTailPatchIsDropped:
 
     @staticmethod
     def _stub_side_path(talker):
+        from vllm_omni.model_executor.models.dots_tts.dots_tts_talker import _IOHelper
+
         vocoder_calls: list[object] = []
         talker._initialize_request_fm_state = lambda state, *, device, dtype: None
         talker._append_hidden_chunk = lambda *_args: None
         talker._append_history_chunk = lambda *_args: None
         talker._run_dit_solver = lambda _state, **_kwargs: torch.zeros(1, 4, 128)
-        talker._io_helper = SimpleNamespace(denormalize=lambda x: x)
+        talker._io_helper = _IOHelper()
         talker._run_patch_encoder_loopback = lambda _state, _patch: torch.zeros(1, 1, 1536)
 
         def _vocoder(state, patch):

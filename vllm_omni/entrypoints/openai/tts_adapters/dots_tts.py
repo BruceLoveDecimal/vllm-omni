@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """dots.tts serving adapter."""
 
 import math
@@ -124,6 +125,9 @@ class DotsTTSAdapter(ARTTSAdapter):
             return "ref_text requires ref_audio (the transcript of the reference audio)"
 
         if request.max_new_tokens is not None:
+            if request.ref_audio is not None and request.ref_text and request.ref_text.strip():
+                if request.max_new_tokens < 2:
+                    return "Voice cloning requires max_new_tokens >= 2 because the first patch is discarded"
             if request.max_new_tokens < self.max_new_tokens_min:
                 return f"max_new_tokens must be at least {self.max_new_tokens_min}"
             if request.max_new_tokens > self.max_new_tokens_max:
@@ -145,9 +149,15 @@ class DotsTTSAdapter(ARTTSAdapter):
         prompt_audio_samples = 0
 
         if request.ref_audio is not None:
-            ref_audio, ref_sr, ref_audio_key = await server._resolve_ref_audio(
+            samples: list[float] | None
+            sample_rate: int | None
+            samples, sample_rate, ref_audio_key = await server._resolve_ref_audio(
                 self._single_ref_audio(request.ref_audio)
             )
+            if samples is None or sample_rate is None:
+                raise ValueError("Failed to resolve reference audio")
+            ref_audio = samples
+            ref_sr = sample_rate
             # Duration bounds are the shared speech API's: _resolve_ref_audio
             # already rejects clips outside [1 s, 30 s] before returning.
             samples_per_patch, target_sample_rate = self._audio_patch_geometry()
@@ -212,10 +222,19 @@ class DotsTTSAdapter(ARTTSAdapter):
         budget = MAX_AUDIO_PATCHES - prompt_patch_count
         requested = request.max_new_tokens
 
-        sampling_params_list = copy.deepcopy(sampling_params_list)
         params = sampling_params_list[0]
         limit = min(requested, budget) if requested is not None else min(params.max_tokens or budget, budget)
-        params.max_tokens = max(1, limit)
+        minimum = 2 if prompt_patch_count else 1
+        if limit < minimum:
+            raise ValueError(
+                f"dots.tts requires at least {minimum} generation tokens with "
+                f"{prompt_patch_count} prompt patches, but the effective budget is {limit}"
+            )
+        # Only max_tokens changes; nested sampling settings remain read-only.
+        sampling_params_list = list(sampling_params_list)
+        params = copy.copy(params)
+        params.max_tokens = limit
+        sampling_params_list[0] = params
         return sampling_params_list
 
     async def warmup(self) -> None:
