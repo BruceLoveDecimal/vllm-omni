@@ -1711,6 +1711,7 @@ def acquire_device_locks(
         )
 
         # Physical device IDs: explicit list first, else the env var.
+        visible_devices_str: str | None
         if visible_devices is not None:
             visible_devices_str = visible_devices
         else:
