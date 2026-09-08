@@ -1114,7 +1114,6 @@ def test_initialize_local_llm_replica_does_not_hold_spawn_lock_during_device_loc
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=30,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -1172,6 +1171,67 @@ def test_initialize_local_llm_replica_does_not_hold_spawn_lock_during_device_loc
     assert observed["visible_devices"] == "1,3"
 
 
+def test_initialize_local_llm_replica_parallel_path_skips_parent_device_lock(monkeypatch):
+    """With parallel_stage_init the engine-core child takes the SH/EX phase
+    locks itself, so the parent must not call acquire_device_locks at all (it
+    would self-deadlock waiting for the child's READY), and it must hand the
+    flag to the launcher so the child installs the phase-lock guard."""
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=30,
+        async_chunk=False,
+        parallel_stage_init=True,
+    )
+
+    fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
+    plan = ReplicaInitPlan(
+        replica_id=0,
+        num_replicas=1,
+        launch_mode="local",
+        stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices="1")),
+        metadata=types.SimpleNamespace(stage_id=1, runtime_cfg={"devices": "1"}),
+        stage_connector_spec={},
+        omni_kv_connector=(None, None, None),
+        stage_vllm_config=types.SimpleNamespace(),
+        executor_class=object,
+        engine_args_dict={},
+    )
+
+    def _unexpected_acquire_device_locks(*_args, **_kwargs):
+        raise AssertionError("parent must not take device flocks when parallel_stage_init is enabled")
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", _unexpected_acquire_device_locks)
+    monkeypatch.setattr(runtime_mod, "resolve_stage_physical_devices", lambda *_a, **_k: "1")
+
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    launch_kwargs: dict[str, object] = {}
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**kwargs):
+        launch_kwargs.update(kwargs)
+        yield StageReplicaResources(
+            manager=types.SimpleNamespace(shutdown=lambda: None),
+            addresses=fake_addresses,
+        )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+    monkeypatch.setattr(
+        runtime_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        staticmethod(lambda **_: types.SimpleNamespace(shutdown=lambda: None)),
+    )
+
+    runtime._initialize_local_llm_replica(plan, 30)
+
+    assert launch_kwargs["omni_parallel_stage_init"] is True
+    assert launch_kwargs["spawn_device_lock"] is runtime._spawn_device_lock
+
+
 def test_parallel_replica_init_with_shared_device_does_not_deadlock(monkeypatch):
     """End-to-end deadlock reproducer: two replicas with overlapping devices
     initializing in parallel must both complete. Uses real flocks (high device
@@ -1187,7 +1247,6 @@ def test_parallel_replica_init_with_shared_device_does_not_deadlock(monkeypatch)
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=30,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
