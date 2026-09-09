@@ -134,7 +134,7 @@ class TestAttentionSpec:
             "tau": 1.0,
             "thresh_type": "diag",
             "kv_splits": None,
-            "dense_steps": 10,
+            "dense_steps": None,
             "dense_layers": [0, 1],
             "sink_mode": "prefix",
             "strict": False,
@@ -165,6 +165,10 @@ class TestAttentionSpec:
             "dense_backend": None,
         }
         assert AttentionSpec(backend="SOL_ATTN", sol_attn={"kv_splits": "auto"}).backend_kwargs()["kv_splits"] is None
+        assert (
+            AttentionSpec(backend="SOL_ATTN", sol_attn={"dense_steps": "auto"}).backend_kwargs()["dense_steps"] is None
+        )
+        assert AttentionSpec(backend="SOL_ATTN", sol_attn={"dense_steps": 1}).backend_kwargs()["dense_steps"] == 1
         assert AttentionSpec(backend="SOL_ATTN", sol_attn={"dense_layers": None}).backend_kwargs()["dense_layers"] == []
 
     def test_sol_attn_dense_backend_normalized_and_guarded(self):
@@ -185,6 +189,9 @@ class TestAttentionSpec:
             {"kv_splits": 3},
             {"kv_splits": True},
             {"dense_steps": -1},
+            {"dense_steps": 1.5},
+            {"dense_steps": "one"},
+            {"dense_steps": True},
             {"sink_mode": "text"},
         ],
     )

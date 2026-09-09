@@ -35,6 +35,7 @@ from vllm_omni.diffusion.attention.backends.sol_attn import (
     SolAttnConfig,
     SolAttnImpl,
     SolAttnPlan,
+    resolve_dense_steps,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -79,9 +80,13 @@ def h3_metadata(total_len: int = USED_LEN, used_len: int = USED_LEN) -> Attentio
     )
 
 
-def set_denoise_step(monkeypatch: pytest.MonkeyPatch, step_idx: int | None) -> None:
+def set_denoise_step(monkeypatch: pytest.MonkeyPatch, step_idx: int | None, total_steps: int | None = None) -> None:
     monkeypatch.setattr(sol_attn_module, "is_forward_context_available", lambda: True)
-    monkeypatch.setattr(sol_attn_module, "get_forward_context", lambda: SimpleNamespace(denoise_step_idx=step_idx))
+    monkeypatch.setattr(
+        sol_attn_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(denoise_step_idx=step_idx, total_denoise_steps=total_steps),
+    )
 
 
 # -- registration and capabilities ------------------------------------------------
@@ -118,7 +123,7 @@ def test_config_defaults_follow_sol_engine_h3_policy():
         tau=1.0,
         thresh_type="diag",
         kv_splits=None,
-        dense_steps=10,
+        dense_steps=None,
         dense_layers=frozenset({0, 1}),
         sink_mode="prefix",
         strict=False,
@@ -146,6 +151,8 @@ def test_config_parses_serialized_spec_kwargs():
     assert cfg.sink_mode == "none"
     assert cfg.strict is True
     assert SolAttnConfig.from_backend_kwargs({"kv_splits": "auto"}).kv_splits is None
+    assert SolAttnConfig.from_backend_kwargs({"dense_steps": "auto"}).dense_steps is None
+    assert SolAttnConfig.from_backend_kwargs({"dense_steps": 1}).dense_steps == 1
     assert SolAttnConfig.from_backend_kwargs({"dense_backend": "CUDNN_ATTN"}).dense_backend == "CUDNN_ATTN"
 
 
@@ -252,6 +259,45 @@ def test_warmup_steps_stay_dense_until_dense_steps(monkeypatch):
     reason = impl._resolve_plan(q, q, q, h3_metadata())
     # Past the gate on CPU, the next contract check (a CUDA tensor) is the one that declines.
     assert isinstance(reason, str) and "CUDA" in reason
+
+
+def test_auto_dense_steps_keeps_a_fifth_of_the_schedule_dense():
+    # Both published Sol-Engine MiniMax-H3 policies fall out of one rule.
+    assert resolve_dense_steps(None, 50) == 10
+    assert resolve_dense_steps(None, 4) == 1  # FastH3: four forwards, one dense (Sol-H3 T2V)
+    assert resolve_dense_steps(None, 8) == 2
+    assert resolve_dense_steps(None, 1) == 1
+    # No published schedule: the 50-step policy applies.
+    assert resolve_dense_steps(None, None) == 10
+    assert resolve_dense_steps(None, 0) == 10
+    # An explicit value is never second-guessed.
+    assert resolve_dense_steps(0, 4) == 0
+    assert resolve_dense_steps(3, 4) == 3
+
+
+def test_auto_dense_steps_follow_the_published_schedule(monkeypatch):
+    q = torch.zeros(1, USED_LEN, 8, HEAD_DIM, dtype=torch.bfloat16)
+    impl = make_impl()  # dense_steps unset -> auto
+    # FastH3's four-forward ladder: only the first forward stays dense.
+    set_denoise_step(monkeypatch, 0, total_steps=4)
+    assert impl._resolve_plan(q, q, q, h3_metadata()) == "warmup_step"
+    set_denoise_step(monkeypatch, 1, total_steps=4)
+    reason = impl._resolve_plan(q, q, q, h3_metadata())
+    assert isinstance(reason, str) and "CUDA" in reason
+    # The 50-step base ladder keeps ten.
+    set_denoise_step(monkeypatch, 9, total_steps=50)
+    assert impl._resolve_plan(q, q, q, h3_metadata()) == "warmup_step"
+    set_denoise_step(monkeypatch, 10, total_steps=50)
+    assert "CUDA" in impl._resolve_plan(q, q, q, h3_metadata())
+
+
+def test_explicit_dense_steps_override_the_schedule(monkeypatch):
+    q = torch.zeros(1, USED_LEN, 8, HEAD_DIM, dtype=torch.bfloat16)
+    impl = make_impl(dense_steps=3)
+    set_denoise_step(monkeypatch, 2, total_steps=4)
+    assert impl._resolve_plan(q, q, q, h3_metadata()) == "warmup_step"
+    set_denoise_step(monkeypatch, 3, total_steps=4)
+    assert "CUDA" in impl._resolve_plan(q, q, q, h3_metadata())
 
 
 def test_missing_step_index_runs_sparse(monkeypatch):

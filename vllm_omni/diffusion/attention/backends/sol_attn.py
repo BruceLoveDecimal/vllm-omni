@@ -65,6 +65,23 @@ _VALID_KV_SPLITS = (1, 2, 4)
 _VALID_SINK_MODES = ("prefix", "none")
 # Sol-Engine selects split-KV only on SM90 for sequences of at least this many tokens.
 _SM90_SPLIT_KV_MIN_TOKENS = 65536
+# ``dense_steps=None`` (auto) keeps this fraction of the request's schedule
+# dense, at least one step. It reproduces both published Sol-Engine MiniMax-H3
+# policies: 10 of the 50-step base ladder and 1 of FastH3's 4 forwards.
+_AUTO_DENSE_FRACTION = 0.2
+# The 50-step policy, used when a pipeline never publishes its total step count.
+_AUTO_DENSE_STEPS_FALLBACK = 10
+
+
+def resolve_dense_steps(dense_steps: int | None, total_steps: int | None) -> int:
+    """The number of leading denoise steps that stay dense for this request."""
+    if dense_steps is not None:
+        return dense_steps
+    if total_steps is None or total_steps <= 0:
+        return _AUTO_DENSE_STEPS_FALLBACK
+    return max(1, round(_AUTO_DENSE_FRACTION * total_steps))
+
+
 _INSTALL_HINT = (
     "Install the released kernel from the NVlabs/Sana `sol-engine` branch: "
     "`git clone -b sol-engine https://github.com/NVlabs/Sana && "
@@ -131,15 +148,17 @@ class SolAttnConfig:
     ``thresh_type`` picks the diagonal or full-covariance threshold estimate.
     ``kv_splits`` is the split-KV factor, ``None`` meaning the Sol-Engine
     policy (4 on SM90 for >= 65536 tokens, else 1). ``dense_steps`` and
-    ``dense_layers`` are the accuracy knobs. ``sink_mode`` selects whether the
-    published prefix is kept as an exact KV sink. ``strict`` turns silent dense
-    fallbacks on kernel errors into exceptions.
+    ``dense_layers`` are the accuracy knobs; ``dense_steps=None`` resolves per
+    request from the published schedule length (see ``resolve_dense_steps``).
+    ``sink_mode`` selects whether the published prefix is kept as an exact KV
+    sink. ``strict`` turns silent dense fallbacks on kernel errors into
+    exceptions.
     """
 
     tau: float = 1.0
     thresh_type: str = "diag"
     kv_splits: int | None = None
-    dense_steps: int = 10
+    dense_steps: int | None = None
     dense_layers: frozenset[int] = frozenset({0, 1})
     sink_mode: str = "prefix"
     strict: bool = False
@@ -165,9 +184,14 @@ class SolAttnConfig:
         tau = float(bk.get("tau", 1.0))
         if not math.isfinite(tau):
             raise ValueError(f"SOL_ATTN tau must be finite, got {tau}")
-        dense_steps = int(bk.get("dense_steps", 10))
-        if dense_steps < 0:
-            raise ValueError(f"SOL_ATTN dense_steps must be >= 0, got {dense_steps}")
+        raw_dense_steps = bk.get("dense_steps")
+        dense_steps: int | None
+        if raw_dense_steps is None or raw_dense_steps == "auto":
+            dense_steps = None
+        else:
+            dense_steps = int(raw_dense_steps)
+            if dense_steps < 0:
+                raise ValueError(f"SOL_ATTN dense_steps must be >= 0, got {dense_steps}")
         dense_layers = bk.get("dense_layers")
         dense_backend = bk.get("dense_backend")
         dense_backend = str(dense_backend) if dense_backend else None
@@ -299,12 +323,12 @@ class SolAttnImpl(AttentionImpl):
         # per-forward "SOL_ATTN active" line below confirms the sparse path was
         # actually taken; without it the run was dense.
         logger.info_once(
-            "SOL_ATTN configured: tau=%.3f, thresh_type=%s, kv_splits=%s, dense_steps=%d, dense_layers=%s, "
+            "SOL_ATTN configured: tau=%.3f, thresh_type=%s, kv_splits=%s, dense_steps=%s, dense_layers=%s, "
             "sink_mode=%s, strict=%s, dense fallback=%s.",
             self.config.tau,
             self.config.thresh_type,
             "auto" if self.config.kv_splits is None else self.config.kv_splits,
-            self.config.dense_steps,
+            "auto" if self.config.dense_steps is None else self.config.dense_steps,
             tuple(sorted(self.config.dense_layers)),
             self.config.sink_mode,
             self.config.strict,
@@ -423,15 +447,16 @@ class SolAttnImpl(AttentionImpl):
                 "SOL_ATTN cannot resolve a layer index from this attention prefix; dense_layers=%s is ignored.",
                 tuple(sorted(cfg.dense_layers)),
             )
-        if cfg.dense_steps > 0:
+        dense_steps = self._resolve_dense_steps()
+        if dense_steps > 0:
             step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
             if step_idx is None:
                 logger.warning_once(
                     "SOL_ATTN dense_steps=%d is ignored: the pipeline does not publish the denoise "
                     "step index on the forward context, so every step runs sparse.",
-                    cfg.dense_steps,
+                    dense_steps,
                 )
-            elif step_idx < cfg.dense_steps:
+            elif step_idx < dense_steps:
                 return "warmup_step"
 
         if self.qkv_layout is None:
@@ -479,7 +504,7 @@ class SolAttnImpl(AttentionImpl):
             "used_len=%d, sink=[%d, %d), total_len=%d, heads=%d.",
             cfg.tau,
             cfg.thresh_type,
-            cfg.dense_steps,
+            dense_steps,
             tuple(sorted(cfg.dense_layers)),
             cfg.sink_mode,
             used_len,
@@ -489,6 +514,29 @@ class SolAttnImpl(AttentionImpl):
             int(query.shape[2]),
         )
         return plan
+
+    def _resolve_dense_steps(self) -> int:
+        """Leading dense steps for the current request (explicit, or auto from the schedule)."""
+        cfg = self.config
+        if cfg.dense_steps is not None:
+            return cfg.dense_steps
+        total_steps = (
+            getattr(get_forward_context(), "total_denoise_steps", None) if is_forward_context_available() else None
+        )
+        dense_steps = resolve_dense_steps(None, total_steps)
+        if total_steps is None or total_steps <= 0:
+            logger.warning_once(
+                "SOL_ATTN dense_steps=auto: the pipeline does not publish its total denoise step count, "
+                "so the 50-step policy (%d dense steps) applies.",
+                dense_steps,
+            )
+        else:
+            logger.info_once(
+                "SOL_ATTN dense_steps=auto resolved to %d of %d denoise steps.",
+                dense_steps,
+                total_steps,
+            )
+        return dense_steps
 
     @staticmethod
     def _resolve_used_len(attn_metadata: AttentionMetadata | None, total_len: int) -> int | str:

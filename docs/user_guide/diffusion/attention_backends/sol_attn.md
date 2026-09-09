@@ -50,7 +50,7 @@ before the model is built.
 | `tau` | finite float | Routing threshold coefficient; larger routes fewer key blocks exactly. Default `1.0` |
 | `thresh_type` | `"diag"`, `"exact"` | Diagonal or full-covariance threshold estimate. Default `"diag"` |
 | `kv_splits` | `"auto"`, `1`, `2`, `4` | Split-KV factor. `"auto"` (default) picks `4` on H100 for sequences of at least 65536 tokens and `1` elsewhere; `2`/`4` are H100-only |
-| `dense_steps` | integer, `>= 0` | Number of early denoise steps kept dense. Default `10` |
+| `dense_steps` | integer `>= 0`, or `"auto"` | Number of early denoise steps kept dense. Default `"auto"`: the first 20% of the request's schedule, at least one step, which gives the two published Sol-Engine MiniMax-H3 policies (10 of the 50-step base ladder, 1 of FastH3's 4 forwards). A pipeline that never publishes its step count falls back to `10` |
 | `dense_layers` | selector such as `"0-1,38"` | DiT blocks kept dense. Default `"0-1"` |
 | `sink_mode` | `"prefix"`, `"none"` | Keep the published prefix as an exact KV sink (default) or route it like every other block |
 | `strict` | bool | Raise on kernel failures, and on a role the kernel cannot serve, instead of silently running dense. Default `false` |
@@ -59,7 +59,7 @@ before the model is built.
 ```bash
 vllm-omni serve MiniMaxAI/MiniMax-H3 \
   --diffusion-attention-config '{"default":{"backend":"SOL_ATTN",\
-    "sol_attn":{"tau":1.0,"dense_steps":10,"dense_layers":"0-1"}}}'
+    "sol_attn":{"tau":1.0,"dense_steps":"auto","dense_layers":"0-1"}}}'
 ```
 
 ```python
@@ -68,7 +68,7 @@ from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, SolAttnSpec
 config = AttentionConfig(
     default=AttentionSpec(
         backend="SOL_ATTN",
-        sol_attn=SolAttnSpec(tau=1.0, dense_steps=10, dense_layers="0-1"),
+        sol_attn=SolAttnSpec(tau=1.0, dense_steps=None, dense_layers="0-1"),
     ),
 )
 ```
@@ -85,7 +85,8 @@ plausible measurement.
 
 ```text
 Resolved diffusion attention backend 'SOL_ATTN' for role='self' via attention_config
-SOL_ATTN configured: tau=1.000, thresh_type=diag, kv_splits=auto, dense_steps=10, dense_layers=(0, 1), sink_mode=prefix, strict=False, dense fallback=CUDNN_ATTN.
+SOL_ATTN configured: tau=1.000, thresh_type=diag, kv_splits=auto, dense_steps=auto, dense_layers=(0, 1), sink_mode=prefix, strict=False, dense fallback=CUDNN_ATTN.
+SOL_ATTN dense_steps=auto resolved to 10 of 50 denoise steps.
 SOL_ATTN active: tau=1.000, thresh_type=diag, dense_steps=10, dense_layers=[0, 1], sink_mode=prefix, used_len=38247, sink=[0, 951), total_len=38272, heads=7.
 ```
 
@@ -93,7 +94,9 @@ SOL_ATTN active: tau=1.000, thresh_type=diag, dense_steps=10, dense_layers=[0, 1
   routed to `SOL_ATTN` rather than the platform default. A second such line
   names the dense fallback, resolved for role `sol_attn.dense_fallback`.
 - `SOL_ATTN configured` is logged once when the attention layers are built and
-  echoes the resolved `sol_attn` block.
+  echoes the resolved `sol_attn` block. With `dense_steps=auto`, the
+  `resolved to N of M` line follows on the first forward of each schedule
+  length.
 - `SOL_ATTN active` is logged on the first forward that actually reaches the
   kernel, with the valid row count and the exact sink range. If it never
   appears, every forward stayed dense.
@@ -102,6 +105,34 @@ Each reason for staying dense is logged once as
 `SOL_ATTN staying dense: <reason>` (warmup steps and dense layers are
 expected and are not logged). With `strict: true`, a kernel failure raises
 instead of producing that line.
+
+## Pairing with FastH3
+
+Sol-Attn routes whatever weights are loaded, so it composes with the
+[FastH3](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md) four-forward students
+the same way Sol-H3 in the `sol-engine` branch serves them:
+
+| FastH3 adapter | `SOL_ATTN` | `FASTVIDEO_VSA` | dense backend |
+| --- | --- | --- | --- |
+| Dense / Data-Free | yes (the Sol-H3 configuration) | refused: no compression gates | yes |
+| VSA variants | refused: the student needs its trained gates | yes | refused |
+
+Sol-Attn and VSA are two sparse policies for the same attention slot, so a
+server selects one of them; the FastH3 contract check refuses the other
+pairings at startup instead of running the student dense under a sparse label.
+
+`dense_steps` is the knob to watch. The 50-step policy of 10 would keep every
+one of the four forwards dense while the logs still said `SOL_ATTN`, so the
+FastH3 contract refuses any explicit `dense_steps >= 4`. Left at `"auto"` it
+resolves to 1, the Sol-H3 T2V policy (one dense forward, three routed, blocks
+0-1 dense throughout):
+
+```bash
+vllm-omni serve MiniMaxAI/MiniMax-H3 \
+  --lora-path FastVideo-FastH3-4-step-Preview-v1-LoRA/dense-datafree/adapter_model.safetensors \
+  --diffusion-attention-config '{"default":{"backend":"SOL_ATTN",\
+    "sol_attn":{"tau":1.0,"dense_layers":"0-1","strict":true}}}'
+```
 
 ## Requirements and compatibility
 

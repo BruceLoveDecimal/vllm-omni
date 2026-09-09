@@ -1751,16 +1751,20 @@ class SolAttnSpec:
     Sol-Engine: 4 on H100 for sequences of at least 65536 tokens, else 1).
     ``dense_steps`` keeps the first N denoise steps dense and ``dense_layers``
     (an index selector such as "0-1,38") keeps individual DiT blocks dense;
-    those are the accuracy knobs. ``sink_mode`` keeps the packed prefix (text,
-    conditions, audio) as an exact KV sink (``"prefix"``) or routes it like
-    everything else (``"none"``). ``strict`` raises on kernel failures instead
-    of silently running dense.
+    those are the accuracy knobs. ``dense_steps`` left unset (``None``, the
+    default) means "auto": the first 20% of the request's schedule stays
+    dense, at least one step, which reproduces both published Sol-Engine
+    MiniMax-H3 policies (10 of the 50-step base ladder, 1 of FastH3's 4
+    forwards) without retuning per checkpoint. ``sink_mode`` keeps the packed
+    prefix (text, conditions, audio) as an exact KV sink (``"prefix"``) or
+    routes it like everything else (``"none"``). ``strict`` raises on kernel
+    failures instead of silently running dense.
     """
 
     tau: float = 1.0
     thresh_type: str = "diag"
     kv_splits: int | str | None = None
-    dense_steps: int = 10
+    dense_steps: int | None = None
     dense_layers: str | list[int] | None = "0-1"
     sink_mode: str = "prefix"
     strict: bool = False
@@ -1783,8 +1787,18 @@ class SolAttnSpec:
                     f"sol_attn.kv_splits must be 'auto' or one of {list(SOL_ATTN_KV_SPLITS)}; got {self.kv_splits!r}."
                 )
             self.kv_splits = int(self.kv_splits)
-        if self.dense_steps < 0:
-            raise ValueError(f"sol_attn.dense_steps must be >= 0; got {self.dense_steps!r}.")
+        if self.dense_steps in (None, "auto"):
+            self.dense_steps = None
+        else:
+            try:
+                valid = not isinstance(self.dense_steps, bool) and self.dense_steps == int(self.dense_steps)
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise ValueError(f"sol_attn.dense_steps must be an integer or 'auto'; got {self.dense_steps!r}.")
+            self.dense_steps = int(self.dense_steps)
+            if self.dense_steps < 0:
+                raise ValueError(f"sol_attn.dense_steps must be >= 0; got {self.dense_steps!r}.")
         if self.sink_mode not in SOL_ATTN_SINK_MODES:
             raise ValueError(f"sol_attn.sink_mode must be one of {list(SOL_ATTN_SINK_MODES)}; got {self.sink_mode!r}.")
         if self.dense_backend is not None:

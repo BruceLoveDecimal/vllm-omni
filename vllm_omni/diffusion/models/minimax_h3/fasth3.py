@@ -142,16 +142,26 @@ def _resolve_dit_attention_backend(od_config: Any) -> str:
     Reading only the default would accept a config that runs the sparse student
     dense, and reject a per-role-only config that is correct.
     """
+    spec = _resolve_dit_attention_spec(od_config)
+    if spec is not None:
+        return str(getattr(spec, "backend", "") or "").upper()
+    return str(getattr(od_config, "diffusion_attention_backend", "") or "").upper()
+
+
+def _resolve_dit_attention_spec(od_config: Any) -> Any | None:
+    """The typed ``AttentionSpec`` the DiT's ``"self"`` role resolves to, if any.
+
+    A bare ``--diffusion-attention-backend`` name outranks the config's
+    ``default`` block but not a ``per_role`` entry, mirroring the selector.
+    """
     attention_config = getattr(od_config, "diffusion_attention_config", None)
     per_role = getattr(attention_config, "per_role", None) or {}
     spec = per_role.get(_H3_DIT_ATTENTION_ROLE)
     if spec is not None:
-        return str(getattr(spec, "backend", "") or "").upper()
-    backend = str(getattr(od_config, "diffusion_attention_backend", "") or "").upper()
-    if backend:
-        return backend
-    default_spec = getattr(attention_config, "default", None)
-    return str(getattr(default_spec, "backend", "") or "").upper()
+        return spec
+    if str(getattr(od_config, "diffusion_attention_backend", "") or ""):
+        return None
+    return getattr(attention_config, "default", None)
 
 
 class FastH3AdapterError(ValueError):
@@ -619,14 +629,21 @@ class FastH3WeightFusion:
                 f"FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
                 f"{sorted(offloads)}. Serve it without offload."
             )
+        backend = _resolve_dit_attention_backend(od_config)
         if self.requires_vsa:
-            backend = _resolve_dit_attention_backend(od_config)
             if backend != "FASTVIDEO_VSA":
+                exclusive = (
+                    " Sol-Attn and VSA are two sparse policies for the same attention slot: the VSA "
+                    "student needs its trained gates, Sol-Attn routes stock weights on the fly, so "
+                    "pair SOL_ATTN with the Dense/Data-Free adapter instead."
+                    if backend == "SOL_ATTN"
+                    else ""
+                )
                 raise ValueError(
                     f"{self.source} is a Video Sparse Attention variant of FastH3. Its compression "
                     "gates only mean anything to the VSA kernel, and any other backend would run it "
                     f"as dense attention on a student distilled for 90% sparsity (got {backend or 'default'}). "
-                    "Serve it with --diffusion-attention-backend FASTVIDEO_VSA."
+                    f"Serve it with --diffusion-attention-backend FASTVIDEO_VSA.{exclusive}"
                 )
             parallel_config = getattr(od_config, "parallel_config", None)
             ring_degree = int(getattr(parallel_config, "ring_degree", 1) or 1)
@@ -636,6 +653,17 @@ class FastH3WeightFusion:
                     "FastH3 VSA supports local attention or pure Ulysses sequence parallelism; "
                     "ring/all-gather SP does not give the block-sparse kernel the complete packed sequence."
                 )
+        elif backend == "FASTVIDEO_VSA":
+            # The dense student carries no compression gates: nothing trained
+            # its attention to survive a 90%-sparse kernel, and the gate modules
+            # the VSA path reads are never even created for it.
+            raise ValueError(
+                f"{self.source} is the dense-attention variant of FastH3, but the DiT resolves to "
+                "FASTVIDEO_VSA. It has no compression gates for the VSA kernel; serve it with a dense "
+                "backend or SOL_ATTN, or load a VSA variant of the adapter."
+            )
+        elif backend == "SOL_ATTN":
+            self._check_sol_attn_policy(od_config)
         logger.info(
             "FastH3 adapter active: sigma points %s for %d transformer forwards, "
             "flow_shift=%g, audio_flow_shift=%g, tasks=%s",
@@ -644,6 +672,35 @@ class FastH3WeightFusion:
             video_shift,
             audio_shift,
             sorted(FASTH3_SUPPORTED_TASKS),
+        )
+
+    def _check_sol_attn_policy(self, od_config: Any) -> None:
+        """Hold ``sol_attn.dense_steps`` to the four-forward ladder.
+
+        Sol-Attn routes the fused weights on the fly, so the dense student is
+        served exactly as Sol-H3 serves it. The one knob that can silently undo
+        that is ``dense_steps``: the 50-step default of 10 would keep every one
+        of the four forwards dense while the logs still say SOL_ATTN. Auto
+        (``None``) resolves to 1 from the published step count, the Sol-H3 T2V
+        policy; an explicit value has to leave at least one sparse forward.
+        """
+        spec = _resolve_dit_attention_spec(od_config)
+        sol_attn = getattr(spec, "sol_attn", None)
+        dense_steps = getattr(sol_attn, "dense_steps", None)
+        if dense_steps is not None and int(dense_steps) >= FASTH3_DENOISE_STEPS:
+            raise ValueError(
+                f"sol_attn.dense_steps={int(dense_steps)} keeps every one of FastH3's {FASTH3_DENOISE_STEPS} "
+                "forwards dense, so SOL_ATTN would never route a block. Leave dense_steps unset (auto resolves "
+                f"to 1 on this ladder, the Sol-H3 policy) or set it below {FASTH3_DENOISE_STEPS}; select a dense "
+                "backend instead if dense attention is what you want."
+            )
+        from vllm_omni.diffusion.attention.backends.sol_attn import resolve_dense_steps
+
+        logger.info(
+            "FastH3 + SOL_ATTN: dense_steps=%s, so %d of the %d forwards run dense before Sol-Attn routes.",
+            "auto" if dense_steps is None else int(dense_steps),
+            resolve_dense_steps(None if dense_steps is None else int(dense_steps), FASTH3_DENOISE_STEPS),
+            FASTH3_DENOISE_STEPS,
         )
 
     def check_task(self, task: str) -> None:

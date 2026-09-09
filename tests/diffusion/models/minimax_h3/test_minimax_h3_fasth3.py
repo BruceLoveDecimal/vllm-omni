@@ -493,6 +493,69 @@ def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path)
     fusion.check_serving_contract(od_config=sparse_dit, **contract)
 
 
+def _sol_attn_config(dense_steps, per_role: bool = False):
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+
+    spec = AttentionSpec(backend="SOL_ATTN", sol_attn={"dense_steps": dense_steps})
+    if per_role:
+        return SimpleNamespace(diffusion_attention_config=AttentionConfig(default=None, per_role={"self": spec}))
+    return SimpleNamespace(diffusion_attention_config=AttentionConfig(default=spec))
+
+
+def test_the_dense_student_takes_sol_attn_as_sol_h3_serves_it(tmp_path):
+    # Sol-Attn routes the fused weights on the fly, so Dense/Data-Free plus
+    # SOL_ATTN is the Sol-H3 configuration. Auto dense_steps resolves to one of
+    # the four forwards; an explicit value below the ladder is honoured.
+    fusion = _fusion(tmp_path)
+    contract = {"partition": "fl2va", "video_shift": 12.0, "audio_shift": 3.0}
+    fusion.check_serving_contract(od_config=_sol_attn_config(None), **contract)
+    fusion.check_serving_contract(od_config=_sol_attn_config("auto", per_role=True), **contract)
+    fusion.check_serving_contract(od_config=_sol_attn_config(1), **contract)
+    fusion.check_serving_contract(od_config=_sol_attn_config(0), **contract)
+    # A bare backend name carries no spec, so it takes the auto policy too.
+    fusion.check_serving_contract(od_config=SimpleNamespace(diffusion_attention_backend="SOL_ATTN"), **contract)
+
+
+@pytest.mark.parametrize("dense_steps", [FASTH3_DENOISE_STEPS, 10])
+def test_sol_attn_dense_steps_must_leave_a_sparse_forward(dense_steps, tmp_path):
+    # The 50-step default would keep all four forwards dense while the logs
+    # still said SOL_ATTN; that is a dense run mislabelled, so it is refused.
+    fusion = _fusion(tmp_path)
+    contract = {"partition": "fl2va", "video_shift": 12.0, "audio_shift": 3.0}
+    with pytest.raises(ValueError, match="keeps every one of FastH3's 4 forwards dense"):
+        fusion.check_serving_contract(od_config=_sol_attn_config(dense_steps), **contract)
+    with pytest.raises(ValueError, match="keeps every one of FastH3's 4 forwards dense"):
+        fusion.check_serving_contract(od_config=_sol_attn_config(dense_steps, per_role=True), **contract)
+
+
+def test_the_dense_student_refuses_the_vsa_kernel(tmp_path):
+    # No compression gates were trained for it, and the gate modules are never built.
+    fusion = _fusion(tmp_path)
+    contract = {"partition": "fl2va", "video_shift": 12.0, "audio_shift": 3.0}
+    with pytest.raises(ValueError, match="no compression gates"):
+        fusion.check_serving_contract(
+            od_config=SimpleNamespace(diffusion_attention_backend="FASTVIDEO_VSA"), **contract
+        )
+    with pytest.raises(ValueError, match="no compression gates"):
+        fusion.check_serving_contract(
+            od_config=SimpleNamespace(
+                diffusion_attention_config=SimpleNamespace(
+                    default=None, per_role={"self": SimpleNamespace(backend="FASTVIDEO_VSA")}
+                )
+            ),
+            **contract,
+        )
+
+
+def test_sol_attn_and_vsa_are_mutually_exclusive(tmp_path):
+    # The VSA student under SOL_ATTN names the pairing that does work.
+    sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+    _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+    contract = {"partition": "fl2va", "video_shift": 12.0, "audio_shift": 3.0}
+    with pytest.raises(ValueError, match="Sol-Attn and VSA are two sparse policies for the same attention slot"):
+        _load(sparse.parent).check_serving_contract(od_config=_sol_attn_config(None), **contract)
+
+
 def test_a_gate_that_never_reached_the_model_is_refused(tmp_path):
     # load_weights only logs a skip for a parameter the model does not have, so
     # yielding the gate is not evidence it arrived.
