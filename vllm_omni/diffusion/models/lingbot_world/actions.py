@@ -41,11 +41,6 @@ LingBotCameraActionFrames: TypeAlias = tuple[tuple[str, ...], ...]
 LingBotCameraActionScript: TypeAlias = tuple[LingBotCameraActionFrames, ...]
 
 
-def as_camera_action_frames(value: Iterable[Iterable[str]]) -> LingBotCameraActionFrames:
-    """Restore the tuple form of one chunk's per-latent-frame key states."""
-    return tuple(tuple(frame) for frame in value)
-
-
 def as_camera_action_script(value: Iterable[Iterable[Iterable[str]]]) -> LingBotCameraActionScript:
     """Restore the tuple form of a whole request's script.
 
@@ -53,7 +48,7 @@ def as_camera_action_script(value: Iterable[Iterable[Iterable[str]]]) -> LingBot
     validated script comes back as lists; this rebuilds the hashable tuple form
     without re-running validation.
     """
-    return tuple(as_camera_action_frames(chunk) for chunk in value)
+    return tuple(tuple(tuple(frame) for frame in chunk) for chunk in value)
 
 
 def _normalize_frames(value: object, *, field: str) -> LingBotCameraActionFrames:

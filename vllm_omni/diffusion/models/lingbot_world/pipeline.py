@@ -796,7 +796,6 @@ class LingBotWorldCausalDMDPipeline(
         *,
         dtype: torch.dtype,
         previous: CameraTrajectory | None = None,
-        latent_aligned: bool = False,
     ) -> tuple[torch.Tensor, CameraTrajectory]:
         """Convert raw camera frames to a latent-aligned ray tensor."""
 
@@ -804,7 +803,7 @@ class LingBotWorldCausalDMDPipeline(
         if trajectory is None:
             raise RuntimeError("LingBot camera trajectory was not prepared before camera embedding.")
         available_frames = int(trajectory.poses.shape[0])
-        if inputs.camera_actions is not None or latent_aligned:
+        if inputs.camera_actions is not None:
             if available_frames != inputs.num_latent_frames:
                 raise ValueError(
                     "camera actions must produce exactly one pose per latent frame; "
@@ -866,17 +865,10 @@ class LingBotWorldCausalDMDPipeline(
         )
         return _fold_camera_embedding(camera_embedding), tail
 
-    def _ar_text_caches(
-        self,
-        prompt_embeds: torch.Tensor,
-        *,
-        invalidate: bool,
-    ) -> list[LingBotAttentionCache]:
+    def _ar_text_caches(self, prompt_embeds: torch.Tensor) -> list[LingBotAttentionCache]:
         state = self._ar_diffusion_kv_state
         if state is None:
             raise RuntimeError("LingBot AR text cache requested without a bound state.")
-        if invalidate:
-            state.clear_cross_attention()
         if not state.is_cross_attention_populated(
             self._AR_BRANCH,
             self._AR_TEXT_CACHE,
@@ -941,14 +933,8 @@ class LingBotWorldCausalDMDPipeline(
             self._dmd_block_runner = runner
         return runner
 
-    def _ar_block_context(
-        self,
-        cross_attention: list[LingBotAttentionCache] | None,
-    ) -> ARBlockContext | None:
-        """Wrap the bound session for the block runner; ``None`` keeps
-        request-local KV."""
-        if cross_attention is None:
-            return None
+    def _ar_block_context(self, cross_attention: list[LingBotAttentionCache]) -> ARBlockContext:
+        """Wrap the bound session for the block runner."""
         state = self._ar_diffusion_kv_state
         if state is None:
             raise RuntimeError("LingBot AR cache requested without a bound state.")
@@ -960,19 +946,20 @@ class LingBotWorldCausalDMDPipeline(
         condition: torch.Tensor,
         camera: torch.Tensor,
         prompt_embeds: torch.Tensor,
-        cache: LingBotTransformerCache | None,
-        ar_cross_attention: list[LingBotAttentionCache] | None,
+        cache: LingBotTransformerCache,
         start_frame: int,
         schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
     ) -> torch.Tensor:
+        """Generate one block against request-local KV; step execution uses
+        the bound AR session through :meth:`_ar_block_context` instead."""
         return self._dmd_blocks.generate_block(
             condition=condition,
             camera=camera,
             prompt_embeds=prompt_embeds,
             cache=cache,
-            ar=self._ar_block_context(ar_cross_attention),
+            ar=None,
             start_frame=start_frame,
             schedule=schedule,
             generator=generator,
@@ -1057,7 +1044,6 @@ class LingBotWorldCausalDMDPipeline(
                         camera=camera[:, :, start_frame:stop_frame],
                         prompt_embeds=prompt_embeds,
                         cache=cache,
-                        ar_cross_attention=None,
                         start_frame=start_frame,
                         schedule=schedule,
                         generator=inputs.generator,
@@ -1210,7 +1196,7 @@ class LingBotWorldCausalDMDPipeline(
             "camera_trajectory_cache": camera_trajectory_cache,
             "camera_embedding_cache": camera_embedding_cache,
         }
-        self._ar_text_caches(prompt_embeds, invalidate=False)
+        self._ar_text_caches(prompt_embeds)
         self._prepare_next_chunk(state)
         return state
 
@@ -1270,10 +1256,7 @@ class LingBotWorldCausalDMDPipeline(
         extra["camera"] = camera
         extra["camera_tail"] = camera_tail
         extra["start_frame"] = start_frame
-        extra["ar_cross_attention"] = self._ar_text_caches(
-            cast(torch.Tensor, state.prompt_embeds),
-            invalidate=False,
-        )
+        extra["ar_cross_attention"] = self._ar_text_caches(cast(torch.Tensor, state.prompt_embeds))
         state.latents = randn_tensor(
             (
                 1,
