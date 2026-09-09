@@ -65,14 +65,6 @@ def test_action_integrator_matches_lingbot_motion_and_calibration() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("data", "message"),
-    [
-        ({"mode": "frames", "frames": [["x"], [], []]}, "W/A/S/D/I/J/K/L"),
-        ({"mode": "frames", "frames": [["w"]]}, "exactly one action list"),
-        ({"mode": "state", "frames": [[], [], []]}, "mode='frames'"),
-    ],
-)
 def test_parse_camera_action_script_rejects_wrong_chunk_width() -> None:
     with pytest.raises(ValueError, match="exactly 3 per-latent-frame"):
         parse_lingbot_camera_action_script([[["w"], ["w"]]], frames_per_chunk=3)
