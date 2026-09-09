@@ -1512,9 +1512,6 @@ class _FakeARState:
     def commit_paged_context(self, branch):
         self.commits.append(branch)
 
-    def clear_cross_attention(self):
-        return None
-
     def is_cross_attention_populated(self, branch, name):
         del branch, name
         return True
