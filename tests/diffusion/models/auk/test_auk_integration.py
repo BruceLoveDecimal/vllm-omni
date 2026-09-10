@@ -142,6 +142,24 @@ def test_pipeline_rejects_overlength_before_encoding():
         pipeline(batch)
 
 
+def test_pipeline_duration_matches_native_arithmetic():
+    import math
+
+    pipeline = small_pipeline(False)
+    seconds = 2.72
+    batch = DiffusionRequestBatch(
+        [
+            OmniDiffusionRequest(
+                prompt={"input": "hello", "gen_seconds": seconds},
+                request_id="duration",
+                sampling_params=OmniDiffusionSamplingParams(seed=42, num_inference_steps=1),
+            )
+        ]
+    )
+    audio = pipeline(batch)[0].output
+    assert audio.shape[-1] == math.ceil(seconds * 24000 / 480) * 480 == 65760
+
+
 def test_checkpoint_rejects_missing_and_unexpected_weights(tmp_path):
     from safetensors.torch import save_file
 

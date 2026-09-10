@@ -133,7 +133,12 @@ class AuKPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscovery):
         reference_frames = 0 if waveform is None else waveform.shape[-1] // self.hop_size
         if waveform is not None and reference_frames == 0:
             raise ValueError("Reference audio must contain at least one 20 ms latent frame")
-        target_frames = reference_frames if request.seconds is None else math.ceil(request.seconds * 50)
+        # Preserve the native operation order at floating-point boundaries.
+        target_frames = (
+            reference_frames
+            if request.seconds is None
+            else math.ceil(request.seconds * self.sample_rate / self.hop_size)
+        )
         # The public ComfyUI recipe bounds source + target to 30 seconds.
         if target_frames + reference_frames > 1500:
             raise ValueError("AuK supports at most 30 seconds of reference + generated audio per request")
