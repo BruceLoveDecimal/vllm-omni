@@ -124,6 +124,8 @@ def is_diffusion_model(model_name: str) -> bool:
     2. Check using vllm's get_hf_file_to_dict utility
     3. Try the standard diffusers approach (may fail due to import issues)
     """
+    from vllm_omni.diffusion.models.auk.configuration_auk import is_auk_model
+
     # Strategy 1: Check local file system first (fastest, avoids import issues)
     if os.path.isdir(model_name):
         for filename in DIFFUSION_MODEL_INDEX_FILES:
@@ -162,7 +164,8 @@ def is_diffusion_model(model_name: str) -> bool:
     # Bagel is not a diffusers pipeline (no model_index.json), but is still a
     # diffusion-style model in vllm-omni. Detect it via config.json.
     return (
-        _looks_like_bagel(model_name)
+        is_auk_model(model_name)
+        or _looks_like_bagel(model_name)
         or _looks_like_sana_wm(model_name)
         or _looks_like_dreamzero(model_name)
         or _looks_like_hidream_o1(model_name)

@@ -618,6 +618,12 @@ def resolve_model_class_name(
     model_type = cfg.get("model_type")
     architectures = cfg.get("architectures") or []
 
+    if not cfg:
+        from vllm_omni.diffusion.models.auk.configuration_auk import is_auk_model
+
+        if is_auk_model(model, revision):
+            return "AuKPipeline"
+
     from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
     if _looks_like_hidream_o1(model, cfg):
@@ -1328,6 +1334,14 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
+                    from vllm_omni.diffusion.models.auk.configuration_auk import read_auk_config
+
+                    auk_config = read_auk_config(self.model, self.revision)
+                    if auk_config is not None:
+                        self.model_class_name = "AuKPipeline"
+                        self.set_tf_model_config(TransformerConfig.from_dict(auk_config["model"]["arch"]))
+                        self.update_multimodal_support()
+                        return
                     try:
                         from vllm.transformers_utils.repo_utils import file_or_path_exists
 

@@ -1021,6 +1021,8 @@ class DiffusionEngine:
         """Build a one-step model request for startup profiling or warmup."""
 
         prompt: OmniTextPrompt = {"prompt": "dummy run"}
+        if self.od_config.model_class_name == "AuKPipeline":
+            prompt["mm_processor_kwargs"] = {"gen_seconds": 1.0}
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
         if supports_image_input:
             color_format = image_color_format(self.od_config.model_class_name)

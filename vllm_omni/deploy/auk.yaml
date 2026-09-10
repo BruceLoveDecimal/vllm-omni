@@ -1,0 +1,9 @@
+async_chunk: false
+pipeline: auk
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    enforce_eager: true
+    distributed_executor_backend: "mp"
+    dtype: "bfloat16"
