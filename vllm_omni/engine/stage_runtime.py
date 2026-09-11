@@ -750,12 +750,16 @@ class StageRuntime:
             # READY handshake.
             if not self._parallel_stage_init:
                 g3_start = time.perf_counter()
-                with self._scoped_spawn_device_env(physical_devices):
-                    lock_fds = acquire_device_locks(
-                        plan.metadata.stage_id,
-                        plan.engine_args_dict,
-                        stage_init_timeout,
-                    )
+                # Pass devices explicitly rather than scoping the device env:
+                # the flock wait must stay outside the spawn-env lock, else it
+                # deadlocks against a replica that already holds device locks
+                # and needs the spawn-env lock to launch (AB-BA lock ordering).
+                lock_fds = acquire_device_locks(
+                    plan.metadata.stage_id,
+                    plan.engine_args_dict,
+                    stage_init_timeout,
+                    visible_devices=physical_devices,
+                )
                 logger.debug(
                     "[stage_init] Stage-%s G3 device-lock acquire took %.3fs",
                     plan.metadata.stage_id,
