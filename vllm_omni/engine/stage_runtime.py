@@ -411,15 +411,20 @@ class StageRuntime:
                         replica.metadata.runtime_cfg,
                     )
                     if not self._parallel_stage_init:
-                        with self._scoped_spawn_device_env(physical_devices):
-                            lock_fds.extend(
-                                acquire_device_locks(
-                                    replica.metadata.stage_id,
-                                    replica.engine_args_dict,
-                                    timeout,
-                                    locked_devices,
-                                )
+                        # Pass devices explicitly rather than scoping the
+                        # device env: the flock wait must stay outside the
+                        # spawn-env lock, else it deadlocks against a replica
+                        # that already holds device locks and needs the
+                        # spawn-env lock to launch (AB-BA lock ordering).
+                        lock_fds.extend(
+                            acquire_device_locks(
+                                replica.metadata.stage_id,
+                                replica.engine_args_dict,
+                                timeout,
+                                locked_devices,
+                                visible_devices=physical_devices,
                             )
+                        )
 
                     launch_context = launch_stage_replica(
                         vllm_config=replica.stage_vllm_config,
