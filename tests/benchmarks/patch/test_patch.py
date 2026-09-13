@@ -108,6 +108,43 @@ def test_seed_tts_text_chat_messages_do_not_add_reference_audio() -> None:
     assert "ref_audio" not in request_func_input.extra_body
 
 
+@pytest.mark.parametrize(
+    ("model_name", "sample_cls", "expected_instruction"),
+    [
+        ("tencent/AuK", SeedTTSTextSampleRequest, "Say the following: 'target text'"),
+        ("tencent/AuK-Flash", SeedTTSSampleRequest, "Say the following with the same voice: 'target text'"),
+    ],
+)
+def test_auk_speech_benchmark_prompt_is_explicitly_wrapped(
+    model_name: str,
+    sample_cls: type[SeedTTSSampleRequest],
+    expected_instruction: str,
+) -> None:
+    speech_extra = None
+    if sample_cls is SeedTTSSampleRequest:
+        speech_extra = {
+            "ref_audio": "data:audio/wav;base64,AAAA",
+            "ref_text": "reference text",
+        }
+    sample = sample_cls(
+        prompt="target text",
+        prompt_len=2,
+        expected_output_len=20,
+        multi_modal_data=None,
+        seed_tts_speech_extra=speech_extra,
+    )
+    request_func_input = _seed_tts_request_func_input()
+    request_func_input.model_name = model_name
+
+    _attach_seed_tts_to_request_func_input(sample, request_func_input)
+
+    assert request_func_input.prompt == ""
+    assert request_func_input.extra_body["instructions"] == expected_instruction
+    if speech_extra is not None:
+        assert request_func_input.extra_body["ref_audio"] == speech_extra["ref_audio"]
+        assert request_func_input.extra_body["ref_text"] == speech_extra["ref_text"]
+
+
 class MockResponse:
     """Mock aiohttp response for testing"""
 

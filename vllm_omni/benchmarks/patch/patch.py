@@ -64,6 +64,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSDesignDataset,
     SeedTTSSampleRequest,
     SeedTTSTextDataset,
+    SeedTTSTextSampleRequest,
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
@@ -294,6 +295,24 @@ def _attach_daily_omni_to_request_func_input(sample: SampleRequest, rfi: Request
         setattr(rfi, "mm_position", sample.omni_chat_mm_position)
 
 
+def _is_auk_benchmark_request(rfi: RequestFuncInput) -> bool:
+    """Return whether a request targets an AuK benchmark model."""
+    model_names = (getattr(rfi, "model", None), getattr(rfi, "model_name", None))
+    return any(isinstance(name, str) and "auk" in name.lower() for name in model_names)
+
+
+def _apply_auk_benchmark_prompt(sample: SeedTTSSampleRequest, rfi: RequestFuncInput) -> None:
+    """Build the task-specific AuK instruction used by benchmark requests."""
+    if not _is_auk_benchmark_request(rfi):
+        return
+    if isinstance(sample, SeedTTSTextSampleRequest):
+        instruction = f"Say the following: '{sample.prompt}'"
+    else:
+        instruction = f"Say the following with the same voice: '{sample.prompt}'"
+    rfi.prompt = ""
+    rfi.extra_body = {**(rfi.extra_body or {}), "instructions": instruction}
+
+
 def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
     """Merge Seed-TTS per-row TTS fields into ``extra_body`` and mark for PCM capture.
 
@@ -319,11 +338,11 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
         ],
     )
     ex = sample.seed_tts_speech_extra
-    if not ex:
-        return  # voice comes from --extra-body in config; no ref_audio to merge
-    base = dict(rfi.extra_body) if rfi.extra_body else {}
-    base.update(ex)
-    rfi.extra_body = base
+    if ex:
+        base = dict(rfi.extra_body) if rfi.extra_body else {}
+        base.update(ex)
+        rfi.extra_body = base
+    _apply_auk_benchmark_prompt(sample, rfi)
 
 
 def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
