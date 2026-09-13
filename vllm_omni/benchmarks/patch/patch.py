@@ -295,15 +295,15 @@ def _attach_daily_omni_to_request_func_input(sample: SampleRequest, rfi: Request
         setattr(rfi, "mm_position", sample.omni_chat_mm_position)
 
 
-def _is_auk_benchmark_request(rfi: RequestFuncInput) -> bool:
-    """Return whether a request targets an AuK benchmark model."""
-    model_names = (getattr(rfi, "model", None), getattr(rfi, "model_name", None))
-    return any(isinstance(name, str) and "auk" in name.lower() for name in model_names)
+_AUK_BENCHMARK_MODEL_MARKER = "_vllm_omni_benchmark_model"
 
 
 def _apply_auk_benchmark_prompt(sample: SeedTTSSampleRequest, rfi: RequestFuncInput) -> None:
     """Build the task-specific AuK instruction used by benchmark requests."""
-    if not _is_auk_benchmark_request(rfi):
+    extra_body = dict(rfi.extra_body or {})
+    benchmark_model = extra_body.pop(_AUK_BENCHMARK_MODEL_MARKER, None)
+    rfi.extra_body = extra_body
+    if benchmark_model != "auk":
         return
     if isinstance(sample, SeedTTSTextSampleRequest):
         instruction = f"Say the following: '{sample.prompt}'"

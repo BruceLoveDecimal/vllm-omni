@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -31,6 +32,9 @@ class AuKAdapter(ARTTSAdapter):
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         if not request.input.strip() and not (request.instructions and request.instructions.strip()):
             return "AuK requires input text or a complete instructions prompt"
+        if request.duration_seconds is not None:
+            if not math.isfinite(request.duration_seconds) or request.duration_seconds <= 0:
+                return "AuK requires duration_seconds to be a positive finite value"
         if request.duration_seconds is None and request.ref_audio is None:
             return "AuK requires duration_seconds for requests without ref_audio"
         if request.instructions is not None:

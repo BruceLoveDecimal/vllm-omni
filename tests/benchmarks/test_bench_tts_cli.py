@@ -11,10 +11,17 @@ from pathlib import Path
 
 import pytest
 import yaml
+from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 # Add benchmarks/tts to path for import
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "benchmarks" / "tts"))
 import bench_tts
+
+from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
+    SeedTTSSampleRequest,
+    SeedTTSTextSampleRequest,
+)
+from vllm_omni.benchmarks.patch.patch import _attach_seed_tts_to_request_func_input
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -78,8 +85,77 @@ def test_auk_benchmark_duration_and_local_bundle(model, task):
     )
     assert cmd[cmd.index("--model") + 1] == "/models/auk"
     body = json.loads(cmd[cmd.index("--extra-body") + 1])
-    assert body == {"voice": "default", "duration_seconds": 3.5, "seed": 7}
+    assert body == {
+        "voice": "default",
+        "duration_seconds": 3.5,
+        "seed": 7,
+        bench_tts._AUK_BENCHMARK_MODEL_MARKER: "auk",
+    }
     assert config["task_extra_body"][task]["duration_seconds"] == 5.0
+
+
+@pytest.mark.parametrize(
+    ("task", "sample_cls", "expected_instruction"),
+    [
+        ("default_voice", SeedTTSTextSampleRequest, "Say the following: 'target text'"),
+        ("voice_clone", SeedTTSSampleRequest, "Say the following with the same voice: 'target text'"),
+    ],
+)
+def test_auk_benchmark_marker_survives_served_model_alias(task, sample_cls, expected_instruction):
+    model = "tencent/AuK-Flash"
+    served_model = "models/flash"
+    config = bench_tts.load_model_configs(bench_tts._DEFAULT_MODEL_CONFIGS)[model]
+    cmd = bench_tts.build_bench_args(
+        host="localhost",
+        port=8000,
+        model=model,
+        task=task,
+        model_cfg=config,
+        locale="en",
+        num_prompts=1,
+        concurrency=1,
+        dataset_path="/data/seed-tts",
+        wer_eval=False,
+        output_dir=None,
+        result_filename=None,
+        extra_cli_args=[],
+        served_model_name=served_model,
+    )
+
+    assert cmd[cmd.index("--model") + 1] == served_model
+    extra_body = json.loads(cmd[cmd.index("--extra-body") + 1])
+    assert extra_body[bench_tts._AUK_BENCHMARK_MODEL_MARKER] == "auk"
+
+    speech_extra = None
+    if sample_cls is SeedTTSSampleRequest:
+        speech_extra = {
+            "ref_audio": "data:audio/wav;base64,AAAA",
+            "ref_text": "reference text",
+        }
+    sample = sample_cls(
+        prompt="target text",
+        prompt_len=2,
+        expected_output_len=20,
+        multi_modal_data=None,
+        seed_tts_speech_extra=speech_extra,
+    )
+    request = RequestFuncInput(
+        model=served_model,
+        model_name=None,
+        prompt=sample.prompt,
+        api_url="http://localhost:8000/v1/audio/speech",
+        prompt_len=sample.prompt_len,
+        output_len=sample.expected_output_len,
+        extra_body=extra_body,
+    )
+    _attach_seed_tts_to_request_func_input(sample, request)
+
+    assert request.prompt == ""
+    assert request.extra_body["instructions"] == expected_instruction
+    assert bench_tts._AUK_BENCHMARK_MODEL_MARKER not in request.extra_body
+    if speech_extra is not None:
+        assert request.extra_body["ref_audio"] == speech_extra["ref_audio"]
+        assert request.extra_body["ref_text"] == speech_extra["ref_text"]
 
 
 def test_indextts25_is_registered_in_shared_model_configs() -> None:

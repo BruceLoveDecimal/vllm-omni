@@ -50,6 +50,7 @@ def _vllm_omni_bin() -> str:
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _DEFAULT_MODEL_CONFIGS = _SCRIPT_DIR / "model_configs.yaml"
+_AUK_BENCHMARK_MODEL_MARKER = "_vllm_omni_benchmark_model"
 
 # Maps task name to the dataset_name used with vllm bench serve
 _TASK_TO_DATASET: dict[str, str] = {
@@ -103,6 +104,8 @@ def build_bench_args(
         if not math.isfinite(duration_seconds) or duration_seconds <= 0:
             raise ValueError("duration_seconds must be finite and positive")
         task_extra_body["duration_seconds"] = duration_seconds
+    if model.rsplit("/", 1)[-1].lower() in {"auk", "auk-flash"}:
+        task_extra_body[_AUK_BENCHMARK_MODEL_MARKER] = "auk"
 
     # Resolve dataset path
     if dataset_path:
