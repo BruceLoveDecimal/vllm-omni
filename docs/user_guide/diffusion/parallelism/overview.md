@@ -15,3 +15,6 @@ This guide covers the parallelism methods in vLLM-Omni for speeding up diffusion
 | **[Expert Parallelism](expert_parallel.md)**       | Shards MoE expert blocks across GPUs for MoE models (e.g. HunyuanImage3.0)                                          |
 
 See [Supported Models](../../diffusion_features.md#supported-models) for per-model compatibility.
+
+SolarWM-5B Stage2 currently uses one resident GPU; parallel execution is not supported.
+See its [deployment recipe](../../../../recipes/SolarWM/solarwm-5b-rtx-pro-6000.md).

@@ -24,6 +24,7 @@ This folder provides a unified CLI script for image-to-video generation using vL
 | Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM Notes |
 | ----- | ------------------ | -------------- | ------------- | -------- | ---------- |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 480 x 832 | 81 | 50 | 5.0 | Around 60 GiB BF16 for basic single-card usage |
+| SolarWM-5B Stage2 (assembled native index) | 480 x 864 | 81 | 4 per chunk | 1.0 | [Single-GPU recipe](../../../recipes/SolarWM/solarwm-5b-rtx-pro-6000.md); rolling camera-conditioned video |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 480 x 832 | 81 | 50 | 4.0 | Around 20–25 GiB BF16, smallest I2V model |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832 | 121 | 50 | 6.0 | Around 100 GiB at default settings; the example enables `--enable-cpu-offload` + VAE tiling/slicing to fit an 80 GiB card |
 | `Lightricks/LTX-2` | 512 x 768 | 121 | 40 | video 3.0 / audio 7.0 | Memory use depends on frame count and tensor parallelism |

@@ -313,6 +313,14 @@ steps:
       build.pull_request.labels includes "diffusion-x2v-test"
     steps:
 
+      - label: ":full_moon: Diffusion X2V · SolarWM Stage2 · Single-GPU"
+        # Native release assets must be assembled before scheduling this job.
+        if: build.env("SOLARWM_MODEL") != null && build.env("SOLARWM_IMAGE") != null
+        timeout_in_minutes: 30
+        commands:
+          - pytest -s -v tests/e2e/offline_inference/test_solarwm_expansion.py -m "full_model and cuda and H100 and cards_1" --run-level "full_model"
+        mirror_hardwares: h100_1
+
       - label: ":full_moon: Diffusion X2V · Wan2.2 T2V Function Test · Single-GPU"
         timeout_in_minutes: 90
         commands:

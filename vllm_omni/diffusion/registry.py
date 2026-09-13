@@ -21,6 +21,7 @@ logger = init_logger(__name__)
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
+    "SolarWMStage2Pipeline": ("solarwm", "pipeline", "SolarWMStage2Pipeline"),
     "QwenImagePipeline": (
         "qwen_image",
         "pipeline_qwen_image",
@@ -544,6 +545,7 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {
+    "SolarWMStage2Pipeline": "get_solarwm_post_process_func",
     # arch: post_process_func
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key

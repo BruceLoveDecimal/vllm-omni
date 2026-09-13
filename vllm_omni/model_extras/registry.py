@@ -69,6 +69,11 @@ from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.solarwm import (
+    SOLARWM_EXTRA_BODY_PARAMS,
+    get_solarwm_video_generation_defaults,
+    solarwm_preserves_reference_image_size,
+)
 from vllm_omni.model_extras.vace import (
     VACE_EXTRA_BODY_PARAMS,
     VACE_EXTRA_OUTPUT_PARAMS,
@@ -179,6 +184,11 @@ def default_image_to_image_prompt(
 
 
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
+    "SolarWMStage2Pipeline": {
+        "extra_body_params": SOLARWM_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_solarwm_video_generation_defaults,
+        "reference_image_size_resolver": solarwm_preserves_reference_image_size,
+    },
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
         "extra_output_params": BAGEL_EXTRA_OUTPUT_PARAMS,
