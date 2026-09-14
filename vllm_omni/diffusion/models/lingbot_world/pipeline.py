@@ -25,6 +25,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
+from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -1433,7 +1434,6 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("LingBot chunk_index exceeds the configured causal image condition horizon.")
         condition = image_condition[:, :, start_frame:stop_frame]
         previous = extra.get("camera_tail")
-        from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
 
         if extra.get("camera_action_script") is not None:
             chunk_actions = extra["camera_action_script"][state.chunk_index]
