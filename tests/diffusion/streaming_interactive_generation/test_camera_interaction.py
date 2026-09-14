@@ -103,7 +103,6 @@ class TestCoordinatorResolution:
         assert isinstance(session, CameraSession)
         assert session.last_absolute_poses is not None
         assert session.last_absolute_poses.shape == (3, 4, 4)
-        assert state.conditioning["camera"].shape == (3, 4, 4)
         assert meta.started_event_ids == []
         assert meta.active_event_ids == []
 
@@ -239,12 +238,14 @@ class TestCameraHandlers:
             fps=16.0,
             boundary_at=0.25,
         )
-        tensor = state.conditioning["camera"]
+        session = state.interaction_sessions["camera"]
+        assert isinstance(session, CameraSession)
+        assert session.last_absolute_poses is not None
         assert meta is not None
         assert meta.started_event_ids == ["cam-1"]
         assert meta.active_event_ids == ["cam-1"]
         assert meta.completed_event_ids == []
-        assert tensor.shape == (4, 4, 4)
+        assert session.last_absolute_poses.shape == (4, 4, 4)
 
         meta2 = handler.apply_at_chunk_boundary(
             state,
@@ -257,8 +258,6 @@ class TestCameraHandlers:
         assert meta2.started_event_ids == []
         assert meta2.active_event_ids == []
         assert meta2.completed_event_ids == ["cam-1"]
-        session = state.interaction_sessions["camera"]
-        assert isinstance(session, CameraSession)
         assert session.active_event is None
         assert session.current_pose.translation[2] == pytest.approx(3.0)
         assert session.last_absolute_poses is not None
@@ -327,12 +326,15 @@ class TestCameraHandlers:
         assert session.current_pose.translation[2] == pytest.approx(0.15)
         assert session.last_absolute_poses is not None
         assert session.last_absolute_poses.shape == (3, 4, 4)
-        conditioning = state.conditioning["camera"]
-        assert conditioning.shape == (3, 4, 4)
-        torch.testing.assert_close(conditioning[0], torch.eye(4), atol=1e-6, rtol=0)
         torch.testing.assert_close(
-            conditioning[1, :3, 3],
+            session.last_absolute_poses[0, :3, 3],
             torch.tensor([0.0, 0.0, 0.05], dtype=torch.float64),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            session.last_absolute_poses[1, :3, 3],
+            torch.tensor([0.0, 0.0, 0.10], dtype=torch.float64),
             atol=1e-6,
             rtol=0,
         )

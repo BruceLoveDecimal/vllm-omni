@@ -101,15 +101,14 @@ class CameraSession(InteractionSession):
 
 
 class SE3DeltaCameraHandler(InteractionHandler):
-    """Generic camera timeline that projects absolute poses to f2f SE3 deltas.
+    """Generic camera timeline that samples absolute poses per media frame.
 
     * ``mode=target``: lerp toward an absolute pose (relative to session start).
     * ``mode=velocity``: hold a structural per-frame SE3 delta until replaced.
 
-    ``state.conditioning['camera']`` receives dense frame-to-frame 4x4 deltas
-    ``[T, 4, 4]``. Absolute poses for the chunk are stored on
-    ``CameraSession.last_absolute_poses`` for pipelines that need them (e.g.
-    LingBot plucker embedding via ``prepare_next_chunk``).
+    Absolute poses for the chunk are stored on ``CameraSession.last_absolute_poses``
+    for pipelines that need them (e.g. LingBot plucker embedding via
+    ``prepare_next_chunk``).
     """
 
     modality: ClassVar[str] = "camera"
@@ -220,7 +219,6 @@ class SE3DeltaCameraHandler(InteractionHandler):
                 session.last_absolute_poses = torch.stack([p.as_matrix() for p in samples], dim=0)
             else:
                 session.last_absolute_poses = torch.zeros((0, 4, 4), dtype=torch.float64)
-            state.conditioning[self.modality] = self._project(samples)
 
         return InteractionChunkMetadata(
             started_event_ids=started,
@@ -335,19 +333,6 @@ class SE3DeltaCameraHandler(InteractionHandler):
         # Velocity: apply the held structural SE3 delta once per output frame.
         session.current_pose = _compose_pose(session.current_pose, event.pose)
         return None
-
-    def _project(self, poses: list[CameraPose]) -> torch.Tensor:
-        """Pack absolute poses into dense frame-to-frame 4x4 SE3 deltas."""
-        if not poses:
-            return torch.zeros((0, 4, 4), dtype=torch.float64)
-        mats = [p.as_matrix() for p in poses]
-        deltas: list[torch.Tensor] = [torch.eye(4, dtype=torch.float64)]
-        prev = mats[0]
-        for mat in mats[1:]:
-            # Relative rigid transform: T_delta = inv(T_prev) @ T_curr.
-            deltas.append(torch.linalg.inv(prev) @ mat)
-            prev = mat
-        return torch.stack(deltas, dim=0)
 
 
 def _as_xyz(value: object, *, name: str) -> Vec3:

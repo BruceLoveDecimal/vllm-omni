@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-request mutable state for step-wise diffusion execution."""
 
 from __future__ import annotations
@@ -106,7 +106,6 @@ class StepRequestState:
 
     # ── Optional interaction information in streaming output mode ──
     interaction_sessions: dict[str, InteractionSession] = field(default_factory=dict)  # Modality -> transition progress
-    conditioning: dict[str, torch.Tensor] = field(default_factory=dict)  # Modality -> conditioning tensor
     interaction_chunk_metadata: InteractionChunkMetadata | None = None  # Acknowledging completion of each interaction
 
     # ── Per-request scheduler instance (set once by prepare_encode) ──
