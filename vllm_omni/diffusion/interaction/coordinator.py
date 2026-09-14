@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.interaction.registry import STRUCTURED_HANDLER_REGISTRY
@@ -12,6 +11,7 @@ from vllm_omni.diffusion.interaction.types import (
     InteractionChunkMetadata,
     InteractionPayload,
     merge_interaction_metadata,
+    synchronized_monotonic_time,
 )
 from vllm_omni.diffusion.models.interface import SupportsInteractionApply, supports_interaction_apply
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -101,6 +101,9 @@ class InteractionCoordinator:
         if not parts:
             raise ValueError("interaction event requires prompt and/or multi_modal_data")
 
+        # Reconcile rank-local samples so USP/SP shards share one arrival time.
+        received_at = synchronized_monotonic_time(received_at)
+
         for modality, _payload in parts:
             self.get_handler(modality)  # Resolve handlers. Happy path expects no ValueError
         for modality, payload in parts:
@@ -132,7 +135,7 @@ class InteractionCoordinator:
             num_frames = media.num_frames
             fps = media.fps
 
-        boundary_at = time.monotonic()
+        boundary_at = synchronized_monotonic_time()
         chunk_index = state.chunk_index
         metas: list[InteractionChunkMetadata] = []
         for handler in self._handlers_in_apply_order():

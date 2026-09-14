@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared types for midway interaction handlers."""
 
 from __future__ import annotations
 
+import math
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Literal
+
+import torch
 
 # Wire payload for one modality track. Handlers validate keys they need.
 InteractionPayload = Mapping[str, object]
@@ -15,6 +19,30 @@ InteractionPayload = Mapping[str, object]
 # Shared command semantics across modalities that support them.
 # Prompt specialization narrows this to ``"target"`` only.
 InteractionMode = Literal["target", "velocity"]
+
+
+def synchronized_monotonic_time(stamp: float | None = None) -> float:
+    """Return a monotonic timestamp shared across DiT ranks.
+
+    ``submit_interaction`` and chunk-boundary apply run as collectives, but
+    ``time.monotonic()`` is rank-local. Under USP/SP, inter-rank skew that
+    straddles a ``1/fps`` bucket edge would schedule the same event onto
+    different frames per shard. Rank 0's stamp is broadcast (callers may pass
+    a local sample; non-source ranks' values are ignored).
+    """
+    if stamp is None:
+        stamp = time.monotonic()
+    if not torch.distributed.is_initialized():
+        return stamp
+    try:
+        from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+        group = get_world_group()
+    except Exception:
+        return stamp
+    if group.world_size <= 1:
+        return stamp
+    return group.broadcast_object(stamp, src=0)
 
 
 @dataclass(frozen=True)
@@ -81,8 +109,6 @@ def resolve_event_frame_offset(
     * Events without a prior boundary (or with non-positive fps) map to frame 0.
     * Offsets past the represented media window are clamped to the final frame.
     """
-    import math
-
     num_frames = max(int(num_frames), 1)
     if previous_boundary_at is None or fps <= 0:
         return 0
