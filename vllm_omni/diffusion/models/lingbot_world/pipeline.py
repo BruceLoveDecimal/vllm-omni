@@ -1477,21 +1477,23 @@ class LingBotWorldCausalDMDPipeline(
                     "LingBot camera interaction requires apply_interaction_at_chunk_boundary before prepare_next_chunk."
                 )
             absolute_poses = camera_session.last_absolute_poses
-            if int(absolute_poses.shape[0]) != block_frames:
+            media_frames = (block_frames - 1) * self.vae_scale_factor_temporal + 1
+            if int(absolute_poses.shape[0]) != media_frames:
                 raise ValueError(
-                    "camera interaction must produce exactly one pose per latent frame; "
-                    f"got {int(absolute_poses.shape[0])}, expected {block_frames}."
+                    "camera interaction must produce exactly one pose per media frame; "
+                    f"got {int(absolute_poses.shape[0])}, expected {media_frames}."
                 )
-            # Model-native digest: absolute C2W + reference-frame intrinsics, then
-            # the existing plucker path (which relativizes internally).
-            action_trajectory = camera_trajectory_from_absolute_pose(
+            # Model-native digest: absolute C2W on the media timeline, resample to
+            # latent frames, then the existing plucker path (which relativizes).
+            media_trajectory = camera_trajectory_from_absolute_pose(
                 absolute_poses, width=inputs.width, height=inputs.height
             )
+            action_trajectory = interpolate_camera_trajectory(media_trajectory, block_frames)
             chunk_inputs = replace(
                 inputs,
                 camera_trajectory=action_trajectory,
                 camera_actions=None,
-                num_frames=(block_frames - 1) * self.vae_scale_factor_temporal + 1,
+                num_frames=media_frames,
                 num_latent_frames=block_frames,
             )
             camera, camera_tail = self._prepare_camera(
@@ -1644,14 +1646,15 @@ class LingBotWorldCausalDMDPipeline(
         )
 
     def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
-        """Expose this chunk's latent-frame extent for camera interaction timelines."""
+        """Expose this chunk's decoded media extent for camera interaction timelines."""
         block_frames = int(state.extra.get("block_frames") or self.transformer.config.num_frames_per_block)
+        media_frames = (block_frames - 1) * self.vae_scale_factor_temporal + 1
         fps = state.sampling.fps
         if fps is None or float(fps) <= 0:
-            # Latent-frame camera controls are not wall-clock paced; a unit fps keeps
+            # Media-frame camera controls are not wall-clock paced; a unit fps keeps
             # resolve_event_frame_offset well-defined when the client omits sampling.fps.
-            fps = float(block_frames)
-        return ChunkMediaSpec(num_frames=int(block_frames), fps=float(fps))
+            fps = float(media_frames)
+        return ChunkMediaSpec(num_frames=int(media_frames), fps=float(fps))
 
     def prepare_next_chunk(self, state: StepRequestState) -> None:
         """Prepare the next AR block after chunk-boundary interaction apply."""

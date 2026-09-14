@@ -47,7 +47,13 @@ def synchronized_monotonic_time(stamp: float | None = None) -> float:
 
 @dataclass(frozen=True)
 class ChunkMediaSpec:
-    """Media extent of one generation chunk, for interaction timeline mapping."""
+    """Decoded media extent of one generation chunk for interaction timelines.
+
+    ``num_frames`` and ``fps`` are in *media* (pixel/audio) units, not latent
+    frames. ``duration_s`` is therefore the chunk's wall-clock media length.
+    Model-specific digests (e.g. latent pose counts) must adapt after the
+    media timeline is sampled.
+    """
 
     num_frames: int
     fps: float
