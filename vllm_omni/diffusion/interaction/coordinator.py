@@ -166,9 +166,8 @@ class InteractionCoordinator:
             chunk_index = state.chunk_index
         metas: list[InteractionChunkMetadata] = []
         for handler in self._handlers_in_apply_order():
-            if handler.modality not in state.interaction_sessions:
-                # This modality's interaction session is lazy-initialized and is not initialized yet.
-                # Skip handler.apply_at_chunk_boundary until the first enqueue creates the session.
+            if handler.lazy_initialize_session and handler.modality not in state.interaction_sessions:
+                # Lazy modalities skip apply until the first enqueue creates the session.
                 continue
             meta = handler.apply_at_chunk_boundary(
                 state,
