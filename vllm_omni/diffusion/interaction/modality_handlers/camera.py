@@ -158,7 +158,8 @@ class SE3DeltaCameraHandler(InteractionHandler):
         else:
             duration = 0
 
-        session = _get_camera_session(state)
+        session = state.interaction_sessions.setdefault("camera", CameraSession())
+        assert isinstance(session, CameraSession)
         with session.lock:
             session.pending_events.append(
                 QueuedCameraEvent(
@@ -183,7 +184,8 @@ class SE3DeltaCameraHandler(InteractionHandler):
         del chunk_index
         if num_frames is None or fps is None:
             raise ValueError("SE3DeltaCameraHandler requires chunk num_frames and fps")
-        session = _get_camera_session(state)
+        session = state.interaction_sessions.setdefault("camera", CameraSession())
+        assert isinstance(session, CameraSession)
         with session.lock:
             samples, started, active, completed = self._step_one_chunk(
                 session,
@@ -320,15 +322,6 @@ class SE3DeltaCameraHandler(InteractionHandler):
             deltas.append(torch.linalg.inv(prev) @ mat)
             prev = mat
         return torch.stack(deltas, dim=0)
-
-
-def _get_camera_session(state: StepRequestState) -> CameraSession:
-    session = state.interaction_sessions.get("camera")
-    if isinstance(session, CameraSession):
-        return session
-    session = CameraSession()
-    state.interaction_sessions["camera"] = session
-    return session
 
 
 def _as_xyz(value: object, *, name: str) -> Vec3:
