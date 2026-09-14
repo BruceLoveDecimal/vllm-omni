@@ -1457,6 +1457,16 @@ class LingBotWorldCausalDMDPipeline(
                 dtype=extra["dtype"],
                 previous=previous,
             )
+        elif extra.get("camera_embedding_cache") is not None:
+            # Prefer the full-trajectory cache (action_path / request-mode replay)
+            # over live interaction so stepwise serving does not silently drop
+            # a precomputed path when the camera modality is registered.
+            trajectory = extra["camera_trajectory_cache"]
+            camera = extra["camera_embedding_cache"][:, :, start_frame:stop_frame]
+            camera_tail = CameraTrajectory(
+                poses=trajectory.poses[stop_frame - 1 : stop_frame].clone(),
+                intrinsics=trajectory.intrinsics[stop_frame - 1 : stop_frame].clone(),
+            )
         elif self._interaction_coordinator is not None and self._interaction_coordinator.has_modality("camera"):
             # Poses come from the latest boundary apply: ``prepare_encode`` for
             # chunk 0, the diffusion runner for later chunks. This method only
@@ -1489,15 +1499,6 @@ class LingBotWorldCausalDMDPipeline(
                 dtype=extra["dtype"],
                 previous=previous,
                 latent_aligned=True,
-            )
-        elif extra.get("camera_embedding_cache") is not None:
-            # Same slice request mode takes from its one full-trajectory
-            # embedding, so both paths condition a block identically.
-            trajectory = extra["camera_trajectory_cache"]
-            camera = extra["camera_embedding_cache"][:, :, start_frame:stop_frame]
-            camera_tail = CameraTrajectory(
-                poses=trajectory.poses[stop_frame - 1 : stop_frame].clone(),
-                intrinsics=trajectory.intrinsics[stop_frame - 1 : stop_frame].clone(),
             )
         else:
             raise RuntimeError("LingBot step execution is missing a camera trajectory or action script.")
