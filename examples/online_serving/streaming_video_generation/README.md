@@ -76,7 +76,7 @@ python streaming_video_client.py \
 Schedule midway camera updates with `--camera-updates` when the served model
 registers the camera modality (e.g., LingBot World 2).
 It accepts `["camera"]["data"]["translation"/"rotation"]` in the endpoint's required SE3 format.
-If also accepts `["action"]` and offers to convert keystrokes to the SE3 format.
+It also accepts `["actions"]` at the update level and converts keystrokes to the SE3 format.
 
 ```bash
 python streaming_video_client.py \
