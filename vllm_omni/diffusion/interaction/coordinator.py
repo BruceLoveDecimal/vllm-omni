@@ -93,10 +93,10 @@ class InteractionCoordinator:
         received_at: float,
         transition_chunks: int | None,
     ) -> None:
-        """Ensure every modality is supported, then enqueue all parts.
+        """Ensure every modality is supported and every payload validates, then enqueue.
 
         Composite events must not partially mutate queues when a later track is
-        unsupported.
+        unsupported or carries an invalid payload.
         """
         if not parts:
             raise ValueError("interaction event requires prompt and/or multi_modal_data")
@@ -104,9 +104,16 @@ class InteractionCoordinator:
         # Reconcile rank-local samples so USP/SP shards share one arrival time.
         received_at = synchronized_monotonic_time(received_at)
 
-        for modality, _payload in parts:
-            self.get_handler(modality)  # Resolve handlers. Happy path expects no ValueError
-        for modality, payload in parts:
+        handlers = [(self.get_handler(modality), payload) for modality, payload in parts]
+        for handler, payload in handlers:
+            handler.validate_payload(
+                state,
+                event_id=event_id,
+                payload=payload,
+                transition_chunks=transition_chunks,
+            )
+        for (modality, payload), (handler, _) in zip(parts, handlers, strict=True):
+            del handler
             self.enqueue(
                 state,
                 modality=modality,

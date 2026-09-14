@@ -125,12 +125,11 @@ class SE3DeltaCameraHandler(InteractionHandler):
         return cls()
 
     @override
-    def enqueue(
+    def validate_payload(
         self,
         state: StepRequestState,
         *,
         event_id: str,
-        received_at: float,
         payload: InteractionPayload,
         transition_chunks: int | None,
     ) -> None:
@@ -140,7 +139,6 @@ class SE3DeltaCameraHandler(InteractionHandler):
         mode = payload.get("mode", "target")
         if mode not in ("target", "velocity"):
             raise ValueError("camera mode must be 'target' or 'velocity'")
-        camera_mode = cast(InteractionMode, mode)
         data = payload.get("data")
         if not isinstance(data, Mapping):
             raise ValueError("camera data must be an object")
@@ -149,12 +147,35 @@ class SE3DeltaCameraHandler(InteractionHandler):
                 "camera data.actions (WASD keys) is not accepted by the engine; "
                 "send structural translation/rotation instead"
             )
-
-        pose = _parse_pose(data)
-        if camera_mode == "target":
+        _parse_pose(data)
+        if mode == "target":
             duration = self.default_transition_chunks if transition_chunks is None else int(transition_chunks)
             if duration < 0:
                 raise ValueError("transition_chunks must be >= 0")
+        del state
+
+    @override
+    def enqueue(
+        self,
+        state: StepRequestState,
+        *,
+        event_id: str,
+        received_at: float,
+        payload: InteractionPayload,
+        transition_chunks: int | None,
+    ) -> None:
+        self.validate_payload(
+            state,
+            event_id=event_id,
+            payload=payload,
+            transition_chunks=transition_chunks,
+        )
+        mode = payload.get("mode", "target")
+        camera_mode = cast(InteractionMode, mode)
+        data = cast(Mapping[str, object], payload.get("data"))
+        pose = _parse_pose(data)
+        if camera_mode == "target":
+            duration = self.default_transition_chunks if transition_chunks is None else int(transition_chunks)
         else:
             duration = 0
 

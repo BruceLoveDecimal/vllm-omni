@@ -177,6 +177,33 @@ class TestCoordinatorResolution:
         assert pending.prompt == "already-queued"
         assert "camera" not in state.interaction_sessions
 
+        # Invalid camera payload must also fail before any track is queued.
+        dual = InteractionCoordinator(
+            {
+                "prompt": coordinator.get_handler("prompt"),
+                "camera": SE3DeltaCameraHandler(),
+            },
+            model_class_name="HeliosPipeline",
+        )
+        pipeline.encode_prompt.reset_mock()
+        with pytest.raises(ValueError, match="actions"):
+            dual.enqueue_parts(
+                state,
+                parts=[
+                    ("prompt", {"prompt": "should-not-replace"}),
+                    ("camera", {"mode": "velocity", "data": {"actions": ["w"]}}),
+                ],
+                event_id="composite-bad-payload",
+                received_at=2.0,
+                transition_chunks=2,
+            )
+        pipeline.encode_prompt.assert_not_called()
+        pending = prior_session.pending_event
+        assert pending is not None
+        assert pending.event_id == "prior"
+        assert pending.prompt == "already-queued"
+        assert "camera" not in state.interaction_sessions
+
 
 class TestCameraHandlers:
     def test_rejects_wasd_actions_payload(self) -> None:

@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar, Self
+from typing import ClassVar
+
+from typing_extensions import Self
 
 from vllm_omni.diffusion.interaction.types import (
     InteractionChunkMetadata,
@@ -41,6 +43,21 @@ class InteractionHandler(ABC):
         """
         del pipeline
         return cls()
+
+    @abstractmethod
+    def validate_payload(
+        self,
+        state: StepRequestState,
+        *,
+        event_id: str,
+        payload: InteractionPayload,
+        transition_chunks: int | None,
+    ) -> None:
+        """Validate a modality payload without mutating request state.
+
+        Used by ``InteractionCoordinator.enqueue_parts`` so composite events
+        fail before any track is queued.
+        """
 
     @abstractmethod
     def enqueue(
