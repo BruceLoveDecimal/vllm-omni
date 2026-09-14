@@ -266,41 +266,46 @@ class TestCameraHandlers:
 
     def test_single_chunk_target_completes_once(self) -> None:
         handler = SE3DeltaCameraHandler()
-        state = _make_state()
-        handler.enqueue(
-            state,
-            event_id="cam-fast",
-            received_at=0.0,
-            payload={
-                "mode": "target",
-                "data": {"translation": [1.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0]},
-            },
-            transition_chunks=1,
-        )
+        # Include a non-power-of-two frame count (7) so float reciprocal drift
+        # would previously miss the final snap / completion ack.
+        for num_frames in (8, 7):
+            state = _make_state()
+            handler.enqueue(
+                state,
+                event_id="cam-fast",
+                received_at=0.0,
+                payload={
+                    "mode": "target",
+                    "data": {"translation": [1.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0]},
+                },
+                transition_chunks=1,
+            )
+            meta = handler.apply_at_chunk_boundary(
+                state,
+                chunk_index=0,
+                num_frames=num_frames,
+                fps=16.0,
+                boundary_at=0.5,
+            )
+            assert meta is not None
+            assert meta.started_event_ids == ["cam-fast"]
+            assert meta.active_event_ids == []
+            assert meta.completed_event_ids == ["cam-fast"]
 
-        meta = handler.apply_at_chunk_boundary(
-            state,
-            chunk_index=0,
-            num_frames=8,
-            fps=16.0,
-            boundary_at=0.5,
-        )
-        assert meta is not None
-        assert meta.started_event_ids == ["cam-fast"]
-        assert meta.active_event_ids == []
-        assert meta.completed_event_ids == ["cam-fast"]
-
-        meta2 = handler.apply_at_chunk_boundary(
-            state,
-            chunk_index=1,
-            num_frames=8,
-            fps=16.0,
-            boundary_at=1.0,
-        )
-        assert meta2 is not None
-        assert meta2.started_event_ids == []
-        assert meta2.active_event_ids == []
-        assert meta2.completed_event_ids == []
+            meta2 = handler.apply_at_chunk_boundary(
+                state,
+                chunk_index=1,
+                num_frames=num_frames,
+                fps=16.0,
+                boundary_at=1.0,
+            )
+            assert meta2 is not None
+            assert meta2.started_event_ids == []
+            assert meta2.active_event_ids == []
+            assert meta2.completed_event_ids == []
+            session = state.interaction_sessions["camera"]
+            assert isinstance(session, CameraSession)
+            assert session.current_pose.translation[0] == pytest.approx(1.0)
 
     def test_velocity_composes_structural_se3_delta(self) -> None:
         handler = SE3DeltaCameraHandler()

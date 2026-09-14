@@ -82,6 +82,8 @@ class QueuedCameraEvent(InteractionEvent):
 
     # Absolute pose for ``target``; per-frame SE3 delta for ``velocity``.
     pose: CameraPose = field(default_factory=CameraPose.identity)
+    # Integer frame progress for ``target`` lerps (avoids float reciprocal drift).
+    elapsed_transition_frames: int = 0
 
 
 @dataclass
@@ -290,6 +292,7 @@ class SE3DeltaCameraHandler(InteractionHandler):
             cancelled_id = session.active_event.event_id
 
         event.elapsed_transition_chunks = 0.0
+        event.elapsed_transition_frames = 0
         session.active_event = event
         if event.mode == "target":
             session.target_source = session.current_pose.clone()
@@ -320,10 +323,12 @@ class SE3DeltaCameraHandler(InteractionHandler):
             if duration <= 0:
                 return self._clear_active_target(session)
 
-            event.elapsed_transition_chunks += 1.0 / float(total_num_frames_this_chunk)
-            alpha = min(1.0, event.elapsed_transition_chunks / float(duration))
+            total_frames = max(1, int(round(duration * float(total_num_frames_this_chunk))))
+            event.elapsed_transition_frames += 1
+            event.elapsed_transition_chunks = event.elapsed_transition_frames / float(total_num_frames_this_chunk)
+            alpha = min(1.0, event.elapsed_transition_frames / float(total_frames))
             session.current_pose = _lerp_pose(source, target, alpha)
-            if event.elapsed_transition_chunks >= duration:
+            if event.elapsed_transition_frames >= total_frames:
                 return self._clear_active_target(session)
             return None
 
