@@ -71,10 +71,25 @@ def _looks_like_magi2(model_name: str) -> bool:
     )
 
 
+_SOLARWM_H3_MODEL_ID = "junchaoh-cs/SolarWM-H3-33B"
+_SOLARWM_H3_BASE_INDEX = "SolarWM-h3-33B-base/model_index.json"
+
+
+def _looks_like_solarwm_h3(model_name: str) -> bool:
+    """SolarWM-H3 repositories nest the Diffusers index under the base-model folder."""
+    if model_name == _SOLARWM_H3_MODEL_ID:
+        return True
+    return os.path.isfile(os.path.join(model_name, _SOLARWM_H3_BASE_INDEX))
+
+
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
 
-    return "Magi2Pipeline" if _looks_like_magi2(model_name) else None
+    if _looks_like_magi2(model_name):
+        return "Magi2Pipeline"
+    if _looks_like_solarwm_h3(model_name):
+        return "SolarWMH3Pipeline"
+    return None
 
 
 def _looks_like_dreamzero(model_name: str) -> bool:

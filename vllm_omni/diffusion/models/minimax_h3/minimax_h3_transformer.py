@@ -833,6 +833,10 @@ class MiniMaxH3TokenRefiner(nn.Module):
 
 
 class MiniMaxH3DiTBlock(nn.Module):
+    # Derived models (SolarWM-H3) swap in an attention subclass that keeps the
+    # same parameters and checkpoint names but adds a windowed forward.
+    _attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention
+
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -845,7 +849,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         # The prefix also carries the block index that block-sparse attention
         # backends match against their skip_layers selector.
-        self.attn = MiniMaxH3Attention(
+        self.attn = self._attention_cls(
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
@@ -1027,6 +1031,8 @@ class MiniMaxH3DiTModel(nn.Module):
     )
     _repeated_blocks = ["MiniMaxH3DiTBlock"]
     _layerwise_offload_blocks_attrs = ["blocks"]
+    # Derived models replace the block class without re-declaring the model.
+    _block_cls: type[MiniMaxH3DiTBlock] = MiniMaxH3DiTBlock
 
     @staticmethod
     def _is_transformer_block(name: str, module: nn.Module) -> bool:
@@ -1172,7 +1178,7 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         self.blocks = nn.ModuleList(
             [
-                MiniMaxH3DiTBlock(
+                self._block_cls(
                     arch,
                     quant_config,
                     prefix=f"blocks.{i}",

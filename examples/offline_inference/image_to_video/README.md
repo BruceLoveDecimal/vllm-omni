@@ -348,6 +348,33 @@ Key arguments:
 
 > ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
 
+### SolarWM-H3 (camera-controlled world model)
+
+SolarWM-H3 is the Stage-2 causal student of MiniMax-H3. It generates a
+768x1344 video from a first frame, a caption and one absolute camera-to-world
+pose per output frame. Point `--model` at the SolarWM-H3-33B repository root
+(the folder holding `SolarWM-h3-33B-base/` and `SolarWM-h3-33B-sgf-stage2-158f/`)
+and pass the trajectory through `--extra-body`; `camera_c2w` accepts a nested
+list or a path to a `.npy` / `.npz` (key `c2w`) / `.json` file with shape
+`[num_frames, 4, 4]`. Intrinsics are fixed by the checkpoint and not read.
+
+```bash
+python image_to_video.py \
+  --model /path/to/SolarWM-H3-33B \
+  --image first_frame.png \
+  --prompt "A slow dolly forward through a sunlit forest path." \
+  --num-frames 158 --fps 24 --seed 42 \
+  --extra-body '{"camera_c2w": "/path/to/camera_c2w.npy"}' \
+  --output solarwm_h3.mp4
+```
+
+The 33B DiT and the 50-layer Qwen3-VL encoder do not fit together on one
+96 GiB GPU. Add `--diffusion-offload-config '{"mode": "layer", "components": ["text_encoder"]}'`
+(or the equivalent `Omni(...)` argument) to stream the encoder from pinned host
+memory; the six-chunk KV window also lives in pinned host memory by default
+(`"kv_cache_on_device": true` in `--extra-body` keeps it on the GPU when there
+is room). See [`recipes/SolarWM/SolarWM-H3-RTX-PRO-6000.md`](../../../recipes/SolarWM/SolarWM-H3-RTX-PRO-6000.md).
+
 ## Wan2.1 VACE Conditional Tasks
 
 The shared script selects the VACE conditioning structure from the media inputs.

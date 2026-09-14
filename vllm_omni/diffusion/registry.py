@@ -116,6 +116,11 @@ _DIFFUSION_MODELS = {
         "pipeline_minimax_h3",
         "MiniMaxH3Pipeline",
     ),
+    "SolarWMH3Pipeline": (
+        "solarwm_h3",
+        "pipeline_solarwm_h3",
+        "SolarWMH3Pipeline",
+    ),
     "AuKPipeline": (
         "auk",
         "pipeline_auk",
@@ -572,6 +577,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
+    "SolarWMH3Pipeline": "get_solarwm_h3_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",

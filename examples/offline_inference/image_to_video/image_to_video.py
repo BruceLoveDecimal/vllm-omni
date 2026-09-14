@@ -238,6 +238,16 @@ def parse_args() -> argparse.Namespace:
         help="Enable distributed layerwise offloading with overlapped host-to-device weight streaming.",
     )
     parser.add_argument(
+        "--diffusion-offload-config",
+        type=functools.partial(parse_json_object, flag_name="--diffusion-offload-config"),
+        default=None,
+        help=(
+            "Compact offload policy as a JSON object, e.g. "
+            '\'{"mode": "layer", "components": ["text_encoder"]}\'. '
+            "See docs/user_guide/diffusion/cpu_offload.md."
+        ),
+    )
+    parser.add_argument(
         "--dlo-use-allgather",
         dest="dlo_use_allgather",
         action="store_true",
@@ -583,6 +593,7 @@ def main():
         diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
         diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
         enable_cpu_offload=args.enable_cpu_offload,
+        diffusion_offload_config=args.diffusion_offload_config,
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,

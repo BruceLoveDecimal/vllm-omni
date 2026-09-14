@@ -80,6 +80,10 @@ from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.solarwm_h3 import (
+    SOLARWM_H3_EXTRA_BODY_PARAMS,
+    get_solarwm_h3_video_generation_defaults,
+)
 from vllm_omni.model_extras.vace import (
     VACE_EXTRA_BODY_PARAMS,
     VACE_EXTRA_OUTPUT_PARAMS,
@@ -255,6 +259,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "init_extra_args_for_non_diffusion_stages": HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
         "ar_input_builder": build_hunyuan_image3_ar_stage_inputs,
         "ar_tokenizer_validator": validate_hunyuan_image3_ar_tokenizer,
+    },
+    "SolarWMH3Pipeline": {
+        "extra_body_params": SOLARWM_H3_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_solarwm_h3_video_generation_defaults,
     },
     "SanaVideoPipeline": {
         "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
