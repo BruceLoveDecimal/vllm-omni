@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """WebSocket handler for streaming generated video chunks.
 
 Protocol:
@@ -388,26 +388,12 @@ class OmniStreamingVideoOutputHandler:
             )
             return
         if has_mm:
+            assert isinstance(multi_modal_data, dict)
             for modality, payload in multi_modal_data.items():
                 if not isinstance(payload, dict):
                     await self._send_error(
                         websocket,
                         f"session.interaction multi_modal_data[{modality!r}] must be an object",
-                        send_lock=send_lock,
-                    )
-                    return
-                mode = payload.get("mode", "target")
-                if mode not in ("target", "velocity"):
-                    await self._send_error(
-                        websocket,
-                        f"session.interaction multi_modal_data[{modality!r}].mode must be 'target' or 'velocity'",
-                        send_lock=send_lock,
-                    )
-                    return
-                if "data" not in payload or not isinstance(payload.get("data"), dict):
-                    await self._send_error(
-                        websocket,
-                        f"session.interaction multi_modal_data[{modality!r}].data must be an object",
                         send_lock=send_lock,
                     )
                     return
@@ -614,8 +600,11 @@ class OmniStreamingVideoOutputHandler:
     @staticmethod
     async def _decode_image_reference(request: VideoGenerationRequest) -> Image.Image | None:
         try:
+            image_reference = request.image_reference
+            if isinstance(image_reference, list):
+                raise InvalidInputReferenceError("image_reference must be a single image reference.")
             media_data = await decode_input_reference(
-                request.image_reference,
+                image_reference,
                 None,
                 None,
             )
