@@ -344,6 +344,12 @@ def camera_trajectory_from_absolute_pose(
     width: int,
     height: int,
 ) -> CameraTrajectory:
+    if width <= 0 or height <= 0:
+        raise ValueError("camera action resolution must be positive.")
+    if poses.ndim != 3 or poses.shape[-2:] != (4, 4):
+        raise ValueError(f"absolute camera poses must have shape [frames, 4, 4], got {tuple(poses.shape)}.")
+    if poses.shape[0] == 0:
+        raise ValueError("absolute camera poses must not be empty.")
     # build_plucker_embedding expects intrinsics in the 832x480 reference
     # coordinate system. These values become SGLang's [500, 500, W/2, H/2]
     # after that function scales them to the requested resolution.
