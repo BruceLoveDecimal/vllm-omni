@@ -38,7 +38,7 @@ class AuKCUDAGraphWrapper:
     reuse one graph.
     """
 
-    def __init__(self, dit: AuKTransformer, *, enabled: bool = True, max_graphs: int = 32) -> None:
+    def __init__(self, dit: AuKTransformer, *, enabled: bool = True, max_graphs: int = 64) -> None:
         self.dit = dit
         self.enabled = bool(enabled)
         self.max_graphs = max(1, int(max_graphs))
