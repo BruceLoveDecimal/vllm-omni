@@ -519,6 +519,11 @@ class TestRequestParsing:
         assert pipeline_auk._pack_dit_groups(rows, branches=2) == [[3], [1, 0], [2]]
         # Without CFG all three short rows fit behind the 740-position one.
         assert pipeline_auk._pack_dit_groups(rows, branches=1) == [[3], [1, 0, 2]]
+        # Capacity is a power of two: 3072 // (2 * 298) = 5 rows would be padded
+        # to eight by the graph wrapper, so eight equal rows go as 4 + 4.
+        equal = [parsed(0, 250, 48) for _ in range(8)]
+        assert pipeline_auk._pack_dit_groups(equal, branches=2) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+        assert pipeline_auk._pack_dit_groups(equal, branches=1) == [list(range(8))]
 
     def test_pre_process_keys_requests_on_the_schedule_knobs(self):
         pre_process = pipeline_auk.get_auk_pre_process_func(None)

@@ -571,21 +571,24 @@ def _pack_dit_groups(parsed: list[_ParsedRequest], *, branches: int = 1) -> list
     """Split the batch into DiT forwards that stay within the position budget.
 
     Requests are ordered longest first, so each group is padded to its first
-    member; a group grows while ``rows * longest * branches`` fits the budget,
-    ``branches`` being 2 under classifier-free guidance (the DiT runs the cond
-    and uncond rows as one batch). A single request always forms a group of
-    its own, however long it is. Returned indices refer to ``parsed``.
+    member, which fixes the group's capacity: the largest power of two whose
+    ``rows * longest * branches`` fits the budget, ``branches`` being 2 under
+    classifier-free guidance (the DiT runs the cond and uncond rows as one
+    batch). Powers of two because the CUDA graph wrapper pads the batch up to
+    one anyway: five rows would run as eight. A single request always forms a
+    group of its own, however long it is. Returned indices refer to
+    ``parsed``.
     """
 
     order = sorted(range(len(parsed)), key=lambda i: (-_row_positions(parsed[i]), i))
     groups: list[list[int]] = []
+    capacity = 0
     for i in order:
-        if groups:
-            group = groups[-1]
-            longest = _row_positions(parsed[group[0]]) * branches
-            if (len(group) + 1) * longest <= _DIT_BATCH_POSITION_BUDGET:
-                group.append(i)
-                continue
+        if groups and len(groups[-1]) < capacity:
+            groups[-1].append(i)
+            continue
+        rows = _DIT_BATCH_POSITION_BUDGET // max(1, _row_positions(parsed[i]) * branches)
+        capacity = 1 << max(0, rows.bit_length() - 1)
         groups.append([i])
     return groups
 
