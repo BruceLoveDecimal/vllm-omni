@@ -318,9 +318,10 @@ class TestRequestParsing:
     def test_text_only_request_without_a_duration_is_rejected(self, build_pipeline):
         pipeline, calls = build_pipeline()
 
-        with pytest.raises(ValueError, match="gen_seconds"):
-            pipeline.forward(_batch(_prompt(knobs={"gen_seconds": None}), seed=1))
+        outputs = pipeline.forward(_batch(_prompt(knobs={"gen_seconds": None}), seed=1))
+
         assert calls == []
+        assert outputs[0].output is None and "gen_seconds" in outputs[0].error
 
     def test_text_only_request_gets_an_empty_reference(self, build_pipeline):
         pipeline, calls = build_pipeline()
@@ -350,8 +351,9 @@ class TestRequestParsing:
         prompt = _prompt(knobs={"gen_seconds": 1.0})
         del prompt["prompt_embeds"]
 
-        with pytest.raises(ValueError, match="prompt_embeds"):
-            pipeline.forward(_batch(prompt, seed=1))
+        outputs = pipeline.forward(_batch(prompt, seed=1))
+
+        assert outputs[0].output is None and "prompt_embeds" in outputs[0].error
 
     def test_base_variant_uses_the_requested_schedule(self, build_pipeline):
         pipeline, calls = build_pipeline()
