@@ -17,6 +17,10 @@ from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer
 logger = init_logger(__name__)
 
 
+def _next_power_of_2(n: int) -> int:
+    return 1 << max(0, n - 1).bit_length()
+
+
 @dataclass
 class _GraphEntry:
     graph: torch.cuda.CUDAGraph
@@ -34,10 +38,14 @@ class _GraphEntry:
 class AuKCUDAGraphWrapper:
     """Replay one DiT denoise step and leave Euler scheduling to the caller.
 
-    The graph is keyed by the target, text and reference sequence lengths plus
-    whether the CFG branch is enabled. Timestep and the CFG strength are
-    mutable scalar buffers, so all Euler steps and CFG values within one path
-    reuse one graph.
+    The graph is keyed by the bucketed batch size, the target, text and
+    reference sequence lengths, plus whether the CFG branch is enabled.
+    Timestep and the CFG strength are mutable scalar buffers, so all Euler
+    steps and CFG values within one path reuse one graph.
+
+    Batch rows are independent requests; each row's real length is carried by
+    the padding masks, so a batch of mixed-length requests shares the graph of
+    its longest member.
     """
 
     _TARGET_ALIGNMENT = 64
@@ -59,18 +67,33 @@ class AuKCUDAGraphWrapper:
         c_mask: torch.Tensor,
         ref: torch.Tensor,
         ref_mask: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pad every axis to its bucket: batch to a power of two, lengths to fixed steps.
+
+        Padded batch rows keep their first target frame and text token valid so
+        no attention row is fully masked; their output is discarded.
+        """
+        batch = x.shape[0]
+        batch_bucket = _next_power_of_2(batch)
         target_bucket = round_up(x.shape[1], cls._TARGET_ALIGNMENT)
         text_bucket = round_up(text.shape[1], cls._TEXT_ALIGNMENT)
         ref_bucket = round_up(ref.shape[1], cls._REF_ALIGNMENT)
-        x_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+        if x_mask is None:
+            x_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+        pad_rows = batch_bucket - batch
+        x_mask = F.pad(x_mask, (0, target_bucket - x_mask.shape[1], 0, pad_rows), value=False)
+        c_mask = F.pad(c_mask, (0, text_bucket - c_mask.shape[1], 0, pad_rows), value=False)
+        if pad_rows:
+            x_mask[batch:, 0] = True
+            c_mask[batch:, 0] = True
         return (
-            F.pad(x, (0, 0, 0, target_bucket - x.shape[1])),
-            F.pad(x_mask, (0, target_bucket - x_mask.shape[1]), value=False),
-            F.pad(text, (0, 0, 0, text_bucket - text.shape[1])),
-            F.pad(c_mask, (0, text_bucket - c_mask.shape[1]), value=False),
-            F.pad(ref, (0, 0, 0, ref_bucket - ref.shape[1])),
-            F.pad(ref_mask, (0, ref_bucket - ref_mask.shape[1]), value=False),
+            F.pad(x, (0, 0, 0, target_bucket - x.shape[1], 0, pad_rows)),
+            x_mask,
+            F.pad(text, (0, 0, 0, text_bucket - text.shape[1], 0, pad_rows)),
+            c_mask,
+            F.pad(ref, (0, 0, 0, ref_bucket - ref.shape[1], 0, pad_rows)),
+            F.pad(ref_mask, (0, ref_bucket - ref_mask.shape[1], 0, pad_rows), value=False),
         )
 
     @staticmethod
@@ -79,8 +102,8 @@ class AuKCUDAGraphWrapper:
         text: torch.Tensor,
         ref: torch.Tensor,
         uses_cfg: bool,
-    ) -> tuple[int, int, int, bool]:
-        return (x.shape[1], text.shape[1], ref.shape[1], uses_cfg)
+    ) -> tuple[int, int, int, int, bool]:
+        return (x.shape[0], x.shape[1], text.shape[1], ref.shape[1], uses_cfg)
 
     @torch.no_grad()
     def __call__(
@@ -93,17 +116,17 @@ class AuKCUDAGraphWrapper:
         ref_mask: torch.Tensor,
         timestep: torch.Tensor,
         cfg_strength: float,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        inputs = (x, text, c_mask, ref, ref_mask, timestep)
         uses_cfg = cfg_strength >= 1e-5
         cfg_strength = torch.tensor(cfg_strength, device=x.device, dtype=torch.float32)
         if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
             if uses_cfg:
-                return self._run_cfg(x, None, text, c_mask, ref, ref_mask, timestep, cfg_strength=cfg_strength)
-            return self._run(x, None, text, c_mask, ref, ref_mask, timestep)
+                return self._run_cfg(x, mask, text, c_mask, ref, ref_mask, timestep, cfg_strength=cfg_strength)
+            return self._run(x, mask, text, c_mask, ref, ref_mask, timestep)
 
-        target_frames = x.shape[1]
-        x, x_mask, text, c_mask, ref, ref_mask = self._bucket_inputs(x, text, c_mask, ref, ref_mask)
+        batch, target_frames = x.shape[:2]
+        x, x_mask, text, c_mask, ref, ref_mask = self._bucket_inputs(x, text, c_mask, ref, ref_mask, mask)
         inputs = (x, x_mask, text, c_mask, ref, ref_mask, timestep)
         key = self._key(x, text, ref, uses_cfg)
         entry = self._cache.get(key)
@@ -125,7 +148,7 @@ class AuKCUDAGraphWrapper:
         if entry.static_cfg is not None:
             entry.static_cfg.copy_(cfg_strength)
         entry.graph.replay()
-        return entry.static_out[:, :target_frames].clone()
+        return entry.static_out[:batch, :target_frames].clone()
 
     def _run(
         self,
@@ -202,7 +225,8 @@ class AuKCUDAGraphWrapper:
             self.dit.clear_cache()
 
         logger.info(
-            "Captured AuK DiT single-step CUDA graph: target_frames=%d text_tokens=%d ref_frames=%d cfg=%s",
+            "Captured AuK DiT single-step CUDA graph: batch=%d target_frames=%d text_tokens=%d ref_frames=%d cfg=%s",
+            inputs[0].shape[0],
             inputs[0].shape[1],
             inputs[2].shape[1],
             inputs[4].shape[1],

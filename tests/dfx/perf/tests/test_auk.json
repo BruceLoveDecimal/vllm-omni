@@ -1,0 +1,206 @@
+[
+  {
+    "test_name": "test_auk_flash",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 1
+        }
+      },
+      "local_model",
+      "tts"
+    ],
+    "server_params": {
+      "model": "ckpts/auk-omni-flash",
+      "trust_remote_code": true,
+      "extra_cli_args": [
+        "--trust-remote-code"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "task": "voice_clone",
+        "eval_phase": "latency",
+        "dataset_name": "seed-tts",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "num_prompts": [
+          20
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "duration_seconds": 5.0,
+          "voice": "default",
+          "task_type": "Base",
+          "seed": 7
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {}
+      },
+      {
+        "task": "voice_clone",
+        "eval_phase": "throughput",
+        "dataset_name": "seed-tts",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "num_prompts": [
+          64,
+          64
+        ],
+        "max_concurrency": [
+          4,
+          8
+        ],
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "duration_seconds": 5.0,
+          "voice": "default",
+          "task_type": "Base",
+          "seed": 7
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {}
+      },
+      {
+        "task": "default_voice",
+        "eval_phase": "latency",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "num_prompts": [
+          20
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "duration_seconds": 5.0,
+          "voice": "default",
+          "task_type": "CustomVoice",
+          "seed": 7
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {}
+      },
+      {
+        "task": "default_voice",
+        "eval_phase": "throughput",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "num_prompts": [
+          64,
+          64
+        ],
+        "max_concurrency": [
+          4,
+          8
+        ],
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "duration_seconds": 5.0,
+          "voice": "default",
+          "task_type": "CustomVoice",
+          "seed": 7
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {}
+      }
+    ]
+  },
+  {
+    "test_name": "test_auk_flash_serial",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 1
+        }
+      },
+      "local_model",
+      "tts"
+    ],
+    "server_params": {
+      "model": "ckpts/auk-omni-flash",
+      "trust_remote_code": true,
+      "extra_cli_args": [
+        "--trust-remote-code"
+      ],
+      "stage_overrides": {
+        "0": {
+          "max_num_seqs": 1
+        },
+        "1": {
+          "max_num_seqs": 1
+        }
+      }
+    },
+    "benchmark_params": [
+      {
+        "task": "voice_clone",
+        "eval_phase": "throughput",
+        "dataset_name": "seed-tts",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "num_prompts": [
+          64
+        ],
+        "max_concurrency": [
+          8
+        ],
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "duration_seconds": 5.0,
+          "voice": "default",
+          "task_type": "Base",
+          "seed": 7
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {}
+      },
+      {
+        "task": "default_voice",
+        "eval_phase": "throughput",
+        "dataset_name": "seed-tts-text",
+        "backend": "openai-audio-speech",
+        "endpoint": "/v1/audio/speech",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "num_prompts": [
+          64
+        ],
+        "max_concurrency": [
+          8
+        ],
+        "seed_tts_locale": "en",
+        "extra_body": {
+          "duration_seconds": 5.0,
+          "voice": "default",
+          "task_type": "CustomVoice",
+          "seed": 7
+        },
+        "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+        "baseline": {}
+      }
+    ]
+  }
+]

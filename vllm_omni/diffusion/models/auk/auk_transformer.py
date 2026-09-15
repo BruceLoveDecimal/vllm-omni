@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-__all__ = ["AuKTransformer", "build_time_grid", "dit_state_dict", "sample_latents"]
+__all__ = ["AuKTransformer", "build_time_grid", "dit_state_dict", "integrate_latents", "sample_latents"]
 
 
 def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -619,10 +619,11 @@ def sample_latents(
     dtype: torch.dtype | None = None,
     sampler: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Integrate the flow from noise to audio latents with explicit Euler steps.
+    """Draw the initial noise for one request and integrate it to audio latents.
 
-    Single-request only: the batch dimension carries the CFG branches, not
-    separate prompts, so no target padding mask is needed.
+    Single-request convenience over :func:`integrate_latents`: the batch
+    dimension is 1, so no target padding mask is needed. Pipelines that batch
+    several requests draw their own noise and call :func:`integrate_latents`.
 
     Args:
         dit: The velocity model.
@@ -669,17 +670,80 @@ def sample_latents(
             .unsqueeze(0)
         )
 
+    return integrate_latents(
+        dit,
+        x=x,
+        mask=None,
+        text=text,
+        c_mask=c_mask,
+        ref=ref,
+        ref_mask=ref_mask,
+        nfe=nfe,
+        cfg_strength=cfg_strength,
+        sway_sampling_coef=sway_sampling_coef,
+        t_grid=t_grid,
+        sampler=sampler,
+    )
+
+
+@torch.no_grad()
+def integrate_latents(
+    dit: AuKTransformer,
+    *,
+    x: torch.Tensor,
+    mask: torch.Tensor | None,
+    text: torch.Tensor,
+    c_mask: torch.Tensor | None,
+    ref: torch.Tensor,
+    ref_mask: torch.Tensor | None,
+    nfe: int = 32,
+    cfg_strength: float = 1.0,
+    sway_sampling_coef: float | None = None,
+    t_grid: list[float] | None = None,
+    sampler: Callable[..., torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Integrate a batch of noised targets from ``t=0`` to ``t=1`` with Euler steps.
+
+    Every row of the batch is an independent request sharing one schedule:
+    the rows may differ in target, text and reference length, which the
+    padding masks express, but ``nfe``, ``cfg_strength`` and the time grid are
+    batch-wide. Under CFG the velocity model doubles the batch internally.
+
+    Args:
+        dit: The velocity model.
+        x: Initial latents ``[B, n, latent_dim]`` at ``t=0``; padded rows
+            beyond each request's own length are ignored via ``mask``.
+        mask: Target padding mask ``[B, n]``, ``True`` where valid, or
+            ``None`` when no row is padded.
+        text: Pre-encoded text hidden states ``[B, nt, text_hidden_dim]``.
+        c_mask: Text padding mask ``[B, nt]``.
+        ref: Reference prompt latents ``[B, np, latent_dim]``; ``np == 0``
+            means no request in the batch carries a reference.
+        ref_mask: Reference padding mask ``[B, np]``.
+        nfe: Euler steps, ignored when ``t_grid`` is given.
+        cfg_strength: Classifier-free guidance weight. Below ``1e-5`` the
+            uncond branch is skipped entirely.
+        sway_sampling_coef: Reshapes the uniform time grid towards ``t=0``.
+        t_grid: Explicit timesteps, overriding ``nfe`` and the sway reshape.
+        sampler: Optional single-step velocity callable (the CUDA graph
+            wrapper). When given it replaces the eager DiT call per step.
+
+    Returns:
+        The latents at ``t=1``, ``[B, n, latent_dim]``; padded positions hold
+        unspecified values and must be sliced away by the caller.
+    """
     t = build_time_grid(
         nfe=nfe,
         sway_sampling_coef=sway_sampling_coef,
         t_grid=t_grid,
-        device=device,
+        device=x.device,
     )
     if sampler is not None:
         try:
             for i in range(t.shape[0] - 1):
                 velocity = sampler(
                     x=x,
+                    mask=mask,
                     text=text,
                     c_mask=c_mask,
                     ref=ref,
@@ -691,9 +755,10 @@ def sample_latents(
         finally:
             dit.clear_cache()
         return x
-    return _sample_latents(
+    return _integrate_eager(
         dit,
         initial_latents=x,
+        mask=mask,
         text=text,
         c_mask=c_mask,
         ref=ref,
@@ -703,10 +768,11 @@ def sample_latents(
     )
 
 
-def _sample_latents(
+def _integrate_eager(
     dit: AuKTransformer,
     *,
     initial_latents: torch.Tensor,
+    mask: torch.Tensor | None,
     text: torch.Tensor,
     c_mask: torch.Tensor | None,
     ref: torch.Tensor,
@@ -714,7 +780,7 @@ def _sample_latents(
     timesteps: torch.Tensor,
     cfg_strength: float,
 ) -> torch.Tensor:
-    """Euler integration shared by eager sampling and CUDA graph capture."""
+    """Euler integration through the eager DiT."""
     x = initial_latents
     guided = cfg_strength >= 1e-5
     try:
@@ -724,6 +790,7 @@ def _sample_latents(
                     x,
                     text,
                     timesteps[i],
+                    mask=mask,
                     c_mask=c_mask,
                     ref=ref,
                     ref_mask=ref_mask,
@@ -733,7 +800,7 @@ def _sample_latents(
                 v_cond, v_uncond = pred.chunk(2, dim=0)
                 v = v_cond + (v_cond - v_uncond) * cfg_strength
             else:
-                v = dit(x, text, timesteps[i], c_mask=c_mask, ref=ref, ref_mask=ref_mask)
+                v = dit(x, text, timesteps[i], mask=mask, c_mask=c_mask, ref=ref, ref_mask=ref_mask)
             x = x + (timesteps[i + 1] - timesteps[i]) * v
     finally:
         # The cached text projections belong to this request only; a failed

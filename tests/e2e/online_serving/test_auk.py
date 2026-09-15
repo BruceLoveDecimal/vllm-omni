@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -83,3 +84,61 @@ def test_auk_speech_api_request(omni_server, reference, stream) -> None:
         return int(np.asarray(waveform).reshape(-1).shape[0])
 
     assert generate(2.0) == 100 * 480
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(
+                model=MODEL or ".",
+                stage_config_path=get_deploy_config_path("auk.yaml"),
+                server_args=["--trust-remote-code", "--disable-log-stats"],
+            ),
+            id="auk",
+        )
+    ],
+    indirect=True,
+)
+def test_auk_concurrent_requests_are_batched_per_request(omni_server) -> None:
+    """Mixed-length concurrent requests come back with their own lengths and seeds.
+
+    The diffusion stage pads concurrent requests into one DiT batch; each
+    request must still get exactly ``ceil(duration * 50)`` latent frames of
+    audio and a waveform that depends on its own seed, not its neighbours'.
+    """
+
+    def generate(duration: float, seed: int) -> np.ndarray:
+        response = requests.post(
+            f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech",
+            json={
+                "model": omni_server.model,
+                "input": "",
+                "instructions": (
+                    'Generate speech based on the following description: "A clear, natural voice.". '
+                    'The content to speak is: "Concurrent AuK requests are batched together.".'
+                ),
+                "voice": "default",
+                "duration_seconds": duration,
+                "seed": seed,
+                "response_format": "wav",
+            },
+            timeout=300,
+        )
+        assert response.status_code == 200, response.text
+        waveform, sample_rate = sf.read(io.BytesIO(response.content), dtype="float32")
+        assert sample_rate == 24_000
+        waveform = np.asarray(waveform).reshape(-1)
+        assert np.isfinite(waveform).all()
+        return waveform
+
+    jobs = [(1.0, 7), (2.5, 8), (1.0, 9), (3.0, 7), (2.5, 8), (1.5, 10)]
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        waveforms = list(pool.map(lambda job: generate(*job), jobs))
+
+    for (duration, _), waveform in zip(jobs, waveforms):
+        assert waveform.shape[0] == int(np.ceil(duration * 50)) * 480
+        assert np.max(np.abs(waveform)) > 0
+    # Same duration, different seeds: the rows of one batch are not copies of each other.
+    assert not np.allclose(waveforms[0], waveforms[2])

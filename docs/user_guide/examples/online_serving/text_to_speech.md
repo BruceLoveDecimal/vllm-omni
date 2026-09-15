@@ -115,6 +115,8 @@ For compatibility with clients that can only send `input`, AuK treats an input-o
 
 `extra_params` accepts `num_inference_steps`, `guidance_scale`, `sway`, `t_grid`, and `vae_sample`; `seed` is a top-level field.
 
+Concurrent requests are batched: the diffusion stage runs up to `max_num_seqs` requests (8 in `vllm_omni/deploy/auk.yaml`) as rows of one padded DiT forward, so the per-step cost is shared instead of serialised. Only requests with the same schedule share a batch (`num_inference_steps`, `guidance_scale`, `sway`, `t_grid`, `vae_sample`; AuK-Flash pins all of them), and each request keeps its own `seed`. Raise `max_num_seqs` on both stages for higher concurrency; `request_batch_max_wait_ms` (10 ms by default) lets an idle engine hold the first request briefly to collect a burst.
+
 ```bash
 python examples/online_serving/text_to_speech/auk/speech_client.py \
     --model ckpts/auk-omni \
