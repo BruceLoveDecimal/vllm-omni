@@ -16,9 +16,11 @@ models:
       default_voice:
         duration_seconds: 5.0
         voice: default
+        task_type: CustomVoice
       voice_clone:
         duration_seconds: 5.0
         voice: default
+        task_type: Base
   tencent/AuK-Flash: *auk
 
   IndexTeam/IndexTTS-2.5:

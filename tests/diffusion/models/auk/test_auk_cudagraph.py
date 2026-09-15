@@ -8,6 +8,8 @@ import torch
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, sample_latents
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _make_dit(device: str) -> AuKTransformer:
     torch.manual_seed(12)
@@ -53,11 +55,17 @@ def _assert_graph_matches_eager(
     eager = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7))
     graph = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
     torch.testing.assert_close(graph, eager, atol=3e-6, rtol=3e-5)
+    bucketed = wrapper._bucket_inputs(
+        torch.empty(1, gen_frames, dit.latent_dim, device="cuda"),
+        inputs["text"],
+        inputs["c_mask"],
+        inputs["ref"],
+        inputs["ref_mask"],
+    )
+    assert wrapper._key(bucketed[0], bucketed[2], bucketed[4], False) in wrapper._cache
     return inputs
 
 
-@pytest.mark.core_model
-@pytest.mark.cpu
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
 def test_single_request_graph_wrapper_cpu_falls_back_to_eager(cfg_strength: float, mocker) -> None:
@@ -88,6 +96,69 @@ def test_single_request_graph_wrapper_cpu_falls_back_to_eager(cfg_strength: floa
     assert not wrapper._cache
 
 
+def test_graph_inputs_use_bounded_length_buckets() -> None:
+    wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"))
+    x = torch.ones(1, 65, 4)
+    text = torch.ones(1, 65, 8)
+    c_mask = torch.ones(1, 65, dtype=torch.bool)
+    ref = torch.ones(1, 51, 4)
+    ref_mask = torch.ones(1, 51, dtype=torch.bool)
+
+    padded = wrapper._bucket_inputs(x, text, c_mask, ref, ref_mask)
+
+    assert padded[0].shape == (1, 128, 4)
+    assert padded[1].shape == (1, 128)
+    assert padded[2].shape == (1, 128, 8)
+    assert padded[3].shape == (1, 128)
+    assert padded[4].shape == (1, 100, 4)
+    assert padded[5].shape == (1, 100)
+    assert [mask.sum().item() for mask in (padded[1], padded[3], padded[5])] == [65, 65, 51]
+    assert wrapper._key(padded[0], padded[2], padded[4], False) == (128, 128, 100, False)
+    assert wrapper.max_graphs == 32
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
+def test_bucket_padding_preserves_real_frame_outputs(cfg_strength: float) -> None:
+    dit = _make_dit("cpu")
+    wrapper = AuKCUDAGraphWrapper(dit)
+    inputs = _sample_inputs("cpu")
+    x = torch.randn(1, 9, 4)
+    timestep = torch.tensor(0.4)
+    cfg = torch.tensor(cfg_strength)
+    if cfg_strength >= 1e-5:
+        eager = wrapper._run_cfg(
+            x,
+            None,
+            inputs["text"],
+            inputs["c_mask"],
+            inputs["ref"],
+            inputs["ref_mask"],
+            timestep,
+            cfg_strength=cfg,
+        )
+    else:
+        eager = wrapper._run(
+            x,
+            None,
+            inputs["text"],
+            inputs["c_mask"],
+            inputs["ref"],
+            inputs["ref_mask"],
+            timestep,
+        )
+    dit.clear_cache()
+
+    bucketed = wrapper._bucket_inputs(x, inputs["text"], inputs["c_mask"], inputs["ref"], inputs["ref_mask"])
+    if cfg_strength >= 1e-5:
+        padded = wrapper._run_cfg(*bucketed, timestep, cfg_strength=cfg)
+    else:
+        padded = wrapper._run(*bucketed, timestep)
+    dit.clear_cache()
+
+    torch.testing.assert_close(padded[:, : x.shape[1]], eager)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
@@ -107,14 +178,22 @@ def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_streng
         graph = sample_latents(dit, **common, generator=torch.Generator(device="cuda").manual_seed(7), sampler=wrapper)
         torch.testing.assert_close(graph, eager, atol=3e-6, rtol=3e-5)
 
-        key = wrapper._key(torch.empty(1, 9, 4, device="cuda"), inputs["text"], inputs["ref"], cfg_strength >= 1e-5)
+        bucketed = wrapper._bucket_inputs(
+            torch.empty(1, 9, 4, device="cuda"),
+            inputs["text"],
+            inputs["c_mask"],
+            inputs["ref"],
+            inputs["ref_mask"],
+        )
+        key = wrapper._key(bucketed[0], bucketed[2], bucketed[4], cfg_strength >= 1e-5)
         assert key in wrapper._cache
 
         entry = wrapper._cache[key]
-        torch.testing.assert_close(entry.static_text, inputs["text"])
-        torch.testing.assert_close(entry.static_c_mask, inputs["c_mask"])
-        torch.testing.assert_close(entry.static_ref, inputs["ref"])
-        torch.testing.assert_close(entry.static_ref_mask, inputs["ref_mask"])
+        torch.testing.assert_close(entry.static_x_mask, bucketed[1])
+        torch.testing.assert_close(entry.static_text, bucketed[2])
+        torch.testing.assert_close(entry.static_c_mask, bucketed[3])
+        torch.testing.assert_close(entry.static_ref, bucketed[4])
+        torch.testing.assert_close(entry.static_ref_mask, bucketed[5])
         torch.testing.assert_close(entry.static_timestep, torch.tensor(0.4, device="cuda"))
 
     assert len(wrapper._cache) == 1
@@ -126,69 +205,43 @@ def test_graph_lru_eviction_keeps_retained_entries_replayable() -> None:
     dit = _make_dit("cuda")
     wrapper = AuKCUDAGraphWrapper(dit, max_graphs=2)
 
-    inputs_a = _assert_graph_matches_eager(dit, wrapper, gen_frames=9)
-    key_a = wrapper._key(torch.empty(1, 9, 4, device="cuda"), inputs_a["text"], inputs_a["ref"], False)
-    assert key_a in wrapper._cache
-
-    inputs_b = _assert_graph_matches_eager(dit, wrapper, gen_frames=10)
-    key_b = wrapper._key(torch.empty(1, 10, 4, device="cuda"), inputs_b["text"], inputs_b["ref"], False)
-    assert key_b in wrapper._cache
-
-    inputs_c = _assert_graph_matches_eager(dit, wrapper, gen_frames=11)
-    key_c = wrapper._key(torch.empty(1, 11, 4, device="cuda"), inputs_c["text"], inputs_c["ref"], False)
+    inputs = _sample_inputs("cuda")
+    keys = []
+    for gen_frames in (64, 65, 129):
+        _assert_graph_matches_eager(dit, wrapper, gen_frames=gen_frames)
+        bucketed = wrapper._bucket_inputs(
+            torch.empty(1, gen_frames, 4, device="cuda"),
+            inputs["text"],
+            inputs["c_mask"],
+            inputs["ref"],
+            inputs["ref_mask"],
+        )
+        keys.append(wrapper._key(bucketed[0], bucketed[2], bucketed[4], False))
+    key_a, key_b, key_c = keys
 
     assert key_a not in wrapper._cache
     assert set(wrapper._cache) == {key_b, key_c}
+    assert wrapper._pool_handle is not None
 
-    _assert_graph_matches_eager(dit, wrapper, gen_frames=10)
-    _assert_graph_matches_eager(dit, wrapper, gen_frames=11)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
-@torch.inference_mode()
-def test_graph_capture_failure_keeps_existing_entries_replayable(mocker) -> None:
-    dit = _make_dit("cuda")
-    wrapper = AuKCUDAGraphWrapper(dit, max_graphs=2)
-
-    inputs_a = _assert_graph_matches_eager(dit, wrapper, gen_frames=9)
-    key_a = wrapper._key(torch.empty(1, 9, 4, device="cuda"), inputs_a["text"], inputs_a["ref"], False)
-    assert key_a in wrapper._cache
-
-    original_capture = wrapper._capture
-
-    def fail_shape_b(*inputs: torch.Tensor, **kwargs):
-        if inputs[0].shape[1] == 10:
-            return None
-        return original_capture(*inputs, **kwargs)
-
-    mocker.patch.object(wrapper, "_capture", side_effect=fail_shape_b)
-
-    inputs_b = _assert_graph_matches_eager(dit, wrapper, gen_frames=10)
-    key_b = wrapper._key(torch.empty(1, 10, 4, device="cuda"), inputs_b["text"], inputs_b["ref"], False)
-
-    assert key_b in wrapper._failed_keys
-    assert key_b not in wrapper._cache
-    assert key_a in wrapper._cache
-
-    _assert_graph_matches_eager(dit, wrapper, gen_frames=9)
+    _assert_graph_matches_eager(dit, wrapper, gen_frames=65)
+    _assert_graph_matches_eager(dit, wrapper, gen_frames=129)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
-def test_failed_graph_key_does_not_retry_capture(mocker) -> None:
+def test_graph_capture_failure_is_propagated(mocker) -> None:
     dit = _make_dit("cuda")
     wrapper = AuKCUDAGraphWrapper(dit)
-    attempts = 0
+    mocker.patch.object(wrapper, "_capture", side_effect=RuntimeError("capture failed"))
+    inputs = _sample_inputs("cuda")
 
-    def fail_capture(*_inputs: torch.Tensor, **_kwargs) -> None:
-        nonlocal attempts
-        attempts += 1
-        return None
-
-    mocker.patch.object(wrapper, "_capture", side_effect=fail_capture)
-
-    _assert_graph_matches_eager(dit, wrapper, gen_frames=10)
-    _assert_graph_matches_eager(dit, wrapper, gen_frames=10)
-
-    assert attempts == 1
-    assert len(wrapper._failed_keys) == 1
+    with pytest.raises(RuntimeError, match="capture failed"):
+        sample_latents(
+            dit,
+            **inputs,
+            gen_frames=9,
+            t_grid=[0.0, 0.4, 1.0],
+            cfg_strength=0.0,
+            generator=torch.Generator(device="cuda").manual_seed(7),
+            sampler=wrapper,
+        )

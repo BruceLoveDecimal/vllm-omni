@@ -86,14 +86,17 @@ class Rotary(nn.Module):
         exponents = torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim
         return 1.0 / (self.base**exponents)
 
-    def forward(self, seq_len: int) -> torch.Tensor:
-        """Return frequencies ``[1, 1, seq_len, dim]`` for positions ``0..seq_len-1``."""
+    def forward(self, seq_len: int, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Return rotary frequencies, compressing positions across padding."""
         inv_freq = self.inv_freq
         if inv_freq.dtype != torch.float32:
             inv_freq = self._frequencies(inv_freq.device)
-        pos = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)
-        freqs = torch.outer(pos, inv_freq)
-        return torch.stack((freqs, freqs), dim=-1).flatten(-2)[None, None]
+        if mask is None:
+            pos = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)[None]
+        else:
+            pos = (mask.to(torch.int32).cumsum(dim=1) - 1).clamp_min(0).to(torch.float32)
+        freqs = pos.unsqueeze(-1) * inv_freq
+        return torch.stack((freqs, freqs), dim=-1).flatten(-2).unsqueeze(1)
 
 
 class TimeEmbedding(nn.Module):
@@ -541,15 +544,15 @@ class AuKTransformer(nn.Module):
 
         seq_len = x.shape[1]
         text_len = c.shape[1]
-        rope_audio = self.rotary_embed(seq_len)
-        rope_text = self.rotary_embed(text_len)
+        rope_audio = self.rotary_embed(seq_len, audio_mask)
+        rope_text = self.rotary_embed(text_len, c_mask)
 
         for block in self.transformer_blocks:
             c, x = block(x, c, t, mask=audio_mask, rope=rope_audio, c_rope=rope_text, c_mask=c_mask)
 
         x = torch.cat([c, x], dim=1)
-        rope = self.rotary_embed(text_len + seq_len)
         single_mask = None if audio_mask is None else torch.cat([c_mask, audio_mask], dim=1)
+        rope = self.rotary_embed(text_len + seq_len, single_mask)
 
         for block in self.single_transformer_blocks:
             x = block(x, t, mask=single_mask, rope=rope)

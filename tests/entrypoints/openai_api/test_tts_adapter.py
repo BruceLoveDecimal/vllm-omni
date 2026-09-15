@@ -157,6 +157,81 @@ def test_auk_source_length_default_and_complete_instruction(auk_adapter):
     auk_adapter.ctx.server._resolve_ref_audio.assert_awaited_once_with("reference.wav")
 
 
+@pytest.mark.parametrize(
+    ("task_type", "expected_instruction"),
+    [
+        ("CustomVoice", "Say the following: 'target text'"),
+        ("Base", "Say the following with the same voice: 'target text'"),
+    ],
+)
+def test_auk_task_type_normalizes_benchmark_text(auk_adapter, task_type, expected_instruction, mocker):
+    warning_once = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning_once")
+    request = OpenAICreateSpeechRequest(
+        input="target text",
+        task_type=task_type,
+        duration_seconds=2,
+        ref_audio="reference.wav" if task_type == "Base" else None,
+    )
+
+    server = SimpleNamespace(
+        _validate_speech_sample_rate=lambda _request: None,
+        _get_tts_adapter=lambda: auk_adapter,
+    )
+    assert OmniOpenAIServingSpeech._validate_tts_request(server, request) is None
+
+    assert request.input == ""
+    assert request.instructions == expected_instruction
+    warning_once.assert_called_once()
+    assert "prefer a complete `instructions` prompt" in warning_once.call_args.args[0]
+
+
+def test_auk_task_type_preserves_explicit_instructions(auk_adapter, mocker):
+    warning_once = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning_once")
+    warning = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning")
+    request = OpenAICreateSpeechRequest(
+        input="target text",
+        task_type="Base",
+        instructions="Use this complete AuK instruction.",
+        duration_seconds=2,
+    )
+
+    server = SimpleNamespace(
+        _validate_speech_sample_rate=lambda _request: None,
+        _get_tts_adapter=lambda: auk_adapter,
+    )
+    assert OmniOpenAIServingSpeech._validate_tts_request(server, request) is None
+
+    assert request.input == ""
+    assert request.instructions == "Use this complete AuK instruction."
+    warning_once.assert_called_once()
+    warning.assert_called_once()
+    assert "without applying another task template" in warning.call_args.args[0]
+
+
+def test_auk_task_type_does_not_double_wrap_preformatted_input(auk_adapter, mocker):
+    warning_once = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning_once")
+    warning = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.auk.logger.warning")
+    instruction = "Say the following with the same voice: 'target text'"
+    request = OpenAICreateSpeechRequest(
+        input=instruction,
+        task_type="Base",
+        duration_seconds=2,
+        ref_audio="reference.wav",
+    )
+    server = SimpleNamespace(
+        _validate_speech_sample_rate=lambda _request: None,
+        _get_tts_adapter=lambda: auk_adapter,
+    )
+
+    assert OmniOpenAIServingSpeech._validate_tts_request(server, request) is None
+
+    assert request.input == ""
+    assert request.instructions == instruction
+    warning_once.assert_called_once()
+    warning.assert_called_once()
+    assert "already contains a complete task instruction" in warning.call_args.args[0]
+
+
 def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter):
     """Exercise one request from the Speech adapter through stage-1 admission."""
 
