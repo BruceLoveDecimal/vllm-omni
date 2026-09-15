@@ -63,14 +63,17 @@ def model():
     return model
 
 
-def _observation(seed: int, num_live_cameras: int):
+def _observation(seed: int, num_live_cameras: int, batch_size: int = 1):
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    images = [torch.rand(1, 3, 224, 224, device="cuda", generator=gen) * 2 - 1 for _ in range(3)]
-    masks = [torch.tensor([i < num_live_cameras], device="cuda") for i in range(3)]
-    lang = torch.randint(0, 1000, (1, 200), device="cuda", generator=gen)
-    lang_mask = torch.zeros(1, 200, dtype=torch.bool, device="cuda")
-    lang_mask[:, : 40 + seed] = True
-    noise = torch.randn(1, 4, 8, device="cuda", generator=gen)
+    images = [
+        torch.rand(batch_size, 3, 224, 224, device="cuda", generator=gen) * 2 - 1 for _ in range(3)
+    ]
+    camera_counts = (torch.arange(batch_size, device="cuda") + num_live_cameras - 1) % 3 + 1
+    masks = [i < camera_counts for i in range(3)]
+    lang = torch.randint(0, 1000, (batch_size, 200), device="cuda", generator=gen)
+    prompt_lengths = 40 + seed + torch.arange(batch_size, device="cuda")
+    lang_mask = torch.arange(200, device="cuda")[None, :] < prompt_lengths[:, None]
+    noise = torch.randn(batch_size, 4, 8, device="cuda", generator=gen)
     return dict(images=images, image_masks=masks, lang_tokens=lang, lang_masks=lang_mask, noise=noise, num_steps=3)
 
 
@@ -108,6 +111,46 @@ def test_denoise_step_rejects_a_foreign_kv_cache(model):
         timestep = torch.ones(1, device="cuda")
         with pytest.raises(RuntimeError, match="encode_prefix"):
             runner.denoise_step(prefix_pad_masks, past_key_values, inputs["noise"], timestep)
+
+
+def test_cuda_graph_replays_multiple_batch_sizes_without_recapture(model):
+    observations = {
+        bsize: [_observation(10 + bsize, 1, bsize), _observation(20 + bsize, 3, bsize)]
+        for bsize in (1, 2, 3)
+    }
+    with torch.inference_mode():
+        eager = {bsize: [model.sample_actions(**obs) for obs in cases] for bsize, cases in observations.items()}
+
+        runner = Pi05CudaGraphRunner(model)
+        # Exercise pre-capture for two non-adjacent sizes and lazy capture for
+        # the remaining one when the interleaved replay sequence reaches it.
+        runner.capture(batch_size=1)
+        runner.capture(batch_size=3)
+        model.cuda_graph_runner = runner
+        try:
+            replay_order = [(3, 0), (1, 0), (2, 0), (1, 1), (3, 1), (2, 1)]
+            first = {(bsize, case): model.sample_actions(**observations[bsize][case]) for bsize, case in replay_order}
+            graph_ids = {
+                bsize: (id(runner._prefix[bsize].graph), id(runner._denoise[bsize].graph)) for bsize in (1, 2, 3)
+            }
+
+            # Replay new inputs in a different order. A stale static buffer or
+            # a graph lookup keyed incorrectly by batch size breaks equality.
+            second_order = [(2, 1), (3, 0), (1, 1), (2, 0), (1, 0), (3, 1)]
+            second = {
+                (bsize, case): model.sample_actions(**observations[bsize][case]) for bsize, case in second_order
+            }
+        finally:
+            model.cuda_graph_runner = None
+
+    assert set(runner._prefix) == {1, 2, 3}
+    assert set(runner._denoise) == {1, 2, 3}
+    assert graph_ids == {
+        bsize: (id(runner._prefix[bsize].graph), id(runner._denoise[bsize].graph)) for bsize in (1, 2, 3)
+    }
+    for results in (first, second):
+        for (bsize, case), replayed in results.items():
+            assert torch.equal(eager[bsize][case], replayed)
 
 
 def test_torch_compile_tracks_eager_and_captures(model):
