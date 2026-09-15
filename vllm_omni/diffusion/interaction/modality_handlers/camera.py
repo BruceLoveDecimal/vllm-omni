@@ -338,12 +338,16 @@ class SE3DeltaCameraHandler(InteractionHandler):
 def _as_xyz(value: object, *, name: str) -> Vec3:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 3:
         raise ValueError(f"camera {name} must be a length-3 list/tuple")
+    if any(math.isnan(v) or math.isinf(v) for v in value):
+        raise ValueError(f"camera {name} must be non-nan and non-inf")
     return (float(value[0]), float(value[1]), float(value[2]))
 
 
 def _as_quat(value: object, *, name: str) -> Quat:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 4:
         raise ValueError(f"camera {name} must be a length-4 list/tuple (x, y, z, w)")
+    if any(math.isnan(v) or math.isinf(v) for v in value):
+        raise ValueError(f"camera {name} must be non-nan and non-inf")
     return _quat_normalize((float(value[0]), float(value[1]), float(value[2]), float(value[3])))
 
 
