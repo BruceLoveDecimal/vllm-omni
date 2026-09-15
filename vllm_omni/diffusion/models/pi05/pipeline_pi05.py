@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
+from vllm_omni.diffusion.models.pi05.cuda_graph import Pi05CudaGraphRunner, serving_shaped_inputs
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
 from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
@@ -132,6 +133,10 @@ class Pi05Pipeline(nn.Module):
 
         custom_args = od_config.custom_pipeline_args or {}
         self.tokenizer_source = str(custom_args.get("tokenizer", self._resolve_tokenizer_source()))
+        # Both apply only when the stage is not ``enforce_eager`` (the runner
+        # calls ``setup_compile`` in that case). Documented in recipes/lerobot/Pi05.md.
+        self.use_cuda_graph = bool(custom_args.get("use_cuda_graph", True))
+        self.use_torch_compile = bool(custom_args.get("use_torch_compile", True))
 
         self._torch_dtype = self._resolve_dtype(od_config)
         self._device = self._resolve_device(od_config)
@@ -251,6 +256,40 @@ class Pi05Pipeline(nn.Module):
             model.load_weights(state.items())
         except Exception as exc:
             raise RuntimeError(f"Failed to load complete π0.5 checkpoint {path}: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # torch.compile + CUDA graph (runner calls this unless enforce_eager)
+    # ------------------------------------------------------------------
+    def setup_compile(self) -> None:
+        """Compile the per-layer compute and capture the two inference graphs.
+
+        torch.compile fuses the many small elementwise kernels around each
+        attention/MLP (RMSNorm, AdaRMS modulation, RoPE, gating); the CUDA
+        graphs remove the per-kernel launch cost that dominates the 50-token
+        denoising steps. Both are warmed up here so the first robot request does
+        not pay for compilation or capture.
+        """
+        if self._device.type != "cuda":
+            logger.warning("Pi05Pipeline: torch.compile/CUDA graphs need a CUDA device; running eagerly.")
+            return
+
+        if self.use_torch_compile:
+            self.model.paligemma_with_expert.enable_torch_compile(dynamic=False, fullgraph=True)
+            try:
+                self._warmup_compiled_layers()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Pi05Pipeline: torch.compile failed (%s); running the layers uncompiled.", exc)
+                self.model.paligemma_with_expert.disable_torch_compile()
+
+        if self.use_cuda_graph:
+            runner = Pi05CudaGraphRunner(self.model)
+            runner.capture(batch_size=1)
+            self.model.cuda_graph_runner = runner
+
+    def _warmup_compiled_layers(self) -> None:
+        """One pass at the serving shapes, no graphs; triggers the lazy compilation."""
+        with torch.inference_mode():
+            self.model.sample_actions(**serving_shaped_inputs(self.model, batch_size=1), num_steps=1)
 
     # ------------------------------------------------------------------
     # Framework weight-loading hook

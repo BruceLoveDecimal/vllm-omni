@@ -251,15 +251,18 @@ def _match(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
     return tensor.to(module.weight.dtype) if tensor.dtype != module.weight.dtype else tensor
 
 
-def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, position_ids, paligemma):
+def _compute_layer_prefix_only(layer, rotary_emb, hidden_states, attention_mask, position_ids):
     """Run one PaliGemma LM layer on the prefix, returning the layer output and
     the post-RoPE ``(k, v)`` for the suffix pass.
 
     Identical to π0: the prefix backbone is unchanged in π0.5 (no AdaRMS —
     there is no timestep in the prefix).
+
+    Takes the layer module rather than an index so that one ``torch.compile``
+    of this function serves every layer: Dynamo inlines the module and turns
+    its parameters into graph inputs, whereas an integer index would
+    specialize a separate graph per layer.
     """
-    model = paligemma.model.language_model
-    layer = model.layers[layer_idx]
     residual = hidden_states
     x = _match(layer.input_layernorm(hidden_states), layer.self_attn.q_proj)
 
@@ -268,7 +271,7 @@ def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, positio
     k = layer.self_attn.k_proj(x).view(hidden_shape).transpose(1, 2)
     v = layer.self_attn.v_proj(x).view(hidden_shape).transpose(1, 2)
 
-    cos, sin = model.rotary_emb(v, position_ids)
+    cos, sin = rotary_emb(v, position_ids)
     q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
 
     att = _attend(
@@ -289,12 +292,12 @@ def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, positio
 
 
 def _compute_layer_suffix_only(
-    layer_idx,
+    layer,
+    rotary_emb,
     hidden_states,
     prefix_kv,
     attention_mask,
     position_ids,
-    gemma_expert,
     adarms_cond,
 ):
     """Run one action-expert layer on the suffix with AdaRMS conditioning.
@@ -303,8 +306,6 @@ def _compute_layer_suffix_only(
     :class:`Pi05AdaRMSNorm` and each returns a gate that scales its sublayer's
     contribution to the residual stream.
     """
-    layer = gemma_expert.model.layers[layer_idx]
-
     residual = hidden_states
     x, gate = layer.input_layernorm(hidden_states, adarms_cond)
     x = _match(x, layer.self_attn.q_proj)
@@ -315,7 +316,7 @@ def _compute_layer_suffix_only(
     v_suf = layer.self_attn.v_proj(x).view(hidden_shape).transpose(1, 2)
 
     # RoPE frequencies are shared between PaliGemma and the expert.
-    cos, sin = gemma_expert.model.rotary_emb(v_suf, position_ids)
+    cos, sin = rotary_emb(v_suf, position_ids)
     q, k_suf = apply_rotary_pos_emb(q, k_suf, cos, sin, unsqueeze_dim=1)
 
     # Concatenate cached prefix K/V (possibly different dtype) with suffix K/V.
@@ -395,6 +396,25 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         self.adarms_cond_dim = action_expert_config.width
         self._install_adarms_norms(action_expert_config)
 
+        # Per-layer compute, held as plain attributes so ``enable_torch_compile``
+        # can swap in compiled versions without touching the module tree.
+        self.prefix_layer_fn = _compute_layer_prefix_only
+        self.suffix_layer_fn = _compute_layer_suffix_only
+
+    def enable_torch_compile(self, **compile_kwargs) -> None:
+        """Route both per-layer functions through ``torch.compile``.
+
+        Compilation itself is lazy; the first forward pays for it. One compiled
+        callable serves all layers of a backbone (see
+        :func:`_compute_layer_prefix_only`).
+        """
+        self.prefix_layer_fn = torch.compile(_compute_layer_prefix_only, **compile_kwargs)
+        self.suffix_layer_fn = torch.compile(_compute_layer_suffix_only, **compile_kwargs)
+
+    def disable_torch_compile(self) -> None:
+        self.prefix_layer_fn = _compute_layer_prefix_only
+        self.suffix_layer_fn = _compute_layer_suffix_only
+
     def _install_adarms_norms(self, action_expert_config) -> None:
         """Replace every action-expert RMSNorm with a conditioned AdaRMS norm."""
         expert = self.gemma_expert.model
@@ -445,20 +465,19 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         """Dispatch to prefix_only / suffix_only and return
         ``([prefix_out, suffix_out], past_key_values_or_None)``.
         """
-        num_layers = self.paligemma.config.text_config.num_hidden_layers
         pali_lm = self.paligemma.model.language_model
         expert_lm = self.gemma_expert.model
 
         if inputs_embeds[1] is None:
             hidden_states = inputs_embeds[0]
             kv_list: list[tuple[torch.Tensor, torch.Tensor]] = []
-            for layer_idx in range(num_layers):
-                hidden_states, kv = _compute_layer_prefix_only(
-                    layer_idx,
+            for layer in pali_lm.layers:
+                hidden_states, kv = self.prefix_layer_fn(
+                    layer,
+                    pali_lm.rotary_emb,
                     hidden_states,
                     attention_mask,
                     position_ids,
-                    paligemma=self.paligemma,
                 )
                 kv_list.append(kv)
             hidden_states = pali_lm.norm(hidden_states)
@@ -476,15 +495,15 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
                 f"got {type(past_key_values)}"
             )
         hidden_states = inputs_embeds[1]
-        for layer_idx in range(num_layers):
-            hidden_states = _compute_layer_suffix_only(
-                layer_idx,
+        for layer, prefix_kv in zip(expert_lm.layers, past_key_values):
+            hidden_states = self.suffix_layer_fn(
+                layer,
+                expert_lm.rotary_emb,
                 hidden_states,
-                past_key_values[layer_idx],
+                prefix_kv,
                 attention_mask,
                 position_ids,
-                gemma_expert=self.gemma_expert,
-                adarms_cond=adarms_cond,
+                adarms_cond,
             )
         hidden_states, _ = expert_lm.norm(hidden_states, adarms_cond)
         return [None, hidden_states], None
@@ -542,6 +561,10 @@ class Pi05ForActionPrediction(nn.Module):
         self.time_mlp_in = nn.Linear(self.expert_width, self.expert_width)
         self.time_mlp_out = nn.Linear(self.expert_width, self.expert_width)
 
+        # Optional CUDA-graph executor for ``encode_prefix`` / ``denoise_step``
+        # (see ``cuda_graph.Pi05CudaGraphRunner``). ``None`` runs eagerly.
+        self.cuda_graph_runner = None
+
     # ── Prefix embedding ─────────────────────────────────────────────
     def embed_prefix(
         self,
@@ -571,24 +594,22 @@ class Pi05ForActionPrediction(nn.Module):
 
         embs: list[torch.Tensor] = []
         pad_masks: list[torch.Tensor] = []
-        att_masks: list[int] = []
 
         for img, img_mask in zip(images, image_masks):
             img_emb = self.paligemma_with_expert.embed_image(img)
             bsize, num_img_embs = img_emb.shape[:2]
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-            att_masks += [0] * num_img_embs
 
         lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
-        att_masks += [0] * lang_emb.shape[1]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=embs.device)
-        att_masks = att_masks[None, :].expand(pad_masks.shape[0], -1)
+        # Fully bidirectional prefix: an all-zero AR mask. Built on-device (no
+        # host-side list → tensor copy) so the prefix pass is CUDA-graph capturable.
+        att_masks = torch.zeros(pad_masks.shape, dtype=torch.bool, device=embs.device)
 
         return embs, pad_masks, att_masks
 
@@ -634,11 +655,11 @@ class Pi05ForActionPrediction(nn.Module):
 
         bsize, action_len = action_emb.shape[:2]
         pad_masks = torch.ones(bsize, action_len, dtype=torch.bool, device=action_emb.device)
-        att_masks = torch.tensor(
-            [1] + [0] * (self.action_horizon - 1),
-            dtype=action_emb.dtype,
-            device=action_emb.device,
-        )[None, :].expand(bsize, -1)
+        # ``[1] + [0] * (horizon - 1)``, built on-device so the step is CUDA-graph
+        # capturable (a host-side list → tensor copy is not).
+        att_masks = torch.zeros(self.action_horizon, dtype=action_emb.dtype, device=action_emb.device)
+        att_masks[0] = 1
+        att_masks = att_masks[None, :].expand(bsize, -1)
         return action_emb, pad_masks, att_masks, time_cond
 
     # ── Denoising step ───────────────────────────────────────────────
@@ -683,6 +704,36 @@ class Pi05ForActionPrediction(nn.Module):
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         return self.action_out_proj(suffix_out)
 
+    # ── Prefix pass ──────────────────────────────────────────────────
+    def encode_prefix(
+        self,
+        images: list[torch.Tensor],
+        image_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Embed the prefix and run it through PaliGemma once per observation.
+
+        Returns the prefix padding mask and the per-layer ``(k, v)`` cache the
+        denoising steps attend to. This and :meth:`denoise_step` are the two
+        units the CUDA-graph runner replays.
+        """
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, image_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return prefix_pad_masks, past_key_values
+
     # ── Full action generation ───────────────────────────────────────
     @torch.no_grad()
     def sample_actions(
@@ -724,30 +775,20 @@ class Pi05ForActionPrediction(nn.Module):
                     generator=generator,
                 )
 
-        # 1. Prefix embeddings + mask building.
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, image_masks, lang_tokens, lang_masks
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
+        # The graph runner exposes the same two entry points as the model and
+        # replays captured graphs behind them.
+        executor = self if self.cuda_graph_runner is None else self.cuda_graph_runner
 
-        # 2. Forward prefix through PaliGemma LM, producing a list[(k, v)] cache.
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        # 1. Prefix: embeddings + one PaliGemma pass → list[(k, v)] cache.
+        prefix_pad_masks, past_key_values = executor.encode_prefix(images, image_masks, lang_tokens, lang_masks)
 
-        # 3. Euler-integrated denoising from t=1 down to t=0.
+        # 2. Euler-integrated denoising from t=1 down to t=0.
         dt = -1.0 / num_steps
         x_t = noise
         for step in range(num_steps):
             t = 1.0 + step * dt
             time_tensor = torch.full((bsize,), t, dtype=torch.float32, device=device)
-            v_t = self.denoise_step(
+            v_t = executor.denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=past_key_values,
                 x_t=x_t,

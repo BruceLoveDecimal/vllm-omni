@@ -850,6 +850,70 @@ def test_sample_actions_uses_request_generator(tiny_model):
     assert not torch.equal(first, different)
 
 
+class _RecordingExecutor:
+    """Stands in for ``Pi05CudaGraphRunner``: same two entry points, eager math."""
+
+    def __init__(self, model):
+        self.model = model
+        self.prefix_calls = 0
+        self.denoise_calls = 0
+
+    def encode_prefix(self, *args, **kwargs):
+        self.prefix_calls += 1
+        return self.model.encode_prefix(*args, **kwargs)
+
+    def denoise_step(self, *args, **kwargs):
+        self.denoise_calls += 1
+        return self.model.denoise_step(*args, **kwargs)
+
+
+@pytest.mark.slow
+def test_sample_actions_routes_through_the_installed_executor(tiny_model):
+    """The CUDA-graph runner plugs in behind ``encode_prefix`` / ``denoise_step``:
+    one prefix pass per observation, one denoise call per Euler step, and the
+    same chunk as the plain eager path."""
+    model = tiny_model.eval()
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
+    lang = torch.zeros(1, 200, dtype=torch.long)
+    lang_mask = torch.ones(1, 200, dtype=torch.bool)
+    noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(42))
+    kwargs = dict(images=images, image_masks=masks, lang_tokens=lang, lang_masks=lang_mask, noise=noise, num_steps=3)
+
+    executor = _RecordingExecutor(model)
+    with torch.no_grad():
+        eager = model.sample_actions(**kwargs)
+        model.cuda_graph_runner = executor
+        try:
+            routed = model.sample_actions(**kwargs)
+        finally:
+            model.cuda_graph_runner = None
+
+    assert executor.prefix_calls == 1
+    assert executor.denoise_calls == 3
+    assert torch.equal(eager, routed)
+
+
+@pytest.mark.slow
+def test_enable_torch_compile_swaps_only_the_layer_functions(tiny_model):
+    """``enable_torch_compile`` must not touch the module tree — the checkpoint
+    key layout and ``load_weights`` depend on it — and must be reversible."""
+    backbone = tiny_model.paligemma_with_expert
+    before = [name for name, _ in backbone.named_modules()]
+    eager_prefix_fn = backbone.prefix_layer_fn
+    eager_suffix_fn = backbone.suffix_layer_fn
+
+    backbone.enable_torch_compile(dynamic=False)
+    try:
+        assert backbone.prefix_layer_fn is not eager_prefix_fn
+        assert backbone.suffix_layer_fn is not eager_suffix_fn
+        assert [name for name, _ in backbone.named_modules()] == before
+    finally:
+        backbone.disable_torch_compile()
+    assert backbone.prefix_layer_fn is eager_prefix_fn
+    assert backbone.suffix_layer_fn is eager_suffix_fn
+
+
 # ----------------------------------------------------------------------------
 # Serving dtype
 # ----------------------------------------------------------------------------
