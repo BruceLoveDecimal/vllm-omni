@@ -657,8 +657,7 @@ class Pi05ForActionPrediction(nn.Module):
         pad_masks = torch.ones(bsize, action_len, dtype=torch.bool, device=action_emb.device)
         # ``[1] + [0] * (horizon - 1)``, built on-device so the step is CUDA-graph
         # capturable (a host-side list → tensor copy is not).
-        att_masks = torch.zeros(self.action_horizon, dtype=action_emb.dtype, device=action_emb.device)
-        att_masks[0] = 1
+        att_masks = torch.arange(self.action_horizon, device=action_emb.device) == 0
         att_masks = att_masks[None, :].expand(bsize, -1)
         return action_emb, pad_masks, att_masks, time_cond
 
