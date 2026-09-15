@@ -53,6 +53,15 @@ _FLASH_NFE = 4
 _FLASH_CFG = 0.0
 # Decorrelates the VAE posterior draw from the initial latent for the same request seed.
 _VAE_SEED_OFFSET = 0x5EED_0A0C
+# Cap on padded positions (rows times the longest row's reference + target
+# frames + text tokens) in one DiT forward. Measured on one GPU with the
+# per-step CUDA graph: rows of ~320 positions (5 s target, no reference) keep
+# getting cheaper per request up to eight rows, while rows of ~750 positions
+# (5 s target plus a 6 s reference) are compute-bound at one row and lose to
+# padding beyond two. The budget admits the first regime to large batches and
+# splits the second into small ones; the scheduler's batch size stays the
+# upper bound.
+_DIT_BATCH_POSITION_BUDGET = 2048
 
 
 def get_auk_post_process_func(od_config: OmniDiffusionConfig):
@@ -499,47 +508,94 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                     )
             nfe, cfg, sway, t_grid = first.schedule
 
-            text, c_mask = self._pad_rows([item.text for item in parsed], self.dtype)
-            ref, ref_mask = self._pad_rows([item.ref for item in parsed], torch.float32)
+            # Noise is drawn in request order so a request's initial latent
+            # does not depend on which rows it shares a forward with.
             noise = [self._draw_noise(item, torch.float32) for item in parsed]
-            x, x_mask = self._pad_rows(noise, torch.float32)
-            if req.num_reqs == 1:
-                # No padding inside a single-request batch; the graph wrapper
-                # buckets on its own.
-                x_mask = None
+            request_latents: list[torch.Tensor | None] = [None] * len(parsed)
+            for group in _pack_dit_groups(parsed):
+                text, c_mask = self._pad_rows([parsed[i].text for i in group], self.dtype)
+                ref, ref_mask = self._pad_rows([parsed[i].ref for i in group], torch.float32)
+                x, x_mask = self._pad_rows([noise[i] for i in group], torch.float32)
+                if len(group) == 1:
+                    # No padding inside a single-row forward; the graph
+                    # wrapper buckets on its own.
+                    x_mask = None
+                with self._dit_autocast():
+                    latents = integrate_latents(
+                        self.dit,
+                        x=x,
+                        mask=x_mask,
+                        text=text,
+                        c_mask=c_mask,
+                        ref=ref,
+                        ref_mask=ref_mask,
+                        nfe=nfe,
+                        cfg_strength=cfg,
+                        sway_sampling_coef=sway,
+                        t_grid=t_grid,
+                        sampler=self.cudagraph_wrapper,
+                    )
+                latents = latents.float()
+                for row, i in enumerate(group):
+                    request_latents[i] = latents[row : row + 1, : parsed[i].gen_frames]
 
-            with self._dit_autocast():
-                latents = integrate_latents(
-                    self.dit,
-                    x=x,
-                    mask=x_mask,
-                    text=text,
-                    c_mask=c_mask,
-                    ref=ref,
-                    ref_mask=ref_mask,
-                    nfe=nfe,
-                    cfg_strength=cfg,
-                    sway_sampling_coef=sway,
-                    t_grid=t_grid,
-                    sampler=self.cudagraph_wrapper,
-                )
-            latents = latents.float()
-
-            outputs: list[DiffusionOutput] = []
+            outputs: list[DiffusionOutput | None] = [None] * len(parsed)
             for i, item in enumerate(parsed):
-                request_latents = latents[i : i + 1, : item.gen_frames]
-                if not torch.isfinite(request_latents).all():
+                latent = request_latents[i]
+                assert latent is not None
+                if not torch.isfinite(latent).all():
                     raise RuntimeError("AuK generated latents contain NaN or Inf.")
                 if item.output_type == "latent":
-                    outputs.append(DiffusionOutput(output=request_latents.detach().cpu()))
-                    continue
-                wav = self.vae.decode(request_latents)
-                # One mono waveform per request; the formatter expects [T].
-                wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
-                if not torch.isfinite(wav).all():
-                    raise RuntimeError("AuK generated audio contains NaN or Inf.")
-                outputs.append(DiffusionOutput(output=wav))
-        return outputs
+                    outputs[i] = DiffusionOutput(output=latent.detach().cpu())
+
+            # The codec's convolutions are not causal, so only clips of equal
+            # length decode together: padding a shorter clip would change its
+            # last samples. Equal-length clips are exactly what a duration-
+            # driven workload produces, and one decode call for the group is
+            # markedly cheaper than one per request.
+            by_length: dict[int, list[int]] = {}
+            for i, item in enumerate(parsed):
+                if item.output_type != "latent":
+                    by_length.setdefault(item.gen_frames, []).append(i)
+            for members in by_length.values():
+                batch_latents = torch.cat([request_latents[i] for i in members], dim=0)  # type: ignore[misc]
+                wavs = self.vae.decode(batch_latents)
+                for row, i in enumerate(members):
+                    # One mono waveform per request; the formatter expects [T].
+                    wav = wavs[row].detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+                    if not torch.isfinite(wav).all():
+                        raise RuntimeError("AuK generated audio contains NaN or Inf.")
+                    outputs[i] = DiffusionOutput(output=wav)
+        assert all(output is not None for output in outputs)
+        return outputs  # type: ignore[return-value]
+
+
+def _row_positions(item: _ParsedRequest) -> int:
+    """Sequence positions one request occupies in the DiT: reference, target and text."""
+
+    return item.ref.shape[0] + item.gen_frames + item.text.shape[0]
+
+
+def _pack_dit_groups(parsed: list[_ParsedRequest]) -> list[list[int]]:
+    """Split the batch into DiT forwards that stay within the position budget.
+
+    Requests are ordered longest first, so each group is padded to its first
+    member; a group grows while ``rows * longest`` fits the budget. A single
+    request always forms a group of its own, however long it is. Returned
+    indices refer to ``parsed``.
+    """
+
+    order = sorted(range(len(parsed)), key=lambda i: (-_row_positions(parsed[i]), i))
+    groups: list[list[int]] = []
+    for i in order:
+        if groups:
+            group = groups[-1]
+            longest = _row_positions(parsed[group[0]])
+            if (len(group) + 1) * longest <= _DIT_BATCH_POSITION_BUDGET:
+                group.append(i)
+                continue
+        groups.append([i])
+    return groups
 
 
 def _read_config(model_dir: str) -> dict[str, Any]:

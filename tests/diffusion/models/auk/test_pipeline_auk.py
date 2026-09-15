@@ -155,7 +155,7 @@ class _StubVAE(nn.Module):
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         self.decode_calls += 1
-        return torch.zeros(1, latents.shape[1] * HOP, device=latents.device)
+        return torch.zeros(latents.shape[0], latents.shape[1] * HOP, device=latents.device)
 
 
 def _stub_sampler(calls: list[dict[str, Any]]):
@@ -467,6 +467,58 @@ class TestRequestParsing:
         with pytest.raises(ValueError, match="share one sampling schedule"):
             pipeline.forward(batch)
         assert calls == []
+
+    def test_long_rows_are_split_into_forwards_within_the_position_budget(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        # 20 s reference plus 20 s target is 2000 positions per row: over half
+        # the budget, so no two of these may share a forward.
+        long = lambda seed: (_prompt(audio=_silence(20.0), knobs={"gen_seconds": 20.0}), {"seed": seed})  # noqa: E731
+        short = (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 9})
+
+        outputs = pipeline.forward(_batch_of(long(1), short, long(2)))
+
+        # Longest rows first, each alone; the short request rides on its own too.
+        assert [call["x"].shape[0] for call in calls] == [1, 1, 1]
+        assert [call["x"].shape[1] for call in calls] == [1000, 1000, 50]
+        assert all(call["mask"] is None for call in calls)
+        # Outputs come back in request order regardless of forward order.
+        assert [output.output.shape for output in outputs] == [(1000 * HOP,), (50 * HOP,), (1000 * HOP,)]
+
+    def test_equal_length_clips_decode_in_one_codec_call(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        requests = [
+            (_prompt(tokens=6, knobs={"gen_seconds": 2.0}), {"seed": 1}),
+            (_prompt(tokens=9, knobs={"gen_seconds": 1.0}), {"seed": 2}),
+            (_prompt(tokens=4, knobs={"gen_seconds": 2.0}), {"seed": 3}),
+        ]
+
+        outputs = pipeline.forward(_batch_of(*requests))
+
+        assert len(calls) == 1 and calls[0]["x"].shape == (3, 100, LATENT_DIM)
+        # Two 2 s clips share one decode; the 1 s clip gets its own.
+        assert pipeline.vae.decode_calls == 2
+        assert [output.output.shape for output in outputs] == [(100 * HOP,), (50 * HOP,), (100 * HOP,)]
+
+    def test_pack_groups_orders_longest_first_and_respects_the_budget(self):
+        def parsed(ref: int, gen: int, text: int) -> pipeline_auk._ParsedRequest:
+            return pipeline_auk._ParsedRequest(
+                text=torch.zeros(text, TEXT_HIDDEN_DIM),
+                ref=torch.zeros(ref, LATENT_DIM),
+                gen_frames=gen,
+                generator=None,
+                schedule=(4, 0.0, None, None),
+                output_type="np",
+            )
+
+        budget = pipeline_auk._DIT_BATCH_POSITION_BUDGET
+        rows = [parsed(0, 250, 70), parsed(300, 250, 190), parsed(0, 250, 70), parsed(0, budget, 1)]
+
+        groups = pipeline_auk._pack_dit_groups(rows)
+
+        # The oversized row is alone; the 740-position row fits two (2 * 740);
+        # a third would exceed the budget, so the 320-position rows follow it
+        # in their own group.
+        assert groups == [[3], [1, 0], [2]]
 
     def test_pre_process_keys_requests_on_the_schedule_knobs(self):
         pre_process = pipeline_auk.get_auk_pre_process_func(None)
