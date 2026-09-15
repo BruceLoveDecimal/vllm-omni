@@ -158,6 +158,32 @@ def test_auk_source_length_default_and_complete_instruction(auk_adapter):
 
 
 @pytest.mark.parametrize(
+    "t_grid",
+    [
+        [],
+        [0.0],
+        [0.0, 0.0],
+        [0.5, 0.25],
+        [0.0, float("nan")],
+        [0.0, float("inf")],
+        [0.0, "invalid"],
+        "0,1",
+    ],
+)
+def test_auk_rejects_invalid_t_grid_before_dispatch(auk_adapter, t_grid):
+    request = OpenAICreateSpeechRequest(
+        input="Say the following: 'target text'",
+        duration_seconds=2,
+        extra_params={"t_grid": t_grid},
+    )
+
+    error = auk_adapter.validate(request)
+
+    assert error == "AuK extra_params.t_grid must contain at least two finite, strictly increasing values"
+    auk_adapter.ctx.server._resolve_ref_audio.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
     ("task_type", "expected_instruction"),
     [
         ("CustomVoice", "Say the following: 'target text'"),

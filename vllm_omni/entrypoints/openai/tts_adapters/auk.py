@@ -85,6 +85,19 @@ class AuKAdapter(ARTTSAdapter):
         for key in extra:
             if key not in {"num_inference_steps", "guidance_scale", "sway", "t_grid", "vae_sample"}:
                 return f"AuK does not support extra_params.{key}"
+        t_grid = extra.get("t_grid")
+        if t_grid is not None:
+            t_grid_error = "AuK extra_params.t_grid must contain at least two finite, strictly increasing values"
+            if not isinstance(t_grid, (list, tuple)) or len(t_grid) < 2:
+                return t_grid_error
+            try:
+                values = [float(value) for value in t_grid]
+            except (TypeError, ValueError):
+                return t_grid_error
+            if not all(math.isfinite(value) for value in values) or any(
+                right <= left for left, right in zip(values, values[1:])
+            ):
+                return t_grid_error
         return None
 
     async def build(

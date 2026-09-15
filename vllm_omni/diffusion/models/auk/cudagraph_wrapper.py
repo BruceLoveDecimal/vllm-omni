@@ -96,7 +96,6 @@ class AuKCUDAGraphWrapper:
     ) -> torch.Tensor:
         inputs = (x, text, c_mask, ref, ref_mask, timestep)
         uses_cfg = cfg_strength >= 1e-5
-        cfg_strength = torch.tensor(cfg_strength, device=x.device, dtype=torch.float32)
         if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
             if uses_cfg:
                 return self._run_cfg(x, None, text, c_mask, ref, ref_mask, timestep, cfg_strength=cfg_strength)
@@ -123,7 +122,7 @@ class AuKCUDAGraphWrapper:
         entry.static_ref_mask.copy_(ref_mask)
         entry.static_timestep.copy_(timestep)
         if entry.static_cfg is not None:
-            entry.static_cfg.copy_(cfg_strength)
+            entry.static_cfg.fill_(cfg_strength)
         entry.graph.replay()
         return entry.static_out[:, :target_frames].clone()
 
@@ -149,7 +148,7 @@ class AuKCUDAGraphWrapper:
         ref_mask: torch.Tensor,
         timestep: torch.Tensor,
         *,
-        cfg_strength: torch.Tensor,
+        cfg_strength: torch.Tensor | float,
     ) -> torch.Tensor:
         pred = self.dit(
             x,
@@ -168,11 +167,14 @@ class AuKCUDAGraphWrapper:
     def _capture(
         self,
         *inputs: torch.Tensor,
-        cfg_strength: torch.Tensor,
+        cfg_strength: float,
         uses_cfg: bool,
     ) -> _GraphEntry:
         static_inputs = tuple(value.clone() for value in inputs)
-        static_cfg = cfg_strength.clone() if uses_cfg else None
+        static_cfg = None
+        if uses_cfg:
+            static_cfg = torch.empty((), device=static_inputs[0].device, dtype=torch.float32)
+            static_cfg.fill_(cfg_strength)
         try:
             for _ in range(3):
                 if uses_cfg:
@@ -186,7 +188,7 @@ class AuKCUDAGraphWrapper:
             # request's projection and ignoring later static_text updates.
             self.dit.clear_cache()
             if static_cfg is not None:
-                static_cfg.copy_(cfg_strength)
+                static_cfg.fill_(cfg_strength)
             if self._pool_handle is None:
                 self._pool_handle = torch.cuda.graph_pool_handle()
             graph = torch.cuda.CUDAGraph()
