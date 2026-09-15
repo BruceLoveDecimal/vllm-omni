@@ -54,14 +54,14 @@ _FLASH_CFG = 0.0
 # Decorrelates the VAE posterior draw from the initial latent for the same request seed.
 _VAE_SEED_OFFSET = 0x5EED_0A0C
 # Cap on padded positions (rows times the longest row's reference + target
-# frames + text tokens) in one DiT forward. Measured on one GPU with the
-# per-step CUDA graph: rows of ~320 positions (5 s target, no reference) keep
-# getting cheaper per request up to eight rows, while rows of ~750 positions
-# (5 s target plus a 6 s reference) are compute-bound at one row and lose to
-# padding beyond two. The budget admits the first regime to large batches and
-# splits the second into small ones; the scheduler's batch size stays the
-# upper bound.
-_DIT_BATCH_POSITION_BUDGET = 2048
+# frames + text tokens, times the CFG branches) in one DiT forward. Measured
+# on one GPU with the per-step CUDA graph: rows of ~320 positions (5 s target,
+# no reference) keep getting cheaper per request up to eight rows, while rows
+# of ~750 positions (5 s target plus a 6 s reference) are compute-bound at one
+# row and lose to padding beyond a few. The budget admits the first regime to
+# eight rows and keeps the second in small groups; the scheduler's batch size
+# stays the upper bound.
+_DIT_BATCH_POSITION_BUDGET = 3072
 
 
 def get_auk_post_process_func(od_config: OmniDiffusionConfig):
@@ -512,7 +512,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             # does not depend on which rows it shares a forward with.
             noise = [self._draw_noise(item, torch.float32) for item in parsed]
             request_latents: list[torch.Tensor | None] = [None] * len(parsed)
-            for group in _pack_dit_groups(parsed):
+            for group in _pack_dit_groups(parsed, branches=2 if cfg >= 1e-5 else 1):
                 text, c_mask = self._pad_rows([parsed[i].text for i in group], self.dtype)
                 ref, ref_mask = self._pad_rows([parsed[i].ref for i in group], torch.float32)
                 x, x_mask = self._pad_rows([noise[i] for i in group], torch.float32)
@@ -576,13 +576,14 @@ def _row_positions(item: _ParsedRequest) -> int:
     return item.ref.shape[0] + item.gen_frames + item.text.shape[0]
 
 
-def _pack_dit_groups(parsed: list[_ParsedRequest]) -> list[list[int]]:
+def _pack_dit_groups(parsed: list[_ParsedRequest], *, branches: int = 1) -> list[list[int]]:
     """Split the batch into DiT forwards that stay within the position budget.
 
     Requests are ordered longest first, so each group is padded to its first
-    member; a group grows while ``rows * longest`` fits the budget. A single
-    request always forms a group of its own, however long it is. Returned
-    indices refer to ``parsed``.
+    member; a group grows while ``rows * longest * branches`` fits the budget,
+    ``branches`` being 2 under classifier-free guidance (the DiT runs the cond
+    and uncond rows as one batch). A single request always forms a group of
+    its own, however long it is. Returned indices refer to ``parsed``.
     """
 
     order = sorted(range(len(parsed)), key=lambda i: (-_row_positions(parsed[i]), i))
@@ -590,7 +591,7 @@ def _pack_dit_groups(parsed: list[_ParsedRequest]) -> list[list[int]]:
     for i in order:
         if groups:
             group = groups[-1]
-            longest = _row_positions(parsed[group[0]])
+            longest = _row_positions(parsed[group[0]]) * branches
             if (len(group) + 1) * longest <= _DIT_BATCH_POSITION_BUDGET:
                 group.append(i)
                 continue

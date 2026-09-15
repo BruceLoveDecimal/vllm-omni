@@ -513,12 +513,12 @@ class TestRequestParsing:
         budget = pipeline_auk._DIT_BATCH_POSITION_BUDGET
         rows = [parsed(0, 250, 70), parsed(300, 250, 190), parsed(0, 250, 70), parsed(0, budget, 1)]
 
-        groups = pipeline_auk._pack_dit_groups(rows)
-
-        # The oversized row is alone; the 740-position row fits two (2 * 740);
-        # a third would exceed the budget, so the 320-position rows follow it
-        # in their own group.
-        assert groups == [[3], [1, 0], [2]]
+        # Under CFG every row counts twice: the oversized row is alone, the
+        # 740-position row admits one more (2 * 2 * 740), and the remaining
+        # 320-position row starts its own group.
+        assert pipeline_auk._pack_dit_groups(rows, branches=2) == [[3], [1, 0], [2]]
+        # Without CFG all three short rows fit behind the 740-position one.
+        assert pipeline_auk._pack_dit_groups(rows, branches=1) == [[3], [1, 0, 2]]
 
     def test_pre_process_keys_requests_on_the_schedule_knobs(self):
         pre_process = pipeline_auk.get_auk_pre_process_func(None)
