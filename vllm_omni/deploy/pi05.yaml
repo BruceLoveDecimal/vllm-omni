@@ -16,8 +16,8 @@ stages:
     # false: torch.compile the per-layer compute and replay the prefix pass and
     # each denoising step as CUDA graphs (captured at startup). Pass
     # --enforce-eager, or set this to true, for the plain eager path; the two
-    # pieces can be disabled individually with
-    # custom_pipeline_args: {use_torch_compile: false, use_cuda_graph: false}.
+    # pieces can be disabled individually with custom_pipeline_args; that map
+    # must also include Pi05Pipeline's qualified pipeline_class. See the recipe.
     enforce_eager: false
     model_class_name: Pi05Pipeline
     model_config:
