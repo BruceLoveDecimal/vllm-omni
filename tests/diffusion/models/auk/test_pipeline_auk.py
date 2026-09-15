@@ -484,7 +484,7 @@ class TestRequestParsing:
         # Outputs come back in request order regardless of forward order.
         assert [output.output.shape for output in outputs] == [(1000 * HOP,), (50 * HOP,), (1000 * HOP,)]
 
-    def test_equal_length_clips_decode_in_one_codec_call(self, build_pipeline):
+    def test_short_rows_share_one_forward_and_decode_one_clip_per_call(self, build_pipeline):
         pipeline, calls = build_pipeline()
         requests = [
             (_prompt(tokens=6, knobs={"gen_seconds": 2.0}), {"seed": 1}),
@@ -495,8 +495,8 @@ class TestRequestParsing:
         outputs = pipeline.forward(_batch_of(*requests))
 
         assert len(calls) == 1 and calls[0]["x"].shape == (3, 100, LATENT_DIM)
-        # Two 2 s clips share one decode; the 1 s clip gets its own.
-        assert pipeline.vae.decode_calls == 2
+        # The codec runs one clip per call even when lengths match.
+        assert pipeline.vae.decode_calls == 3
         assert [output.output.shape for output in outputs] == [(100 * HOP,), (50 * HOP,), (100 * HOP,)]
 
     def test_pack_groups_orders_longest_first_and_respects_the_budget(self):

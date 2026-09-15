@@ -165,5 +165,5 @@ about 47 s with a warm page cache.
 | Online `/v1/chat/completions` with audio | not yet qualified | `docs/serving/` |
 | `/v1/audio/speech` | not supported (needs a TTS adapter) | `docs/contributing/model/adding_tts_model.md` |
 | Streaming / async chunk | not supported | `docs/design/feature/async_chunk.md` |
-| Batching across requests | supported: padded, masked rows of one DiT forward, split so rows times the longest row stays under 3072 positions (CFG rows count twice); equal-length clips share one codec decode | `docs/design/feature/diffusion_continuous_batching.md` |
+| Batching across requests | supported: padded, masked rows of one DiT forward, split so rows times the longest row stays under 3072 positions (CFG rows count twice); one codec decode per request | `docs/design/feature/diffusion_continuous_batching.md` |
 | Tensor / sequence parallelism | not supported | `docs/configuration/composable_parallel.md` |
