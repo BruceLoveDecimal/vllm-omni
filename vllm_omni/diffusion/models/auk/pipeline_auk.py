@@ -53,15 +53,6 @@ _FLASH_NFE = 4
 _FLASH_CFG = 0.0
 # Decorrelates the VAE posterior draw from the initial latent for the same request seed.
 _VAE_SEED_OFFSET = 0x5EED_0A0C
-# Cap on padded positions (rows times the longest row's reference + target
-# frames + text tokens, times the CFG branches) in one DiT forward. Measured
-# on one GPU with the per-step CUDA graph: rows of ~320 positions (5 s target,
-# no reference) keep getting cheaper per request up to eight rows, while rows
-# of ~750 positions (5 s target plus a 6 s reference) are compute-bound at one
-# row and lose to padding beyond a few. The budget admits the first regime to
-# eight rows and keeps the second in small groups; the scheduler's batch size
-# stays the upper bound.
-_DIT_BATCH_POSITION_BUDGET = 3072
 
 
 def get_auk_post_process_func(od_config: OmniDiffusionConfig):
@@ -89,25 +80,51 @@ def get_auk_pre_process_func(od_config: OmniDiffusionConfig):
     """Tag each request with the schedule knobs that must match across a batch.
 
     ``nfe`` and ``cfg`` already live on the sampling params, which the request
-    scheduler keys on. ``sway``, ``t_grid`` and ``vae_sample`` travel in the
-    prompt's ``additional_information`` and change the time grid or the
-    reference latent, so they go into the batch-compatibility key here.
+    scheduler keys on. ``sway`` and ``t_grid`` travel in the prompt's
+    ``additional_information`` and change the time grid, so they go into the
+    batch-compatibility key here, resolved the way :meth:`_resolve_schedule`
+    resolves them: an absent ``sway`` is the checkpoint default, and the Flash
+    variant pins the whole schedule so every Flash request is compatible.
+    ``vae_sample`` only changes the request's own reference latent and does
+    not affect batching.
     """
 
-    del od_config  # The key does not depend on the config.
+    is_flash, default_sway = _schedule_key_defaults(getattr(od_config, "model", None))
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        if is_flash:
+            request.batch_compatibility_key = ("auk", "flash")
+            return request
         knobs = (_prompt_mapping(request.prompt).get("additional_information") or {}).get("auk") or {}
+        sway = knobs.get("sway")
         t_grid = knobs.get("t_grid")
         request.batch_compatibility_key = (
             "auk",
-            knobs.get("sway"),
+            default_sway if sway is None else float(sway),
             tuple(float(t) for t in t_grid) if t_grid else None,
-            bool(knobs.get("vae_sample")),
         )
         return request
 
     return pre_process_func
+
+
+def _schedule_key_defaults(model_dir: Any) -> tuple[bool, float | None]:
+    """Read the variant and default ``sway`` the pipeline will resolve against.
+
+    The pre-process hook runs on the engine side before the pipeline exists;
+    an unreadable directory fails loudly at pipeline construction instead, so
+    here it only means "no defaults known".
+    """
+
+    if not isinstance(model_dir, str) or not os.path.isdir(model_dir):
+        return False, None
+    try:
+        config = _read_config(model_dir)
+    except (OSError, ValueError, KeyError):
+        return False, None
+    defaults = dict(config.get("defaults") or {})
+    sway = defaults.get("sway", -1.0)
+    return str(config.get("variant", "base")) == "flash", None if sway is None else float(sway)
 
 
 @dataclass
@@ -151,11 +168,16 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
 
     Several requests share one forward: each becomes a row of the DiT batch,
     padded to the longest text, reference and target in the batch and masked
-    back to its own length. The rows must share one sampling schedule, which
-    the request scheduler guarantees through the sampling-params key and the
-    batch-compatibility key set in :func:`get_auk_pre_process_func`. The codec
-    still runs one request at a time: its convolutions are not causal, so a
-    padded batch would change the last few samples of every shorter clip.
+    back to its own length. The scheduler's ``max_num_seqs`` is the batch
+    size; the pipeline does not split the batch further, so the deploy config
+    sizes it for the traffic (short, reference-free rows keep gaining up to
+    eight rows, long voice-clone rows are compute-bound at one). The rows must
+    share one sampling schedule, which the request scheduler guarantees
+    through the sampling-params key and the batch-compatibility key set in
+    :func:`get_auk_pre_process_func`. A request that fails to parse gets its
+    own error output and the rest of the batch still runs. The codec runs one
+    request at a time: its convolutions are not causal, so a padded batch
+    would change the last few samples of every shorter clip.
 
     Args:
         od_config: OmniDiffusion configuration. ``od_config.model`` must be an
@@ -488,19 +510,29 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             One ``DiffusionOutput`` per request, in order, whose ``output`` is a
             float32 mono waveform ``[T]`` at 24 kHz, or the normalized target
             latents ``[1, gen_frames, latent_dim]`` when ``output_type`` is
-            ``latent``.
+            ``latent``. A request that cannot be parsed, or whose generation
+            is not finite, gets a ``DiffusionOutput`` carrying ``error``
+            instead; it does not fail the other requests in the batch.
         """
 
         if req.num_reqs < 1:
             raise ValueError("AuKPipeline received an empty request batch.")
 
+        outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
         with torch.inference_mode():
-            parsed = [
-                self._parse_request(prompt, sampling_params)
-                for prompt, sampling_params in zip(req.prompts, req.sampling_params_list)
-            ]
-            first = parsed[0]
-            for other in parsed[1:]:
+            # Parsing (shape checks, target length, VAE encode of the source
+            # clip) is where a bad request surfaces; keep that per request.
+            parsed: list[tuple[int, _ParsedRequest]] = []
+            for i, (prompt, sampling_params) in enumerate(zip(req.prompts, req.sampling_params_list)):
+                try:
+                    parsed.append((i, self._parse_request(prompt, sampling_params)))
+                except Exception as exc:
+                    outputs[i] = DiffusionOutput.from_exception(exc)
+            if not parsed:
+                return _complete(outputs)
+
+            first = parsed[0][1]
+            for _, other in parsed[1:]:
                 if other.schedule != first.schedule or other.output_type != first.output_type:
                     raise ValueError(
                         "AuK requests batched together must share one sampling schedule and output type; "
@@ -510,87 +542,57 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
 
             # Noise is drawn in request order so a request's initial latent
             # does not depend on which rows it shares a forward with.
-            noise = [self._draw_noise(item, torch.float32) for item in parsed]
-            request_latents: list[torch.Tensor | None] = [None] * len(parsed)
-            for group in _pack_dit_groups(parsed, branches=2 if cfg >= 1e-5 else 1):
-                text, c_mask = self._pad_rows([parsed[i].text for i in group], self.dtype)
-                ref, ref_mask = self._pad_rows([parsed[i].ref for i in group], torch.float32)
-                x, x_mask = self._pad_rows([noise[i] for i in group], torch.float32)
-                if len(group) == 1:
-                    # No padding inside a single-row forward; the graph
-                    # wrapper buckets on its own.
-                    x_mask = None
-                with self._dit_autocast():
-                    latents = integrate_latents(
-                        self.dit,
-                        x=x,
-                        mask=x_mask,
-                        text=text,
-                        c_mask=c_mask,
-                        ref=ref,
-                        ref_mask=ref_mask,
-                        nfe=nfe,
-                        cfg_strength=cfg,
-                        sway_sampling_coef=sway,
-                        t_grid=t_grid,
-                        sampler=self.cudagraph_wrapper,
-                    )
-                latents = latents.float()
-                for row, i in enumerate(group):
-                    request_latents[i] = latents[row : row + 1, : parsed[i].gen_frames]
+            rows = [item for _, item in parsed]
+            noise = [self._draw_noise(item, torch.float32) for item in rows]
+            text, c_mask = self._pad_rows([item.text for item in rows], self.dtype)
+            ref, ref_mask = self._pad_rows([item.ref for item in rows], torch.float32)
+            x, x_mask = self._pad_rows(noise, torch.float32)
+            if len(rows) == 1:
+                # No padding inside a single-row forward; the graph wrapper
+                # buckets on its own.
+                x_mask = None
+            with self._dit_autocast():
+                latents = integrate_latents(
+                    self.dit,
+                    x=x,
+                    mask=x_mask,
+                    text=text,
+                    c_mask=c_mask,
+                    ref=ref,
+                    ref_mask=ref_mask,
+                    nfe=nfe,
+                    cfg_strength=cfg,
+                    sway_sampling_coef=sway,
+                    t_grid=t_grid,
+                    sampler=self.cudagraph_wrapper,
+                )
+            latents = latents.float()
 
             # The codec decodes one clip per call. Its convolutions are not
             # causal, so clips of different length cannot share a call, and a
             # batched call over equal-length clips measured 1.7x slower per
             # clip than one call each on the GPU used for tuning.
-            outputs: list[DiffusionOutput] = []
-            for i, item in enumerate(parsed):
-                latent = request_latents[i]
-                assert latent is not None
+            for row, (i, item) in enumerate(parsed):
+                latent = latents[row : row + 1, : item.gen_frames]
                 if not torch.isfinite(latent).all():
-                    raise RuntimeError("AuK generated latents contain NaN or Inf.")
+                    outputs[i] = DiffusionOutput(error="AuK generated latents contain NaN or Inf.")
+                    continue
                 if item.output_type == "latent":
-                    outputs.append(DiffusionOutput(output=latent.detach().cpu()))
+                    outputs[i] = DiffusionOutput(output=latent.detach().cpu())
                     continue
                 wav = self.vae.decode(latent)
                 # One mono waveform per request; the formatter expects [T].
                 wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
                 if not torch.isfinite(wav).all():
-                    raise RuntimeError("AuK generated audio contains NaN or Inf.")
-                outputs.append(DiffusionOutput(output=wav))
-        return outputs
+                    outputs[i] = DiffusionOutput(error="AuK generated audio contains NaN or Inf.")
+                    continue
+                outputs[i] = DiffusionOutput(output=wav)
+        return _complete(outputs)
 
 
-def _row_positions(item: _ParsedRequest) -> int:
-    """Sequence positions one request occupies in the DiT: reference, target and text."""
-
-    return item.ref.shape[0] + item.gen_frames + item.text.shape[0]
-
-
-def _pack_dit_groups(parsed: list[_ParsedRequest], *, branches: int = 1) -> list[list[int]]:
-    """Split the batch into DiT forwards that stay within the position budget.
-
-    Requests are ordered longest first, so each group is padded to its first
-    member, which fixes the group's capacity: the largest power of two whose
-    ``rows * longest * branches`` fits the budget, ``branches`` being 2 under
-    classifier-free guidance (the DiT runs the cond and uncond rows as one
-    batch). Powers of two because the CUDA graph wrapper pads the batch up to
-    one anyway: five rows would run as eight. A single request always forms a
-    group of its own, however long it is. Returned indices refer to
-    ``parsed``.
-    """
-
-    order = sorted(range(len(parsed)), key=lambda i: (-_row_positions(parsed[i]), i))
-    groups: list[list[int]] = []
-    capacity = 0
-    for i in order:
-        if groups and len(groups[-1]) < capacity:
-            groups[-1].append(i)
-            continue
-        rows = _DIT_BATCH_POSITION_BUDGET // max(1, _row_positions(parsed[i]) * branches)
-        capacity = 1 << max(0, rows.bit_length() - 1)
-        groups.append([i])
-    return groups
+def _complete(outputs: list[DiffusionOutput | None]) -> list[DiffusionOutput]:
+    assert all(output is not None for output in outputs), "every request must produce exactly one output"
+    return outputs  # type: ignore[return-value]
 
 
 def _read_config(model_dir: str) -> dict[str, Any]:

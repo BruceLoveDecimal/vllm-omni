@@ -43,6 +43,7 @@ import json
 import math
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -468,21 +469,40 @@ class TestRequestParsing:
             pipeline.forward(batch)
         assert calls == []
 
-    def test_long_rows_are_split_into_forwards_within_the_position_budget(self, build_pipeline):
+    def test_long_and_short_rows_share_one_forward(self, build_pipeline):
         pipeline, calls = build_pipeline()
-        # 20 s reference plus 20 s target is 2000 positions per row: over half
-        # the budget, so no two of these may share a forward.
+        # The pipeline does not split the scheduler's batch: a 20 s voice-clone
+        # row and a 1 s text-only row ride in one padded forward.
         long = lambda seed: (_prompt(audio=_silence(20.0), knobs={"gen_seconds": 20.0}), {"seed": seed})  # noqa: E731
         short = (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 9})
 
         outputs = pipeline.forward(_batch_of(long(1), short, long(2)))
 
-        # Longest rows first, each alone; the short request rides on its own too.
-        assert [call["x"].shape[0] for call in calls] == [1, 1, 1]
-        assert [call["x"].shape[1] for call in calls] == [1000, 1000, 50]
-        assert all(call["mask"] is None for call in calls)
-        # Outputs come back in request order regardless of forward order.
+        assert len(calls) == 1 and calls[0]["x"].shape == (3, 1000, LATENT_DIM)
+        assert calls[0]["mask"].sum(dim=1).tolist() == [1000, 50, 1000]
+        assert calls[0]["ref_mask"].sum(dim=1).tolist() == [1000, 0, 1000]
         assert [output.output.shape for output in outputs] == [(1000 * HOP,), (50 * HOP,), (1000 * HOP,)]
+
+    def test_a_request_that_fails_to_parse_does_not_fail_the_batch(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        good = (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 1})
+        # Text-only with no duration is a request error, not a batch error.
+        bad = (_prompt(knobs={}), {"seed": 2})
+
+        outputs = pipeline.forward(_batch_of(good, bad, good))
+
+        assert len(calls) == 1 and calls[0]["x"].shape == (2, 50, LATENT_DIM)
+        assert outputs[0].error is None and outputs[2].error is None
+        assert outputs[1].output is None and "gen_seconds is required" in outputs[1].error
+        assert pipeline.vae.decode_calls == 2
+
+    def test_a_batch_of_only_bad_requests_runs_no_forward(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+
+        outputs = pipeline.forward(_batch_of((_prompt(knobs={}), {"seed": 1})))
+
+        assert calls == []
+        assert outputs[0].error is not None
 
     def test_short_rows_share_one_forward_and_decode_one_clip_per_call(self, build_pipeline):
         pipeline, calls = build_pipeline()
@@ -499,48 +519,60 @@ class TestRequestParsing:
         assert pipeline.vae.decode_calls == 3
         assert [output.output.shape for output in outputs] == [(100 * HOP,), (50 * HOP,), (100 * HOP,)]
 
-    def test_pack_groups_orders_longest_first_and_respects_the_budget(self):
-        def parsed(ref: int, gen: int, text: int) -> pipeline_auk._ParsedRequest:
-            return pipeline_auk._ParsedRequest(
-                text=torch.zeros(text, TEXT_HIDDEN_DIM),
-                ref=torch.zeros(ref, LATENT_DIM),
-                gen_frames=gen,
-                generator=None,
-                schedule=(4, 0.0, None, None),
-                output_type="np",
+    def test_pre_process_keys_requests_on_the_schedule_knobs(self, tmp_path):
+        od_config = SimpleNamespace(model=str(_write_checkpoint(tmp_path, "base")))
+        pre_process = pipeline_auk.get_auk_pre_process_func(od_config)
+
+        def request(index: int, knobs: dict[str, Any]) -> OmniDiffusionRequest:
+            return OmniDiffusionRequest(
+                prompt=_prompt(knobs={"gen_seconds": 1.0, **knobs}),
+                sampling_params=OmniDiffusionSamplingParams(seed=1),
+                request_id=f"auk-key-{index}",
             )
 
-        budget = pipeline_auk._DIT_BATCH_POSITION_BUDGET
-        rows = [parsed(0, 250, 70), parsed(300, 250, 190), parsed(0, 250, 70), parsed(0, budget, 1)]
+        # An absent sway resolves to the checkpoint default, so it shares a
+        # batch with a request that spells the default out.
+        assert pre_process(request(0, {})).batch_compatibility_key == ("auk", -1.0, None)
+        assert pre_process(request(1, {"sway": -1.0})).batch_compatibility_key == ("auk", -1.0, None)
+        assert pre_process(request(2, {"sway": 0.5})).batch_compatibility_key == ("auk", 0.5, None)
+        assert pre_process(request(3, {"t_grid": FLASH_T_GRID})).batch_compatibility_key == (
+            "auk",
+            -1.0,
+            tuple(FLASH_T_GRID),
+        )
+        # vae_sample only changes the request's own reference latent.
+        assert (
+            pre_process(request(4, {"vae_sample": True})).batch_compatibility_key
+            == pre_process(request(0, {})).batch_compatibility_key
+        )
 
-        # Under CFG every row counts twice: the oversized row is alone, the
-        # 740-position row admits one more (2 * 2 * 740), and the remaining
-        # 320-position row starts its own group.
-        assert pipeline_auk._pack_dit_groups(rows, branches=2) == [[3], [1, 0], [2]]
-        # Without CFG all three short rows fit behind the 740-position one.
-        assert pipeline_auk._pack_dit_groups(rows, branches=1) == [[3], [1, 0, 2]]
-        # Capacity is a power of two: 3072 // (2 * 298) = 5 rows would be padded
-        # to eight by the graph wrapper, so eight equal rows go as 4 + 4.
-        equal = [parsed(0, 250, 48) for _ in range(8)]
-        assert pipeline_auk._pack_dit_groups(equal, branches=2) == [[0, 1, 2, 3], [4, 5, 6, 7]]
-        assert pipeline_auk._pack_dit_groups(equal, branches=1) == [list(range(8))]
-
-    def test_pre_process_keys_requests_on_the_schedule_knobs(self):
-        pre_process = pipeline_auk.get_auk_pre_process_func(None)
+    def test_pre_process_keys_every_flash_request_alike(self, tmp_path):
+        od_config = SimpleNamespace(model=str(_write_checkpoint(tmp_path, "flash")))
+        pre_process = pipeline_auk.get_auk_pre_process_func(od_config)
         plain = OmniDiffusionRequest(
-            prompt=_prompt(knobs={"gen_seconds": 1.0, "sway": -1.0}),
+            prompt=_prompt(knobs={"gen_seconds": 1.0}),
             sampling_params=OmniDiffusionSamplingParams(seed=1),
-            request_id="auk-key-0",
+            request_id="auk-flash-0",
         )
-        gridded = OmniDiffusionRequest(
-            prompt=_prompt(knobs={"gen_seconds": 1.0, "t_grid": FLASH_T_GRID, "vae_sample": True}),
+        swayed = OmniDiffusionRequest(
+            prompt=_prompt(knobs={"gen_seconds": 1.0, "sway": 0.5, "t_grid": [0.0, 0.5, 1.0]}),
             sampling_params=OmniDiffusionSamplingParams(seed=1),
-            request_id="auk-key-1",
+            request_id="auk-flash-1",
         )
 
-        assert pre_process(plain).batch_compatibility_key == ("auk", -1.0, None, False)
-        assert pre_process(gridded).batch_compatibility_key == ("auk", None, tuple(FLASH_T_GRID), True)
-        assert pre_process(plain).batch_compatibility_key != pre_process(gridded).batch_compatibility_key
+        # Flash pins the schedule, so the knobs cannot split the batch.
+        assert pre_process(plain).batch_compatibility_key == ("auk", "flash")
+        assert pre_process(swayed).batch_compatibility_key == ("auk", "flash")
+
+    def test_pre_process_without_a_checkpoint_keys_on_the_raw_knobs(self):
+        pre_process = pipeline_auk.get_auk_pre_process_func(SimpleNamespace(model=None))
+        request = OmniDiffusionRequest(
+            prompt=_prompt(knobs={"gen_seconds": 1.0}),
+            sampling_params=OmniDiffusionSamplingParams(seed=1),
+            request_id="auk-key-raw",
+        )
+
+        assert pre_process(request).batch_compatibility_key == ("auk", None, None)
 
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:

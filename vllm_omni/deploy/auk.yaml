@@ -43,6 +43,12 @@ stages:
   # Concurrent requests share one DiT forward as rows of a padded batch (the
   # scheduler only batches requests with the same schedule), so the DiT's
   # per-step launch cost is amortised across up to max_num_seqs requests.
+  # max_num_seqs is the whole batching policy: the pipeline pads every row
+  # to the longest one and never splits the batch. Eight suits short,
+  # reference-free rows (about 5 s targets keep gaining up to eight rows);
+  # long voice-clone rows (5 s target plus a 6 s reference) are
+  # compute-bound at one row and only pay for padding, so a deployment
+  # serving mostly those should lower it to 2-4.
   # request_batch_max_wait_ms lets an idle engine hold the first arrival
   # briefly to collect a burst; once a batch is in flight, later arrivals
   # queue and form the next batch without waiting.

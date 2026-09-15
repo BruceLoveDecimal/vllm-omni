@@ -40,7 +40,7 @@ text, exactly as in the upstream repository's cookbook.
 | Sequence limit | reference plus target latents up to 65536 frames (about 21 minutes) |
 | Sampling knobs | `num_inference_steps` (default 32), `guidance_scale` (default 2.0), `seed`; Flash pins 4 steps, CFG 0 and its own time grid |
 | Request knobs | `gen_seconds`, `sway` (default -1.0), `t_grid`, `vae_sample` via `additional_information["auk"]` |
-| Concurrency | up to `max_num_seqs` (default 8) requests per forward as rows of one padded DiT batch, split when rows times the longest row would exceed 3072 positions, CFG rows counting twice (long references are compute-bound and gain nothing from padding); requests only share a batch when their schedule matches; prefix caching and chunked prefill stay off on the encoder |
+| Concurrency | up to `max_num_seqs` (default 8) requests per forward as rows of one padded DiT batch; the batch is never split, so lower `max_num_seqs` to 2-4 for traffic dominated by long voice-clone rows (compute-bound at one row, padding costs them throughput); requests only share a batch when their schedule matches; prefix caching and chunked prefill stay off on the encoder |
 | Streaming | none: the ODE runs over the whole target |
 
 ## References
@@ -165,5 +165,5 @@ about 47 s with a warm page cache.
 | Online `/v1/chat/completions` with audio | not yet qualified | `docs/serving/` |
 | `/v1/audio/speech` | not supported (needs a TTS adapter) | `docs/contributing/model/adding_tts_model.md` |
 | Streaming / async chunk | not supported | `docs/design/feature/async_chunk.md` |
-| Batching across requests | supported: padded, masked rows of one DiT forward, split so rows times the longest row stays under 3072 positions (CFG rows count twice); one codec decode per request | `docs/design/feature/diffusion_continuous_batching.md` |
+| Batching across requests | supported: padded, masked rows of one DiT forward sized by `max_num_seqs`; per-request error isolation; one codec decode per request | `docs/design/feature/diffusion_continuous_batching.md` |
 | Tensor / sequence parallelism | not supported | `docs/configuration/composable_parallel.md` |
