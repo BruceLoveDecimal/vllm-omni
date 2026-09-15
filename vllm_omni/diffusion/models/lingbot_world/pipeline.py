@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.lingbot_world.actions import (
     LINGBOT_CAMERA_ACTION_SCHEMA,
     LINGBOT_CAMERA_TRAJECTORY_SCHEMA,
+    LINGBOT_CONTROLLER_TRANSLATION_UNIT,
     LingBotCameraActionFrames,
     LingBotCameraActionScript,
     as_camera_action_frames,
@@ -941,6 +942,9 @@ class LingBotWorldCausalDMDPipeline(
                 ),
             )
             drop_anchor = True
+        # Realtime interaction cannot see future steps; use the controller translation unit
+        # so speed is not renormalized per chunk. Full action_path keeps max-norm.
+        is_realtime_interaction_control = inputs.camera_actions is not None or latent_aligned
         camera_embedding = build_plucker_embedding(
             embedding_trajectory,
             height=inputs.height,
@@ -949,6 +953,7 @@ class LingBotWorldCausalDMDPipeline(
             target_width=inputs.width,
             device=self.device,
             dtype=dtype,
+            translation_scale=LINGBOT_CONTROLLER_TRANSLATION_UNIT if is_realtime_interaction_control else None,
         )
         if drop_anchor:
             camera_embedding = camera_embedding[1:]

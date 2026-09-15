@@ -337,8 +337,10 @@ def _stub_pipeline_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
             intrinsics=value.intrinsics[:num_frames],
         )
 
-    def build_plucker_embedding(value, *, height, width, target_height, target_width, device, dtype):
-        del target_height, target_width
+    def build_plucker_embedding(
+        value, *, height, width, target_height, target_width, device, dtype, translation_scale=None
+    ):
+        del target_height, target_width, translation_scale
         frames = value.poses.shape[0]
         data = torch.arange(frames * 6 * height * width, device=device, dtype=torch.float32)
         return data.reshape(frames, 6, height, width).to(dtype=dtype)
@@ -1629,6 +1631,7 @@ def test_first_typed_yaw_action_uses_pre_action_identity_anchor(
         target_width=16,
         device=torch.device("cpu"),
         dtype=torch.float32,
+        translation_scale=module.LINGBOT_CONTROLLER_TRANSLATION_UNIT,
     )[1:]
 
     assert not torch.equal(action_embedding, neutral_embedding)
