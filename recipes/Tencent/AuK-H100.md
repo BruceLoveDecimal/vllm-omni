@@ -139,8 +139,11 @@ about 47 s with a warm page cache.
 - Memory usage: about 25 GB peak on the device for a 12 s generation with
   both stages resident (deploy defaults: encoder 0.45, diffusion stage 0.35
   of device memory).
-- Key flags: `enforce_eager` on both stages (the encoder walks the decoder
-  layers itself for the layer fusion). `enable_prefix_caching` must stay off
+- Key flags: `enforce_eager` on the diffusion stage only. The encoder runs
+  through vLLM's compiled forward and CUDA graphs, collecting the per-layer
+  outputs for the fusion via auxiliary hidden states (the earlier eager layer
+  walk cost about 44 ms per request for 7 ms of GPU work on an RTX 5090).
+  `enable_prefix_caching` must stay off
   for the encoder: a cache hit skips prompt positions that the fused
   condition needs. `enable_chunked_prefill` is off by default: forcing it
   (128-token chunks, so two to three chunks per prompt) reproduces the
