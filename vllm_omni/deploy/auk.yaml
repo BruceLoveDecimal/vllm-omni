@@ -53,13 +53,17 @@ stages:
   # briefly to collect a burst; once a batch is in flight, later arrivals
   # queue and form the next batch without waiting.
   # step_execution advances every active request one Euler step per
-  # scheduler tick: a request joins the DiT batch at the next step boundary
-  # instead of waiting for the batch in flight to finish, so the encoder
-  # stage keeps feeding the DiT while it runs.
+  # scheduler tick, so a request joins the DiT batch at the next step boundary
+  # instead of waiting for the batch in flight. Off by default: measured on
+  # AuK-Flash under Poisson arrivals and at saturation it matched or trailed
+  # request batching by up to 10% (the 4-step ODE makes a whole batch only
+  # about 100 ms of waiting, while the per-step re-batching costs more than
+  # that saves). Turn it on for long schedules (the 32-step base recipe) where
+  # waiting for a whole batch costs seconds.
   - stage_id: 1
     devices: "0"
     max_num_seqs: 8
-    step_execution: true
+    step_execution: false
     request_batch_max_wait_ms: 10
     gpu_memory_utilization: 0.35
     enforce_eager: false
