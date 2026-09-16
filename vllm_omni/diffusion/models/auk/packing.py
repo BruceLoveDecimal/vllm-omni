@@ -107,6 +107,46 @@ class PackPlan:
             values[name] = value.clone()
         return PackPlan(**values)
 
+    def to(self, device: torch.device | str) -> PackPlan:
+        values = {f.name: getattr(self, f.name) for f in fields(self)}
+        for name, value in self.tensors().items():
+            values[name] = value.to(device, non_blocking=True)
+        return PackPlan(**values)
+
+
+def _lengths_mask(lengths: list[int], width: int) -> torch.Tensor:
+    return torch.arange(width)[None, :] < torch.tensor(lengths, dtype=torch.long)[:, None]
+
+
+def build_pack_plan_from_lengths(
+    ref_lens: list[int],
+    target_lens: list[int],
+    text_lens: list[int],
+    *,
+    ref_len: int,
+    target_len: int,
+    text_len: int,
+    audio_capacity: int | None = None,
+    text_capacity: int | None = None,
+    device: torch.device | str = "cpu",
+) -> PackPlan:
+    """Build the plan from host-side row lengths, without touching the device.
+
+    The rows are laid out the way :class:`AuKTransformer` pads them: the audio
+    stream is ``[ref (padded to ref_len) | target (padded to target_len)]``
+    and the text stream is padded to ``text_len``. Building on the CPU from
+    lengths the caller already knows avoids the host synchronisations a
+    mask-based build needs, which matters when a plan is rebuilt per Euler
+    step under CUDA graph replay.
+    """
+    if not (len(ref_lens) == len(target_lens) == len(text_lens)):
+        raise ValueError("ref, target and text length lists must have one entry per row")
+    target_mask = _lengths_mask(list(target_lens), target_len)
+    audio_mask = torch.cat([_lengths_mask(list(ref_lens), ref_len), target_mask], dim=1) if ref_len > 0 else target_mask
+    text_mask = _lengths_mask(list(text_lens), text_len)
+    plan = build_pack_plan(audio_mask, text_mask, audio_capacity=audio_capacity, text_capacity=text_capacity)
+    return plan.to(device)
+
 
 def _pack_stream(
     mask: torch.Tensor, capacity: int | None

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -13,7 +14,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer
-from vllm_omni.diffusion.models.auk.packing import PackPlan, build_pack_plan
+from vllm_omni.diffusion.models.auk.packing import PackPlan, build_pack_plan_from_lengths
 
 logger = init_logger(__name__)
 
@@ -37,6 +38,9 @@ class _GraphEntry:
     # Packed-layout plan captured with the graph; its index tensors are
     # refreshed before every replay, its capacities fix the packed shapes.
     static_plan: PackPlan | None = None
+    # Identity of the row lengths last copied into static_plan, so consecutive
+    # Euler steps of one batch skip the copy.
+    plan_key: tuple | None = None
 
 
 class AuKCUDAGraphWrapper:
@@ -61,6 +65,7 @@ class AuKCUDAGraphWrapper:
         self.enabled = bool(enabled)
         self.max_graphs = max(1, int(max_graphs))
         self._cache: OrderedDict[tuple, _GraphEntry] = OrderedDict()
+        self._plans: OrderedDict[tuple, PackPlan] = OrderedDict()
         self._pool_handle: int | None = None
 
     @classmethod
@@ -123,6 +128,7 @@ class AuKCUDAGraphWrapper:
         timestep: torch.Tensor,
         cfg_strength: float,
         mask: torch.Tensor | None = None,
+        row_lengths: tuple[Sequence[int], Sequence[int], Sequence[int]] | None = None,
     ) -> torch.Tensor:
         uses_cfg = cfg_strength >= 1e-5
         cfg_strength = torch.tensor(cfg_strength, device=x.device, dtype=torch.float32)
@@ -139,13 +145,14 @@ class AuKCUDAGraphWrapper:
             timestep = torch.cat([timestep, timestep[-1:].expand(x.shape[0] - timestep.shape[0])])
         inputs = (x, x_mask, text, c_mask, ref, ref_mask, timestep)
         key = self._key(x, text, ref, uses_cfg, timestep.ndim)
-        plan = None
+        plan = plan_key = None
         if self.dit.packed_attention:
-            plan = self._packed_plan(x_mask, c_mask, ref_mask, uses_cfg)
+            plan, plan_key = self._packed_plan(x_mask, c_mask, ref_mask, uses_cfg, row_lengths)
             key = key + (plan.audio_capacity, plan.text_capacity)
         entry = self._cache.get(key)
         if entry is None:
             entry = self._capture(*inputs, cfg_strength=cfg_strength, uses_cfg=uses_cfg, plan=plan)
+            entry.plan_key = plan_key
             if len(self._cache) >= self.max_graphs:
                 self._cache.popitem(last=False)
             self._cache[key] = entry
@@ -161,40 +168,75 @@ class AuKCUDAGraphWrapper:
         entry.static_timestep.copy_(timestep)
         if entry.static_cfg is not None:
             entry.static_cfg.copy_(cfg_strength)
-        if plan is not None:
+        if plan is not None and entry.plan_key != plan_key:
             assert entry.static_plan is not None
             plan.copy_into(entry.static_plan)
+            entry.plan_key = plan_key
         entry.graph.replay()
         return entry.static_out[:batch, :target_frames].clone()
 
     _PACK_ALIGNMENT = 64
+    _MAX_PLANS = 128
 
     def _packed_plan(
-        self, x_mask: torch.Tensor, c_mask: torch.Tensor, ref_mask: torch.Tensor, uses_cfg: bool
-    ) -> PackPlan:
-        """Build the packed plan for the bucketed rows with token capacities fixed per graph.
+        self,
+        x_mask: torch.Tensor,
+        c_mask: torch.Tensor,
+        ref_mask: torch.Tensor,
+        uses_cfg: bool,
+        row_lengths: tuple[Sequence[int], Sequence[int], Sequence[int]] | None,
+    ) -> tuple[PackPlan, tuple]:
+        """Return the packed plan for the bucketed rows, built on the host and cached.
 
         The rows are the ones the DiT will see: ``[ref | target]`` audio and
-        the text, doubled under CFG. Capacities round the real token counts up
-        so the plan's shapes, and hence the graph, are shared by nearby batch
-        compositions; the extra room always leaves a filler segment, and the
-        kernel's max-segment bound is the bucket total so any composition
-        that fits the bucket replays correctly.
+        the text, doubled under CFG. ``row_lengths`` are the real rows'
+        (reference, target, text) lengths when the caller knows them, which
+        avoids the device synchronisation of reading them off the masks;
+        filler rows added by the batch bucket keep one target frame and one
+        text token (see :meth:`_bucket_inputs`). Capacities round the real
+        token counts up so the plan's shapes, and hence the graph, are shared
+        by nearby batch compositions; the extra room always leaves a filler
+        segment, and the kernel's max-segment bound is the bucket total so any
+        composition that fits the bucket replays correctly. Plans are cached
+        by their lengths, so an ODE loop pays for one build per batch.
         """
-        audio_mask = torch.cat([ref_mask, x_mask], dim=1) if ref_mask.shape[1] > 0 else x_mask
+        rows = int(x_mask.shape[0])
+        if row_lengths is None:
+            ref_lens = [int(n) for n in ref_mask.sum(dim=1).tolist()]
+            target_lens = [int(n) for n in x_mask.sum(dim=1).tolist()]
+            text_lens = [int(n) for n in c_mask.sum(dim=1).tolist()]
+        else:
+            ref_lens, target_lens, text_lens = ([int(n) for n in lens] for lens in row_lengths)
+            filler = rows - len(target_lens)
+            ref_lens += [0] * filler
+            target_lens += [1] * filler
+            text_lens += [1] * filler
         if uses_cfg:
-            audio_mask = torch.cat([audio_mask, audio_mask], dim=0)
-            c_mask = torch.cat([c_mask, c_mask], dim=0)
-        audio_real = int(audio_mask.sum().item())
-        text_real = int(c_mask.sum().item())
-        plan = build_pack_plan(
-            audio_mask,
-            c_mask,
-            audio_capacity=round_up(audio_real + 1, self._PACK_ALIGNMENT),
-            text_capacity=round_up(text_real + 1, self._PACK_ALIGNMENT),
-        )
-        plan.joint_max = plan.single_max = plan.audio_capacity + plan.text_capacity
-        return plan
+            ref_lens, target_lens, text_lens = ref_lens * 2, target_lens * 2, text_lens * 2
+        shape = (int(ref_mask.shape[1]), int(x_mask.shape[1]), int(c_mask.shape[1]))
+        plan_key = (tuple(ref_lens), tuple(target_lens), tuple(text_lens), shape)
+        plan = self._plans.get(plan_key)
+        if plan is None:
+            audio_capacity = round_up(sum(ref_lens) + sum(target_lens) + 1, self._PACK_ALIGNMENT)
+            text_capacity = round_up(sum(text_lens) + 1, self._PACK_ALIGNMENT)
+            plan = build_pack_plan_from_lengths(
+                ref_lens,
+                target_lens,
+                text_lens,
+                ref_len=shape[0],
+                target_len=shape[1],
+                text_len=shape[2],
+                audio_capacity=audio_capacity,
+                text_capacity=text_capacity,
+                device=x_mask.device,
+            )
+            plan.joint_max = plan.single_max = audio_capacity + text_capacity
+            if len(self._plans) >= self._MAX_PLANS:
+                self._plans.popitem(last=False)
+            self._plans[plan_key] = plan
+        else:
+            self._plans.move_to_end(plan_key)
+        return plan, plan_key
 
     def _run(
         self,

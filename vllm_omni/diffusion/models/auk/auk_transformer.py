@@ -29,6 +29,7 @@ Deliberate differences from the reference, all inference-only:
 
 import math
 from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -922,6 +923,7 @@ def integrate_latents(
     sway_sampling_coef: float | None = None,
     t_grid: list[float] | None = None,
     sampler: Callable[..., torch.Tensor] | None = None,
+    sampler_kwargs: Mapping[str, Any] | None = None,
 ) -> torch.Tensor:
     """Integrate a batch of noised targets from ``t=0`` to ``t=1`` with Euler steps.
 
@@ -971,6 +973,7 @@ def integrate_latents(
                     ref_mask=ref_mask,
                     timestep=t[i],
                     cfg_strength=cfg_strength,
+                    **(sampler_kwargs or {}),
                 )
                 x = x + (t[i + 1] - t[i]) * velocity
         finally:

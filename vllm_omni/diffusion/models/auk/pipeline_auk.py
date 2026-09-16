@@ -604,6 +604,11 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                         ref_mask=ref_mask,
                         timestep=t,
                         cfg_strength=cfg_values[0],
+                        row_lengths=(
+                            [state.extra["ref"].shape[0] for state in rows],
+                            [state.extra["gen_frames"] for state in rows],
+                            [state.extra["text"].shape[0] for state in rows],
+                        ),
                     ).float()
             with self._dit_autocast():
                 pred = self.dit(
@@ -727,6 +732,15 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                     sway_sampling_coef=sway,
                     t_grid=t_grid,
                     sampler=self.cudagraph_wrapper,
+                    # Host-side row lengths let the graph wrapper build its
+                    # packed plan once per batch without reading the masks.
+                    sampler_kwargs={
+                        "row_lengths": (
+                            [item.ref.shape[0] for item in rows],
+                            [item.gen_frames for item in rows],
+                            [item.text.shape[0] for item in rows],
+                        )
+                    },
                 )
             latents = latents.float()
 
