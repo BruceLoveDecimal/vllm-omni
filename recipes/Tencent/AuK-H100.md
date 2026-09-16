@@ -40,7 +40,7 @@ text, exactly as in the upstream repository's cookbook.
 | Sequence limit | reference plus target latents up to 65536 frames (about 21 minutes) |
 | Sampling knobs | `num_inference_steps` (default 32), `guidance_scale` (default 2.0), `seed`; Flash pins 4 steps, CFG 0 and its own time grid |
 | Request knobs | `gen_seconds`, `sway` (default -1.0), `t_grid`, `vae_sample` via `additional_information["auk"]` |
-| Concurrency | one request per DiT forward; the encoder stage runs with `max_num_seqs: 1`, prefix caching and chunked prefill off |
+| Concurrency | up to `max_num_seqs` (default 8) requests per forward as rows of one padded DiT batch; the batch is never split, so lower `max_num_seqs` to 2-4 for traffic dominated by long voice-clone rows (compute-bound at one row, padding costs them throughput); requests only share a batch when their schedule matches; prefix caching and chunked prefill stay off on the encoder |
 | Streaming | none: the ODE runs over the whole target |
 
 ## References
@@ -140,7 +140,8 @@ about 47 s with a warm page cache.
   both stages resident (deploy defaults: encoder 0.45, diffusion stage 0.35
   of device memory).
 - Key flags: `enforce_eager` on both stages (the encoder walks the decoder
-  layers itself for the layer fusion). `enable_prefix_caching` must stay off
+  layers itself for the layer fusion); the diffusion stage batches concurrent
+  requests as rows of one padded DiT forward. `enable_prefix_caching` must stay off
   for the encoder: a cache hit skips prompt positions that the fused
   condition needs. `enable_chunked_prefill` is off by default: forcing it
   (128-token chunks, so two to three chunks per prompt) reproduces the
@@ -163,5 +164,5 @@ about 47 s with a warm page cache.
 | Online `/v1/chat/completions` with audio | not yet qualified | `docs/serving/` |
 | `/v1/audio/speech` | not supported (needs a TTS adapter) | `docs/contributing/model/adding_tts_model.md` |
 | Streaming / async chunk | not supported | `docs/design/feature/async_chunk.md` |
-| Batching across requests | one request per DiT forward | `docs/user_guide/diffusion/` |
+| Batching across requests | supported: padded, masked rows of one DiT forward sized by `max_num_seqs`; per-request error isolation; one codec decode per request | `docs/design/feature/diffusion_continuous_batching.md` |
 | Tensor / sequence parallelism | not supported | `docs/configuration/composable_parallel.md` |

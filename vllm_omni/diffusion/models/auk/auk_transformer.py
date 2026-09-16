@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-__all__ = ["AuKTransformer", "dit_state_dict", "sample_latents"]
+__all__ = ["AuKTransformer", "dit_state_dict", "integrate_latents", "sample_latents"]
 
 
 def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -86,14 +86,24 @@ class Rotary(nn.Module):
         exponents = torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim
         return 1.0 / (self.base**exponents)
 
-    def forward(self, seq_len: int) -> torch.Tensor:
-        """Return frequencies ``[1, 1, seq_len, dim]`` for positions ``0..seq_len-1``."""
+    def forward(self, seq_len: int, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Return rotary frequencies ``[B or 1, 1, seq_len, dim]``.
+
+        Without ``mask`` the positions are ``0..seq_len-1``. With a padding
+        mask ``[B, seq_len]`` each row counts only its valid positions, so a
+        row whose reference is shorter than its neighbours' still sees its
+        target frames at the positions a single-request forward would give
+        them.
+        """
         inv_freq = self.inv_freq
         if inv_freq.dtype != torch.float32:
             inv_freq = self._frequencies(inv_freq.device)
-        pos = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)
-        freqs = torch.outer(pos, inv_freq)
-        return torch.stack((freqs, freqs), dim=-1).flatten(-2)[None, None]
+        if mask is None:
+            pos = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)[None]
+        else:
+            pos = (mask.to(torch.int32).cumsum(dim=1) - 1).clamp_min(0).to(torch.float32)
+        freqs = pos.unsqueeze(-1) * inv_freq
+        return torch.stack((freqs, freqs), dim=-1).flatten(-2).unsqueeze(1)
 
 
 class TimeEmbedding(nn.Module):
@@ -541,15 +551,15 @@ class AuKTransformer(nn.Module):
 
         seq_len = x.shape[1]
         text_len = c.shape[1]
-        rope_audio = self.rotary_embed(seq_len)
-        rope_text = self.rotary_embed(text_len)
+        rope_audio = self.rotary_embed(seq_len, audio_mask)
+        rope_text = self.rotary_embed(text_len, c_mask)
 
         for block in self.transformer_blocks:
             c, x = block(x, c, t, mask=audio_mask, rope=rope_audio, c_rope=rope_text, c_mask=c_mask)
 
         x = torch.cat([c, x], dim=1)
-        rope = self.rotary_embed(text_len + seq_len)
         single_mask = None if audio_mask is None else torch.cat([c_mask, audio_mask], dim=1)
+        rope = self.rotary_embed(text_len + seq_len, single_mask)
 
         for block in self.single_transformer_blocks:
             x = block(x, t, mask=single_mask, rope=rope)
@@ -640,6 +650,65 @@ def sample_latents(
             .unsqueeze(0)
         )
 
+    return integrate_latents(
+        dit,
+        x=x,
+        mask=None,
+        text=text,
+        c_mask=c_mask,
+        ref=ref,
+        ref_mask=ref_mask,
+        nfe=nfe,
+        cfg_strength=cfg_strength,
+        sway_sampling_coef=sway_sampling_coef,
+        t_grid=t_grid,
+    )
+
+
+@torch.no_grad()
+def integrate_latents(
+    dit: AuKTransformer,
+    *,
+    x: torch.Tensor,
+    mask: torch.Tensor | None,
+    text: torch.Tensor,
+    c_mask: torch.Tensor | None,
+    ref: torch.Tensor,
+    ref_mask: torch.Tensor | None,
+    nfe: int = 32,
+    cfg_strength: float = 1.0,
+    sway_sampling_coef: float | None = None,
+    t_grid: list[float] | None = None,
+) -> torch.Tensor:
+    """Integrate a batch of noised targets from ``t=0`` to ``t=1`` with Euler steps.
+
+    Every row of the batch is an independent request sharing one schedule:
+    the rows may differ in target, text and reference length, which the
+    padding masks express, but ``nfe``, ``cfg_strength`` and the time grid are
+    batch-wide. Under CFG the velocity model doubles the batch internally.
+
+    Args:
+        dit: The velocity model.
+        x: Initial latents ``[B, n, latent_dim]`` at ``t=0``; padded rows
+            beyond each request's own length are ignored via ``mask``.
+        mask: Target padding mask ``[B, n]``, ``True`` where valid, or
+            ``None`` when no row is padded.
+        text: Pre-encoded text hidden states ``[B, nt, text_hidden_dim]``.
+        c_mask: Text padding mask ``[B, nt]``.
+        ref: Reference prompt latents ``[B, np, latent_dim]``; ``np == 0``
+            means no request in the batch carries a reference.
+        ref_mask: Reference padding mask ``[B, np]``.
+        nfe: Euler steps, ignored when ``t_grid`` is given.
+        cfg_strength: Classifier-free guidance weight. Below ``1e-5`` the
+            uncond branch is skipped entirely.
+        sway_sampling_coef: Reshapes the uniform time grid towards ``t=0``.
+        t_grid: Explicit timesteps, overriding ``nfe`` and the sway reshape.
+
+    Returns:
+        The latents at ``t=1``, ``[B, n, latent_dim]``; padded positions hold
+        unspecified values and must be sliced away by the caller.
+    """
+    device = x.device
     if t_grid is not None:
         t = torch.tensor(t_grid, device=device, dtype=torch.float32)
     else:
@@ -659,6 +728,7 @@ def sample_latents(
                     x,
                     text,
                     t[i],
+                    mask=mask,
                     c_mask=c_mask,
                     ref=ref,
                     ref_mask=ref_mask,
@@ -668,10 +738,10 @@ def sample_latents(
                 v_cond, v_uncond = pred.chunk(2, dim=0)
                 v = v_cond + (v_cond - v_uncond) * cfg_strength
             else:
-                v = dit(x, text, t[i], c_mask=c_mask, ref=ref, ref_mask=ref_mask)
+                v = dit(x, text, t[i], mask=mask, c_mask=c_mask, ref=ref, ref_mask=ref_mask)
             x = x + (t[i + 1] - t[i]) * v
     finally:
-        # The cached text projections belong to this request only; a failed
+        # The cached text projections belong to this batch only; a failed
         # step must not leak them into the next one.
         dit.clear_cache()
     return x

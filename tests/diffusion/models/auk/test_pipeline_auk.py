@@ -43,6 +43,7 @@ import json
 import math
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -155,21 +156,17 @@ class _StubVAE(nn.Module):
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         self.decode_calls += 1
-        return torch.zeros(1, latents.shape[1] * HOP, device=latents.device)
+        return torch.zeros(latents.shape[0], latents.shape[1] * HOP, device=latents.device)
 
 
 def _stub_sampler(calls: list[dict[str, Any]]):
-    """Record the ODE arguments and return noise drawn from the request generator."""
+    """Record the ODE arguments and hand the pipeline's own initial noise back as the result."""
 
-    def sample_latents(dit: nn.Module, **kwargs: Any) -> torch.Tensor:
+    def integrate_latents(dit: nn.Module, **kwargs: Any) -> torch.Tensor:
         calls.append(kwargs)
-        shape = (1, kwargs["gen_frames"], kwargs["latent_dim"])
-        generator = kwargs.get("generator")
-        if generator is None:
-            return torch.zeros(*shape, device=kwargs["device"], dtype=kwargs["dtype"])
-        return torch.randn(*shape, generator=generator, device=kwargs["device"], dtype=kwargs["dtype"])
+        return kwargs["x"]
 
-    return sample_latents
+    return integrate_latents
 
 
 def _write_checkpoint(root: Path, variant: str) -> Path:
@@ -225,7 +222,7 @@ def build_pipeline(tmp_path, monkeypatch):
 
     def _build(variant: str = "base") -> tuple[AuKPipeline, list[dict[str, Any]]]:
         calls: list[dict[str, Any]] = []
-        monkeypatch.setattr(pipeline_auk, "sample_latents", _stub_sampler(calls))
+        monkeypatch.setattr(pipeline_auk, "integrate_latents", _stub_sampler(calls))
         od_config = OmniDiffusionConfig(
             model=str(_write_checkpoint(tmp_path, variant)),
             dtype=torch.float32,
@@ -255,12 +252,22 @@ def _prompt(
 
 
 def _batch(prompt: dict[str, Any], **sampling: Any) -> DiffusionRequestBatch:
-    request = OmniDiffusionRequest(
-        prompt=prompt,
-        sampling_params=OmniDiffusionSamplingParams(**sampling),
-        request_id="auk-test-0",
+    return _batch_of((prompt, sampling))
+
+
+def _batch_of(*requests: tuple[dict[str, Any], dict[str, Any]]) -> DiffusionRequestBatch:
+    """Build a request batch from ``(prompt, sampling_kwargs)`` pairs."""
+
+    return DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt=prompt,
+                sampling_params=OmniDiffusionSamplingParams(**sampling),
+                request_id=f"auk-test-{index}",
+            )
+            for index, (prompt, sampling) in enumerate(requests)
+        ]
     )
-    return DiffusionRequestBatch(requests=[request])
 
 
 def _silence(seconds: float, sample_rate: int = SAMPLE_RATE) -> tuple[np.ndarray, int]:
@@ -275,7 +282,7 @@ class TestRequestParsing:
 
         assert pipeline.support_audio_output is True
         assert pipeline.audio_sample_rate == SAMPLE_RATE
-        assert pipeline.supports_request_batch is False
+        assert pipeline.supports_request_batch is True
         # The warmup request cannot carry an encoder-stage text condition.
         assert pipeline.dummy_run_num_frames == 0
 
@@ -291,7 +298,9 @@ class TestRequestParsing:
 
         outputs = pipeline.forward(_batch(_prompt(audio=_silence(2.0), knobs={"gen_seconds": 6.0}), seed=1))
 
-        assert calls[0]["gen_frames"] == math.ceil(6.0 * SAMPLE_RATE / HOP)
+        assert calls[0]["x"].shape == (1, math.ceil(6.0 * SAMPLE_RATE / HOP), LATENT_DIM)
+        # A single request is never padded, so no target mask is built.
+        assert calls[0]["mask"] is None
         assert calls[0]["ref"].shape == (1, 100, LATENT_DIM)
         assert calls[0]["ref_mask"].shape == (1, 100)
         assert calls[0]["c_mask"].shape == (1, 8)
@@ -303,14 +312,15 @@ class TestRequestParsing:
 
         pipeline.forward(_batch(_prompt(audio=_silence(2.0), knobs={"gen_seconds": None}), seed=1))
 
-        assert calls[0]["gen_frames"] == 100
+        assert calls[0]["x"].shape[1] == 100
 
     def test_text_only_request_without_a_duration_is_rejected(self, build_pipeline):
         pipeline, calls = build_pipeline()
 
-        with pytest.raises(ValueError, match="gen_seconds"):
-            pipeline.forward(_batch(_prompt(knobs={"gen_seconds": None}), seed=1))
+        outputs = pipeline.forward(_batch(_prompt(knobs={"gen_seconds": None}), seed=1))
+
         assert calls == []
+        assert outputs[0].output is None and "gen_seconds" in outputs[0].error
 
     def test_text_only_request_gets_an_empty_reference(self, build_pipeline):
         pipeline, calls = build_pipeline()
@@ -318,7 +328,7 @@ class TestRequestParsing:
         pipeline.forward(_batch(_prompt(knobs={"gen_seconds": 3.5}), seed=1))
 
         assert calls[0]["ref"].shape == (1, 0, LATENT_DIM)
-        assert calls[0]["gen_frames"] == 175
+        assert calls[0]["x"].shape[1] == 175
 
     def test_source_clip_is_resampled_to_the_codec_rate(self, build_pipeline):
         pipeline, _ = build_pipeline()
@@ -340,8 +350,9 @@ class TestRequestParsing:
         prompt = _prompt(knobs={"gen_seconds": 1.0})
         del prompt["prompt_embeds"]
 
-        with pytest.raises(ValueError, match="prompt_embeds"):
-            pipeline.forward(_batch(prompt, seed=1))
+        outputs = pipeline.forward(_batch(prompt, seed=1))
+
+        assert outputs[0].output is None and "prompt_embeds" in outputs[0].error
 
     def test_base_variant_uses_the_requested_schedule(self, build_pipeline):
         pipeline, calls = build_pipeline()
@@ -393,11 +404,9 @@ class TestRequestParsing:
             _batch(_prompt(knobs={"gen_seconds": 1.0}), seed=0, output_type="latent"),
         )
 
-        expected = torch.randn(1, 50, LATENT_DIM, generator=torch.Generator().manual_seed(0))
+        expected = torch.randn(50, LATENT_DIM, generator=torch.Generator().manual_seed(0)).unsqueeze(0)
         assert torch.equal(outputs[0].output, expected)
-        # The global RNG is never seeded on the pipeline's behalf.
-        assert calls[0]["seed"] is None
-        assert isinstance(calls[0]["generator"], torch.Generator)
+        assert calls[0]["x"].dtype is torch.float32
 
     def test_latent_output_type_skips_the_decoder(self, build_pipeline):
         pipeline, _ = build_pipeline()
@@ -416,13 +425,155 @@ class TestRequestParsing:
         assert call["sample"] is True
         assert isinstance(call["generator"], torch.Generator)
 
-    def test_one_request_per_forward(self, build_pipeline):
-        pipeline, _ = build_pipeline()
-        batch = _batch(_prompt(knobs={"gen_seconds": 1.0}), seed=1)
-        batch.requests.append(batch.requests[0])
+    def test_batched_requests_are_padded_and_masked(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        long_clip = (_prompt(tokens=8, audio=_silence(2.0), knobs={"gen_seconds": 6.0}), {"seed": 1})
+        short_text = (_prompt(tokens=12, knobs={"gen_seconds": 1.0}), {"seed": 2})
 
-        with pytest.raises(AssertionError, match="one request per forward"):
+        outputs = pipeline.forward(_batch_of(long_clip, short_text))
+
+        call = calls[0]
+        assert call["x"].shape == (2, 300, LATENT_DIM)
+        assert call["mask"].tolist() == [[True] * 300, [True] * 50 + [False] * 250]
+        assert call["text"].shape == (2, 12, TEXT_HIDDEN_DIM)
+        assert call["c_mask"].sum(dim=1).tolist() == [8, 12]
+        assert call["ref"].shape == (2, 100, LATENT_DIM)
+        assert call["ref_mask"].sum(dim=1).tolist() == [100, 0]
+        # Padded positions carry no noise, so a padded row never leaks into a shorter request.
+        assert torch.equal(call["x"][1, 50:], torch.zeros(250, LATENT_DIM))
+        assert [output.output.shape for output in outputs] == [(300 * HOP,), (50 * HOP,)]
+        # The codec decodes one request at a time.
+        assert pipeline.vae.decode_calls == 2
+
+    def test_batched_noise_matches_the_single_request_draw(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+        requests = [
+            (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 0, "output_type": "latent"}),
+            (_prompt(knobs={"gen_seconds": 2.0}), {"seed": 1, "output_type": "latent"}),
+        ]
+
+        batched = pipeline.forward(_batch_of(*requests))
+        single = [pipeline.forward(_batch_of(request))[0] for request in requests]
+
+        assert [output.output.shape for output in batched] == [(1, 50, LATENT_DIM), (1, 100, LATENT_DIM)]
+        for batched_output, single_output in zip(batched, single):
+            assert torch.equal(batched_output.output, single_output.output)
+
+    def test_batched_requests_must_share_a_schedule(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        batch = _batch_of(
+            (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 1, "num_inference_steps": 16}),
+            (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 1, "num_inference_steps": 32}),
+        )
+
+        with pytest.raises(ValueError, match="share one sampling schedule"):
             pipeline.forward(batch)
+        assert calls == []
+
+    def test_long_and_short_rows_share_one_forward(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        # The pipeline does not split the scheduler's batch: a 20 s voice-clone
+        # row and a 1 s text-only row ride in one padded forward.
+        long = lambda seed: (_prompt(audio=_silence(20.0), knobs={"gen_seconds": 20.0}), {"seed": seed})  # noqa: E731
+        short = (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 9})
+
+        outputs = pipeline.forward(_batch_of(long(1), short, long(2)))
+
+        assert len(calls) == 1 and calls[0]["x"].shape == (3, 1000, LATENT_DIM)
+        assert calls[0]["mask"].sum(dim=1).tolist() == [1000, 50, 1000]
+        assert calls[0]["ref_mask"].sum(dim=1).tolist() == [1000, 0, 1000]
+        assert [output.output.shape for output in outputs] == [(1000 * HOP,), (50 * HOP,), (1000 * HOP,)]
+
+    def test_a_request_that_fails_to_parse_does_not_fail_the_batch(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        good = (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 1})
+        # Text-only with no duration is a request error, not a batch error.
+        bad = (_prompt(knobs={}), {"seed": 2})
+
+        outputs = pipeline.forward(_batch_of(good, bad, good))
+
+        assert len(calls) == 1 and calls[0]["x"].shape == (2, 50, LATENT_DIM)
+        assert outputs[0].error is None and outputs[2].error is None
+        assert outputs[1].output is None and "gen_seconds is required" in outputs[1].error
+        assert pipeline.vae.decode_calls == 2
+
+    def test_a_batch_of_only_bad_requests_runs_no_forward(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+
+        outputs = pipeline.forward(_batch_of((_prompt(knobs={}), {"seed": 1})))
+
+        assert calls == []
+        assert outputs[0].error is not None
+
+    def test_short_rows_share_one_forward_and_decode_one_clip_per_call(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        requests = [
+            (_prompt(tokens=6, knobs={"gen_seconds": 2.0}), {"seed": 1}),
+            (_prompt(tokens=9, knobs={"gen_seconds": 1.0}), {"seed": 2}),
+            (_prompt(tokens=4, knobs={"gen_seconds": 2.0}), {"seed": 3}),
+        ]
+
+        outputs = pipeline.forward(_batch_of(*requests))
+
+        assert len(calls) == 1 and calls[0]["x"].shape == (3, 100, LATENT_DIM)
+        # The codec runs one clip per call even when lengths match.
+        assert pipeline.vae.decode_calls == 3
+        assert [output.output.shape for output in outputs] == [(100 * HOP,), (50 * HOP,), (100 * HOP,)]
+
+    def test_pre_process_keys_requests_on_the_schedule_knobs(self, tmp_path):
+        od_config = SimpleNamespace(model=str(_write_checkpoint(tmp_path, "base")))
+        pre_process = pipeline_auk.get_auk_pre_process_func(od_config)
+
+        def request(index: int, knobs: dict[str, Any]) -> OmniDiffusionRequest:
+            return OmniDiffusionRequest(
+                prompt=_prompt(knobs={"gen_seconds": 1.0, **knobs}),
+                sampling_params=OmniDiffusionSamplingParams(seed=1),
+                request_id=f"auk-key-{index}",
+            )
+
+        # An absent sway resolves to the checkpoint default, so it shares a
+        # batch with a request that spells the default out.
+        assert pre_process(request(0, {})).batch_compatibility_key == ("auk", -1.0, None)
+        assert pre_process(request(1, {"sway": -1.0})).batch_compatibility_key == ("auk", -1.0, None)
+        assert pre_process(request(2, {"sway": 0.5})).batch_compatibility_key == ("auk", 0.5, None)
+        assert pre_process(request(3, {"t_grid": FLASH_T_GRID})).batch_compatibility_key == (
+            "auk",
+            -1.0,
+            tuple(FLASH_T_GRID),
+        )
+        # vae_sample only changes the request's own reference latent.
+        assert (
+            pre_process(request(4, {"vae_sample": True})).batch_compatibility_key
+            == pre_process(request(0, {})).batch_compatibility_key
+        )
+
+    def test_pre_process_keys_every_flash_request_alike(self, tmp_path):
+        od_config = SimpleNamespace(model=str(_write_checkpoint(tmp_path, "flash")))
+        pre_process = pipeline_auk.get_auk_pre_process_func(od_config)
+        plain = OmniDiffusionRequest(
+            prompt=_prompt(knobs={"gen_seconds": 1.0}),
+            sampling_params=OmniDiffusionSamplingParams(seed=1),
+            request_id="auk-flash-0",
+        )
+        swayed = OmniDiffusionRequest(
+            prompt=_prompt(knobs={"gen_seconds": 1.0, "sway": 0.5, "t_grid": [0.0, 0.5, 1.0]}),
+            sampling_params=OmniDiffusionSamplingParams(seed=1),
+            request_id="auk-flash-1",
+        )
+
+        # Flash pins the schedule, so the knobs cannot split the batch.
+        assert pre_process(plain).batch_compatibility_key == ("auk", "flash")
+        assert pre_process(swayed).batch_compatibility_key == ("auk", "flash")
+
+    def test_pre_process_without_a_checkpoint_keys_on_the_raw_knobs(self):
+        pre_process = pipeline_auk.get_auk_pre_process_func(SimpleNamespace(model=None))
+        request = OmniDiffusionRequest(
+            prompt=_prompt(knobs={"gen_seconds": 1.0}),
+            sampling_params=OmniDiffusionSamplingParams(seed=1),
+            request_id="auk-key-raw",
+        )
+
+        assert pre_process(request).batch_compatibility_key == ("auk", None, None)
 
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:
