@@ -56,9 +56,11 @@ from torch import nn
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.auk import pipeline_auk
+from vllm_omni.diffusion.models.auk.auk_transformer import integrate_latents as real_integrate_latents
 from vllm_omni.diffusion.models.auk.pipeline_auk import AuKPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 LATENT_DIM = 64
@@ -575,6 +577,173 @@ class TestRequestParsing:
         )
 
         assert pre_process(request).batch_compatibility_key == ("auk", None, None)
+
+
+class _VelocityDiT(nn.Module):
+    """Stand-in DiT with a linear velocity field, so Euler steps are checkable by hand.
+
+    ``v = 0.1 * x`` per row; under ``cfg_infer`` the uncond branch returns half
+    of that, so the guidance combination is exercised too. Records the
+    per-row timesteps it was called with.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict[str, Any]] = []
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        text: torch.Tensor,
+        time: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        c_mask: torch.Tensor | None = None,
+        ref: torch.Tensor | None = None,
+        ref_mask: torch.Tensor | None = None,
+        cfg_infer: bool = False,
+        cache: bool = False,
+    ) -> torch.Tensor:
+        self.calls.append(
+            {
+                "time": time.detach().clone(),
+                "rows": x.shape[0],
+                "frames": x.shape[1],
+                "tokens": text.shape[1],
+                "ref_frames": ref.shape[1] if ref is not None else None,
+                "cfg_infer": cfg_infer,
+                "cache": cache,
+                "mask": None if mask is None else mask.clone(),
+            }
+        )
+        v = 0.1 * x
+        return torch.cat([v, 0.5 * v], dim=0) if cfg_infer else v
+
+    def clear_cache(self) -> None:
+        pass
+
+
+def _state(request_id: str, prompt: dict[str, Any], **sampling: Any) -> StepRequestState:
+    return StepRequestState(
+        request_id=request_id,
+        sampling=OmniDiffusionSamplingParams(**sampling),
+        prompt=prompt,
+    )
+
+
+def _run_stepwise(pipeline: AuKPipeline, states: list[StepRequestState]) -> list[Any]:
+    """Drive the step protocol the way the runner does, with every state active at once."""
+
+    for state in states:
+        pipeline.prepare_encode(state)
+    outputs: dict[str, Any] = {}
+    while any(not state.denoise_completed for state in states):
+        active = [state for state in states if not state.denoise_completed]
+        velocity = pipeline.denoise_step(None, states=active)
+        for row, state in enumerate(active):
+            pipeline.step_scheduler(state, velocity[row : row + 1])
+            if state.denoise_completed:
+                outputs[state.request_id] = pipeline.post_decode(state)
+    return [outputs[state.request_id] for state in states]
+
+
+class TestStepExecution:
+    """Step execution: one Euler step per tick, rows joining at step boundaries."""
+
+    def test_prepare_encode_initialises_the_request_state(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+        pipeline.dit = pipeline.cudagraph_wrapper.dit = _VelocityDiT()
+        state = _state("s0", _prompt(tokens=6, knobs={"gen_seconds": 1.0}), seed=3, num_inference_steps=4)
+
+        pipeline.prepare_encode(state)
+
+        assert state.extra["x"].shape == (1, 50, LATENT_DIM)
+        assert state.extra["text"].shape == (6, TEXT_HIDDEN_DIM)
+        assert state.extra["ref"].shape == (0, LATENT_DIM)
+        assert state.extra["grid"].shape == (5,)
+        # The scheduler counts Euler steps: one per grid point except the last.
+        assert state.total_steps == 4 and state.step_index == 0
+        # The latents field only carries the row count; the batch gatherer
+        # needs one trailing shape across requests of different lengths.
+        assert state.latents.shape == (1, 1, LATENT_DIM)
+        expected = torch.randn(50, LATENT_DIM, generator=torch.Generator().manual_seed(3)).unsqueeze(0)
+        assert torch.equal(state.extra["x"], expected)
+
+    def test_step_path_matches_the_request_batch_forward(self, build_pipeline, monkeypatch):
+        pipeline, _ = build_pipeline()
+        pipeline.dit = pipeline.cudagraph_wrapper.dit = _VelocityDiT()
+        monkeypatch.setattr(pipeline_auk, "integrate_latents", real_integrate_latents)
+        requests = [
+            (_prompt(tokens=6, audio=_silence(2.0), knobs={"gen_seconds": 2.0}), {"seed": 1}),
+            (_prompt(tokens=9, knobs={"gen_seconds": 1.0}), {"seed": 2}),
+        ]
+        sampling = {"num_inference_steps": 4, "guidance_scale": 2.0, "output_type": "latent"}
+
+        batched = pipeline.forward(_batch_of(*[(p, {**s, **sampling}) for p, s in requests]))
+        stepped = _run_stepwise(pipeline, [_state(f"r{i}", p, **s, **sampling) for i, (p, s) in enumerate(requests)])
+
+        for batch_output, step_output in zip(batched, stepped):
+            assert step_output.error is None
+            assert torch.equal(step_output.output, batch_output.output)
+        assert [output.output.shape for output in stepped] == [(1, 100, LATENT_DIM), (1, 50, LATENT_DIM)]
+
+    def test_rows_at_different_steps_get_their_own_timestep(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+        dit = pipeline.dit = pipeline.cudagraph_wrapper.dit = _VelocityDiT()
+        early = _state("early", _prompt(knobs={"gen_seconds": 1.0}), seed=1, num_inference_steps=4)
+        late = _state("late", _prompt(knobs={"gen_seconds": 2.0}), seed=2, num_inference_steps=4)
+        pipeline.prepare_encode(early)
+        # The first request takes one step alone, then the second arrives.
+        pipeline.step_scheduler(early, pipeline.denoise_step(None, states=[early]))
+        pipeline.prepare_encode(late)
+
+        velocity = pipeline.denoise_step(None, states=[early, late])
+
+        assert velocity.shape == (2, 100, LATENT_DIM)
+        call = dit.calls[-1]
+        assert call["rows"] == 2 and call["cfg_infer"] is True and call["cache"] is False
+        torch.testing.assert_close(call["time"], torch.stack([early.extra["grid"][1], late.extra["grid"][0]]))
+        assert call["mask"].tolist() == [[True] * 50 + [False] * 50, [True] * 100]
+
+    def test_zero_guidance_rows_ignore_the_uncond_branch(self, build_pipeline):
+        pipeline, _ = build_pipeline("flash")
+        pipeline.dit = pipeline.cudagraph_wrapper.dit = _VelocityDiT()
+        state = _state("f0", _prompt(knobs={"gen_seconds": 1.0}), seed=1)
+        pipeline.prepare_encode(state)
+        assert state.total_steps == 4 and state.extra["cfg"] == 0.0
+
+        velocity = pipeline.denoise_step(None, states=[state])
+
+        torch.testing.assert_close(velocity, 0.1 * state.extra["x"])
+
+    def test_non_finite_latents_become_a_request_error(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+        pipeline.dit = pipeline.cudagraph_wrapper.dit = _VelocityDiT()
+        state = _state("bad", _prompt(knobs={"gen_seconds": 1.0}), seed=1, num_inference_steps=1)
+        pipeline.prepare_encode(state)
+        with torch.inference_mode():
+            state.extra["x"][0, 0, 0] = float("nan")
+
+        output = pipeline.post_decode(state)
+
+        assert output.output is None and "NaN" in output.error
+
+    def test_pre_process_aligns_the_scheduler_step_count(self, tmp_path):
+        flash = pipeline_auk.get_auk_pre_process_func(SimpleNamespace(model=str(_write_checkpoint(tmp_path, "flash"))))
+        base = pipeline_auk.get_auk_pre_process_func(SimpleNamespace(model=str(_write_checkpoint(tmp_path, "base"))))
+        pinned = OmniDiffusionRequest(
+            prompt=_prompt(knobs={"gen_seconds": 1.0}),
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=32),
+            request_id="k0",
+        )
+        gridded = OmniDiffusionRequest(
+            prompt=_prompt(knobs={"gen_seconds": 1.0, "t_grid": [0.0, 0.3, 1.0]}),
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=32),
+            request_id="k1",
+        )
+
+        assert flash(pinned).sampling_params.num_inference_steps == 4
+        assert base(gridded).sampling_params.num_inference_steps == 2
 
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:

@@ -102,8 +102,10 @@ class AuKCUDAGraphWrapper:
         text: torch.Tensor,
         ref: torch.Tensor,
         uses_cfg: bool,
-    ) -> tuple[int, int, int, int, bool]:
-        return (x.shape[0], x.shape[1], text.shape[1], ref.shape[1], uses_cfg)
+        timestep_rank: int = 0,
+    ) -> tuple[int, int, int, int, bool, int]:
+        """Graph key: bucketed batch and lengths, CFG branch, and whether the timestep is per row."""
+        return (x.shape[0], x.shape[1], text.shape[1], ref.shape[1], uses_cfg, timestep_rank)
 
     @torch.no_grad()
     def __call__(
@@ -127,8 +129,12 @@ class AuKCUDAGraphWrapper:
 
         batch, target_frames = x.shape[:2]
         x, x_mask, text, c_mask, ref, ref_mask = self._bucket_inputs(x, text, c_mask, ref, ref_mask, mask)
+        if timestep.ndim == 1:
+            # Step execution gives every row its own timestep; the filler
+            # rows the batch bucket adds can carry any value.
+            timestep = torch.cat([timestep, timestep[-1:].expand(x.shape[0] - timestep.shape[0])])
         inputs = (x, x_mask, text, c_mask, ref, ref_mask, timestep)
-        key = self._key(x, text, ref, uses_cfg)
+        key = self._key(x, text, ref, uses_cfg, timestep.ndim)
         entry = self._cache.get(key)
         if entry is None:
             entry = self._capture(*inputs, cfg_strength=cfg_strength, uses_cfg=uses_cfg)

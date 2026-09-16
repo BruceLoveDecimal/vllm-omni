@@ -190,7 +190,7 @@ def test_graph_inputs_use_bounded_length_buckets() -> None:
     assert padded[4].shape == (1, 100, 4)
     assert padded[5].shape == (1, 100)
     assert [mask.sum().item() for mask in (padded[1], padded[3], padded[5])] == [65, 65, 51]
-    assert wrapper._key(padded[0], padded[2], padded[4], False) == (1, 128, 128, 100, False)
+    assert wrapper._key(padded[0], padded[2], padded[4], False) == (1, 128, 128, 100, False, 0)
     assert wrapper.max_graphs == 32
 
 
@@ -214,7 +214,7 @@ def test_graph_inputs_pad_the_batch_to_a_power_of_two() -> None:
     assert padded[1][3].tolist() == [True] + [False] * 63
     assert padded[3][3].tolist() == [True] + [False] * 63
     assert torch.equal(padded[0][3], torch.zeros(64, 4))
-    assert wrapper._key(padded[0], padded[2], padded[4], True) == (4, 64, 64, 50, True)
+    assert wrapper._key(padded[0], padded[2], padded[4], True) == (4, 64, 64, 50, True, 0)
 
 
 @torch.inference_mode()
@@ -330,7 +330,8 @@ def test_batched_graph_replay_matches_per_request_eager(cfg_strength: float) -> 
     uses_cfg = cfg_strength >= 1e-5
     keys = set(wrapper._cache)
     # One graph per single request (batch bucket 1) plus one for the padded batch of three (bucket 4).
-    assert (4, 64, 64, 50, uses_cfg) in keys
+    # The trailing 0 is the timestep rank: a scalar timestep shared by the rows.
+    assert (4, 64, 64, 50, uses_cfg, 0) in keys
     assert all(key[0] in (1, 4) for key in keys)
     assert x.shape[0] == 3 and ref.shape[1] == 4
 
