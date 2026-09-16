@@ -15,7 +15,6 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 from functools import cached_property
-from itertools import islice
 
 import torch
 import torch.nn as nn
@@ -55,6 +54,36 @@ TEXT_COND_KEY = "output"
 _FUSION_LN_EPS = 1e-5
 
 
+def aux_hidden_state_layers(num_layers: int) -> tuple[int, ...]:
+    """Auxiliary indices that make the thinker return every layer's output but the last."""
+    return tuple(range(1, num_layers))
+
+
+def fuse_layer_outputs(
+    layer_outputs: list[torch.Tensor],
+    *,
+    layer_weights: torch.Tensor,
+    layer_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Softmax-weighted sum of the per-layer LayerNorm'ed outputs, in fp32.
+
+    ``layer_outputs`` holds one ``[tokens, hidden]`` tensor per decoder layer in
+    layer order (HF's ``output_hidden_states[1:]``). The layers are folded one
+    at a time into a single fp32 accumulator: stacking them would need
+    ``layers x tokens x hidden`` fp32 at once, which is 9 GiB for the 32768-token
+    dummy run vLLM uses to size the KV cache.
+    """
+    weights = torch.softmax(layer_weights.float(), dim=0)
+    normed_shape = (layer_outputs[0].shape[-1],)
+    fused: torch.Tensor | None = None
+    for idx, layer_output in enumerate(layer_outputs):
+        normed = F.layer_norm(layer_output.float(), normed_shape, eps=_FUSION_LN_EPS)
+        contribution = normed * weights[idx]
+        fused = contribution if fused is None else fused + contribution
+    assert fused is not None
+    return fused * layer_scale.float()
+
+
 class AuKProcessingInfo(Qwen2_5OmniThinkerProcessingInfo):
     """Qwen2.5-Omni thinker processing restricted to AuK's single audio input.
 
@@ -75,11 +104,13 @@ class AuKProcessingInfo(Qwen2_5OmniThinkerProcessingInfo):
 class AuKForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
     """Encoder stage of AuK: Qwen2.5-Omni thinker with learned layer fusion.
 
-    The forward pass re-implements the thinker language model's layer loop so
-    the per-layer outputs can be fused on the fly: vLLM's decoder layers carry
-    the residual stream separately, and ``hidden + residual`` after layer ``i``
-    is the HF ``output_hidden_states[i + 1]`` entry, while the last entry is
-    the final-normed state. Only one accumulator lives at a time.
+    The forward pass runs the thinker language model's own compiled forward
+    and collects the per-layer outputs through vLLM's auxiliary-hidden-state
+    mechanism, so the encoder stays eligible for torch.compile and CUDA graph
+    capture: vLLM's decoder layers carry the residual stream separately, and
+    ``hidden + residual`` after layer ``i`` is the HF ``output_hidden_states[i
+    + 1]`` entry, while the last entry is the final-normed state. The layers
+    are then LayerNorm'ed and softmax-weighted into one fp32 accumulator.
     """
 
     have_multimodal_outputs = True
@@ -124,6 +155,12 @@ class AuKForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, Sup
         self.register_buffer("layer_weights", torch.zeros(num_layers, dtype=torch.float32))
         self.register_buffer("layer_scale", torch.ones(1, dtype=torch.float32))
         self._fusion_loaded = False
+        # vLLM's Qwen2Model records the residual stream that enters layer i,
+        # which is layer i-1's output, whenever i is an auxiliary index (the
+        # EAGLE-3 mechanism). Indices 1..L-1 therefore yield the outputs of
+        # layers 0..L-2 from inside the compiled forward; the last layer's
+        # entry is the final-normed state the forward returns anyway.
+        self.thinker.language_model.model._set_aux_hidden_state_layers(aux_hidden_state_layers(num_layers))
 
     # -------------------- delegations to the thinker --------------------
 
@@ -221,34 +258,27 @@ class AuKForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, Sup
         if intermediate_tensors is not None:
             raise NotImplementedError("AuK encoder does not support pipeline parallelism")
         language_model = self.thinker.language_model.model
-        num_layers = len(language_model.layers)
+        num_layers = int(self.layer_weights.shape[0])
         if language_model.start_layer != 0 or language_model.end_layer != num_layers:
             raise NotImplementedError("AuK encoder needs all decoder layers on one rank")
 
-        if inputs_embeds is None:
-            hidden_states = language_model.embed_input_ids(input_ids)
-        else:
-            hidden_states = inputs_embeds
-        residual: torch.Tensor | None = None
-
-        weights = torch.softmax(self.layer_weights, dim=0)
-        fused: torch.Tensor | None = None
-        normed_shape = (hidden_states.shape[-1],)
-        layers = islice(language_model.layers, language_model.start_layer, language_model.end_layer)
-        for idx, layer in enumerate(layers):
-            hidden_states, residual = layer(positions, hidden_states, residual)
-            if idx + 1 < num_layers:
-                layer_output = hidden_states + residual
-            else:
-                # HF's last hidden_states entry is post final norm.
-                hidden_states, _ = language_model.norm(hidden_states, residual)
-                layer_output = hidden_states
-            normed = F.layer_norm(layer_output.float(), normed_shape, eps=_FUSION_LN_EPS)
-            contribution = normed * weights[idx]
-            fused = contribution if fused is None else fused + contribution
-
-        assert fused is not None
-        text_cond = (fused * self.layer_scale).to(hidden_states.dtype)
+        # The thinker's own forward is the one vLLM compiles and captures in
+        # CUDA graphs. With the auxiliary layers registered in __init__ it
+        # returns the residual stream after every layer but the last, plus the
+        # final-normed state, which is HF's output_hidden_states layout.
+        output = language_model(input_ids, positions, None, inputs_embeds=inputs_embeds)
+        if not isinstance(output, tuple):
+            raise RuntimeError("AuK encoder expected the thinker to return auxiliary hidden states")
+        hidden_states, aux_hidden_states = output
+        if len(aux_hidden_states) != num_layers - 1:
+            raise RuntimeError(
+                f"AuK encoder expected {num_layers - 1} auxiliary hidden states, got {len(aux_hidden_states)}"
+            )
+        text_cond = fuse_layer_outputs(
+            [*aux_hidden_states, hidden_states],
+            layer_weights=self.layer_weights,
+            layer_scale=self.layer_scale,
+        ).to(hidden_states.dtype)
         # Stage-wire layout: [tokens, features] under hidden_states.output so
         # the runner slices it per request (and concatenates across chunked
         # prefill steps); the stage-1 processor reads the same path.
