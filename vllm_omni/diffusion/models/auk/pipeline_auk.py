@@ -34,6 +34,7 @@ from vllm_omni.diffusion.models.auk.auk_transformer import (
 )
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
+from vllm_omni.diffusion.models.auk.packing import packed_attention_available
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
     SupportAudioOutput,
@@ -276,6 +277,9 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.dit.load_state_dict(_read_dit_weights(model_dir, self.dtype), strict=True)
         self.dit = self.dit.to(device=self.device).eval()
         self.dit.requires_grad_(False)
+        # Packed varlen attention needs a FlashAttention varlen kernel; without
+        # one the blocks run over padded rows as before.
+        self.dit.packed_attention = packed_attention_available(self.device)
         self.cudagraph_wrapper = AuKCUDAGraphWrapper(self.dit, enabled=not od_config.enforce_eager)
 
         logger.info(

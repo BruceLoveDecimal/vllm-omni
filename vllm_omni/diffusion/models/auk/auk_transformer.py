@@ -34,6 +34,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm_omni.diffusion.models.auk.packing import PackPlan, build_pack_plan, flash_attn_varlen
+
 __all__ = ["AuKTransformer", "build_time_grid", "dit_state_dict", "integrate_latents", "sample_latents"]
 
 
@@ -48,6 +50,48 @@ def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor 
     if mask is not None:
         attn_mask = mask[:, None, None, :].expand(q.shape[0], q.shape[1], q.shape[-2], k.shape[-2])
     return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+
+
+def _varlen_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int
+) -> torch.Tensor:
+    """Attend within each packed segment of ``[T, H, D]`` tensors.
+
+    FlashAttention's varlen kernel does the work on CUDA; without it (CPU
+    tests) each segment is attended on its own with SDPA, which is exact but
+    slow and only meant to check the packing itself.
+    """
+    if flash_attn_varlen is not None and q.is_cuda:
+        out = flash_attn_varlen(
+            q=q.to(torch.bfloat16),
+            k=k.to(torch.bfloat16),
+            v=v.to(torch.bfloat16),
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=False,
+            softmax_scale=q.shape[-1] ** -0.5,
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+        return out.to(q.dtype)
+    out = torch.empty_like(q)
+    bounds = cu_seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        if end <= start:
+            continue
+        seg = slice(start, end)
+        # [T, H, D] -> [1, H, T, D] for SDPA and back.
+        attended = F.scaled_dot_product_attention(
+            q[seg].transpose(0, 1).unsqueeze(0),
+            k[seg].transpose(0, 1).unsqueeze(0),
+            v[seg].transpose(0, 1).unsqueeze(0),
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        out[seg] = attended.squeeze(0).transpose(0, 1).to(q.dtype)
+    return out
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -96,6 +140,14 @@ class Rotary(nn.Module):
         else:
             pos = (mask.to(torch.int32).cumsum(dim=1) - 1).clamp_min(0).to(torch.float32)
         freqs = pos.unsqueeze(-1) * inv_freq
+        return torch.stack((freqs, freqs), dim=-1).flatten(-2).unsqueeze(1)
+
+    def forward_positions(self, pos: torch.Tensor) -> torch.Tensor:
+        """Return frequencies ``[T, 1, dim]`` for explicit packed-token positions ``[T]``."""
+        inv_freq = self.inv_freq
+        if inv_freq.dtype != torch.float32:
+            inv_freq = self._frequencies(inv_freq.device)
+        freqs = pos.to(torch.float32).unsqueeze(-1) * inv_freq
         return torch.stack((freqs, freqs), dim=-1).flatten(-2).unsqueeze(1)
 
 
@@ -174,6 +226,20 @@ class AdaLayerNorm(nn.Module):
         x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
+    def forward_packed(
+        self, x: torch.Tensor, emb: torch.Tensor, seg: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Modulate packed tokens ``[T, dim]`` with their row's embedding ``emb[seg]``.
+
+        ``seg`` may name one row past the end for filler tokens; those read a
+        zero modulation.
+        """
+        mods = self.linear(self.silu(emb))
+        mods = torch.cat([mods, mods.new_zeros(1, mods.shape[1])])[seg]
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods.chunk(6, dim=1)
+        x = self.norm(x) * (1 + scale_msa) + shift_msa
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
 
 class AdaLayerNormFinal(nn.Module):
     """Timestep-conditioned modulation before the output projection."""
@@ -187,6 +253,12 @@ class AdaLayerNormFinal(nn.Module):
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         scale, shift = self.linear(self.silu(emb)).chunk(2, dim=1)
         return self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+
+    def forward_packed(self, x: torch.Tensor, emb: torch.Tensor, seg: torch.Tensor) -> torch.Tensor:
+        """Modulate packed tokens ``[T, dim]`` with their row's embedding ``emb[seg]``."""
+        mods = self.linear(self.silu(emb))
+        scale, shift = torch.cat([mods, mods.new_zeros(1, mods.shape[1])])[seg].chunk(2, dim=1)
+        return self.norm(x) * (1 + scale) + shift
 
 
 class FeedForward(nn.Module):
@@ -255,6 +327,25 @@ class Attention(nn.Module):
             out = out.masked_fill(~mask.unsqueeze(-1), 0.0)
         return out
 
+    def _qkv_packed(
+        self,
+        packed: torch.Tensor,
+        q_norm: nn.Module,
+        k_norm: nn.Module,
+        freqs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split a packed ``[T, 3 * inner]`` projection into ``[T, H, D]`` heads, norm and rotate."""
+        q, k, v = (t.view(t.shape[0], self.heads, self.dim_head) for t in packed.chunk(3, dim=-1))
+        return _apply_rope(q_norm(q), freqs), _apply_rope(k_norm(k), freqs), v
+
+    def forward_packed(
+        self, x: torch.Tensor, freqs: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int
+    ) -> torch.Tensor:
+        """Self-attention over packed tokens ``[T, dim]`` within their varlen segments."""
+        q, k, v = self._qkv_packed(self.to_qkv(x), self.q_norm, self.k_norm, freqs)
+        out = _varlen_attention(q, k, v, cu_seqlens, max_seqlen)
+        return self.to_out[0](out.reshape(out.shape[0], self.heads * self.dim_head))
+
 
 class JointAttention(Attention):
     """Attention over the audio and text streams jointly, with separate projections."""
@@ -304,6 +395,34 @@ class JointAttention(Attention):
             c_out = c_out.masked_fill(~c_mask.unsqueeze(-1), 0.0)
         return x_out, c_out
 
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        freqs: torch.Tensor,
+        c_freqs: torch.Tensor,
+        plan: PackPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Joint attention over packed audio ``[Ta, dim]`` and text ``[Tc, dim]`` tokens.
+
+        Each row's audio and text tokens are interleaved into one varlen
+        segment (``plan.joint_perm``) so the kernel attends across both
+        streams of a row and never across rows.
+        """
+        audio_len = x.shape[0]
+        q, k, v = self._qkv_packed(self.to_qkv(x), self.q_norm, self.k_norm, freqs)
+        c_q, c_k, c_v = self._qkv_packed(self.to_qkv_c(c), self.c_q_norm, self.c_k_norm, c_freqs)
+        perm = plan.joint_perm
+        out = _varlen_attention(
+            torch.cat([q, c_q])[perm],
+            torch.cat([k, c_k])[perm],
+            torch.cat([v, c_v])[perm],
+            plan.joint_cu,
+            plan.joint_max,
+        )[plan.joint_inv]
+        out = out.reshape(out.shape[0], self.heads * self.dim_head)
+        return self.to_out[0](out[:audio_len]), self.to_out_c(out[audio_len:])
+
 
 class DoubleBlock(nn.Module):
     """MM-DiT block: joint attention, separate modulation and feed-forward per stream."""
@@ -344,6 +463,30 @@ class DoubleBlock(nn.Module):
         x = x + x_gate_mlp[:, None] * self.ff_x(norm_x)
         return c, x
 
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        t: torch.Tensor,
+        freqs: torch.Tensor,
+        c_freqs: torch.Tensor,
+        plan: PackPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The block over packed audio ``[Ta, dim]`` and text ``[Tc, dim]`` tokens."""
+        norm_c, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.attn_norm_c.forward_packed(c, t, plan.text_seg)
+        norm_x, x_gate_msa, x_shift_mlp, x_scale_mlp, x_gate_mlp = self.attn_norm_x.forward_packed(x, t, plan.audio_seg)
+
+        x_attn, c_attn = self.attn.forward_packed(norm_x, norm_c, freqs, c_freqs, plan)
+
+        c = c + c_gate_msa * c_attn
+        norm_c = self.ff_norm_c(c) * (1 + c_scale_mlp) + c_shift_mlp
+        c = c + c_gate_mlp * self.ff_c(norm_c)
+
+        x = x + x_gate_msa * x_attn
+        norm_x = self.ff_norm_x(x) * (1 + x_scale_mlp) + x_shift_mlp
+        x = x + x_gate_mlp * self.ff_x(norm_x)
+        return c, x
+
 
 class SingleBlock(nn.Module):
     """DiT block over the concatenated text and audio sequence."""
@@ -360,6 +503,21 @@ class SingleBlock(nn.Module):
         x = x + gate_msa[:, None] * self.attn(x=norm, mask=mask, rope=rope)
         norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         return x + gate_mlp[:, None] * self.ff(norm)
+
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        seg: torch.Tensor,
+        freqs: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """The block over the packed single stream ``[Ts, dim]``."""
+        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm.forward_packed(x, t, seg)
+        x = x + gate_msa * self.attn.forward_packed(norm, freqs, cu_seqlens, max_seqlen)
+        norm = self.ff_norm(x) * (1 + scale_mlp) + shift_mlp
+        return x + gate_mlp * self.ff(norm)
 
 
 class AuKTransformer(nn.Module):
@@ -397,6 +555,10 @@ class AuKTransformer(nn.Module):
         self.latent_dim = latent_dim
         self.text_cond: torch.Tensor | None = None
         self.text_uncond: torch.Tensor | None = None
+        # Run the blocks over packed varlen tokens instead of padded rows. Set
+        # by the pipeline when a varlen attention kernel is available; a
+        # caller-supplied PackPlan forces the packed path regardless.
+        self.packed_attention = False
 
         self.time_embed = TimeEmbedding(dim)
         self.txt_norm = nn.RMSNorm(dim, elementwise_affine=True)
@@ -482,6 +644,7 @@ class AuKTransformer(nn.Module):
         drop_text: bool = False,
         cfg_infer: bool = False,
         cache: bool = False,
+        plan: PackPlan | None = None,
     ) -> torch.Tensor:
         """Predict the flow-matching velocity for the target frames of ``x``.
 
@@ -503,6 +666,10 @@ class AuKTransformer(nn.Module):
             cache: Reuse the projected text across calls, for an ODE loop over
                 fixed conditioning. Only the ``cfg_infer`` path caches, as in
                 the reference. Call :meth:`clear_cache` when the text changes.
+            plan: Packed-layout plan for the rows (see :mod:`packing`). Given,
+                the blocks run over packed varlen tokens; otherwise they do so
+                only when :attr:`packed_attention` is set, building the plan
+                here.
 
         Returns:
             Velocity ``[B, n, latent_dim]``, or ``[2B, n, latent_dim]`` under
@@ -542,6 +709,10 @@ class AuKTransformer(nn.Module):
                 c = torch.zeros_like(c)
             x, audio_mask, prompt_len = self._embed_audio(x, ref, drop_audio_cond, mask, ref_mask)
 
+        if plan is not None or self.packed_attention:
+            x = self._blocks_packed(x, c, t, audio_mask, c_mask, plan)
+            return self.proj_out(self.norm_out(x[:, prompt_len:], t))
+
         seq_len = x.shape[1]
         text_len = c.shape[1]
         rope_audio = self.rotary_embed(seq_len, audio_mask)
@@ -559,6 +730,56 @@ class AuKTransformer(nn.Module):
 
         x = x[:, text_len + prompt_len :]
         return self.proj_out(self.norm_out(x, t))
+
+    def _blocks_packed(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        t: torch.Tensor,
+        audio_mask: torch.Tensor | None,
+        c_mask: torch.Tensor,
+        plan: PackPlan | None,
+    ) -> torch.Tensor:
+        """Run every block over packed tokens and return the audio stream padded again.
+
+        ``x`` is the padded ``[rows, na, dim]`` audio stream and ``c`` the padded
+        ``[rows, nt, dim]`` text stream; the result has ``x``'s shape with
+        zeros at the padded positions. A flattened stream gets one scratch
+        slot appended so the plan's filler tokens have somewhere to read from
+        and write to without touching a real row.
+        """
+        rows, audio_len, dim = x.shape
+        text_len = c.shape[1]
+        if audio_mask is None:
+            audio_mask = x.new_ones((rows, audio_len), dtype=torch.bool)
+        if plan is None:
+            plan = build_pack_plan(audio_mask, c_mask)
+        if plan.rows != rows or plan.audio_len != audio_len or plan.text_len != text_len:
+            raise ValueError(
+                f"PackPlan built for ({plan.rows}, {plan.audio_len}, {plan.text_len}) rows/audio/text does not "
+                f"match inputs ({rows}, {audio_len}, {text_len})."
+            )
+
+        x_flat = torch.cat([x.reshape(rows * audio_len, dim), x.new_zeros(1, dim)])
+        c_flat = torch.cat([c.reshape(rows * text_len, dim), c.new_zeros(1, dim)])
+        x_packed = x_flat[plan.audio_idx]
+        c_packed = c_flat[plan.text_idx]
+        freqs_audio = self.rotary_embed.forward_positions(plan.audio_pos)
+        freqs_text = self.rotary_embed.forward_positions(plan.text_pos)
+
+        for block in self.transformer_blocks:
+            c_packed, x_packed = block.forward_packed(x_packed, c_packed, t, freqs_audio, freqs_text, plan)
+
+        single = torch.cat([c_packed, x_packed])[plan.single_perm]
+        single_seg = torch.cat([plan.text_seg, plan.audio_seg])[plan.single_perm]
+        freqs_single = self.rotary_embed.forward_positions(plan.single_pos)
+        for block in self.single_transformer_blocks:
+            single = block.forward_packed(single, t, single_seg, freqs_single, plan.single_cu, plan.single_max)
+        x_packed = single[plan.single_inv][plan.text_capacity :]
+
+        out = torch.zeros(rows * audio_len + 1, dim, dtype=x_packed.dtype, device=x.device)
+        out.index_copy_(0, plan.audio_idx, x_packed)
+        return out[:-1].view(rows, audio_len, dim)
 
 
 def dit_state_dict(

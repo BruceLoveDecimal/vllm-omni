@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer
+from vllm_omni.diffusion.models.auk.packing import PackPlan, build_pack_plan
 
 logger = init_logger(__name__)
 
@@ -33,6 +34,9 @@ class _GraphEntry:
     static_timestep: torch.Tensor
     static_cfg: torch.Tensor | None
     static_out: torch.Tensor
+    # Packed-layout plan captured with the graph; its index tensors are
+    # refreshed before every replay, its capacities fix the packed shapes.
+    static_plan: PackPlan | None = None
 
 
 class AuKCUDAGraphWrapper:
@@ -135,9 +139,13 @@ class AuKCUDAGraphWrapper:
             timestep = torch.cat([timestep, timestep[-1:].expand(x.shape[0] - timestep.shape[0])])
         inputs = (x, x_mask, text, c_mask, ref, ref_mask, timestep)
         key = self._key(x, text, ref, uses_cfg, timestep.ndim)
+        plan = None
+        if self.dit.packed_attention:
+            plan = self._packed_plan(x_mask, c_mask, ref_mask, uses_cfg)
+            key = key + (plan.audio_capacity, plan.text_capacity)
         entry = self._cache.get(key)
         if entry is None:
-            entry = self._capture(*inputs, cfg_strength=cfg_strength, uses_cfg=uses_cfg)
+            entry = self._capture(*inputs, cfg_strength=cfg_strength, uses_cfg=uses_cfg, plan=plan)
             if len(self._cache) >= self.max_graphs:
                 self._cache.popitem(last=False)
             self._cache[key] = entry
@@ -153,8 +161,40 @@ class AuKCUDAGraphWrapper:
         entry.static_timestep.copy_(timestep)
         if entry.static_cfg is not None:
             entry.static_cfg.copy_(cfg_strength)
+        if plan is not None:
+            assert entry.static_plan is not None
+            plan.copy_into(entry.static_plan)
         entry.graph.replay()
         return entry.static_out[:batch, :target_frames].clone()
+
+    _PACK_ALIGNMENT = 64
+
+    def _packed_plan(
+        self, x_mask: torch.Tensor, c_mask: torch.Tensor, ref_mask: torch.Tensor, uses_cfg: bool
+    ) -> PackPlan:
+        """Build the packed plan for the bucketed rows with token capacities fixed per graph.
+
+        The rows are the ones the DiT will see: ``[ref | target]`` audio and
+        the text, doubled under CFG. Capacities round the real token counts up
+        so the plan's shapes, and hence the graph, are shared by nearby batch
+        compositions; the extra room always leaves a filler segment, and the
+        kernel's max-segment bound is the bucket total so any composition
+        that fits the bucket replays correctly.
+        """
+        audio_mask = torch.cat([ref_mask, x_mask], dim=1) if ref_mask.shape[1] > 0 else x_mask
+        if uses_cfg:
+            audio_mask = torch.cat([audio_mask, audio_mask], dim=0)
+            c_mask = torch.cat([c_mask, c_mask], dim=0)
+        audio_real = int(audio_mask.sum().item())
+        text_real = int(c_mask.sum().item())
+        plan = build_pack_plan(
+            audio_mask,
+            c_mask,
+            audio_capacity=round_up(audio_real + 1, self._PACK_ALIGNMENT),
+            text_capacity=round_up(text_real + 1, self._PACK_ALIGNMENT),
+        )
+        plan.joint_max = plan.single_max = plan.audio_capacity + plan.text_capacity
+        return plan
 
     def _run(
         self,
@@ -165,8 +205,9 @@ class AuKCUDAGraphWrapper:
         ref: torch.Tensor,
         ref_mask: torch.Tensor,
         timestep: torch.Tensor,
+        plan: PackPlan | None = None,
     ) -> torch.Tensor:
-        return self.dit(x, text, timestep, mask=x_mask, c_mask=c_mask, ref=ref, ref_mask=ref_mask)
+        return self.dit(x, text, timestep, mask=x_mask, c_mask=c_mask, ref=ref, ref_mask=ref_mask, plan=plan)
 
     def _run_cfg(
         self,
@@ -179,6 +220,7 @@ class AuKCUDAGraphWrapper:
         timestep: torch.Tensor,
         *,
         cfg_strength: torch.Tensor,
+        plan: PackPlan | None = None,
     ) -> torch.Tensor:
         pred = self.dit(
             x,
@@ -190,6 +232,7 @@ class AuKCUDAGraphWrapper:
             ref_mask=ref_mask,
             cfg_infer=True,
             cache=True,
+            plan=plan,
         )
         conditional, unconditional = pred.chunk(2, dim=0)
         return conditional + (conditional - unconditional) * cfg_strength
@@ -199,16 +242,18 @@ class AuKCUDAGraphWrapper:
         *inputs: torch.Tensor,
         cfg_strength: torch.Tensor,
         uses_cfg: bool,
+        plan: PackPlan | None = None,
     ) -> _GraphEntry:
         static_inputs = tuple(value.clone() for value in inputs)
         static_cfg = cfg_strength.clone() if uses_cfg else None
+        static_plan = plan.clone() if plan is not None else None
         try:
             for _ in range(3):
                 if uses_cfg:
                     assert static_cfg is not None
-                    self._run_cfg(*static_inputs, cfg_strength=static_cfg)
+                    self._run_cfg(*static_inputs, cfg_strength=static_cfg, plan=static_plan)
                 else:
-                    self._run(*static_inputs)
+                    self._run(*static_inputs, plan=static_plan)
             # CFG warm-up populates AuKTransformer's Python-side projected-text
             # cache. Clear it before capture so the graph includes
             # project_text(static_text), rather than closing over the first
@@ -224,9 +269,9 @@ class AuKCUDAGraphWrapper:
                 # mutable buffer, so cfg=2 and cfg=3 share this graph.
                 if uses_cfg:
                     assert static_cfg is not None
-                    static_out = self._run_cfg(*static_inputs, cfg_strength=static_cfg)
+                    static_out = self._run_cfg(*static_inputs, cfg_strength=static_cfg, plan=static_plan)
                 else:
-                    static_out = self._run(*static_inputs)
+                    static_out = self._run(*static_inputs, plan=static_plan)
         finally:
             self.dit.clear_cache()
 
@@ -249,6 +294,7 @@ class AuKCUDAGraphWrapper:
             static_timestep=static_inputs[6],
             static_cfg=static_cfg,
             static_out=static_out,
+            static_plan=static_plan,
         )
 
 
