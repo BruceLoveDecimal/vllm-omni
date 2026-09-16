@@ -148,7 +148,9 @@ class AuKCUDAGraphWrapper:
         plan = plan_key = None
         if self.dit.packed_attention:
             plan, plan_key = self._packed_plan(x_mask, c_mask, ref_mask, uses_cfg, row_lengths)
-            key = key + (plan.audio_capacity, plan.text_capacity)
+            # Padded and packed graphs of the same row buckets must not share
+            # an entry; the capacities also distinguish token buckets.
+            key = key + ((plan.audio_capacity, plan.text_capacity) if plan is not None else (0, 0))
         entry = self._cache.get(key)
         if entry is None:
             entry = self._capture(*inputs, cfg_strength=cfg_strength, uses_cfg=uses_cfg, plan=plan)
@@ -177,6 +179,8 @@ class AuKCUDAGraphWrapper:
 
     _PACK_ALIGNMENT = 64
     _MAX_PLANS = 128
+    # Pack only when padding exceeds 10% of the padded positions.
+    _PACK_MIN_WASTE_COMPLEMENT = 0.9
 
     def _packed_plan(
         self,
@@ -185,7 +189,7 @@ class AuKCUDAGraphWrapper:
         ref_mask: torch.Tensor,
         uses_cfg: bool,
         row_lengths: tuple[Sequence[int], Sequence[int], Sequence[int]] | None,
-    ) -> tuple[PackPlan, tuple]:
+    ) -> tuple[PackPlan | None, tuple | None]:
         """Return the packed plan for the bucketed rows, built on the host and cached.
 
         The rows are the ones the DiT will see: ``[ref | target]`` audio and
@@ -214,6 +218,13 @@ class AuKCUDAGraphWrapper:
         if uses_cfg:
             ref_lens, target_lens, text_lens = ref_lens * 2, target_lens * 2, text_lens * 2
         shape = (int(ref_mask.shape[1]), int(x_mask.shape[1]), int(c_mask.shape[1]))
+        real = sum(ref_lens) + sum(target_lens) + sum(text_lens)
+        padded = len(target_lens) * sum(shape)
+        if real >= self._PACK_MIN_WASTE_COMPLEMENT * padded:
+            # Packing trades the padding for per-layer gathers; with little
+            # padding (one row, or rows of near-equal length) the padded
+            # blocks are the cheaper of the two.
+            return None, None
         plan_key = (tuple(ref_lens), tuple(target_lens), tuple(text_lens), shape)
         plan = self._plans.get(plan_key)
         if plan is None:
@@ -249,7 +260,17 @@ class AuKCUDAGraphWrapper:
         timestep: torch.Tensor,
         plan: PackPlan | None = None,
     ) -> torch.Tensor:
-        return self.dit(x, text, timestep, mask=x_mask, c_mask=c_mask, ref=ref, ref_mask=ref_mask, plan=plan)
+        return self.dit(
+            x,
+            text,
+            timestep,
+            mask=x_mask,
+            c_mask=c_mask,
+            ref=ref,
+            ref_mask=ref_mask,
+            plan=plan,
+            packed=plan is not None,
+        )
 
     def _run_cfg(
         self,
@@ -275,6 +296,7 @@ class AuKCUDAGraphWrapper:
             cfg_infer=True,
             cache=True,
             plan=plan,
+            packed=plan is not None,
         )
         conditional, unconditional = pred.chunk(2, dim=0)
         return conditional + (conditional - unconditional) * cfg_strength

@@ -604,8 +604,9 @@ class _VelocityDiT(nn.Module):
         cfg_infer: bool = False,
         cache: bool = False,
         plan: object | None = None,
+        packed: bool | None = None,
     ) -> torch.Tensor:
-        del plan  # The stub has no layout; the packed plan is irrelevant to it.
+        del plan, packed  # The stub has no layout; the packed plan is irrelevant to it.
         self.calls.append(
             {
                 "time": time.detach().clone(),

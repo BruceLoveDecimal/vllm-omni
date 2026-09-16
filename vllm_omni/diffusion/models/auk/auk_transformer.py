@@ -646,6 +646,7 @@ class AuKTransformer(nn.Module):
         cfg_infer: bool = False,
         cache: bool = False,
         plan: PackPlan | None = None,
+        packed: bool | None = None,
     ) -> torch.Tensor:
         """Predict the flow-matching velocity for the target frames of ``x``.
 
@@ -671,6 +672,8 @@ class AuKTransformer(nn.Module):
                 the blocks run over packed varlen tokens; otherwise they do so
                 only when :attr:`packed_attention` is set, building the plan
                 here.
+            packed: Force the packed (``True``) or padded (``False``) blocks
+                regardless of :attr:`packed_attention`; ``None`` follows it.
 
         Returns:
             Velocity ``[B, n, latent_dim]``, or ``[2B, n, latent_dim]`` under
@@ -710,7 +713,8 @@ class AuKTransformer(nn.Module):
                 c = torch.zeros_like(c)
             x, audio_mask, prompt_len = self._embed_audio(x, ref, drop_audio_cond, mask, ref_mask)
 
-        if plan is not None or self.packed_attention:
+        use_packed = (plan is not None or self.packed_attention) if packed is None else packed
+        if use_packed:
             x = self._blocks_packed(x, c, t, audio_mask, c_mask, plan)
             return self.proj_out(self.norm_out(x[:, prompt_len:], t))
 
