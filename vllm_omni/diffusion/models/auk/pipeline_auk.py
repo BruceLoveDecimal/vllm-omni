@@ -185,6 +185,8 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.dit = self.dit.to(device=self.device).eval()
         self.dit.requires_grad_(False)
         self.cudagraph_wrapper = AuKCUDAGraphWrapper(self.dit, enabled=not od_config.enforce_eager)
+        # The compiled decode buckets are warmed by setup_compile(), which the
+        # model runner calls at startup unless the stage is enforce_eager.
         self.vae_decode = AuKVAEDecodeGraph(self.vae, enabled=not od_config.enforce_eager)
 
         logger.info(
@@ -195,6 +197,15 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             self.hop_size,
             self.sample_rate,
         )
+
+    def setup_compile(self) -> None:
+        """Compile and capture the codec decode buckets before the first request.
+
+        The DiT already replays per-shape CUDA graphs and has no repeated
+        block list, so the runner's generic transformer compile would be a
+        no-op; the startup cost worth paying here is the VAE decode.
+        """
+        self.vae_decode.warmup(self.device)
 
     # The assembled checkpoint is not a diffusers layout: __init__ reads
     # auk.safetensors and vae.safetensors directly, so the loader has no
