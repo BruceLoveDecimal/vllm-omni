@@ -1,4 +1,5 @@
-# AuK deploy: thinker encoder (stage 0) + rectified-flow DiT (stage 1).
+# AuK deploy: thinker encoder (stage 0) + rectified-flow DiT (stage 1) +
+# codec decoder (stage 2).
 # Topology declared in vllm_omni/model_executor/models/auk/pipeline.py.
 #
 # Fields omitted from a stage fall back to StageDeployConfig dataclass
@@ -37,7 +38,8 @@ stages:
       detokenize: false
       seed: 0
 
-  # Stage 1: AuKPipeline (DiT + BigVGAN-flow VAE encoder and decoder).
+  # Stage 1: AuKLatentPipeline (DiT plus the VAE encoder for the source clip;
+  # emits latents).
   # Shares GPU 0 with the encoder; 32 Euler steps at CFG 2.0 is the Base
   # recipe, and AuK-Flash overrides both with its distilled 4-step grid.
   # Concurrent requests share one DiT forward as rows of a padded batch (the
@@ -65,9 +67,19 @@ stages:
     max_num_seqs: 8
     step_execution: false
     request_batch_max_wait_ms: 10
-    gpu_memory_utilization: 0.35
+    gpu_memory_utilization: 0.30
     enforce_eager: false
     default_sampling_params:
       seed: 0
       num_inference_steps: 32
       guidance_scale: 2.0
+
+  # Stage 2: AuKVocoderPipeline (BigVGAN-flow VAE decoder). Its own stage so
+  # clip rendering overlaps the next batch's DiT steps. One clip per decode
+  # call: a batched decode measured slower per clip than one call each, so
+  # max_num_seqs stays at 1.
+  - stage_id: 2
+    devices: "0"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.05
+    enforce_eager: true

@@ -1,7 +1,7 @@
 # AuK speech generation and editing — H100
 
 > Instruction-driven zero-shot TTS, instruct TTS, speech editing, enhancement
-> and separation with Tencent's AuK, served as a two-stage vLLM-Omni pipeline
+> and separation with Tencent's AuK, served as a three-stage vLLM-Omni pipeline
 > (Qwen2.5-Omni thinker encoder, then a rectified-flow DiT with a BigVGAN-flow
 > VAE) on one H100.
 
@@ -137,7 +137,7 @@ about 47 s with a warm page cache.
 ## Notes
 
 - Memory usage: about 25 GB peak on the device for a 12 s generation with
-  both stages resident (deploy defaults: encoder 0.45, diffusion stage 0.35
+  all three stages resident (deploy defaults: encoder 0.45, DiT stage 0.30, codec stage 0.05
   of device memory).
 - Key flags: `enforce_eager` on the encoder stage (it walks the decoder
   layers itself for the layer fusion); the diffusion stage captures one CUDA

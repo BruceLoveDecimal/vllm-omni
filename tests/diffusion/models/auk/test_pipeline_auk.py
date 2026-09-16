@@ -746,6 +746,70 @@ class TestStepExecution:
         assert base(gridded).sampling_params.num_inference_steps == 2
 
 
+class TestThreeStageSplit:
+    """The DiT stage emits latents and the vocoder stage renders them."""
+
+    def test_latent_pipeline_emits_latents_for_every_request(self, build_pipeline):
+        base, _ = build_pipeline()  # installs the transformer, codec and ODE stubs
+        pipeline = pipeline_auk.AuKLatentPipeline(od_config=base.od_config)
+
+        assert isinstance(pipeline, AuKPipeline)
+        assert pipeline.support_audio_output is False
+        assert pipeline.emits_latents is True
+        outputs = pipeline.forward(
+            _batch_of(
+                (_prompt(audio=_silence(2.0), knobs={"gen_seconds": 2.0}), {"seed": 1}),
+                (_prompt(knobs={"gen_seconds": 1.0}), {"seed": 2}),
+            )
+        )
+
+        assert [output.output.shape for output in outputs] == [(1, 100, LATENT_DIM), (1, 50, LATENT_DIM)]
+        assert all(output.output.device.type == "cpu" for output in outputs)
+        # The reference clip is still VAE-encoded here; nothing is decoded.
+        assert pipeline.vae.encode_calls and pipeline.vae.decode_calls == 0
+
+    def test_latent_pipeline_step_path_emits_latents(self, build_pipeline):
+        base, _ = build_pipeline()
+        pipeline = pipeline_auk.AuKLatentPipeline(od_config=base.od_config)
+        pipeline.dit = _VelocityDiT()
+        state = _state("s0", _prompt(knobs={"gen_seconds": 1.0}), seed=3, num_inference_steps=2)
+        pipeline.prepare_encode(state)
+        for _ in range(2):
+            pipeline.step_scheduler(state, pipeline.denoise_step(None, states=[state]))
+
+        output = pipeline.post_decode(state)
+
+        assert output.error is None and output.output.shape == (1, 50, LATENT_DIM)
+        assert pipeline.vae.decode_calls == 0
+
+    def test_vocoder_pipeline_decodes_one_clip_per_request(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pipeline_auk, "get_local_device", lambda: torch.device("cpu"))
+        monkeypatch.setattr(pipeline_auk, "AuKVAE", _StubVAE)
+        od_config = OmniDiffusionConfig(
+            model=str(_write_checkpoint(tmp_path, "base")),
+            dtype=torch.float32,
+            model_class_name="AuKVocoderPipeline",
+        )
+        vocoder = pipeline_auk.AuKVocoderPipeline(od_config=od_config)
+        assert vocoder.support_audio_output is True and vocoder.audio_sample_rate == SAMPLE_RATE
+        assert not hasattr(vocoder, "dit")
+
+        outputs = vocoder.forward(
+            _batch_of(
+                ({"prompt": "", "latents": torch.zeros(1, 100, LATENT_DIM)}, {}),
+                ({"prompt": "", "latents": torch.zeros(50, LATENT_DIM)}, {}),
+                ({"prompt": "", "latents": torch.zeros(1, 5, LATENT_DIM + 1)}, {}),
+                ({"prompt": ""}, {}),
+            )
+        )
+
+        assert [output.output.shape for output in outputs[:2]] == [(100 * HOP,), (50 * HOP,)]
+        assert vocoder.vae.decode_calls == 2
+        # Bad latents fail only their own request.
+        assert outputs[2].output is None and "latents" in outputs[2].error
+        assert outputs[3].output is None and "latents" in outputs[3].error
+
+
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:
     for message in messages:
         for item in message.get("content") or ():

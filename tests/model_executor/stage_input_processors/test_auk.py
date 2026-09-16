@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
+from vllm_omni.model_executor.stage_input_processors.auk import dit2vocoder, encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -186,3 +186,38 @@ class TestKnobPropagation:
         knobs = out["additional_information"]["auk"]
         assert knobs["gen_seconds"] is None
         assert knobs["has_audio"] is False
+
+
+class TestDit2Vocoder:
+    """The DiT stage's latents become the vocoder stage's prompt."""
+
+    def test_reads_the_bare_tensor_from_the_generic_payload_slot(self):
+        latents = torch.randn(1, 50, 64)
+
+        out = dit2vocoder([SimpleNamespace(images=[latents], multimodal_output={})], _prompt())
+
+        assert out is not None
+        assert out["prompt"] == ""
+        assert torch.equal(out["latents"], latents)
+        assert out["latents"].device.type == "cpu"
+
+    def test_reads_an_envelope_payload_and_adds_the_batch_axis(self):
+        latents = torch.randn(50, 64)
+
+        out = dit2vocoder([SimpleNamespace(images=[], multimodal_output={"output": latents})], _prompt())
+
+        assert out is not None and out["latents"].shape == (1, 50, 64)
+
+    def test_does_not_carry_the_original_prompt_or_source_clip(self):
+        out = dit2vocoder([SimpleNamespace(images=[torch.zeros(1, 5, 64)], multimodal_output={})], _prompt(audio=True))
+
+        assert out is not None and set(out) == {"prompt", "latents"}
+
+    def test_empty_sources_yield_nothing(self):
+        assert dit2vocoder([], _prompt()) is None
+
+    def test_missing_or_malformed_latents_are_rejected(self):
+        with pytest.raises(ValueError, match="no latents"):
+            dit2vocoder([SimpleNamespace(images=[], multimodal_output={})], _prompt())
+        with pytest.raises(ValueError, match="gen_frames"):
+            dit2vocoder([SimpleNamespace(images=[torch.zeros(2, 5, 64)], multimodal_output={})], _prompt())
