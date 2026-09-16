@@ -4,8 +4,12 @@
 
 Stage 0: Encoder — frozen Qwen2.5-Omni thinker, prefill only, emits the
          learned layer fusion as ``multimodal_outputs["hidden_states"]["output"]``
-Stage 1: DiT     — rectified-flow transformer plus the BigVGAN-flow VAE,
-         emits a 24 kHz waveform
+Stage 1: DiT     — rectified-flow transformer (plus the VAE encoder for the
+         source clip), emits normalized target latents
+Stage 2: Vocoder — BigVGAN-flow VAE decoder, emits a 24 kHz waveform
+
+The codec sits in its own stage so that, under load, one batch's DiT steps
+overlap the previous batch's clip rendering instead of queueing behind it.
 """
 
 from vllm_omni.config.stage_config import (
@@ -47,14 +51,30 @@ AUK_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.DIFFUSION,
             input_sources=(0,),
             requires_multimodal_data=True,
-            final_output=True,
-            final_output_type="audio",
-            model_arch="AuKPipeline",
+            final_output=False,
+            engine_output_type="latent",
+            model_arch="AuKLatentPipeline",
             custom_process_input_func=f"{_PROC}.encoder2dit",
             omni_kv_config={"need_recv_cache": False},
             # Single replica, and the whole ODE runs inside one forward, so
             # the stage stays in the orchestrator process.
             inline_diffusion=True,
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="vocoder",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(1,),
+            final_output=True,
+            final_output_type="audio",
+            model_arch="AuKVocoderPipeline",
+            custom_process_input_func=f"{_PROC}.dit2vocoder",
+            omni_kv_config={"need_recv_cache": False},
+            # The diffusion model-parallel state is process-global, so a
+            # second inline diffusion stage cannot share the orchestrator
+            # process with the DiT stage; the vocoder runs in its own process.
+            # The handoff is a [gen_frames, 64] fp32 latent, a few tens of KB.
+            inline_diffusion=False,
         ),
     ),
 )

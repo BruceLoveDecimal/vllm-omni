@@ -211,6 +211,9 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
     # default stage metadata reports ``final_output_type="audio"`` and the
     # ``multimodal_output`` payload includes the sample rate.
     support_audio_output: ClassVar[bool] = True
+    # The three-stage deploy hands the codec to its own stage: the DiT stage
+    # then emits latents for every request (see AuKLatentPipeline).
+    emits_latents: ClassVar[bool] = False
     support_audio_input: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 24000
 
@@ -258,14 +261,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.default_sway = defaults.get("sway", -1.0)
         self._flash_lock_logged = False
 
-        # The codec is small and numerically sensitive: it stays in fp32. It
-        # must sit on the inference device BEFORE load_weights folds weight
-        # norm: a CPU fold lands one ULP off the accelerator's and the encoder
-        # amplifies that into a 1e-2 latent drift.
-        self.vae = AuKVAE.from_config(vae_config["model_init_kwargs"]).to(device=self.device, dtype=torch.float32)
-        self.vae.load_weights(os.path.join(model_dir, "vae.safetensors"))
-        self.vae = self.vae.eval()
-        self.vae.requires_grad_(False)
+        self.vae = _load_vae(model_dir, vae_config, self.device)
         self._check_vae_geometry()
 
         # The transformer owns every key the checkpoint tool writes into `dit`,
@@ -620,18 +616,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         """Decode the finished request's latents, or return them when asked for."""
 
         del kwargs
-        latent = state.extra["x"]
-        if not torch.isfinite(latent).all():
-            return DiffusionOutput(error="AuK generated latents contain NaN or Inf.")
-        if state.extra["output_type"] == "latent":
-            return DiffusionOutput(output=latent.detach().cpu())
-        with torch.inference_mode():
-            wav = self.vae.decode(latent)
-        # One mono waveform per request; the formatter expects [T].
-        wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
-        if not torch.isfinite(wav).all():
-            return DiffusionOutput(error="AuK generated audio contains NaN or Inf.")
-        return DiffusionOutput(output=wav)
+        return self._finish_request(state.extra["x"], state.extra["output_type"])
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Generate one waveform per request in the batch.
@@ -712,26 +697,150 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             # batched call over equal-length clips measured 1.7x slower per
             # clip than one call each on the GPU used for tuning.
             for row, (i, item) in enumerate(parsed):
-                latent = latents[row : row + 1, : item.gen_frames]
-                if not torch.isfinite(latent).all():
-                    outputs[i] = DiffusionOutput(error="AuK generated latents contain NaN or Inf.")
-                    continue
-                if item.output_type == "latent":
-                    outputs[i] = DiffusionOutput(output=latent.detach().cpu())
-                    continue
-                wav = self.vae.decode(latent)
-                # One mono waveform per request; the formatter expects [T].
-                wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
-                if not torch.isfinite(wav).all():
-                    outputs[i] = DiffusionOutput(error="AuK generated audio contains NaN or Inf.")
-                    continue
-                outputs[i] = DiffusionOutput(output=wav)
+                outputs[i] = self._finish_request(latents[row : row + 1, : item.gen_frames], item.output_type)
         return _complete(outputs)
+
+    def _finish_request(self, latent: torch.Tensor, output_type: str) -> DiffusionOutput:
+        """Turn one request's ``[1, gen_frames, latent_dim]`` latents into its output."""
+
+        if not torch.isfinite(latent).all():
+            return DiffusionOutput(error="AuK generated latents contain NaN or Inf.")
+        if output_type == "latent" or self.emits_latents:
+            return DiffusionOutput(output=latent.detach().cpu())
+        with torch.inference_mode():
+            wav = self.vae.decode(latent)
+        return _waveform_output(wav)
 
 
 def _complete(outputs: list[DiffusionOutput | None]) -> list[DiffusionOutput]:
     assert all(output is not None for output in outputs), "every request must produce exactly one output"
     return outputs  # type: ignore[return-value]
+
+
+def _waveform_output(wav: torch.Tensor) -> DiffusionOutput:
+    """Wrap one decoded clip as the mono ``[T]`` float32 waveform the formatter expects."""
+
+    wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+    if not torch.isfinite(wav).all():
+        return DiffusionOutput(error="AuK generated audio contains NaN or Inf.")
+    return DiffusionOutput(output=wav)
+
+
+def _load_vae(model_dir: str, vae_config: dict[str, Any], device: torch.device) -> AuKVAE:
+    """Build the codec on ``device`` in fp32 and load its weights there.
+
+    The codec is small and numerically sensitive, so it stays in fp32. It must
+    sit on the inference device before ``load_weights`` folds weight norm: a
+    CPU fold lands one ULP off the accelerator's, and the encoder amplifies
+    that into a 1e-2 latent drift.
+    """
+
+    vae = AuKVAE.from_config(vae_config["model_init_kwargs"]).to(device=device, dtype=torch.float32)
+    vae.load_weights(os.path.join(model_dir, "vae.safetensors"))
+    vae = vae.eval()
+    vae.requires_grad_(False)
+    return vae
+
+
+class AuKLatentPipeline(AuKPipeline):
+    """The DiT stage of the three-stage deploy: same model, emits latents.
+
+    It still owns the codec because the reference clip is VAE-encoded here,
+    but it never decodes: every request leaves as ``[1, gen_frames,
+    latent_dim]`` latents for :class:`AuKVocoderPipeline`. Keeping the codec
+    decode out of this stage lets the next batch's DiT run while the previous
+    batch's clips are being rendered.
+    """
+
+    support_audio_output: ClassVar[bool] = False
+    emits_latents: ClassVar[bool] = True
+
+
+class AuKVocoderPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscovery):
+    """The codec stage of the three-stage deploy: latents in, waveform out.
+
+    One clip per decode call. The codec's convolutions are not causal, so
+    clips of different length cannot share a call, and a batched call over
+    equal-length clips measured slower per clip than one call each.
+
+    Args:
+        od_config: OmniDiffusion configuration. ``od_config.model`` is the same
+            assembled AuK directory the DiT stage loads; only ``config.json``
+            and ``vae.safetensors`` are read here.
+        prefix: Unused; kept for the pipeline construction contract.
+    """
+
+    supports_request_batch = True
+    support_audio_output: ClassVar[bool] = True
+    audio_sample_rate: ClassVar[int] = 24000
+    # Nothing to warm up: the request carries the latents to decode.
+    dummy_run_num_frames: ClassVar[int] = 0
+    _dit_modules: ClassVar[list[str]] = []
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    weights_sources: ClassVar[tuple] = ()
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
+        super().__init__()
+        del prefix
+        self.od_config = od_config
+        self.device = get_local_device()
+        model_dir = od_config.model
+        if not model_dir or not os.path.isdir(model_dir):
+            raise ValueError(
+                f"AuK needs an assembled local checkpoint directory, got {model_dir!r}. "
+                "Build one with tools/prepare_auk_checkpoint.py."
+            )
+        vae_config = dict(_read_config(model_dir)["vae"])
+        self.latent_dim = int(vae_config["latent_dim"])
+        self.hop_size = int(vae_config["downsample_rate"])
+        self.sample_rate = int(vae_config["target_sample_rate"])
+        if self.sample_rate != self.audio_sample_rate:
+            raise ValueError(
+                f"AuK advertises {self.audio_sample_rate} Hz output but the checkpoint is {self.sample_rate} Hz."
+            )
+        self.vae = _load_vae(model_dir, vae_config, self.device)
+        logger.info(
+            "AuK vocoder ready: latent_dim=%d hop=%d sample_rate=%d", self.latent_dim, self.hop_size, self.sample_rate
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stray = [name for name, _ in weights]
+        if stray:
+            logger.warning("AuKVocoderPipeline ignores %d loader-provided weights (e.g. %s)", len(stray), stray[:3])
+        return {name for name, _ in self.named_parameters()}
+
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Decode one waveform per request from the ``latents`` its prompt carries."""
+
+        if req.num_reqs < 1:
+            raise ValueError("AuKVocoderPipeline received an empty request batch.")
+        outputs: list[DiffusionOutput | None] = [None] * req.num_reqs
+        for i, prompt in enumerate(req.prompts):
+            try:
+                latent = _latents_from_prompt(prompt, self.latent_dim).to(device=self.device, dtype=torch.float32)
+                with torch.inference_mode():
+                    wav = self.vae.decode(latent)
+                outputs[i] = _waveform_output(wav)
+            except Exception as exc:
+                outputs[i] = DiffusionOutput.from_exception(exc)
+        return _complete(outputs)
+
+
+def _latents_from_prompt(prompt: Any, latent_dim: int) -> torch.Tensor:
+    """Read the ``[1, gen_frames, latent_dim]`` latents the DiT stage handed over."""
+
+    latent = _unwrap_single(_prompt_mapping(prompt).get("latents"))
+    if latent is None:
+        raise ValueError("AuK vocoder stage needs `latents` from the DiT stage.")
+    latent = torch.as_tensor(latent)
+    if latent.ndim == 2:
+        latent = latent.unsqueeze(0)
+    if latent.ndim != 3 or latent.shape[0] != 1 or latent.shape[-1] != latent_dim:
+        raise ValueError(f"AuK `latents` must be [1, gen_frames, {latent_dim}], got {tuple(latent.shape)}.")
+    if latent.shape[1] < 1:
+        raise ValueError("AuK `latents` must hold at least one frame.")
+    return latent
 
 
 def _read_config(model_dir: str) -> dict[str, Any]:

@@ -98,11 +98,14 @@ class TestPromptRendering:
 
 
 class TestSamplingParams:
-    def test_two_stages_in_order(self):
+    def test_three_stages_in_order(self):
         params = auk_sampling_params()
-        assert len(params) == 2
+        assert len(params) == 3
         assert isinstance(params[0], SamplingParams)
         assert isinstance(params[1], OmniDiffusionSamplingParams)
+        # The vocoder stage takes no knobs.
+        assert isinstance(params[2], OmniDiffusionSamplingParams)
+        assert params[2].num_inference_steps is None
 
     def test_encoder_stage_is_prefill_only(self):
         encoder = auk_sampling_params()[0]
@@ -117,7 +120,7 @@ class TestSamplingParams:
         assert diffusion.seed == 0
 
     def test_overrides(self):
-        encoder, diffusion = auk_sampling_params(nfe=4, cfg=0.0, seed=None)
+        encoder, diffusion, _vocoder = auk_sampling_params(nfe=4, cfg=0.0, seed=None)
         assert diffusion.num_inference_steps == 4
         assert diffusion.guidance_scale == 0.0
         assert diffusion.seed is None

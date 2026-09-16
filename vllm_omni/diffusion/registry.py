@@ -121,6 +121,16 @@ _DIFFUSION_MODELS = {
         "pipeline_auk",
         "AuKPipeline",
     ),
+    "AuKLatentPipeline": (
+        "auk",
+        "pipeline_auk",
+        "AuKLatentPipeline",
+    ),
+    "AuKVocoderPipeline": (
+        "auk",
+        "pipeline_auk",
+        "AuKVocoderPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -573,6 +583,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
+    "AuKLatentPipeline": "get_auk_post_process_func",
+    "AuKVocoderPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
@@ -630,6 +642,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "AuKPipeline": "get_auk_pre_process_func",
+    "AuKLatentPipeline": "get_auk_pre_process_func",
     "BagelPipeline": "get_bagel_pre_process_func",
     "GlmImagePipeline": "get_glm_image_pre_process_func",
     "BooguImagePipeline": "get_boogu_image_pre_process_func",

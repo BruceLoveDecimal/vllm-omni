@@ -107,11 +107,12 @@ def auk_sampling_params(
     Stage 0 is a prefill-only encoder, so its vLLM sampling is a no-op that
     only has to satisfy the scheduler. Stage 1 carries the real knobs: ``nfe``
     Euler steps and CFG strength. AuK-Flash ignores both and pins its
-    distilled recipe.
+    distilled recipe. Stage 2 is the codec, which has no knobs.
     """
     return [
         SamplingParams(max_tokens=1, temperature=0.0, detokenize=False, seed=seed),
         OmniDiffusionSamplingParams(num_inference_steps=nfe, guidance_scale=cfg, seed=seed),
+        OmniDiffusionSamplingParams(),
     ]
 
 

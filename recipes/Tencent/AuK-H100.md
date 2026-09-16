@@ -1,7 +1,7 @@
 # AuK speech generation and editing — H100
 
 > Instruction-driven zero-shot TTS, instruct TTS, speech editing, enhancement
-> and separation with Tencent's AuK, served as a two-stage vLLM-Omni pipeline
+> and separation with Tencent's AuK, served as a three-stage vLLM-Omni pipeline
 > (Qwen2.5-Omni thinker encoder, then a rectified-flow DiT with a BigVGAN-flow
 > VAE) on one H100.
 
@@ -137,9 +137,9 @@ about 47 s with a warm page cache.
 ## Notes
 
 - Memory usage: about 25 GB peak on the device for a 12 s generation with
-  both stages resident (deploy defaults: encoder 0.45, diffusion stage 0.35
+  all three stages resident (deploy defaults: encoder 0.45, DiT stage 0.30, codec stage 0.05
   of device memory).
-- Key flags: `enforce_eager` on both stages (the encoder walks the decoder
+- Key flags: `enforce_eager` on all three stages (the encoder walks the decoder
   layers itself for the layer fusion); the diffusion stage batches concurrent
   requests as rows of one padded DiT forward. `enable_prefix_caching` must stay off
   for the encoder: a cache hit skips prompt positions that the fused
@@ -164,5 +164,5 @@ about 47 s with a warm page cache.
 | Online `/v1/chat/completions` with audio | not yet qualified | `docs/serving/` |
 | `/v1/audio/speech` | not supported (needs a TTS adapter) | `docs/contributing/model/adding_tts_model.md` |
 | Streaming / async chunk | not supported | `docs/design/feature/async_chunk.md` |
-| Batching across requests | supported: padded, masked rows of one DiT forward sized by `max_num_seqs`; per-request error isolation; one codec decode per request | `docs/design/feature/diffusion_continuous_batching.md` |
+| Batching across requests | supported: padded, masked rows of one DiT forward sized by `max_num_seqs`; per-request error isolation; the codec decodes one clip per request in its own stage, overlapping the next batch's DiT steps | `docs/design/feature/diffusion_continuous_batching.md` |
 | Tensor / sequence parallelism | not supported | `docs/configuration/composable_parallel.md` |

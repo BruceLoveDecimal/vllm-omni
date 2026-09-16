@@ -146,3 +146,47 @@ def encoder2dit(
         "multi_modal_data": mm_data,
         "additional_information": {"auk": knobs},
     }
+
+
+# The DiT stage of the three-stage deploy emits its latents as a bare tensor;
+# the diffusion output formatter files a bare tensor under ``images`` (its
+# generic payload slot) and, for envelope payloads, under ``multimodal_output``.
+_LATENT_KEYS = ("output", "latents")
+
+
+def _extract_latents(source_output: Any) -> Any:
+    images = getattr(source_output, "images", None)
+    if isinstance(images, list) and images:
+        return images[0]
+    mm_output = getattr(source_output, "multimodal_output", None)
+    if isinstance(mm_output, Mapping):
+        for key in _LATENT_KEYS:
+            if mm_output.get(key) is not None:
+                return mm_output[key]
+    return None
+
+
+def dit2vocoder(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | list | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> dict[str, Any] | None:
+    """Turn the DiT stage's latents into the vocoder stage's prompt.
+
+    The vocoder needs nothing but the ``[1, gen_frames, latent_dim]`` latents;
+    the original prompt and its source clip stay behind.
+    """
+    del prompt, requires_multimodal_data, streaming_context
+    if not source_outputs:
+        return None
+    latents = _extract_latents(source_outputs[0])
+    if latents is None:
+        raise ValueError("AuK DiT stage produced no latents; the vocoder stage cannot run without them")
+    latents = torch.as_tensor(latents).detach().cpu()
+    if latents.ndim == 2:
+        latents = latents.unsqueeze(0)
+    if latents.ndim != 3 or latents.shape[0] != 1:
+        raise ValueError(f"AuK latents must be [1, gen_frames, latent_dim]; got shape {tuple(latents.shape)}")
+    logger.debug("[dit2vocoder] latents=%s dtype=%s", tuple(latents.shape), latents.dtype)
+    return {"prompt": "", "latents": latents}
