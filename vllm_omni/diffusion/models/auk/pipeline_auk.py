@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -26,7 +26,12 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, dit_state_dict, integrate_latents
+from vllm_omni.diffusion.models.auk.auk_transformer import (
+    AuKTransformer,
+    build_time_grid,
+    dit_state_dict,
+    integrate_latents,
+)
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
@@ -34,7 +39,9 @@ from vllm_omni.diffusion.models.interface import (
     SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.model_extras.auk import resolve_gen_frames
 
 logger = init_logger(__name__)
@@ -91,12 +98,19 @@ def get_auk_pre_process_func(od_config: OmniDiffusionConfig):
     is_flash, default_sway = _schedule_key_defaults(getattr(od_config, "model", None))
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        # Under step execution the scheduler tracks progress by
+        # num_inference_steps, so it must equal the number of Euler steps the
+        # pipeline will actually take: Flash pins four, and an explicit time
+        # grid has one step fewer than points.
         if is_flash:
             request.batch_compatibility_key = ("auk", "flash")
+            request.sampling_params.num_inference_steps = _FLASH_NFE
             return request
         knobs = (_prompt_mapping(request.prompt).get("additional_information") or {}).get("auk") or {}
         sway = knobs.get("sway")
         t_grid = knobs.get("t_grid")
+        if t_grid and len(t_grid) >= 2:
+            request.sampling_params.num_inference_steps = len(t_grid) - 1
         request.batch_compatibility_key = (
             "auk",
             default_sway if sway is None else float(sway),
@@ -187,6 +201,11 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
     """
 
     supports_request_batch = True
+    # Step execution (deploy ``step_execution: true``) advances every active
+    # request one Euler step per scheduler tick, so a request joins the DiT
+    # batch at the next step boundary instead of waiting for a whole batch to
+    # finish; the encoder stage and the DiT stage then overlap continuously.
+    supports_step_execution: ClassVar[bool] = True
 
     # Picked up by ``supports_audio_output`` in the diffusion engine so the
     # default stage metadata reports ``final_output_type="audio"`` and the
@@ -490,6 +509,129 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             batch[i, : row.shape[0]] = row.to(dtype)
             mask[i, : row.shape[0]] = True
         return batch, mask
+
+    # ------------------------------------------------------------------
+    # Step execution: one Euler step per scheduler tick. Requests join and
+    # leave the DiT batch at step boundaries, so a request whose encoder
+    # output has just arrived waits at most one step instead of one batch.
+    # ------------------------------------------------------------------
+
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
+        """Parse one request and initialise its latents and time grid.
+
+        ``InputBatch`` gathers ``state.latents`` row by row and needs one
+        trailing shape across the batch, which variable-length audio does not
+        have. ``state.latents`` therefore only carries the row count; the
+        real latents live in ``state.extra["x"]`` as ``[1, gen_frames,
+        latent_dim]``. ``state.timesteps`` holds the grid points a step starts
+        from, so the scheduler's step count equals the number of Euler steps.
+        """
+
+        del kwargs
+        with torch.inference_mode():
+            parsed = self._parse_request(state.prompt, state.sampling)
+            nfe, cfg, sway, t_grid = parsed.schedule
+            grid = build_time_grid(nfe=nfe, sway_sampling_coef=sway, t_grid=t_grid, device=self.device)
+            x = self._draw_noise(parsed, torch.float32).unsqueeze(0)
+        state.extra.update(
+            text=parsed.text,
+            ref=parsed.ref,
+            gen_frames=parsed.gen_frames,
+            x=x,
+            grid=grid,
+            cfg=cfg,
+            output_type=parsed.output_type,
+        )
+        state.latents = x.new_zeros(1, 1, self.latent_dim)
+        state.timesteps = grid[:-1]
+        state.step_index = 0
+        return state
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState] | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """One velocity forward for every active request, padded into one batch.
+
+        Rows may sit at different steps, so the DiT takes a per-row timestep.
+        Rows may also differ in guidance: the uncond branch runs for the whole
+        batch when any row needs it and rows with zero guidance ignore it. The
+        result is ``[B, max frames, latent_dim]`` in ``states`` order, which
+        is how the runner slices it back per request.
+        """
+
+        del input_batch, kwargs
+        if not states:
+            raise ValueError("AuK denoise_step needs the request states.")
+        rows = list(states)
+        timesteps = []
+        for state in rows:
+            timestep = state.current_timestep
+            if timestep is None:
+                raise ValueError(f"Request {state.request_id} has no Euler step left to take.")
+            timesteps.append(timestep)
+
+        with torch.inference_mode():
+            text, c_mask = self._pad_rows([state.extra["text"] for state in rows], self.dtype)
+            ref, ref_mask = self._pad_rows([state.extra["ref"] for state in rows], torch.float32)
+            x, x_mask = self._pad_rows([state.extra["x"][0] for state in rows], torch.float32)
+            if len(rows) == 1:
+                x_mask = None
+            t = torch.stack(timesteps).to(device=self.device, dtype=torch.float32)
+            cfg = torch.tensor([float(state.extra["cfg"]) for state in rows], device=self.device)
+            guided = bool((cfg >= 1e-5).any())
+            with self._dit_autocast():
+                pred = self.dit(
+                    x,
+                    text,
+                    t,
+                    mask=x_mask,
+                    c_mask=c_mask,
+                    ref=ref,
+                    ref_mask=ref_mask,
+                    cfg_infer=guided,
+                    # The batch composition changes between steps, so the
+                    # DiT's request-scoped text cache must stay off.
+                    cache=False,
+                )
+            pred = pred.float()
+            if not guided:
+                return pred
+            v_cond, v_uncond = pred.chunk(2, dim=0)
+            return v_cond + (v_cond - v_uncond) * cfg[:, None, None]
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor | None, **kwargs: Any) -> None:
+        """Take one Euler step: ``x += (t[i+1] - t[i]) * v`` on the request's own frames."""
+
+        del kwargs
+        if noise_pred is None:
+            return
+        grid = state.extra["grid"]
+        x = state.extra["x"]
+        i = state.step_index
+        with torch.inference_mode():
+            state.extra["x"] = x + (grid[i + 1] - grid[i]) * noise_pred[:, : x.shape[1]].to(x.dtype)
+        state.step_index += 1
+
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput:
+        """Decode the finished request's latents, or return them when asked for."""
+
+        del kwargs
+        latent = state.extra["x"]
+        if not torch.isfinite(latent).all():
+            return DiffusionOutput(error="AuK generated latents contain NaN or Inf.")
+        if state.extra["output_type"] == "latent":
+            return DiffusionOutput(output=latent.detach().cpu())
+        with torch.inference_mode():
+            wav = self.vae.decode(latent)
+        # One mono waveform per request; the formatter expects [T].
+        wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+        if not torch.isfinite(wav).all():
+            return DiffusionOutput(error="AuK generated audio contains NaN or Inf.")
+        return DiffusionOutput(output=wav)
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Generate one waveform per request in the batch.

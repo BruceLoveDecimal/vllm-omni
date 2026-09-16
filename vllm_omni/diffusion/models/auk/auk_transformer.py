@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-__all__ = ["AuKTransformer", "dit_state_dict", "integrate_latents", "sample_latents"]
+__all__ = ["AuKTransformer", "build_time_grid", "dit_state_dict", "integrate_latents", "sample_latents"]
 
 
 def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -665,6 +665,27 @@ def sample_latents(
     )
 
 
+def build_time_grid(
+    *,
+    nfe: int,
+    sway_sampling_coef: float | None,
+    t_grid: list[float] | None,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Build and validate the Euler time grid ``[nfe + 1]`` from ``t=0`` to ``t=1``."""
+    if t_grid is not None:
+        t = torch.tensor(t_grid, device=device, dtype=torch.float32)
+    else:
+        t = torch.linspace(0, 1, nfe + 1, device=device, dtype=torch.float32)
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(math.pi / 2 * t) - 1 + t)
+    if t.ndim != 1 or t.numel() < 2 or not bool(torch.isfinite(t).all() & torch.all(t[1:] > t[:-1])):
+        raise ValueError(
+            f"AuK sampling needs a strictly increasing time grid with at least two points; got {t.tolist()}"
+        )
+    return t
+
+
 @torch.no_grad()
 def integrate_latents(
     dit: AuKTransformer,
@@ -708,19 +729,8 @@ def integrate_latents(
         The latents at ``t=1``, ``[B, n, latent_dim]``; padded positions hold
         unspecified values and must be sliced away by the caller.
     """
-    device = x.device
-    if t_grid is not None:
-        t = torch.tensor(t_grid, device=device, dtype=torch.float32)
-    else:
-        t = torch.linspace(0, 1, nfe + 1, device=device, dtype=torch.float32)
-        if sway_sampling_coef is not None:
-            t = t + sway_sampling_coef * (torch.cos(math.pi / 2 * t) - 1 + t)
-
+    t = build_time_grid(nfe=nfe, sway_sampling_coef=sway_sampling_coef, t_grid=t_grid, device=x.device)
     guided = cfg_strength >= 1e-5
-    if t.numel() < 2 or not bool(torch.all(t[1:] > t[:-1])):
-        raise ValueError(
-            f"AuK sampling needs a strictly increasing time grid with at least two points; got {t.tolist()}"
-        )
     try:
         for i in range(t.shape[0] - 1):
             if guided:
