@@ -28,6 +28,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, dit_state_dict, sample_latents
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
+from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
     SupportAudioOutput,
@@ -184,6 +185,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.dit = self.dit.to(device=self.device).eval()
         self.dit.requires_grad_(False)
         self.cudagraph_wrapper = AuKCUDAGraphWrapper(self.dit, enabled=not od_config.enforce_eager)
+        self.vae_decode = AuKVAEDecodeGraph(self.vae, enabled=not od_config.enforce_eager)
 
         logger.info(
             "AuK pipeline ready: variant=%s dtype=%s latent_dim=%d hop=%d sample_rate=%d",
@@ -438,7 +440,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             if output_type == "latent":
                 return [DiffusionOutput(output=latents.detach().cpu())]
 
-            wav = self.vae.decode(latents)
+            wav = self.vae_decode(latents)
 
         # One mono waveform per request; the formatter expects [T].
         wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
