@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The AuK codec's decode fast paths keep the reference numerics.
 
-Three paths are checked against the plain eager decode: the shared Snake
+Four paths are checked against the plain eager decode: the shared Snake
 activation with precomputed exponent caches, the per-channel FIR filter cache,
-and the CUDA graph wrapper (which falls back to eager off CUDA).
+the per-length CUDA graph tier and the torch.compile bucket tier (both fall
+back to eager off CUDA).
 """
 
 import pytest
@@ -97,13 +98,29 @@ def test_decode_fast_paths_reproduce_the_plain_decode() -> None:
 @torch.inference_mode()
 def test_graph_wrapper_falls_back_to_eager_off_cuda(mocker) -> None:
     vae = _small_vae()
-    wrapper = AuKVAEDecodeGraph(vae, frame_alignment=64)
+    wrapper = AuKVAEDecodeGraph(vae, frame_alignment=64, compile_shapes=(8,))
     capture_spy = mocker.spy(wrapper, "_capture")
+    compile_spy = mocker.spy(torch, "compile")
     latents = torch.randn(1, 6, vae.latent_dim)
 
+    wrapper.warmup(torch.device("cpu"))
     assert torch.equal(wrapper(latents), vae.decode(latents))
+    assert wrapper.last_mode == "eager"
     capture_spy.assert_not_called()
-    assert not wrapper._cache
+    compile_spy.assert_not_called()
+    assert not wrapper._cache and not wrapper._compiled
+
+
+def test_compiled_bucket_is_the_smallest_captured_one_that_fits() -> None:
+    wrapper = AuKVAEDecodeGraph(_small_vae(), compile_shapes=(16, 8, 8))
+    assert wrapper.compile_shapes == [8, 16]
+    # Nothing captured yet: every length goes to the per-length graph tier.
+    assert wrapper.compiled_bucket(6) is None
+    wrapper._compiled = {8: object(), 16: object()}  # type: ignore[dict-item]
+    assert [wrapper.compiled_bucket(frames) for frames in (6, 8, 9, 16, 17)] == [8, 8, 16, 16, None]
+    # A bucket whose capture failed is skipped, not padded to.
+    wrapper._compiled = {16: object()}  # type: ignore[dict-item]
+    assert wrapper.compiled_bucket(6) == 16
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
@@ -138,3 +155,31 @@ def test_bucketed_graph_only_disturbs_the_tail() -> None:
     assert torch.isfinite(replay).all()
     assert not torch.equal(replay, eager)
     torch.testing.assert_close(replay, eager, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA graph capture requires CUDA")
+@torch.inference_mode()
+def test_compiled_buckets_replay_within_fusion_tolerance_and_leave_longer_clips_to_plain_graphs() -> None:
+    vae = _small_vae().to("cuda")
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(8,))
+    wrapper.warmup(torch.device("cuda"))
+    assert list(wrapper._compiled) == [8]
+    # The fused Triton Snake is only disabled while Inductor traces.
+    assert all(module.fused for module in vae.modules() if isinstance(module, SnakeBeta))
+
+    exact = torch.randn(1, 8, vae.latent_dim, device="cuda")
+    eager = vae.decode(exact)
+    replay = wrapper(exact)
+    assert wrapper.last_mode == "compiled"
+    assert replay.shape == eager.shape
+    # Same formula, different fusion order: not bit-identical, but close.
+    torch.testing.assert_close(replay, eager, atol=1e-4, rtol=0.0)
+
+    short = torch.randn(1, 5, vae.latent_dim, device="cuda")
+    padded = wrapper(short)
+    assert wrapper.last_mode == "compiled" and padded.shape == (1, 5 * vae.hop_size)
+    torch.testing.assert_close(padded, vae.decode(short), atol=0.1, rtol=0.0)
+
+    long = torch.randn(1, 12, vae.latent_dim, device="cuda")
+    assert torch.equal(wrapper(long), vae.decode(long))
+    assert wrapper.last_mode == "graph" and list(wrapper._cache) == [12]

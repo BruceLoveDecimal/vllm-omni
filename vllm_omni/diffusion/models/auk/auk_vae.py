@@ -496,7 +496,9 @@ class AuKVAE(nn.Module):
 
         Both default to on. They exist as switches so a parity check can pin
         the bit-exact eager formula, and so each path's cost can be measured on
-        its own.
+        its own. Flip them before any CUDA graph is captured: passing
+        cached_filters reallocates the cached taps, and a captured graph
+        keeps reading the old buffers.
         """
 
         for module in self.modules():
