@@ -1739,7 +1739,7 @@ class LingBotWorldCausalDMDPipeline(
                     "LingBot camera interaction requires apply_interaction_at_chunk_boundary before prepare_next_chunk."
                 )
             absolute_poses = camera_session.last_absolute_poses
-            media_frames = (block_frames - 1) * self.vae_scale_factor_temporal + 1
+            media_frames = self._chunk_media_frame_count(state, block_frames=block_frames)
             if int(absolute_poses.shape[0]) != media_frames:
                 raise ValueError(
                     "camera interaction must produce exactly one pose per media frame; "
@@ -1922,10 +1922,23 @@ class LingBotWorldCausalDMDPipeline(
             finished=state.request_denoise_completed,
         )
 
+    def _chunk_media_frame_count(self, state: StepRequestState, *, block_frames: int) -> int:
+        """Pixel frames this chunk will emit when decoded.
+
+        Independent (non-streaming) decode restarts causal expansion every block,
+        so each chunk is ``(block_frames - 1) * temporal + 1`` frames.
+        Streaming decode expands only the session's opening latent to one frame and every later latent to the full
+        temporal factor, so chunk 0 matches the independent count and later chunks are ``block_frames * temporal``.
+        """
+        decode_state = self._streaming_decode_states.get(state.request_id)
+        if decode_state is not None and decode_state.started:
+            return block_frames * self.vae_scale_factor_temporal
+        return (block_frames - 1) * self.vae_scale_factor_temporal + 1
+
     def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
         """Expose this chunk's decoded media extent for camera interaction timelines."""
         block_frames = int(state.extra.get("block_frames") or self.transformer.config.num_frames_per_block)
-        media_frames = (block_frames - 1) * self.vae_scale_factor_temporal + 1
+        media_frames = self._chunk_media_frame_count(state, block_frames=block_frames)
         fps = state.sampling.fps
         if fps is None or float(fps) <= 0:
             # Media-frame camera controls are not wall-clock paced; a unit fps keeps

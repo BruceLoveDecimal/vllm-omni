@@ -2468,6 +2468,30 @@ def test_stepwise_chunks_continue_one_sessions_temporal_decode(monkeypatch) -> N
     assert pipeline.vae._feat_map == ["module-owned"]
 
 
+def test_peek_chunk_media_matches_streaming_decoder_frame_counts(monkeypatch) -> None:
+    """Camera timelines must track the streaming decoder's 9-then-12 media counts."""
+    module = _load_pipeline_module()
+    _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "np"
+    state.sampling.fps = 16.0
+    fake = _FakeARState(state.request_id)
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, fake):
+        pipeline.prepare_encode(state)
+        first = pipeline.peek_chunk_media(state)
+        assert (first.num_frames, first.fps) == (9, 16.0)
+
+        while not state.chunk_denoise_completed:
+            noise = pipeline.denoise_step(None, states=[state])
+            pipeline.step_scheduler(state, noise)
+        pipeline.post_decode(state)
+
+        second = pipeline.peek_chunk_media(state)
+        assert (second.num_frames, second.fps) == (12, 16.0)
+
+
 def test_streaming_decode_state_is_owned_by_the_session(monkeypatch) -> None:
     """Decoder state is keyed by request id and released with the AR session."""
     module = _load_pipeline_module()
