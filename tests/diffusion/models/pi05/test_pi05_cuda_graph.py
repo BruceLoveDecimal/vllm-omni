@@ -65,9 +65,7 @@ def model():
 
 def _observation(seed: int, num_live_cameras: int, batch_size: int = 1):
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    images = [
-        torch.rand(batch_size, 3, 224, 224, device="cuda", generator=gen) * 2 - 1 for _ in range(3)
-    ]
+    images = [torch.rand(batch_size, 3, 224, 224, device="cuda", generator=gen) * 2 - 1 for _ in range(3)]
     camera_counts = (torch.arange(batch_size, device="cuda") + num_live_cameras - 1) % 3 + 1
     masks = [i < camera_counts for i in range(3)]
     lang = torch.randint(0, 1000, (batch_size, 200), device="cuda", generator=gen)
@@ -115,8 +113,7 @@ def test_denoise_step_rejects_a_foreign_kv_cache(model):
 
 def test_cuda_graph_replays_multiple_batch_sizes_without_recapture(model):
     observations = {
-        bsize: [_observation(10 + bsize, 1, bsize), _observation(20 + bsize, 3, bsize)]
-        for bsize in (1, 2, 3)
+        bsize: [_observation(10 + bsize, 1, bsize), _observation(20 + bsize, 3, bsize)] for bsize in (1, 2, 3)
     }
     with torch.inference_mode():
         eager = {bsize: [model.sample_actions(**obs) for obs in cases] for bsize, cases in observations.items()}
@@ -137,9 +134,7 @@ def test_cuda_graph_replays_multiple_batch_sizes_without_recapture(model):
             # Replay new inputs in a different order. A stale static buffer or
             # a graph lookup keyed incorrectly by batch size breaks equality.
             second_order = [(2, 1), (3, 0), (1, 1), (2, 0), (1, 0), (3, 1)]
-            second = {
-                (bsize, case): model.sample_actions(**observations[bsize][case]) for bsize, case in second_order
-            }
+            second = {(bsize, case): model.sample_actions(**observations[bsize][case]) for bsize, case in second_order}
         finally:
             model.cuda_graph_runner = None
 
