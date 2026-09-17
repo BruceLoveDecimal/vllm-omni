@@ -3,8 +3,8 @@
 # Adopted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/flow
 """Conditional Flow Matching (CFM) classes for audio generation."""
 
-from abc import ABC
 import inspect
+from abc import ABC
 
 import torch
 import torch.nn as nn
@@ -258,9 +258,7 @@ class CausalConditionalCFM(ConditionalCFM):
                 t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
 
         with cosyvoice3_batch_flow_profile(f"cosyvoice3_cfm_euler_{max(1, int(n_timesteps))}_steps"):
-            return self.solve_euler(
-                z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, streaming=streaming
-            ), None
+            return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, streaming=streaming), None
 
 
 class CausalMaskedDiffWithDiT(torch.nn.Module):
