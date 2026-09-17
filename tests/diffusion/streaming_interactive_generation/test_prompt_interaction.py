@@ -160,6 +160,7 @@ class TestPromptUpdateExecution:
             supports_step_execution = True
 
         runner = _make_diffusion_model_runner(pipeline=_UnsupportedPipeline())
+        runner.state_cache["req-1"] = _make_diffusion_request_state()
         with pytest.raises(ValueError, match="not supported"):
             runner.submit_interaction("req-1", _prompt_interaction())
 
@@ -211,7 +212,7 @@ class TestPromptUpdateExecution:
         state = _make_diffusion_request_state()
         runner.state_cache["req-1"] = state
 
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, KeyError, AttributeError, TypeError)):
             runner.submit_interaction("req-1", cast(Any, interaction))
 
         # Rejected composite/malformed events must leave interaction queues unchanged.

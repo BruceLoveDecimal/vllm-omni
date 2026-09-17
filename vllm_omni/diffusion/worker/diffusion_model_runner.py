@@ -43,6 +43,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
+from vllm_omni.diffusion.interaction.types import InteractionPayload
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
@@ -1420,43 +1421,25 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if not self._supports_step_mode():
             raise ValueError("submit_interaction requires step execution support")
 
-        event = interaction.get("event")
-        event_id = interaction.get("event_id")
-        transition_chunks = interaction.get("transition_chunks")
-        multi_modal_data = event.get("multi_modal_data") if isinstance(event, dict) else None
-        has_prompt = isinstance(event, dict) and "prompt" in event and event.get("prompt") is not None
-        if isinstance(event, dict) and "multi_modal_data" in event and multi_modal_data is not None:
-            if not isinstance(multi_modal_data, dict) or not multi_modal_data:
-                raise ValueError("interaction event.multi_modal_data must be a non-empty object when provided")
-        has_mm = isinstance(multi_modal_data, dict) and bool(multi_modal_data)
-
-        if not isinstance(event, dict) or (not has_prompt and not has_mm):
-            raise ValueError("interaction event requires prompt and/or multi_modal_data")
-        if not isinstance(event_id, str) or not event_id:
-            raise ValueError("event_id must be non-empty")
-
-        parts: list[tuple[str, dict]] = []
-        if has_prompt:
-            if not self._interaction_coordinator.has_modality("prompt"):
-                raise ValueError(f"prompt_update is not supported by pipeline {self.od_config.model_class_name!r}")
-            prompt = event["prompt"]
-            if not isinstance(prompt, str) or not prompt:
-                raise ValueError("prompt must be non-empty")
-            parts.append(("prompt", {"prompt": prompt}))
-        if has_mm:
-            for modality, payload in multi_modal_data.items():
-                if not isinstance(payload, dict):
-                    raise ValueError(f"multi_modal_data[{modality!r}] must be an object")
-                parts.append((str(modality), payload))
-
         state = self.state_cache.get(request_id)
         if state is None:
             raise ValueError(f"No active request state for interaction: {request_id!r}")
 
+        event = interaction["event"]
+        parts: list[tuple[str, InteractionPayload]] = []
+        prompt = event.get("prompt")
+        if prompt is not None:
+            parts.append(("prompt", {"prompt": prompt}))
+        multi_modal_data = event.get("multi_modal_data")
+        if multi_modal_data:
+            parts.extend(
+                (str(modality), cast(InteractionPayload, payload)) for modality, payload in multi_modal_data.items()
+            )
+
         self._interaction_coordinator.enqueue_parts(
             state,
             parts=parts,
-            event_id=event_id,
+            event_id=interaction["event_id"],
             received_at=time.monotonic(),
-            transition_chunks=transition_chunks,
+            transition_chunks=interaction.get("transition_chunks"),
         )
