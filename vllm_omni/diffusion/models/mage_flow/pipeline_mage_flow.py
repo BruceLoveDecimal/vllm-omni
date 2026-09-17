@@ -847,7 +847,7 @@ class MageFlowPipeline(
             # off. Mage-Flow spells that same intent as 1.0, so accept it here
             # rather than failing startup, while real requests stay validated.
             guidance_scale = 1.0
-        output_type = sampling.output_type or "pil"
+        output_type = sampling.output_type or self.od_config.output_type
         if output_type not in {"pil", "tensor", "latent"}:
             raise ValueError("Mage-Flow output_type must be 'pil', 'tensor', or 'latent'")
         vision_long_edge = parse_mage_flow_extra_args(sampling.extra_args)

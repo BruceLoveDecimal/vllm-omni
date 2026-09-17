@@ -4,6 +4,7 @@
 """Padded-batch attention and the sequence-parallel padding guard."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 @pytest.fixture(autouse=True)
 def _init_distributed():
+    """Gloo on CPU tensors, so a CUDA host does not reach for NCCL."""
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
@@ -27,10 +29,25 @@ def _init_distributed():
         rank=0,
         local_rank=0,
         distributed_init_method="env://",
+        backend="gloo",
     )
     initialize_model_parallel()
     yield
     cleanup_dist_env_and_memory()
+
+
+@pytest.fixture(autouse=True)
+def _force_torch_sdpa():
+    """Pin TORCH_SDPA so these CPU tests do not pick a CUDA-only backend."""
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+        parallel_config=SimpleNamespace(ring_degree=1),
+    )
+    with set_current_diffusion_config(od_config):
+        yield
 
 
 @pytest.fixture(autouse=True)
