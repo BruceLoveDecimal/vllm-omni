@@ -7,7 +7,7 @@
 
 """Native vLLM-Omni implementation of the Mage-Flow NR-MMDiT."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,7 @@ from .mage_flow_layers import (
     MageFlowEmbedRope,
     MageFlowImageRopePrepare,
     MageFlowTimestepProjEmbeddings,
+    _mask_tokens,
     _request_isolated_forward,
     _sequence_parallel_active,
 )
@@ -292,36 +293,48 @@ class MageFlowTransformer2DModel(nn.Module):
         ),
         image_attention_mask: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
+        image_token_lengths: Sequence[int] | None = None,
+        encoder_token_lengths: Sequence[int] | None = None,
     ) -> tuple[torch.Tensor]:
+        """Denoise one padded batch.
+
+        ``*_token_lengths`` are the per-row valid token counts behind the
+        masks. The pipeline knows them as Python ints from its own padding and
+        passes them so the request-isolated projections can slice rows
+        without reading the masks back from the device; a caller that only
+        has the masks may leave them ``None``.
+        """
         if hidden_states.ndim != 3 or encoder_hidden_states.ndim != 3:
             raise ValueError("Mage-Flow hidden_states and encoder_hidden_states must be 3-D")
         if hidden_states.shape[0] != encoder_hidden_states.shape[0]:
             raise ValueError("Mage-Flow image and text batch sizes must match")
         batch_size = hidden_states.shape[0]
-        if image_attention_mask is None:
-            image_attention_mask = torch.ones(
-                hidden_states.shape[:2],
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-        if image_attention_mask.shape != hidden_states.shape[:2]:
+        # ``None`` means every token is real and stays ``None`` all the way
+        # down: the attention backend reads a mask back to the host on every
+        # layer to decide whether to unpad, so materialising an all-ones mask
+        # here would cost one device sync per block per step. The pipeline
+        # validates token counts against the grids once, before denoising,
+        # from the Python lengths it padded with; checking the mask here would
+        # be another per-step readback.
+        if image_attention_mask is not None and image_attention_mask.shape != hidden_states.shape[:2]:
             raise ValueError("image_attention_mask must match image token dimensions")
-        if encoder_attention_mask is not None:
-            if encoder_attention_mask.shape != encoder_hidden_states.shape[:2]:
-                raise ValueError("encoder_attention_mask must match encoder token dimensions")
-        else:
-            encoder_attention_mask = torch.ones(
-                encoder_hidden_states.shape[:2],
-                dtype=torch.bool,
-                device=encoder_hidden_states.device,
-            )
+        if encoder_attention_mask is not None and encoder_attention_mask.shape != encoder_hidden_states.shape[:2]:
+            raise ValueError("encoder_attention_mask must match encoder token dimensions")
+        if image_token_lengths is not None and len(image_token_lengths) != batch_size:
+            raise ValueError("image_token_lengths must have one entry per batch row")
+        if encoder_token_lengths is not None and len(encoder_token_lengths) != batch_size:
+            raise ValueError("encoder_token_lengths must have one entry per batch row")
+        if image_attention_mask is None:
+            image_token_lengths = None
+        if encoder_attention_mask is None:
+            encoder_token_lengths = None
 
         grids_per_sample = self._normalize_batched_image_grids(image_grid_hw, batch_size)
         expected_tokens = [sum(frame * height * width for frame, height, width in grids) for grids in grids_per_sample]
-        actual_tokens = image_attention_mask.to(torch.int64).sum(dim=1).tolist()
-        if actual_tokens != expected_tokens:
+        if image_attention_mask is None and any(tokens != hidden_states.shape[1] for tokens in expected_tokens):
             raise ValueError(
-                f"valid image token counts do not match image grids: got {actual_tokens}, expected {expected_tokens}"
+                f"image token count does not match image grids: "
+                f"got {hidden_states.shape[1]}, expected {expected_tokens}"
             )
 
         hidden_states, image_rotary_emb = self.image_rope_prepare(
@@ -329,15 +342,18 @@ class MageFlowTransformer2DModel(nn.Module):
             image_attention_mask,
             grids_per_sample,
             hidden_states.shape[1],
+            image_token_lengths,
         )
         # The _sp_plan hook fires on image_rope_prepare's outputs, so the image
         # stream is sharded from here on while the text stream stays whole.
         sequence_parallel = _sequence_parallel_active()
-        if sequence_parallel and not (bool(image_attention_mask.all()) and bool(encoder_attention_mask.all())):
+        if sequence_parallel and (image_attention_mask is not None or encoder_attention_mask is not None):
             # Batch padding, not shard padding: sharding splits the padded
             # sequence blindly, so a padded request would put real tokens and
             # filler on different ranks with no mask to tell them apart.
-            # Requests of equal length shard cleanly.
+            # Requests of equal length shard cleanly. The pipeline only hands
+            # down a mask when a sequence is padded, so presence is the test;
+            # reading the mask's values back would be a device sync.
             raise ValueError(
                 "Mage-Flow sequence parallelism does not support padded token "
                 "sequences: sharding would put real tokens and filler on "
@@ -354,20 +370,21 @@ class MageFlowTransformer2DModel(nn.Module):
             self.txt_in,
             self.txt_norm(encoder_hidden_states),
             encoder_attention_mask,
+            encoder_token_lengths,
         )
         if not sequence_parallel:
             # Under SP the mask spans the full sequence while hidden_states holds
-            # only this rank's shard. The masks are all-valid there (checked
+            # only this rank's shard. The masks are absent there (checked
             # above), so skipping these multiplies is a no-op, not a shortcut.
-            hidden_states = hidden_states * image_attention_mask[..., None]
-        encoder_hidden_states = encoder_hidden_states * encoder_attention_mask[..., None]
+            hidden_states = _mask_tokens(hidden_states, image_attention_mask)
+        encoder_hidden_states = _mask_tokens(encoder_hidden_states, encoder_attention_mask)
         timestep = timestep.to(hidden_states.dtype)
         if timestep.shape != (batch_size,):
             raise ValueError(f"Mage-Flow timestep must have shape ({batch_size},), got {tuple(timestep.shape)}")
         temb = self.time_text_embed(timestep, hidden_states)
 
         # Every mask below is indexed against the full sequence, which no longer
-        # matches the sharded image stream. They are all-valid under SP, so the
+        # matches the sharded image stream. They are absent under SP, so the
         # blocks run unmasked instead.
         block_image_mask = None if sequence_parallel else image_attention_mask
 
@@ -379,6 +396,8 @@ class MageFlowTransformer2DModel(nn.Module):
                 image_rotary_emb=image_rotary_emb,
                 image_attention_mask=block_image_mask,
                 encoder_attention_mask=encoder_attention_mask,
+                image_token_lengths=None if sequence_parallel else image_token_lengths,
+                encoder_token_lengths=encoder_token_lengths,
             )
         # proj_out carries the _sp_plan gather hook, so its output is whole
         # again and the trailing mask applies to the full sequence.
@@ -386,8 +405,9 @@ class MageFlowTransformer2DModel(nn.Module):
             self.proj_out,
             self.norm_out(hidden_states, temb),
             block_image_mask,
+            None if sequence_parallel else image_token_lengths,
         )
-        output = output * image_attention_mask[..., None]
+        output = _mask_tokens(output, image_attention_mask)
         return (output,)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

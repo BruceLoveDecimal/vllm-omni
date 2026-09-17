@@ -569,6 +569,17 @@ class MageFlowPipeline(
             mask[index, :length] = True
         return padded, mask, lengths
 
+    @staticmethod
+    def _padding_mask(lengths: list[int], device: torch.device) -> torch.Tensor | None:
+        """Build a ``[B, max_len]`` mask, or ``None`` when nothing is padded."""
+        max_length = max(lengths)
+        if all(length == max_length for length in lengths):
+            return None
+        mask = torch.zeros(len(lengths), max_length, dtype=torch.bool, device=device)
+        for index, length in enumerate(lengths):
+            mask[index, :length] = True
+        return mask
+
     def predict_noise(
         self,
         *,
@@ -578,6 +589,8 @@ class MageFlowPipeline(
         image_grid_hw: list[tuple[int, int]] | list[list[tuple[int, int]]],
         image_attention_mask: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
+        image_token_lengths: list[int] | None = None,
+        encoder_token_lengths: list[int] | None = None,
     ) -> torch.Tensor:
         return self.transformer(
             hidden_states=hidden_states,
@@ -586,7 +599,27 @@ class MageFlowPipeline(
             image_grid_hw=image_grid_hw,
             image_attention_mask=image_attention_mask,
             encoder_attention_mask=encoder_attention_mask,
+            image_token_lengths=image_token_lengths,
+            encoder_token_lengths=encoder_token_lengths,
         )[0]
+
+    @staticmethod
+    def _pack_cfg_tensor(positive_value: torch.Tensor, negative_value: torch.Tensor) -> torch.Tensor:
+        """Stack the two guidance branches, zero-padding the shorter token sequence.
+
+        Per-request scalars such as ``timestep`` have no token axis and are
+        stacked as they are.
+        """
+        if positive_value.ndim < 2:
+            return torch.cat([positive_value, negative_value], dim=0)
+        max_length = max(positive_value.shape[1], negative_value.shape[1])
+        for_cat = []
+        for value in (positive_value, negative_value):
+            padding = max_length - value.shape[1]
+            if padding:
+                value = torch.nn.functional.pad(value, (0, padding) if value.ndim == 2 else (0, 0, 0, padding))
+            for_cat.append(value)
+        return torch.cat(for_cat, dim=0)
 
     def _predict_noise_packed_cfg(
         self,
@@ -600,40 +633,35 @@ class MageFlowPipeline(
             return self.predict_noise(**positive_kwargs)
 
         batch_size = positive_kwargs["hidden_states"].shape[0]
+        # Text lengths may differ between the branches; the shorter one is
+        # padded up and, since the pad tokens must not be attended to, both
+        # branches then need a mask even when neither is padded on its own.
+        text_lengths_differ = (
+            positive_kwargs["encoder_hidden_states"].shape[1] != negative_kwargs["encoder_hidden_states"].shape[1]
+        )
         packed_kwargs: dict[str, Any] = {}
         for key, positive_value in positive_kwargs.items():
             negative_value = negative_kwargs[key]
-            if key == "image_grid_hw":
+            if key in {"image_grid_hw", "image_token_lengths", "encoder_token_lengths"}:
                 packed_kwargs[key] = list(positive_value) + list(negative_value)
-            elif isinstance(positive_value, torch.Tensor):
+            elif key in {"image_attention_mask", "encoder_attention_mask"}:
                 if (
-                    key
-                    in {
-                        "encoder_hidden_states",
-                        "encoder_attention_mask",
-                    }
-                    and positive_value.shape[1] != negative_value.shape[1]
+                    positive_value is None
+                    and negative_value is None
+                    and not (key == "encoder_attention_mask" and text_lengths_differ)
                 ):
-                    max_length = max(
-                        positive_value.shape[1],
-                        negative_value.shape[1],
-                    )
-                    positive_padding = max_length - positive_value.shape[1]
-                    negative_padding = max_length - negative_value.shape[1]
-                    if positive_padding:
-                        positive_value = torch.nn.functional.pad(
-                            positive_value,
-                            (0, positive_padding) if positive_value.ndim == 2 else (0, 0, 0, positive_padding),
-                        )
-                    if negative_padding:
-                        negative_value = torch.nn.functional.pad(
-                            negative_value,
-                            (0, negative_padding) if negative_value.ndim == 2 else (0, 0, 0, negative_padding),
-                        )
-                packed_kwargs[key] = torch.cat(
-                    [positive_value, negative_value],
-                    dim=0,
-                )
+                    packed_kwargs[key] = None
+                    continue
+                stream = "hidden_states" if key == "image_attention_mask" else "encoder_hidden_states"
+                if positive_value is None:
+                    tokens = positive_kwargs[stream]
+                    positive_value = tokens.new_ones(tokens.shape[:2], dtype=torch.bool)
+                if negative_value is None:
+                    tokens = negative_kwargs[stream]
+                    negative_value = tokens.new_ones(tokens.shape[:2], dtype=torch.bool)
+                packed_kwargs[key] = self._pack_cfg_tensor(positive_value, negative_value)
+            elif isinstance(positive_value, torch.Tensor):
+                packed_kwargs[key] = self._pack_cfg_tensor(positive_value, negative_value)
             else:
                 raise TypeError(f"Unsupported Mage-Flow packed CFG field {key!r}")
 
@@ -658,9 +686,11 @@ class MageFlowPipeline(
         target_lengths: list[int],
         reference_latents: list[torch.Tensor],
         prompt_embeds: torch.Tensor,
-        prompt_attention_mask: torch.Tensor,
+        prompt_attention_mask: torch.Tensor | None,
+        prompt_lengths: list[int],
         negative_prompt_embeds: torch.Tensor | None,
         negative_prompt_attention_mask: torch.Tensor | None,
+        negative_prompt_lengths: list[int] | None,
         image_grid_hw: list[list[tuple[int, int]]],
         num_inference_steps: int,
         guidance_scale: float,
@@ -685,19 +715,30 @@ class MageFlowPipeline(
         # rather than failing once the first guided request arrives.
         sequence_parallel = self.od_config.parallel_config.sequence_parallel_size > 1
 
+        # Everything below is fixed for the whole denoise loop and is derived
+        # from Python ints, so it costs no device sync: the attention backend
+        # reads a mask back to the host on every layer to decide whether to
+        # unpad (``torch.any(~mask)``), so a mask is handed down only when a
+        # sequence is actually padded. Equal-length batches (including every
+        # single request) run the dense path with no mask at all.
+        combined_lengths = [
+            target_length + reference.shape[1] for target_length, reference in zip(target_lengths, reference_latents)
+        ]
+        expected_lengths = [sum(height * width for height, width in grids) for grids in image_grid_hw]
+        if combined_lengths != expected_lengths:
+            raise ValueError(
+                f"image token counts do not match image grids: got {combined_lengths}, expected {expected_lengths}"
+            )
+        combined_width = max(combined_lengths)
+        image_attention_mask = self._padding_mask(combined_lengths, target_latents.device)
+        target_width = target_latents.shape[1]
+
         with self.progress_bar(total=len(scheduler.timesteps)) as progress:
             for step_index, timestep in enumerate(scheduler.timesteps):
-                combined_sequences = [
-                    torch.cat(
-                        [
-                            target_latents[index : index + 1, :target_length],
-                            reference_latents[index],
-                        ],
-                        dim=1,
-                    )
-                    for index, target_length in enumerate(target_lengths)
-                ]
-                combined_latents, image_attention_mask, _ = self._pad_token_sequences(combined_sequences)
+                combined_latents = target_latents.new_zeros(batch_size, combined_width, target_latents.shape[-1])
+                for index, (target_length, reference) in enumerate(zip(target_lengths, reference_latents)):
+                    combined_latents[index, :target_length] = target_latents[index, :target_length]
+                    combined_latents[index, target_length : combined_lengths[index]] = reference[0]
                 sigma = scheduler.sigmas[step_index].to(
                     device=self.device,
                     dtype=target_latents.dtype,
@@ -709,6 +750,8 @@ class MageFlowPipeline(
                     "image_grid_hw": image_grid_hw,
                     "image_attention_mask": image_attention_mask,
                     "encoder_attention_mask": prompt_attention_mask,
+                    "image_token_lengths": combined_lengths,
+                    "encoder_token_lengths": prompt_lengths,
                 }
                 negative_kwargs = (
                     {
@@ -718,6 +761,8 @@ class MageFlowPipeline(
                         "image_grid_hw": image_grid_hw,
                         "image_attention_mask": image_attention_mask,
                         "encoder_attention_mask": negative_prompt_attention_mask,
+                        "image_token_lengths": combined_lengths,
+                        "encoder_token_lengths": negative_prompt_lengths,
                     }
                     if do_cfg
                     else None
@@ -742,9 +787,9 @@ class MageFlowPipeline(
                         guidance_scale=guidance_scale,
                         cfg_normalize=cfg_normalize,
                     )
-                target_noise_prediction = torch.zeros_like(target_latents)
-                for index, target_length in enumerate(target_lengths):
-                    target_noise_prediction[index, :target_length] = full_noise_prediction[index, :target_length]
+                # The reference tail of every row is dropped and the padded
+                # target tail is already zero-masked below.
+                target_noise_prediction = full_noise_prediction[:, :target_width] * target_attention_mask[..., None]
                 target_latents = self.scheduler_step(
                     target_noise_prediction,
                     timestep,
@@ -913,17 +958,20 @@ class MageFlowPipeline(
         target_latents, target_attention_mask, target_lengths = self._pad_token_sequences(
             [item.target_latents for item in items]
         )
-        prompt_embeds, prompt_attention_mask, _ = self._pad_token_sequences([item.prompt_embeds for item in items])
+        prompt_embeds, _, prompt_lengths = self._pad_token_sequences([item.prompt_embeds for item in items])
+        prompt_attention_mask = self._padding_mask(prompt_lengths, prompt_embeds.device)
         do_cfg = items[0].guidance_scale > 1.0
         if do_cfg:
-            negative_prompt_embeds, negative_prompt_attention_mask, _ = self._pad_token_sequences(
+            negative_prompt_embeds, _, negative_prompt_lengths = self._pad_token_sequences(
                 [item.negative_prompt_embeds for item in items if item.negative_prompt_embeds is not None]
             )
             if negative_prompt_embeds.shape[0] != len(items):
                 raise ValueError("Mage-Flow CFG request batch is missing negative prompt embeddings")
+            negative_prompt_attention_mask = self._padding_mask(negative_prompt_lengths, negative_prompt_embeds.device)
         else:
             negative_prompt_embeds = None
             negative_prompt_attention_mask = None
+            negative_prompt_lengths = None
 
         target_latents = self.diffuse_batch(
             target_latents=target_latents,
@@ -932,8 +980,10 @@ class MageFlowPipeline(
             reference_latents=[item.reference_latents for item in items],
             prompt_embeds=prompt_embeds,
             prompt_attention_mask=prompt_attention_mask,
+            prompt_lengths=prompt_lengths,
             negative_prompt_embeds=negative_prompt_embeds,
             negative_prompt_attention_mask=negative_prompt_attention_mask,
+            negative_prompt_lengths=negative_prompt_lengths,
             image_grid_hw=[item.image_grids for item in items],
             num_inference_steps=items[0].num_inference_steps,
             guidance_scale=items[0].guidance_scale,

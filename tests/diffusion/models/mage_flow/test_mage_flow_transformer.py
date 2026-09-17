@@ -149,3 +149,26 @@ def test_sp_rejects_request_level_image_padding():
             image_grid_hw=(1, 2),
             image_attention_mask=torch.tensor([[True, True, False]]),
         )
+
+
+def test_request_isolated_forward_slices_padded_rows_by_length():
+    """Padded rows are projected by their Python lengths, not by indexing the mask.
+
+    The pipeline hands the transformer the lengths it padded with, so the
+    per-row projections never read the mask back from the device. The result
+    must match the mask-derived fallback exactly, with zeros in the padding.
+    """
+    from vllm_omni.diffusion.models.mage_flow.mage_flow_layers import _request_isolated_forward
+
+    torch.manual_seed(0)
+    module = nn.Linear(4, 6)
+    hidden_states = torch.randn(2, 5, 4)
+    mask = torch.tensor([[True] * 5, [True, True, True, False, False]])
+
+    with_lengths = _request_isolated_forward(module, hidden_states, mask, [5, 3])
+    from_mask = _request_isolated_forward(module, hidden_states, mask)
+
+    assert torch.equal(with_lengths, from_mask)
+    assert torch.equal(with_lengths[0], module(hidden_states[0:1])[0])
+    assert torch.equal(with_lengths[1, :3], module(hidden_states[1:2, :3])[0])
+    assert not with_lengths[1, 3:].count_nonzero()

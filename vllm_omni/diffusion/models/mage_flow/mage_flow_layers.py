@@ -13,6 +13,7 @@ backend-selectable ``Attention`` layer.
 """
 
 import math
+from collections.abc import Sequence
 from functools import lru_cache
 from typing import Any
 
@@ -55,8 +56,16 @@ def _request_isolated_forward(
     module: nn.Module,
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
+    lengths: Sequence[int] | None = None,
 ) -> torch.Tensor:
-    """Keep BF16 GEMM shapes identical to standalone request execution."""
+    """Keep BF16 GEMM shapes identical to standalone request execution.
+
+    Padding is always a suffix, so a padded row is its first ``lengths[i]``
+    tokens. Slicing by those Python ints keeps the loop free of device syncs;
+    boolean indexing by the mask would read it back on every call, and this
+    runs several times per block per step. ``lengths`` is derived from the
+    mask only when a caller did not pass it, at one sync per call.
+    """
     if hidden_states.shape[0] == 1:
         return module(hidden_states)
     if attention_mask is None:
@@ -64,13 +73,12 @@ def _request_isolated_forward(
             [module(hidden_states[index : index + 1]) for index in range(hidden_states.shape[0])],
             dim=0,
         )
+    if lengths is None:
+        lengths = attention_mask.sum(dim=1).tolist()
 
     output = None
-    for index in range(hidden_states.shape[0]):
-        valid_tokens = attention_mask[index]
-        sample_output = module(
-            hidden_states[index : index + 1, valid_tokens],
-        )
+    for index, length in enumerate(lengths):
+        sample_output = module(hidden_states[index : index + 1, :length])
         if output is None:
             output = sample_output.new_zeros(
                 (
@@ -79,7 +87,7 @@ def _request_isolated_forward(
                     *sample_output.shape[2:],
                 )
             )
-        output[index, valid_tokens] = sample_output[0]
+        output[index, :length] = sample_output[0]
     assert output is not None
     return output
 
@@ -382,6 +390,7 @@ class MageFlowImageRopePrepare(nn.Module):
         image_attention_mask: torch.Tensor | None,
         grids_per_sample: list[list[tuple[int, int, int]]],
         max_image_tokens: int,
+        image_token_lengths: Sequence[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = hidden_states.device
         frequencies = []
@@ -411,6 +420,7 @@ class MageFlowImageRopePrepare(nn.Module):
             self.img_in,
             hidden_states,
             image_attention_mask,
+            image_token_lengths,
         )
         return hidden_states, image_rotary_emb
 
@@ -507,11 +517,13 @@ class MageJointAttention(nn.Module):
         q_norm: nn.Module,
         k_norm: nn.Module,
         attention_mask: torch.Tensor | None = None,
+        lengths: Sequence[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         qkv = _request_isolated_forward(
             qkv_proj,
             hidden_states,
             attention_mask,
+            lengths,
         )
         query, key, value = qkv.split(
             [self.q_size, self.kv_size, self.kv_size],
@@ -529,6 +541,8 @@ class MageJointAttention(nn.Module):
         image_rotary_emb: torch.Tensor,
         image_attention_mask: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
+        image_token_lengths: Sequence[int] | None = None,
+        encoder_token_lengths: Sequence[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] != encoder_hidden_states.shape[0]:
             raise ValueError("Mage-Flow image and text batch sizes must match")
@@ -549,6 +563,7 @@ class MageJointAttention(nn.Module):
             self.norm_q,
             self.norm_k,
             image_attention_mask,
+            image_token_lengths,
         )
         txt_q, txt_k, txt_v = self._project(
             encoder_hidden_states,
@@ -556,6 +571,7 @@ class MageJointAttention(nn.Module):
             self.norm_added_q,
             self.norm_added_k,
             encoder_attention_mask,
+            encoder_token_lengths,
         )
         img_q = apply_rotary_emb_mage_flow(img_q, image_rotary_emb)
         img_k = apply_rotary_emb_mage_flow(img_k, image_rotary_emb)
@@ -709,6 +725,8 @@ class MageFlowDoubleStreamBlock(nn.Module):
         image_attention_mask: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
+        image_token_lengths: Sequence[int] | None = None,
+        encoder_token_lengths: Sequence[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if joint_attention_kwargs:
             unsupported = ", ".join(sorted(joint_attention_kwargs))
@@ -730,6 +748,8 @@ class MageFlowDoubleStreamBlock(nn.Module):
             image_rotary_emb,
             image_attention_mask=image_attention_mask,
             encoder_attention_mask=encoder_attention_mask,
+            image_token_lengths=image_token_lengths,
+            encoder_token_lengths=encoder_token_lengths,
         )
         hidden_states = hidden_states + img_gate1 * img_attn
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn
@@ -742,12 +762,14 @@ class MageFlowDoubleStreamBlock(nn.Module):
             self.img_mlp,
             img_normed,
             image_attention_mask,
+            image_token_lengths,
         )
         hidden_states = hidden_states + img_gate2 * img_mlp_output
         txt_mlp_output = _request_isolated_forward(
             self.txt_mlp,
             txt_normed,
             encoder_attention_mask,
+            encoder_token_lengths,
         )
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
         hidden_states = _mask_tokens(hidden_states, image_attention_mask)
