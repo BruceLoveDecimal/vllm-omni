@@ -1066,7 +1066,7 @@ class LingBotWorldCausalDMDPipeline(
         *,
         dtype: torch.dtype,
         previous: CameraTrajectory | None = None,
-        latent_aligned: bool = False,
+        latent_aligned: bool = False,  # iff using realtime interaction inputs
     ) -> tuple[torch.Tensor, CameraTrajectory]:
         """Convert raw camera frames to a latent-aligned ray tensor."""
 
@@ -1119,9 +1119,8 @@ class LingBotWorldCausalDMDPipeline(
                 ),
             )
             drop_anchor = True
-        # Realtime interaction cannot see future steps; use the controller translation unit
-        # so speed is not renormalized per chunk. Full action_path keeps max-norm.
-        is_realtime_interaction_control = inputs.camera_actions is not None or latent_aligned
+        # Realtime interaction cannot see future steps; use the controller translation unit to normalize speed.
+        # Full action_path keeps max-norm.
         camera_embedding = build_plucker_embedding(
             embedding_trajectory,
             height=inputs.height,
@@ -1130,7 +1129,7 @@ class LingBotWorldCausalDMDPipeline(
             target_width=inputs.width,
             device=self.device,
             dtype=dtype,
-            translation_scale=LINGBOT_CONTROLLER_TRANSLATION_UNIT if is_realtime_interaction_control else None,
+            translation_scale=LINGBOT_CONTROLLER_TRANSLATION_UNIT if latent_aligned else None,
         )
         if drop_anchor:
             camera_embedding = camera_embedding[1:]

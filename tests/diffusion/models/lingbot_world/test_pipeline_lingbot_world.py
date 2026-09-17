@@ -1785,7 +1785,7 @@ def test_first_typed_yaw_action_uses_pre_action_identity_anchor(
         target_width=16,
         device=torch.device("cpu"),
         dtype=torch.float32,
-        translation_scale=module.LINGBOT_CONTROLLER_TRANSLATION_UNIT,
+        translation_scale=None,  # None for camera_actions / action_script input (using max-norm)
     )[1:]
 
     assert not torch.equal(action_embedding, neutral_embedding)
