@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-__all__ = ["AuKTransformer", "build_time_grid", "dit_state_dict", "sample_latents"]
+__all__ = ["AuKTransformer", "build_time_grid", "dit_state_dict", "integrate_latents", "sample_latents"]
 
 
 def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -87,7 +87,14 @@ class Rotary(nn.Module):
         return 1.0 / (self.base**exponents)
 
     def forward(self, seq_len: int, mask: torch.Tensor | None = None) -> torch.Tensor:
-        """Return rotary frequencies, compressing positions across padding."""
+        """Return rotary frequencies ``[B or 1, 1, seq_len, dim]``.
+
+        Without ``mask`` the positions are ``0..seq_len-1``. With a padding
+        mask ``[B, seq_len]`` each row counts only its valid positions, so a
+        row whose reference is shorter than its neighbours' still sees its
+        target frames at the positions a single-request forward would give
+        them.
+        """
         inv_freq = self.inv_freq
         if inv_freq.dtype != torch.float32:
             inv_freq = self._frequencies(inv_freq.device)
@@ -669,13 +676,73 @@ def sample_latents(
             .unsqueeze(0)
         )
 
-    t = build_time_grid(
+    return integrate_latents(
+        dit,
+        x=x,
+        mask=None,
+        text=text,
+        c_mask=c_mask,
+        ref=ref,
+        ref_mask=ref_mask,
         nfe=nfe,
+        cfg_strength=cfg_strength,
         sway_sampling_coef=sway_sampling_coef,
         t_grid=t_grid,
-        device=device,
+        sampler=sampler,
     )
-    if sampler is not None:
+
+
+@torch.no_grad()
+def integrate_latents(
+    dit: AuKTransformer,
+    *,
+    x: torch.Tensor,
+    mask: torch.Tensor | None,
+    text: torch.Tensor,
+    c_mask: torch.Tensor | None,
+    ref: torch.Tensor,
+    ref_mask: torch.Tensor | None,
+    nfe: int = 32,
+    cfg_strength: float = 1.0,
+    sway_sampling_coef: float | None = None,
+    t_grid: list[float] | None = None,
+    sampler: Callable[..., torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Integrate a batch of noised targets from ``t=0`` to ``t=1`` with Euler steps.
+
+    Every row of the batch is an independent request sharing one schedule:
+    the rows may differ in target, text and reference length, which the
+    padding masks express, but ``nfe``, ``cfg_strength`` and the time grid are
+    batch-wide. Under CFG the velocity model doubles the batch internally.
+
+    Args:
+        dit: The velocity model.
+        x: Initial latents ``[B, n, latent_dim]`` at ``t=0``; padded rows
+            beyond each request's own length are ignored via ``mask``.
+        mask: Target padding mask ``[B, n]``, ``True`` where valid, or
+            ``None`` when no row is padded.
+        text: Pre-encoded text hidden states ``[B, nt, text_hidden_dim]``.
+        c_mask: Text padding mask ``[B, nt]``.
+        ref: Reference prompt latents ``[B, np, latent_dim]``; ``np == 0``
+            means no request in the batch carries a reference.
+        ref_mask: Reference padding mask ``[B, np]``.
+        nfe: Euler steps, ignored when ``t_grid`` is given.
+        cfg_strength: Classifier-free guidance weight. Below ``1e-5`` the
+            uncond branch is skipped entirely.
+        sway_sampling_coef: Reshapes the uniform time grid towards ``t=0``.
+        t_grid: Explicit timesteps, overriding ``nfe`` and the sway reshape.
+        sampler: Optional single-step velocity callable (the CUDA graph
+            wrapper) taking ``x, text, c_mask, ref, ref_mask, timestep,
+            cfg_strength``. It captures graphs per sequence length for one
+            row at a time, so it only serves single-row batches; padded
+            multi-row batches run the eager DiT.
+
+    Returns:
+        The latents at ``t=1``, ``[B, n, latent_dim]``; padded positions hold
+        unspecified values and must be sliced away by the caller.
+    """
+    t = build_time_grid(nfe=nfe, sway_sampling_coef=sway_sampling_coef, t_grid=t_grid, device=x.device)
+    if sampler is not None and x.shape[0] == 1:
         try:
             for i in range(t.shape[0] - 1):
                 velocity = sampler(
@@ -691,39 +758,16 @@ def sample_latents(
         finally:
             dit.clear_cache()
         return x
-    return _sample_latents(
-        dit,
-        initial_latents=x,
-        text=text,
-        c_mask=c_mask,
-        ref=ref,
-        ref_mask=ref_mask,
-        timesteps=t,
-        cfg_strength=cfg_strength,
-    )
 
-
-def _sample_latents(
-    dit: AuKTransformer,
-    *,
-    initial_latents: torch.Tensor,
-    text: torch.Tensor,
-    c_mask: torch.Tensor | None,
-    ref: torch.Tensor,
-    ref_mask: torch.Tensor | None,
-    timesteps: torch.Tensor,
-    cfg_strength: float,
-) -> torch.Tensor:
-    """Euler integration shared by eager sampling and CUDA graph capture."""
-    x = initial_latents
     guided = cfg_strength >= 1e-5
     try:
-        for i in range(timesteps.shape[0] - 1):
+        for i in range(t.shape[0] - 1):
             if guided:
                 pred = dit(
                     x,
                     text,
-                    timesteps[i],
+                    t[i],
+                    mask=mask,
                     c_mask=c_mask,
                     ref=ref,
                     ref_mask=ref_mask,
@@ -733,10 +777,10 @@ def _sample_latents(
                 v_cond, v_uncond = pred.chunk(2, dim=0)
                 v = v_cond + (v_cond - v_uncond) * cfg_strength
             else:
-                v = dit(x, text, timesteps[i], c_mask=c_mask, ref=ref, ref_mask=ref_mask)
-            x = x + (timesteps[i + 1] - timesteps[i]) * v
+                v = dit(x, text, t[i], mask=mask, c_mask=c_mask, ref=ref, ref_mask=ref_mask)
+            x = x + (t[i + 1] - t[i]) * v
     finally:
-        # The cached text projections belong to this request only; a failed
+        # The cached text projections belong to this batch only; a failed
         # step must not leak them into the next one.
         dit.clear_cache()
     return x

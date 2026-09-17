@@ -25,7 +25,7 @@ stages:
   # compiled graph.
   - stage_id: 0
     devices: "0"
-    max_num_seqs: 1
+    max_num_seqs: 8
     gpu_memory_utilization: 0.45
     enforce_eager: true
     max_num_batched_tokens: 32768
@@ -40,9 +40,28 @@ stages:
   # Stage 1: AuKPipeline (DiT + BigVGAN-flow VAE encoder and decoder).
   # Shares GPU 0 with the encoder; 32 Euler steps at CFG 2.0 is the Base
   # recipe, and AuK-Flash overrides both with its distilled 4-step grid.
+  # Concurrent requests share one DiT forward as rows of a padded batch (the
+  # scheduler only batches requests with the same schedule). max_num_seqs is
+  # the whole batching policy: the pipeline pads every row to the longest one
+  # and never splits the batch. Eight suits short, reference-free rows;
+  # long voice-clone rows (5 s target plus a 6 s reference) are compute-bound
+  # at one row and only pay for padding, so a deployment serving mostly those
+  # should lower it to 2-4. request_batch_max_wait_ms lets an idle engine
+  # hold the first arrival briefly to collect a burst; once a batch is in
+  # flight, later arrivals queue and form the next batch without waiting.
+  # step_execution advances every active request one Euler step per
+  # scheduler tick, so a request joins the DiT batch at the next step boundary
+  # instead of waiting for the batch in flight. Off by default: measured on
+  # AuK-Flash under Poisson arrivals and at saturation it matched or trailed
+  # request batching by up to 10% (the 4-step ODE makes a whole batch only
+  # about 100 ms of waiting, while the per-step re-batching costs more than
+  # that saves). Turn it on for long schedules (the 32-step base recipe) where
+  # waiting for a whole batch costs seconds.
   - stage_id: 1
     devices: "0"
-    max_num_seqs: 1
+    max_num_seqs: 8
+    step_execution: false
+    request_batch_max_wait_ms: 10
     gpu_memory_utilization: 0.35
     enforce_eager: false
     default_sampling_params:
