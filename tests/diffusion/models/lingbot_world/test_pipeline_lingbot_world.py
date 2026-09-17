@@ -2018,6 +2018,7 @@ def test_stepwise_failed_chunk_releases_pending_encoder_on_close(monkeypatch: py
     transformer.raise_on_call = 1
     with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
         pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
         session = pipeline._ar_sessions[state.request_id]
         assert session.encoder_cache is None and session.pending_encoder_cache is not None
         with pytest.raises(RuntimeError, match="forced transformer failure"):
@@ -2040,6 +2041,7 @@ def test_stateful_condition_rejects_tiled_encoder(monkeypatch: pytest.MonkeyPatc
             state = _stepwise_state()
             with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
                 pipeline.prepare_encode(state)
+                pipeline.prepare_next_chunk(state)
     assert pipeline.vae.encoder.inputs == []
     assert all(s.encoder_cache is None and s.pending_encoder_cache is None for s in pipeline._ar_sessions.values())
 
@@ -2171,13 +2173,14 @@ def _stepwise_state(
 def _run_stepwise(pipeline, state):
     outputs = []
     pipeline.prepare_encode(state)
-    # Runner owns chunk-0 prepare after encode; unit tests call it directly.
     pipeline.prepare_next_chunk(state)
     while not state.request_denoise_completed:
         noise = pipeline.denoise_step(None, states=[state])
         pipeline.step_scheduler(state, noise)
         if state.chunk_denoise_completed:
             outputs.append(pipeline.post_decode(state))
+            if not state.request_denoise_completed:
+                pipeline.prepare_next_chunk(state)
     return outputs
 
 
@@ -2191,6 +2194,7 @@ def _stepwise_chunks(pipeline, state, ar_state):
     """
     with pipeline.bind_ar_diffusion_state(state.request_id, ar_state):
         pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
     while not state.request_denoise_completed:
         output = None
         with pipeline.bind_ar_diffusion_state(state.request_id, ar_state):
@@ -2198,6 +2202,8 @@ def _stepwise_chunks(pipeline, state, ar_state):
             pipeline.step_scheduler(state, noise)
             if state.chunk_denoise_completed:
                 output = pipeline.post_decode(state)
+                if not state.request_denoise_completed:
+                    pipeline.prepare_next_chunk(state)
         if output is not None:
             yield output
 
@@ -2483,6 +2489,7 @@ def test_peek_chunk_media_matches_streaming_decoder_frame_counts(monkeypatch) ->
         first = pipeline.peek_chunk_media(state)
         assert (first.num_frames, first.fps) == (9, 16.0)
 
+        pipeline.prepare_next_chunk(state)
         while not state.chunk_denoise_completed:
             noise = pipeline.denoise_step(None, states=[state])
             pipeline.step_scheduler(state, noise)
@@ -2628,6 +2635,7 @@ def test_streaming_decode_receives_rescaled_latents(monkeypatch) -> None:
 
     with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
         pipeline.prepare_encode(state)
+        pipeline.prepare_next_chunk(state)
         while not state.chunk_denoise_completed:
             pipeline.step_scheduler(state, pipeline.denoise_step(None, states=[state]))
         model_space = state.latents.clone()

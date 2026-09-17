@@ -1672,11 +1672,6 @@ class LingBotWorldCausalDMDPipeline(
         }
         self._ar_text_caches(prompt_embeds, invalidate=False)
         self._ar_sessions[state.request_id] = _LingBotARSessionState()
-        try:
-            self._prepare_next_chunk(state)
-        except Exception:
-            self._release_condition_encoder_state(state.request_id)
-            raise
         return state
 
     def _prepare_next_chunk(self, state: StepRequestState) -> None:
@@ -1906,13 +1901,6 @@ class LingBotWorldCausalDMDPipeline(
         session_state.pending_encoder_cache = None
         session_state.next_chunk_index += 1
         state.chunk_index += 1
-        # When the runner has wired an InteractionCoordinator, it owns next-chunk
-        # prep via ``prepare_next_chunk`` after ``apply_interaction_at_chunk_boundary``.
-        # Direct stepwise callers (unit tests) still prepare here.
-        if not state.request_denoise_completed and self._interaction_coordinator is None:
-            self._prepare_next_chunk(state)
-        else:
-            self._release_condition_encoder_state(state.request_id)
         return DiffusionOutput(
             output=output,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
