@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.models.lingbot_world.camera import CameraTrajectory
 else:
     CameraTrajectory = _CAMERA_MODULE.CameraTrajectory
-LINGBOT_CONTROLLER_TRANSLATION_UNIT = _CAMERA_MODULE.LINGBOT_CONTROLLER_TRANSLATION_UNIT
 build_plucker_embedding = _CAMERA_MODULE.build_plucker_embedding
 interpolate_camera_trajectory = _CAMERA_MODULE.interpolate_camera_trajectory
 load_camera_trajectory = _CAMERA_MODULE.load_camera_trajectory
@@ -455,6 +454,8 @@ def test_build_plucker_embedding_normalizes_framewise_translation_by_max_norm(
     )
 
     torch.testing.assert_close(result[:, :3, 0, 0], torch.tensor(expected_origins))
+
+    from vllm_omni.diffusion.models.lingbot_world.actions import LINGBOT_CONTROLLER_TRANSLATION_UNIT
 
     if translation_scale != LINGBOT_CONTROLLER_TRANSLATION_UNIT:
         return
