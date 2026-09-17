@@ -332,9 +332,7 @@ def add_optional_chunk_mask(
         chunk_masks = chunk_masks.unsqueeze(0)
         chunk_masks = masks & chunk_masks
     elif static_chunk_size > 0:
-        chunk_masks = subsequent_chunk_mask(
-            xs.size(1), static_chunk_size, num_decoding_left_chunks, xs.device
-        )
+        chunk_masks = subsequent_chunk_mask(xs.size(1), static_chunk_size, num_decoding_left_chunks, xs.device)
         chunk_masks = chunk_masks.unsqueeze(0)
         chunk_masks = masks & chunk_masks
     else:

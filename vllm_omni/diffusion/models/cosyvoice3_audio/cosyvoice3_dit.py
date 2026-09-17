@@ -470,9 +470,7 @@ class DiT(nn.Module):
             # Streaming: full QK chunk mask. Non-streaming: keep a padding mask so
             # the default accelerated DiffusionAttention path can still run.
             if streaming is True:
-                attn_mask = add_optional_chunk_mask(
-                    x, mask.bool(), False, False, 0, self.static_chunk_size, -1
-                )
+                attn_mask = add_optional_chunk_mask(x, mask.bool(), False, False, 0, self.static_chunk_size, -1)
                 if attn_mask.dim() == 3 and attn_mask.shape[-1] == attn_mask.shape[-2]:
                     attn_mask = attn_mask.unsqueeze(dim=1)
             else:
