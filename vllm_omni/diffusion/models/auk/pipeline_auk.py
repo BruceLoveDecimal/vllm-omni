@@ -22,6 +22,7 @@ import torch
 import torchaudio
 from safetensors import safe_open
 from torch import nn
+from torch.nn.utils.rnn import pad_sequence
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -315,17 +316,18 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             )
 
     def _resolve_generator(self, sampling_params: Any) -> torch.Generator | None:
-        """Per-request generator; the process-global RNG is never seeded."""
+        """Per-request generator; the runner seeds it from ``seed`` before the pipeline runs.
+
+        The process-global RNG is never seeded.
+        """
 
         generator = sampling_params.generator
         if isinstance(generator, list):
             if len(generator) > 1:
                 logger.warning(
-                    "AuKPipeline runs one request per forward; using the first of %d generators", len(generator)
+                    "AuKPipeline generates one clip per request; using the first of %d generators", len(generator)
                 )
             generator = generator[0] if generator else None
-        if generator is None and sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(int(sampling_params.seed))
         return generator
 
     def _prepare_waveform(self, audio: Any) -> torch.Tensor:
@@ -458,7 +460,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         prompt = _prompt_mapping(prompt_value)
         knobs = dict((prompt.get("additional_information") or {}).get("auk") or {})
 
-        text = _unwrap_single(prompt.get("prompt_embeds"))
+        text = DiffusionRequestBatch.get_prompt_field(prompt_value, "prompt_embeds")
         if text is None:
             raise ValueError("AuK stage 1 needs `prompt_embeds`, the fused text condition from the encoder stage.")
         text = torch.as_tensor(text).to(device=self.device, dtype=self.dtype)
@@ -503,13 +505,9 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
     def _pad_rows(self, rows: list[torch.Tensor], dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
         """Stack variable-length ``[n_i, D]`` rows into ``[B, max n_i, D]`` plus a validity mask."""
 
-        length = max(row.shape[0] for row in rows)
-        width = rows[0].shape[1]
-        batch = torch.zeros(len(rows), length, width, device=self.device, dtype=dtype)
-        mask = torch.zeros(len(rows), length, device=self.device, dtype=torch.bool)
-        for i, row in enumerate(rows):
-            batch[i, : row.shape[0]] = row.to(dtype)
-            mask[i, : row.shape[0]] = True
+        batch = pad_sequence([row.to(dtype) for row in rows], batch_first=True)
+        lengths = torch.tensor([row.shape[0] for row in rows], device=self.device)
+        mask = torch.arange(batch.shape[1], device=self.device)[None, :] < lengths[:, None]
         return batch, mask
 
     # ------------------------------------------------------------------
@@ -521,12 +519,18 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
     def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
         """Parse one request and initialise its latents and time grid.
 
+        The text condition goes into ``state.prompt_embeds`` with a mask, so
+        ``InputBatch`` pads it to the batch's longest text once and reuses the
+        result while the batch composition holds. The guidance strength goes
+        into ``state.guidance`` and the grid points a step starts from into
+        ``state.timesteps``, so the batch carries a per-row timestep and the
+        scheduler's step count equals the number of Euler steps.
+
         ``InputBatch`` gathers ``state.latents`` row by row and needs one
         trailing shape across the batch, which variable-length audio does not
         have. ``state.latents`` therefore only carries the row count; the
         real latents live in ``state.extra["x"]`` as ``[1, gen_frames,
-        latent_dim]``. ``state.timesteps`` holds the grid points a step starts
-        from, so the scheduler's step count equals the number of Euler steps.
+        latent_dim]`` next to the reference latents ``state.extra["ref"]``.
         """
 
         del kwargs
@@ -536,14 +540,15 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             grid = build_time_grid(nfe=nfe, sway_sampling_coef=sway, t_grid=t_grid, device=self.device)
             x = self._draw_noise(parsed, torch.float32).unsqueeze(0)
         state.extra.update(
-            text=parsed.text,
             ref=parsed.ref,
             gen_frames=parsed.gen_frames,
             x=x,
             grid=grid,
-            cfg=cfg,
             output_type=parsed.output_type,
         )
+        state.prompt_embeds = parsed.text.unsqueeze(0)
+        state.prompt_embeds_mask = torch.ones(1, parsed.text.shape[0], dtype=torch.bool, device=self.device)
+        state.guidance = torch.tensor(float(cfg), device=self.device)
         state.latents = x.new_zeros(1, 1, self.latent_dim)
         state.timesteps = grid[:-1]
         state.step_index = 0
@@ -558,32 +563,34 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
     ) -> torch.Tensor | None:
         """One velocity forward for every active request, padded into one batch.
 
+        The text condition, per-row timestep and guidance come padded and
+        gathered from ``input_batch``; the reference and target latents are
+        variable-length per row and are padded here from the request states.
         Rows may sit at different steps, so the DiT takes a per-row timestep.
         Rows may also differ in guidance: the uncond branch runs for the whole
         batch when any row needs it and rows with zero guidance ignore it. The
-        result is ``[B, max frames, latent_dim]`` in ``states`` order, which
-        is how the runner slices it back per request.
+        result is ``[B, max frames, latent_dim]`` in batch order, which is how
+        the runner slices it back per request.
         """
 
-        del input_batch, kwargs
-        if not states:
+        del kwargs
+        rows = list(input_batch.states if states is None else states)
+        if not rows:
             raise ValueError("AuK denoise_step needs the request states.")
-        rows = list(states)
-        timesteps = []
-        for state in rows:
-            timestep = state.current_timestep
-            if timestep is None:
-                raise ValueError(f"Request {state.request_id} has no Euler step left to take.")
-            timesteps.append(timestep)
+        if input_batch.prompt_embeds is None or input_batch.prompt_embeds_mask is None:
+            raise ValueError("AuK denoise_step needs the padded prompt_embeds and mask on the input batch.")
+        if input_batch.guidance is None:
+            raise ValueError("AuK denoise_step needs the per-row guidance on the input batch.")
 
         with torch.inference_mode():
-            text, c_mask = self._pad_rows([state.extra["text"] for state in rows], self.dtype)
+            text = input_batch.prompt_embeds.to(self.dtype)
+            c_mask = input_batch.prompt_embeds_mask
             ref, ref_mask = self._pad_rows([state.extra["ref"] for state in rows], torch.float32)
             x, x_mask = self._pad_rows([state.extra["x"][0] for state in rows], torch.float32)
             if len(rows) == 1:
                 x_mask = None
-            t = torch.stack(timesteps).to(device=self.device, dtype=torch.float32)
-            cfg = torch.tensor([float(state.extra["cfg"]) for state in rows], device=self.device)
+            t = input_batch.timesteps.to(device=self.device, dtype=torch.float32)
+            cfg = input_batch.guidance.to(device=self.device, dtype=torch.float32)
             guided = bool((cfg >= 1e-5).any())
             with self._dit_autocast():
                 pred = self.dit(

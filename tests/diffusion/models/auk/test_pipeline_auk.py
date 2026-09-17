@@ -59,6 +59,7 @@ from vllm_omni.diffusion.models.auk import pipeline_auk
 from vllm_omni.diffusion.models.auk.auk_transformer import integrate_latents as real_integrate_latents
 from vllm_omni.diffusion.models.auk.pipeline_auk import AuKPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -257,6 +258,15 @@ def _batch(prompt: dict[str, Any], **sampling: Any) -> DiffusionRequestBatch:
     return _batch_of((prompt, sampling))
 
 
+def _sampling(**sampling: Any) -> OmniDiffusionSamplingParams:
+    """Sampling params with the generator the runner seeds from ``seed`` before the pipeline runs."""
+
+    params = OmniDiffusionSamplingParams(**sampling)
+    if params.generator is None and params.seed is not None:
+        params.generator = torch.Generator().manual_seed(params.seed)
+    return params
+
+
 def _batch_of(*requests: tuple[dict[str, Any], dict[str, Any]]) -> DiffusionRequestBatch:
     """Build a request batch from ``(prompt, sampling_kwargs)`` pairs."""
 
@@ -264,7 +274,7 @@ def _batch_of(*requests: tuple[dict[str, Any], dict[str, Any]]) -> DiffusionRequ
         requests=[
             OmniDiffusionRequest(
                 prompt=prompt,
-                sampling_params=OmniDiffusionSamplingParams(**sampling),
+                sampling_params=_sampling(**sampling),
                 request_id=f"auk-test-{index}",
             )
             for index, (prompt, sampling) in enumerate(requests)
@@ -624,11 +634,13 @@ class _VelocityDiT(nn.Module):
 
 
 def _state(request_id: str, prompt: dict[str, Any], **sampling: Any) -> StepRequestState:
-    return StepRequestState(
-        request_id=request_id,
-        sampling=OmniDiffusionSamplingParams(**sampling),
-        prompt=prompt,
-    )
+    return StepRequestState(request_id=request_id, sampling=_sampling(**sampling), prompt=prompt)
+
+
+def _denoise(pipeline: AuKPipeline, states: list[StepRequestState]) -> torch.Tensor:
+    """One denoise step over the runner-style ``InputBatch`` built from ``states``."""
+
+    return pipeline.denoise_step(InputBatch.make_batch(states), states=states)
 
 
 def _run_stepwise(pipeline: AuKPipeline, states: list[StepRequestState]) -> list[Any]:
@@ -639,7 +651,7 @@ def _run_stepwise(pipeline: AuKPipeline, states: list[StepRequestState]) -> list
     outputs: dict[str, Any] = {}
     while any(not state.denoise_completed for state in states):
         active = [state for state in states if not state.denoise_completed]
-        velocity = pipeline.denoise_step(None, states=active)
+        velocity = _denoise(pipeline, active)
         for row, state in enumerate(active):
             pipeline.step_scheduler(state, velocity[row : row + 1])
             if state.denoise_completed:
@@ -658,7 +670,10 @@ class TestStepExecution:
         pipeline.prepare_encode(state)
 
         assert state.extra["x"].shape == (1, 50, LATENT_DIM)
-        assert state.extra["text"].shape == (6, TEXT_HIDDEN_DIM)
+        # The text condition rides the shared batch fields so InputBatch pads it.
+        assert state.prompt_embeds.shape == (1, 6, TEXT_HIDDEN_DIM)
+        assert state.prompt_embeds_mask.tolist() == [[True] * 6]
+        assert state.guidance.item() == 2.0
         assert state.extra["ref"].shape == (0, LATENT_DIM)
         assert state.extra["grid"].shape == (5,)
         # The scheduler counts Euler steps: one per grid point except the last.
@@ -694,10 +709,10 @@ class TestStepExecution:
         late = _state("late", _prompt(knobs={"gen_seconds": 2.0}), seed=2, num_inference_steps=4)
         pipeline.prepare_encode(early)
         # The first request takes one step alone, then the second arrives.
-        pipeline.step_scheduler(early, pipeline.denoise_step(None, states=[early]))
+        pipeline.step_scheduler(early, _denoise(pipeline, [early]))
         pipeline.prepare_encode(late)
 
-        velocity = pipeline.denoise_step(None, states=[early, late])
+        velocity = _denoise(pipeline, [early, late])
 
         assert velocity.shape == (2, 100, LATENT_DIM)
         call = dit.calls[-1]
@@ -710,9 +725,9 @@ class TestStepExecution:
         pipeline.dit = _VelocityDiT()
         state = _state("f0", _prompt(knobs={"gen_seconds": 1.0}), seed=1)
         pipeline.prepare_encode(state)
-        assert state.total_steps == 4 and state.extra["cfg"] == 0.0
+        assert state.total_steps == 4 and state.guidance.item() == 0.0
 
-        velocity = pipeline.denoise_step(None, states=[state])
+        velocity = _denoise(pipeline, [state])
 
         torch.testing.assert_close(velocity, 0.1 * state.extra["x"])
 
