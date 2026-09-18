@@ -437,7 +437,7 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
                 image_sizes,
             )
         if "image_grid_thw" in hf_inputs:
-            config["image_grid_thw"] = MultiModalFieldConfig.batched("image")
+            config["image_grid_thw"] = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
 
         # Video fields, same flat layout as images
         video_grid_thw = hf_inputs.get("video_grid_thw", torch.empty((0, 3)))
@@ -448,7 +448,7 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
                 video_sizes,
             )
         if "video_grid_thw" in hf_inputs:
-            config["video_grid_thw"] = MultiModalFieldConfig.batched("video")
+            config["video_grid_thw"] = MultiModalFieldConfig.batched("video", keep_on_cpu=True)
 
         # Audio fields
         if "audio_feats" in hf_inputs:
