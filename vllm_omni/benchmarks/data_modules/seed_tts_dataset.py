@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +150,28 @@ def _ref_audio_payload(wav_path: Path, *, inline: bool) -> str:
     return wav_path.expanduser().resolve().as_uri()
 
 
+# Bench-only knob for fixed-duration TTS models (AuK): derive each row's
+# ``duration_seconds`` from its target text instead of one global value, so
+# a run carries a spread of clip lengths. Off unless the env var is set.
+_DURATION_MODE_ENV = "VLLM_OMNI_BENCH_TTS_DURATION_MODE"
+_WORDS_PER_SEC = 2.7
+_CHARS_PER_SEC = 4.5
+_DURATION_MIN_S = 2.0
+_DURATION_MAX_S = 12.0
+
+
+def _text_duration_seconds(text: str, locale: str) -> float | None:
+    """Estimate speaking time for ``text``; ``None`` unless mixed mode is on."""
+    if os.environ.get(_DURATION_MODE_ENV, "") != "text":
+        return None
+    if locale == "zh":
+        raw = len(text.replace(" ", "")) / _CHARS_PER_SEC
+    else:
+        raw = len(text.split()) / _WORDS_PER_SEC
+    clamped = min(max(raw, _DURATION_MIN_S), _DURATION_MAX_S)
+    return round(clamped * 2) / 2
+
+
 class SeedTTSDataset(BenchmarkDataset):
     """Seed-TTS-style zero-shot TTS rows for throughput/latency benchmarking.
 
@@ -266,6 +289,9 @@ class SeedTTSDataset(BenchmarkDataset):
                 "language": lang,
                 "max_new_tokens": output_len,
             }
+            duration = _text_duration_seconds(turns[0].target_text, self.locale)
+            if duration is not None:
+                speech_extra["duration_seconds"] = duration
 
             out.append(
                 SeedTTSSampleRequest(
@@ -491,6 +517,8 @@ class SeedTTSTextDataset(SeedTTSDataset):
                 break
             target = row.target_text
             prompt_len = len(tok.encode(target))
+            duration = _text_duration_seconds(target, self.locale)
+            speech_extra = {"duration_seconds": duration} if duration is not None else None
             out.append(
                 SeedTTSTextSampleRequest(
                     prompt=target,
@@ -498,7 +526,7 @@ class SeedTTSTextDataset(SeedTTSDataset):
                     expected_output_len=output_len,
                     multi_modal_data=None,
                     request_id=f"{request_id_prefix}{i}",
-                    seed_tts_speech_extra=None,  # voice supplied via --extra-body in config
+                    seed_tts_speech_extra=speech_extra,  # voice supplied via --extra-body in config
                     seed_tts_utterance_id=row.utterance_id,
                     seed_tts_locale=self.locale,
                     seed_tts_system_prompt=self._system_prompt,
