@@ -20,15 +20,23 @@ enable_chunked_prefill: false
 
 stages:
   # Stage 0: Qwen2.5-Omni thinker as a frozen text encoder.
-  # Prefill only — one sampled token, discarded downstream. eager because the
-  # fused-hidden forward walks the decoder layers itself and so bypasses the
-  # compiled graph.
+  # Prefill only — one sampled token, discarded downstream. The fused-hidden
+  # forward collects the per-layer outputs through vLLM's auxiliary hidden
+  # states, so the thinker runs through vLLM's compiled forward and CUDA
+  # graphs: the eager layer walk cost about 44 ms per request for 7 ms of GPU
+  # work on an RTX 5090.
   - stage_id: 0
     devices: "0"
     max_num_seqs: 8
     gpu_memory_utilization: 0.45
-    enforce_eager: true
+    enforce_eager: false
     max_num_batched_tokens: 32768
+    # Prefill-only stage: piecewise graphs cover the whole prompt range. vLLM
+    # would otherwise cap the capture sizes at 2 (twice max_num_seqs) and add
+    # full decode graphs this stage never replays.
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+      cudagraph_capture_sizes: [16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024]
     # AuK takes text plus at most one clip; no image or video tower is built.
     limit_mm_per_prompt: {audio: 1}
     default_sampling_params:
