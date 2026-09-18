@@ -61,6 +61,7 @@ from vllm_omni.transformers_utils.configs.ming_flash_omni import (
     MingFlashOmniConfig,
 )
 
+from .encoder_cudagraph import MingVisionCudaGraphMixin
 from .ming_flash_omni_thinker import (
     MingFlashOmniThinkerDummyInputsBuilder,
     MingFlashOmniThinkerMultiModalProcessor,
@@ -77,6 +78,7 @@ logger = init_logger(__name__)
 )
 class MingFlashOmniForConditionalGeneration(
     nn.Module,
+    MingVisionCudaGraphMixin,
     SupportsMultiModal,
     SupportsPP,
     SupportsMRoPE,
@@ -142,6 +144,10 @@ class MingFlashOmniForConditionalGeneration(
                 f"For the talker stage, use MingFlashOmniTalkerForConditionalGeneration directly. "
                 f"For image generation use stage_type: diffusion with model_arch: MingImagePipeline."
             )
+
+    @property
+    def encoder_cudagraph_model(self):
+        return self.thinker
 
     def get_language_model(self) -> "nn.Module":
         """Return the language model for upstream MoE detection."""

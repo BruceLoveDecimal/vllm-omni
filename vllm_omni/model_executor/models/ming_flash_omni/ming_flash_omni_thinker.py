@@ -79,6 +79,7 @@ from vllm_omni.transformers_utils.processors.ming import (
 )
 
 from .audio_encoder import WhisperAudioEncoder
+from .encoder_cudagraph import MingVisionCudaGraphMixin
 from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
 from .projectors import AudioProjector, VisionProjector
 from .vision_encoder import MingVisionEncoder
@@ -581,6 +582,7 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
 )
 class MingFlashOmniThinkerForConditionalGeneration(
     nn.Module,
+    MingVisionCudaGraphMixin,
     SupportsMultiModal,
     SupportsPP,
     SupportsMRoPE,
@@ -629,6 +631,7 @@ class MingFlashOmniThinkerForConditionalGeneration(
         llm_config = thinker_config.llm_config
 
         self.config = llm_config
+        self.model_config = vllm_config.model_config
         self.thinker_config = thinker_config
         self.have_multimodal_outputs = True
 
@@ -742,7 +745,17 @@ class MingFlashOmniThinkerForConditionalGeneration(
         if loaded == 0:
             logger.warning("[MingFlashOmniThinker] no query_tokens_dict.* keys in mlp/model.safetensors")
 
-    def extract_image_feature(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    @property
+    def encoder_cudagraph_model(self):
+        return self
+
+    def extract_image_feature(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor | None = None,
+        *,
+        encoder_metadata: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         """Extract and project image features.
 
         Args:
@@ -756,7 +769,7 @@ class MingFlashOmniThinkerForConditionalGeneration(
             raise ValueError("Vision encoder not initialized")
 
         with torch.amp.autocast(pixel_values.device.type, dtype=torch.bfloat16):
-            image_embeds = self.vision(pixel_values, grid_thw=grid_thw)
+            image_embeds = self.vision(pixel_values, grid_thw=grid_thw, encoder_metadata=encoder_metadata)
 
         if self.vision.use_deepstack:
             image_embeds = image_embeds[:, : self.vision.image_emb_dim]
