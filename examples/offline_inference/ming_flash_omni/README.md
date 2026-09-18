@@ -128,3 +128,12 @@ For the online path and the full knob list
 ## Online serving
 
 For online serving via the OpenAI-compatible API, see [examples/online_serving/ming_flash_omni/README.md](../../online_serving/ming_flash_omni/README.md).
+
+## Vision encoder CUDA graphs
+
+The [thinker-only deployment](../../../vllm_omni/deploy/ming_flash_omni_thinker_only.yaml)
+enables image/video encoder CUDA graphs with FlashAttention and weight tensor
+parallelism. Default budgets are `[512, 1024, 2048]` merged visual tokens, capped
+by runtime token limits, with at most four packed items. Larger items fall back
+to eager execution. Audio encoding is unchanged; encoder data parallelism is
+unsupported.

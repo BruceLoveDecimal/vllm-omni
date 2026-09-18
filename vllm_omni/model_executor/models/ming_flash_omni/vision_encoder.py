@@ -143,13 +143,7 @@ class MingVisionEncoder(nn.Module):
             hidden_states = torch.cat(features, dim=1)
         return hidden_states
 
-    def prepare_encoder_metadata(
-        self,
-        grid_thw: torch.Tensor,
-        *,
-        max_sequences: int | None = None,
-        max_seqlen_override: int | None = None,
-    ) -> dict[str, torch.Tensor]:
+    def prepare_encoder_metadata(self, grid_thw: torch.Tensor) -> dict[str, torch.Tensor]:
         """Prepare positions and attention metadata outside CUDA graph capture.
 
         Grid metadata stays on CPU through MultiModalFieldConfig.keep_on_cpu.
@@ -170,18 +164,7 @@ class MingVisionEncoder(nn.Module):
 
         lengths = np.repeat(grid[:, 1] * grid[:, 2], grid[:, 0])
         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), lengths.cumsum(dtype=np.int32)])
-        if max_sequences is not None:
-            if len(lengths) > max_sequences:
-                raise ValueError("Ming vision batch exceeds the captured attention sequence capacity")
-            # Repeated terminal offsets represent empty sequences. Zero padding
-            # would make cu_seqlens non-monotonic and corrupt attention.
-            cu_seqlens = np.pad(cu_seqlens, (0, max_sequences - len(lengths)), mode="edge")
-
         max_seqlen = MMEncoderAttention.compute_max_seqlen(encoder.attn_backend, cu_seqlens)
-        if max_seqlen_override is not None:
-            if max_seqlen_override < max_seqlen:
-                raise ValueError("Ming vision capture max_seqlen must cover every attention sequence")
-            max_seqlen = max_seqlen_override
 
         rotary_cos, rotary_sin = encoder.rot_pos_emb(grid_thw)
         metadata = {
