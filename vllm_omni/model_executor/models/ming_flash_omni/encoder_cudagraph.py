@@ -70,7 +70,7 @@ class MingVisionCudaGraphMixin(SupportsEncoderCudaGraph):
         if thinker.vision.encoder.apply_vit_abs_pos_embed:
             buffer_keys.append("pos_embeds")
         return EncoderCudaGraphConfig(
-            modalities=["image"],
+            modalities=["image", "video"],
             buffer_keys=buffer_keys,
             out_hidden_size=thinker.config.hidden_size,
             padding_logics={
@@ -78,34 +78,52 @@ class MingVisionCudaGraphMixin(SupportsEncoderCudaGraph):
                     pad_cumulative_lengths, spatial_merge_unit=thinker.vision.encoder.spatial_merge_size**2
                 )
             },
+            max_frames_per_video=self.get_max_frames_per_video(),
         )
 
     def get_input_modality(self, mm_kwargs: dict[str, Any]) -> str:
         if "image_grid_thw" in mm_kwargs:
             return "image"
-        raise ValueError("Ming image CUDA graph inputs require image_grid_thw")
+        if "video_grid_thw" in mm_kwargs:
+            return "video"
+        raise ValueError("Ming vision CUDA graph inputs require image_grid_thw or video_grid_thw")
 
     def get_max_frames_per_video(self) -> int:
-        return 1
+        # One temporal grid contributes at least one merged token. This is a
+        # conservative bound; per-graph sequence storage uses its token budget.
+        return self.encoder_cudagraph_model.model_config.max_model_len
 
     def get_encoder_cudagraph_budget_range(self, vllm_config: VllmConfig) -> tuple[int, int]:
-        # Budgets count merged output tokens, not raw input patches. Bound
-        # automatic captures independently of the number of language tokens.
-        max_budget = min(vllm_config.scheduler_config.max_num_batched_tokens, vllm_config.model_config.max_model_len)
-        return min(64, max_budget), max_budget
+        # Budgets count merged output tokens, not raw input patches. Keep the
+        # default capture set small enough for deployment without requiring
+        # Ming-specific tuning in YAML. With the normal 2048-token maximum,
+        # upstream infers [512, 1024, 2048] and at most four packed items.
+        runtime_limit = min(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.model_config.max_model_len,
+        )
+        max_budget = min(2048, runtime_limit)
+        min_budget = min(512, max_budget)
+        return min_budget, max_budget
 
     def get_encoder_cudagraph_inputs(self, mm_kwargs: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
         """Read flat pixels and host grids without synchronizing the GPU."""
-        grid = mm_kwargs["image_grid_thw"]
+        modality = self.get_input_modality(mm_kwargs)
+        grid = mm_kwargs[f"{modality}_grid_thw"]
         if not isinstance(grid, torch.Tensor) or grid.device.type != "cpu":
             raise ValueError("Ming encoder CUDA graphs require CPU grid tensors (keep_on_cpu=True)")
         if grid.ndim != 2 or grid.shape[1] != 3:
             raise ValueError("Ming encoder grid must have shape [num_items, 3]")
         merge_size = self.encoder_cudagraph_model.vision.encoder.spatial_merge_size
         for t, h, w in grid.tolist():
-            if t != 1 or h <= 0 or w <= 0 or h % merge_size or w % merge_size:
-                raise ValueError("Ming image grids require t=1 and positive spatial dimensions divisible by merge size")
-        return mm_kwargs["pixel_values"], grid
+            if t <= 0 or h <= 0 or w <= 0 or h % merge_size or w % merge_size:
+                raise ValueError(
+                    "Ming grids require positive dimensions and spatial dimensions divisible by merge size"
+                )
+        pixel_key = "pixel_values"
+        if modality == "video":
+            pixel_key = "pixel_values_videos"
+        return mm_kwargs[pixel_key], grid
 
     def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]) -> list[EncoderItemSpec]:
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
@@ -125,6 +143,9 @@ class MingVisionCudaGraphMixin(SupportsEncoderCudaGraph):
         selected_pixels = pixels[:0]
         if indices:
             selected_pixels = torch.cat([pixels[offsets[i] : offsets[i + 1]] for i in indices])
+        modality = self.get_input_modality(mm_kwargs)
+        if modality == "video":
+            return {"pixel_values_videos": selected_pixels, "video_grid_thw": grid[indices]}
         return {"pixel_values": selected_pixels, "image_grid_thw": grid[indices]}
 
     def prepare_encoder_cudagraph_capture_inputs(
@@ -152,6 +173,10 @@ class MingVisionCudaGraphMixin(SupportsEncoderCudaGraph):
         metadata = vision.prepare_encoder_metadata(seed_grid)
         values = {
             "pixel_values": torch.zeros(patch_count, patch_width, device=device, dtype=vision.dtype),
+            # Each frame needs >= 1 merged token, so token_budget bounds the
+            # number of sequences even for many tiny frames. The upstream
+            # packer budgets tokens/items, not frames. Do not underallocate
+            # from max_frames_per_batch and then overflow on a legal replay.
             "cu_seqlens": async_tensor_h2d([0] + [patch_count] * (token_budget + 1), device=device, dtype=torch.int32),
             "max_seqlen": torch.tensor(patch_count, dtype=torch.int32),
         }

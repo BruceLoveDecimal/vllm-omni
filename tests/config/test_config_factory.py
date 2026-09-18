@@ -2404,6 +2404,12 @@ class TestMingFlashOmniPipeline:
         stages = merge_pipeline_deploy(pipeline, deploy)
         assert len(stages) == 1
         assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
+        assert stages[0].yaml_engine_args["mm_encoder_attn_backend"] == "FLASH_ATTN"
+        assert stages[0].yaml_engine_args["mm_encoder_tp_mode"] == "weights"
+        compilation_config = stages[0].yaml_engine_args["compilation_config"]
+        assert compilation_config["cudagraph_mm_encoder"] is True
+        assert "encoder_cudagraph_token_budgets" not in compilation_config
+        assert "encoder_cudagraph_max_vision_items_per_batch" not in compilation_config
 
     def test_image_pipeline_registered(self):
         p = OMNI_PIPELINES.get("ming_flash_omni_image")

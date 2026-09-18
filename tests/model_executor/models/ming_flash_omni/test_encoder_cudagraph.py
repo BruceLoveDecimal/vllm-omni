@@ -8,6 +8,21 @@ from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
 pytestmark = pytest.mark.core_model
 
 
+def test_default_budget_range_is_bounded():
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.ming_flash_omni.encoder_cudagraph import MingVisionCudaGraphMixin
+
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
+        model_config=SimpleNamespace(max_model_len=32768),
+    )
+    assert MingVisionCudaGraphMixin.get_encoder_cudagraph_budget_range(None, config) == (512, 2048)
+
+    config.scheduler_config.max_num_batched_tokens = 256
+    assert MingVisionCudaGraphMixin.get_encoder_cudagraph_budget_range(None, config) == (256, 256)
+
+
 @torch.inference_mode()
 def test_image_graph_packing_and_output_lifetime(ming_encoder_graph_manager):
     manager = ming_encoder_graph_manager

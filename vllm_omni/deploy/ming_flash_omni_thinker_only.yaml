@@ -20,8 +20,14 @@ stages:
     tensor_parallel_size: 4
     max_num_batched_tokens: 32768
     devices: "0,1,2,3"
-    # disable fused allreduce+rms for flashinfer version mismatch for now
+    # Ming vision encoder CUDA graphs currently support FlashAttention with
+    # weight tensor parallelism. Capture budgets and item capacity are inferred
+    # from the model adapter.
+    mm_encoder_attn_backend: FLASH_ATTN
+    mm_encoder_tp_mode: weights
     compilation_config:
+      cudagraph_mm_encoder: true
+      # disable fused allreduce+rms for flashinfer version mismatch for now
       pass_config:
         fuse_allreduce_rms: false
     default_sampling_params:

@@ -128,3 +128,10 @@ For the online path and the full knob list
 ## Online serving
 
 For online serving via the OpenAI-compatible API, see [examples/online_serving/ming_flash_omni/README.md](../../online_serving/ming_flash_omni/README.md).
+
+### Vision encoder CUDA graphs
+
+The thinker-only deployment enables image/video encoder graphs. Use
+`vllm_omni/deploy/ming_flash_omni_thinker_only.yaml`. See the
+[design and GPU validation guide](../../../docs/design/feature/ming_vision_cuda_graph.md)
+for supported backends, token budgets, dependency versions and parity tests.
