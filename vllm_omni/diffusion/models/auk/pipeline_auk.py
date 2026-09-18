@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.auk.auk_transformer import (
 )
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
+from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
     SupportAudioOutput,
@@ -278,6 +279,9 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.dit = self.dit.to(device=self.device).eval()
         self.dit.requires_grad_(False)
         self.cudagraph_wrapper = AuKCUDAGraphWrapper(self.dit, enabled=not od_config.enforce_eager)
+        # The compiled decode buckets are warmed by setup_compile(), which the
+        # model runner calls at startup unless the stage is enforce_eager.
+        self.vae_decode = AuKVAEDecodeGraph(self.vae, enabled=not od_config.enforce_eager)
 
         logger.info(
             "AuK pipeline ready: variant=%s dtype=%s latent_dim=%d hop=%d sample_rate=%d",
@@ -287,6 +291,15 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             self.hop_size,
             self.sample_rate,
         )
+
+    def setup_compile(self) -> None:
+        """Compile and capture the codec decode buckets before the first request.
+
+        The DiT declares no repeated block list, so the runner's generic
+        regional compile would be a no-op for it; the startup cost worth
+        paying here is the VAE decode.
+        """
+        self.vae_decode.warmup(self.device)
 
     # The assembled checkpoint is not a diffusers layout: __init__ reads
     # auk.safetensors and vae.safetensors directly, so the loader has no
@@ -635,7 +648,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         if state.extra["output_type"] == "latent":
             return DiffusionOutput(output=latent.detach().cpu())
         with torch.inference_mode():
-            wav = self.vae.decode(latent)
+            wav = self.vae_decode(latent)
         # One mono waveform per request; the formatter expects [T].
         wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
         if not torch.isfinite(wav).all():
@@ -729,7 +742,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                 if item.output_type == "latent":
                     outputs[i] = DiffusionOutput(output=latent.detach().cpu())
                     continue
-                wav = self.vae.decode(latent)
+                wav = self.vae_decode(latent)
                 # One mono waveform per request; the formatter expects [T].
                 wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
                 if not torch.isfinite(wav).all():

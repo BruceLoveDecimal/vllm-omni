@@ -421,6 +421,14 @@ class TestRequestParsing:
         assert torch.equal(outputs[0].output, expected)
         assert calls[0]["x"].dtype is torch.float32
 
+    def test_setup_compile_warms_the_decode_buckets_on_the_pipeline_device(self, build_pipeline, mocker):
+        pipeline, _ = build_pipeline()
+        warmup = mocker.patch.object(pipeline.vae_decode, "warmup")
+
+        pipeline.setup_compile()
+
+        warmup.assert_called_once_with(pipeline.device)
+
     def test_latent_output_type_skips_the_decoder(self, build_pipeline):
         pipeline, _ = build_pipeline()
 
