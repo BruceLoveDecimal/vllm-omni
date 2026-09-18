@@ -32,6 +32,8 @@ from torch.nn.utils import remove_weight_norm as _fold_weight_norm
 from torch.nn.utils import weight_norm as _apply_weight_norm
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta as _SharedSnakeBeta
+
 logger = init_logger(__name__)
 
 __all__ = ["AuKVAE"]
@@ -195,27 +197,51 @@ class Encoder(nn.Module):
         return self.generator(x)
 
 
-class SnakeBeta(nn.Module):
-    """``x + sin^2(alpha * x) / beta`` with per-channel learned alpha and beta (log-scale in AuK)."""
+class SnakeBeta(_SharedSnakeBeta):
+    """x + sin^2(alpha * x) / beta with per-channel learned alpha and beta (log-scale in AuK).
+
+    Built on the shared speech-decoder activation: exp(alpha) and
+    1 / (exp(beta) + eps) are materialised once instead of on every call,
+    and on CUDA the whole expression runs as one fused Triton kernel. The
+    eager path keeps the reference's operation order, so fused=False
+    reproduces it bit for bit; the fused kernel differs only in the last ULPs
+    of sin.
+    """
 
     def __init__(self, channels: int, alpha_logscale: bool = False) -> None:
-        super().__init__()
-        self.alpha_logscale = alpha_logscale
-        init = torch.zeros(channels) if alpha_logscale else torch.ones(channels)
-        self.alpha = nn.Parameter(init.clone())
-        self.beta = nn.Parameter(init.clone())
-        self.eps = 1e-9
+        super().__init__(channels, alpha_logscale=alpha_logscale)
+        self.fused = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)
-        beta = self.beta.unsqueeze(0).unsqueeze(-1)
-        if self.alpha_logscale:
-            alpha = torch.exp(alpha)
-            beta = torch.exp(beta)
-        return x + (1.0 / (beta + self.eps)) * torch.sin(x * alpha).pow(2)
+        if not self.fused:
+            return self._eager_forward(x)
+        return super().forward(x)
 
 
-class LowPass(nn.Module):
+class _CachedFilter:
+    """Mixin for the FIR modules: expand the shared taps per channel once, not per call.
+
+    filter.expand(channels, -1, -1) is a stride-0 view, and the convolution
+    then copies it to a contiguous weight on every call. Caching the contiguous
+    copy per channel count removes one launch per activation; the taps are the
+    same, so the output is unchanged.
+    """
+
+    filter: torch.Tensor
+    cache_filters: bool = True
+    _expanded: torch.Tensor | None = None
+
+    def _taps(self, channels: int, x: torch.Tensor) -> torch.Tensor:
+        if not self.cache_filters:
+            return self.filter.expand(channels, -1, -1)
+        cached = self._expanded
+        if cached is None or cached.shape[0] != channels or cached.device != x.device:
+            cached = self.filter.expand(channels, -1, -1).contiguous()
+            self._expanded = cached
+        return cached
+
+
+class LowPass(_CachedFilter, nn.Module):
     """Fixed FIR low-pass with replicate padding, applied per channel."""
 
     def __init__(
@@ -241,10 +267,10 @@ class LowPass(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         channels = x.size(1)
         x = F.pad(x, (self.pad_left, self.pad_right), mode="replicate")
-        return F.conv1d(x, self.filter.expand(channels, -1, -1), stride=self.stride, groups=channels)
+        return F.conv1d(x, self._taps(channels, x), stride=self.stride, groups=channels)
 
 
-class Upsample(nn.Module):
+class Upsample(_CachedFilter, nn.Module):
     """Band-limited interpolation by ``ratio``. Always non-causal, matching how AuK builds it."""
 
     def __init__(self, ratio: int = 2, kernel_size: int = 12) -> None:
@@ -258,7 +284,7 @@ class Upsample(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         channels = x.size(1)
         x = F.pad(x, (self.pad, self.pad), mode="replicate")
-        x = self.ratio * F.conv_transpose1d(x, self.filter.expand(channels, -1, -1), stride=self.ratio, groups=channels)
+        x = self.ratio * F.conv_transpose1d(x, self._taps(channels, x), stride=self.ratio, groups=channels)
         return x[..., self.pad_left : -self.pad_right]
 
 
@@ -458,6 +484,29 @@ class AuKVAE(nn.Module):
                 folded += 1
         self._norm_folded = True
         logger.debug("Folded weight norm on %d AuK VAE convolutions", folded)
+        # The activations' exp(alpha) / 1/(exp(beta)+eps) caches depend only on
+        # the loaded parameters; materialise them here so no decode call, and
+        # in particular no CUDA graph capture, computes them lazily.
+        for module in self.modules():
+            if isinstance(module, SnakeBeta):
+                module.precompute_exp_cache()
+
+    def set_decode_fast_paths(self, *, fused_snake: bool | None = None, cached_filters: bool | None = None) -> None:
+        """Toggle the decoder's fused Snake kernel and per-channel filter caching.
+
+        Both default to on. They exist as switches so a parity check can pin
+        the bit-exact eager formula, and so each path's cost can be measured on
+        its own. Flip them before any CUDA graph is captured: passing
+        cached_filters reallocates the cached taps, and a captured graph
+        keeps reading the old buffers.
+        """
+
+        for module in self.modules():
+            if fused_snake is not None and isinstance(module, SnakeBeta):
+                module.fused = fused_snake
+            if cached_filters is not None and isinstance(module, _CachedFilter):
+                module.cache_filters = cached_filters
+                module._expanded = None
 
     def encode(
         self, wav: torch.Tensor, *, sample: bool = False, generator: torch.Generator | None = None
