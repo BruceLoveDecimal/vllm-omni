@@ -1,0 +1,18 @@
+# AuK perf matrix: eight arms = 2^3 factorial over three optimizations, all
+# stacked on the same base (PR #7469 merged with main@3eb5c3b4e).
+#   E = encoder through vLLM's compiled forward + CUDA graphs (79bdb6d3b)
+#   B = request batching through one padded DiT forward (feat/auk-request-batching)
+#   V = codec decode fast paths + compiled bucketed CUDA graphs (feat/auk_vae_compile)
+# Every arm is a branch on the fork; run_matrix.sh checks each out as a
+# worktree and serves it through PYTHONPATH.
+base_ref: bench/auk-base
+client_ref: bench/auk-client   # bench client checkout (mixed-duration dataset patch)
+arms:
+  base: {ref: bench/auk-base, factors: []}
+  E:    {ref: bench/auk-E,    factors: [E]}
+  B:    {ref: bench/auk-B,    factors: [B]}
+  V:    {ref: bench/auk-V,    factors: [V]}
+  EB:   {ref: bench/auk-EB,   factors: [E, B]}
+  EV:   {ref: bench/auk-EV,   factors: [E, V]}
+  BV:   {ref: bench/auk-BV,   factors: [B, V]}
+  EBV:  {ref: bench/auk-EBV,  factors: [E, B, V]}
