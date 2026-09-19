@@ -161,14 +161,14 @@ run_bench() {
     --dataset-name "$dataset_name" --dataset-path "$DATASET" --seed-tts-locale en --seed 0 \
     --num-prompts "$NUM_PROMPTS" --num-warmups "$NUM_WARMUPS" \
     --max-concurrency "$conc" --request-rate inf \
-    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration \
+    --percentile-metrics ttft,e2el,audio_rtf,audio_ttfp,audio_duration --metric-percentiles 50,90,99 \
     --extra-body "$extra" --trust-remote-code \
     --save-result --result-dir "$outdir" --result-filename "$fname" \
     >"$outdir/${fname%.json}.log" 2>&1
   local rc=$?
   t1=$(date +%s.%N)
   printf '%s,%s,%s,%s\n' "$fname" "$t0" "$t1" "$rc" >>"$outdir/runs.csv"
-  log "bench $fname rc=$rc ($(printf '%.0f' "$(echo "$t1 - $t0" | bc)")s)"
+  log "bench $fname rc=$rc ($(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.0f", b - a}')s)"
   return $rc
 }
 
