@@ -90,8 +90,16 @@ stop_server() {
   kill -KILL -- "-$SERVER_PID" 2>/dev/null
   wait "$SERVER_PID" 2>/dev/null
   SERVER_PID=""
-  # Let the driver release the memory before the next arm allocates.
-  sleep 5
+  # The stage engine cores can outlive the serve process; wait until the GPU
+  # is actually free before the next arm allocates.
+  for _ in $(seq 1 30); do
+    [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)" ] && break
+    for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
+      kill -KILL "$pid" 2>/dev/null
+    done
+    sleep 2
+  done
+  sleep 3
 }
 
 start_sidecar() {
@@ -173,6 +181,8 @@ run_bench() {
 }
 
 trap 'stop_sidecar; stop_server' EXIT
+# A signal must still run the EXIT trap so the server and sidecar go with us.
+trap 'exit 143' TERM INT
 
 mkdir -p "$OUT"
 for ckpt in $CKPTS; do
