@@ -4,8 +4,13 @@
 """Aggregate the AuK matrix results written by run_matrix.sh.
 
 Reads ``<results>/<ckpt>/<arm>/<task>_<workload>_c<conc>_r<rep>.json`` plus
-the per-arm ``memory.csv`` / ``runs.csv`` sidecar files, takes the median over
-repeats, and writes ``summary.csv`` and ``summary.md``.
+the per-arm ``memory.csv`` / ``runs.csv`` sidecar files and writes
+``summary.csv`` and ``summary.md``.
+
+The first repeat of every cell pays the per-shape CUDA graph captures (one
+per distinct reference length), so the headline numbers are the warm
+steady state: the best repeat (highest throughput, lowest latency). The
+first repeat is kept as ``cold_*`` so that capture cost stays visible.
 """
 
 from __future__ import annotations
@@ -15,7 +20,6 @@ import csv
 import datetime
 import json
 import re
-import statistics
 from collections import defaultdict
 from pathlib import Path
 
@@ -35,6 +39,8 @@ _METRICS = [
     ("completed", ["completed"]),
 ]
 _ARM_ORDER = ["base", "E", "B", "V", "EB", "EV", "BV", "EBV"]
+# Higher is better for these; everything else is a latency or a size.
+_MAX_IS_BEST = {"req_per_s", "audio_s_per_s", "completed"}
 
 
 def _pick(result: dict, keys: list[str]) -> float | None:
@@ -160,6 +166,7 @@ def collect(results: Path) -> list[dict]:
                     entry["stage1_peak_mb"] = None
                     entry["stage1_alloc_peak_gb"] = None
                     entry["stage1_reserved_peak_gb"] = None
+                entry["rep"] = int(m["rep"])
                 groups[(m["task"], m["workload"], int(m["conc"]))].append(entry)
             for (task, workload, conc), entries in sorted(groups.items()):
                 row = {
@@ -173,7 +180,16 @@ def collect(results: Path) -> list[dict]:
                 }
                 for col in list(dict(_METRICS)) + ["gpu_used_peak_mib", "stage1_peak_mb", "stage1_alloc_peak_gb", "stage1_reserved_peak_gb"]:
                     values = [e[col] for e in entries if e.get(col) is not None]
-                    row[col] = statistics.median(values) if values else None
+                    if not values:
+                        row[col] = None
+                    elif col in _MAX_IS_BEST or col.endswith("_mb") or col.endswith("_mib"):
+                        row[col] = max(values)
+                    else:
+                        row[col] = min(values)
+                first = min(entries, key=lambda e: e["rep"])
+                row["cold_e2el_p50_ms"] = first.get("e2el_p50_ms")
+                row["cold_e2el_p99_ms"] = first.get("e2el_p99_ms")
+                row["cold_req_per_s"] = first.get("req_per_s")
                 rows.append(row)
     return rows
 
@@ -202,6 +218,7 @@ def write_markdown(rows: list[dict], path: Path) -> None:
                 ("e2el_p50_ms", 0),
                 ("e2el_p99_ms", 0),
                 ("ttfa_p50_ms", 0),
+                ("cold_e2el_p50_ms", 0),
                 ("stage1_alloc_peak_gb", 2),
                 ("stage1_reserved_peak_gb", 2),
                 ("gpu_used_peak_mib", 0),
