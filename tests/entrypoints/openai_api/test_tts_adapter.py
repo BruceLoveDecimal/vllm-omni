@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
@@ -119,7 +120,7 @@ def auk_adapter():
     server = SimpleNamespace(
         _max_instructions_length=4096,
         _validate_ref_audio_format=lambda _audio: None,
-        _resolve_ref_audio=AsyncMock(return_value=([0.1] * 480, 24000, "key")),
+        _resolve_ref_audio_array=AsyncMock(return_value=(np.full(480, 0.1, dtype=np.float32), 24000, "key")),
     )
     return AuKAdapter(SpeechServingContext(server=server))
 
@@ -155,7 +156,7 @@ def test_auk_source_length_default_and_complete_instruction(auk_adapter):
     assert knobs["gen_seconds"] is None
     assert knobs["vae_sample"] is True
     assert knobs["t_grid"] == [0, 0.25, 1]
-    auk_adapter.ctx.server._resolve_ref_audio.assert_awaited_once_with("reference.wav")
+    auk_adapter.ctx.server._resolve_ref_audio_array.assert_awaited_once_with("reference.wav")
 
 
 @pytest.mark.parametrize(
@@ -181,7 +182,7 @@ def test_auk_rejects_invalid_t_grid_before_dispatch(auk_adapter, t_grid):
     error = auk_adapter.validate(request)
 
     assert error == "AuK extra_params.t_grid must contain at least two finite, strictly increasing values"
-    auk_adapter.ctx.server._resolve_ref_audio.assert_not_awaited()
+    auk_adapter.ctx.server._resolve_ref_audio_array.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

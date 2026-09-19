@@ -1233,9 +1233,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         entry, cache_key = await self._resolve_ref_audio_entry(ref_audio_str)
         wav_list = entry[0]
         if wav_list is None:
-            # The list view is built on first use and kept with the entry.
+            # The list view is built on first use and kept with the entry, so
+            # repeated callers get the same list back.
             wav_list = entry[4].tolist()
-            if self._ref_audio_resolve_cache.get(cache_key) is entry:
+            cached = self._ref_audio_resolve_cache.get(cache_key)
+            if cached is not None and cached[4] is entry[4]:
                 self._ref_audio_resolve_cache[cache_key] = (wav_list, entry[1], entry[2], entry[3], entry[4])
         return wav_list, entry[1], cache_key
 
@@ -1305,8 +1307,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             entry = (None, sr, self._ref_audio_entry_size(wav_np), artifact_key, wav_np)
             post_key = await self._ref_audio_cache_key(ref_audio_str, allowed_path)
             if post_key == cache_key:
-                self._put_resolved_ref_audio(cache_key, entry)
-                return entry, cache_key
+                self._put_resolved_ref_audio(cache_key, wav_np, sr, artifact_key)
+                return self._ref_audio_resolve_cache.get(cache_key, entry), cache_key
             logger.debug(
                 "ref_audio metadata changed during fetch (attempt %d/%d); retrying",
                 attempt + 1,
@@ -1350,11 +1352,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # max_entries remains the hard cache cap.
         return int(wav_np.nbytes) + len(wav_np) * 40
 
-    def _put_resolved_ref_audio(self, cache_key: str, entry: tuple) -> None:
+    def _put_resolved_ref_audio(
+        self,
+        cache_key: str,
+        wav: list[float] | np.ndarray,
+        sr: int,
+        artifact_key: str,
+    ) -> None:
         if self._ref_audio_resolve_cache_max_entries <= 0 or self._ref_audio_resolve_cache_max_bytes <= 0:
             return
-        size = entry[2]
-        artifact_key = entry[3]
+        if isinstance(wav, np.ndarray):
+            wav_list = None
+            wav_np = wav
+        else:
+            wav_list = wav
+            wav_np = np.asarray(wav, dtype=np.float32)
+        size = self._ref_audio_entry_size(wav_np)
+        entry = (wav_list, int(sr), size, artifact_key, wav_np)
         if size > self._ref_audio_resolve_cache_max_bytes:
             return
         previous = self._ref_audio_resolve_cache.pop(cache_key, None)

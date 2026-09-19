@@ -113,7 +113,8 @@ class AuKMultiModalProcessor(Qwen2_5OmniThinkerMultiModalProcessor):
         hf_processor_mm_kwargs: Mapping[str, object],
     ):
         audios = mm_items.get("audio")
-        if isinstance(audios, AudioProcessorItems) and "max_length" not in hf_processor_mm_kwargs:
+        # On a processor-cache hit the item list is empty: nothing to bound.
+        if isinstance(audios, AudioProcessorItems) and len(audios) > 0 and "max_length" not in hf_processor_mm_kwargs:
             # Items arrive resampled to the feature extractor's rate, so the
             # length is already in feature-extractor samples.
             longest = max(audios.get_audio_length(i) for i in range(len(audios)))

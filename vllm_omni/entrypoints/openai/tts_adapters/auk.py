@@ -109,8 +109,8 @@ class AuKAdapter(ARTTSAdapter):
         del sampling_params_list, has_inline_ref_audio
         reference: tuple[np.ndarray, int] | None = None
         if request.ref_audio is not None:
-            samples, sample_rate, _ = await self.ctx.server._resolve_ref_audio(request.ref_audio)
-            reference = (np.asarray(samples, dtype=np.float32), int(sample_rate))
+            samples, sample_rate, _ = await self.ctx.server._resolve_ref_audio_array(request.ref_audio)
+            reference = (samples, int(sample_rate))
 
         extra = request.extra_params or {}
         # The caller supplies the complete cookbook prompt in instructions;
