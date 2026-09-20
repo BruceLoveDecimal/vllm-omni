@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import json
 import re
 import statistics
 from collections import defaultdict
 from pathlib import Path
 
-_RUN_RE = re.compile(r"^(?P<task>[a-z_]+)_(?P<workload>uniform|mixed)_c(?P<conc>\d+)_r(?P<rep>\d+)\.json$")
+_RUN_RE = re.compile(r"^(?P<task>[a-z_]+)_(?P<workload>uniform|mixed|random)_c(?P<conc>\d+)_r(?P<rep>\d+)\.json$")
 
 # (column, candidate JSON keys in preference order)
 _METRICS = [
@@ -93,6 +94,27 @@ def _window_max(samples, start: float, end: float, index: int) -> float | None:
     return max(values) if values else None
 
 
+_PEAK_RE = re.compile(r"(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d).*Peak GPU memory \(this request\): ([\d.]+) GB reserved, ([\d.]+) GB allocated")
+
+
+def _load_peaks(arm_dir: Path, year: int) -> list[tuple[float, float, float]]:
+    """(epoch, reserved_gb, allocated_gb) per stage-1 forward, from the server log."""
+    import datetime
+
+    path = arm_dir / "server.log"
+    out: list[tuple[float, float, float]] = []
+    if not path.is_file():
+        return out
+    for line in path.open(errors="ignore"):
+        m = _PEAK_RE.search(line)
+        if not m:
+            continue
+        mo, da, h, mi, s = (int(x) for x in m.groups()[:5])
+        ts = datetime.datetime(year, mo, da, h, mi, s, tzinfo=datetime.timezone.utc).timestamp()
+        out.append((ts, float(m.group(6)), float(m.group(7))))
+    return out
+
+
 def _static(arm_dir: Path) -> dict[str, float]:
     out: dict[str, float] = {}
     path = arm_dir / "static.txt"
@@ -113,6 +135,8 @@ def collect(results: Path) -> list[dict]:
         for arm_dir in sorted(p for p in ckpt_dir.iterdir() if p.is_dir()):
             windows = _load_runs(arm_dir)
             memory = _load_memory(arm_dir)
+            year = datetime.datetime.now(datetime.timezone.utc).year
+            peaks = _load_peaks(arm_dir, year)
             static = _static(arm_dir)
             groups: dict[tuple, list[dict]] = defaultdict(list)
             for path in sorted(arm_dir.glob("*.json")):
@@ -128,9 +152,14 @@ def collect(results: Path) -> list[dict]:
                     start, end = windows[path.name]
                     entry["gpu_used_peak_mib"] = _window_max(memory, start, end, 1)
                     entry["stage1_peak_mb"] = _window_max(memory, start, end, 2)
+                    # server-log timestamps are whole seconds; widen the window by one on each side
+                    entry["stage1_alloc_peak_gb"] = _window_max(peaks, start - 1, end + 1, 2)
+                    entry["stage1_reserved_peak_gb"] = _window_max(peaks, start - 1, end + 1, 1)
                 else:
                     entry["gpu_used_peak_mib"] = None
                     entry["stage1_peak_mb"] = None
+                    entry["stage1_alloc_peak_gb"] = None
+                    entry["stage1_reserved_peak_gb"] = None
                 groups[(m["task"], m["workload"], int(m["conc"]))].append(entry)
             for (task, workload, conc), entries in sorted(groups.items()):
                 row = {
@@ -142,7 +171,7 @@ def collect(results: Path) -> list[dict]:
                     "repeats": len(entries),
                     "idle_mib": static.get("idle_after_probe_mib"),
                 }
-                for col in list(dict(_METRICS)) + ["gpu_used_peak_mib", "stage1_peak_mb"]:
+                for col in list(dict(_METRICS)) + ["gpu_used_peak_mib", "stage1_peak_mb", "stage1_alloc_peak_gb", "stage1_reserved_peak_gb"]:
                     values = [e[col] for e in entries if e.get(col) is not None]
                     row[col] = statistics.median(values) if values else None
                 rows.append(row)
@@ -173,7 +202,8 @@ def write_markdown(rows: list[dict], path: Path) -> None:
                 ("e2el_p50_ms", 0),
                 ("e2el_p99_ms", 0),
                 ("ttfa_p50_ms", 0),
-                ("stage1_peak_mb", 0),
+                ("stage1_alloc_peak_gb", 2),
+                ("stage1_reserved_peak_gb", 2),
                 ("gpu_used_peak_mib", 0),
             ):
                 cells = [_fmt(by_conc[c][col], digits) if c in by_conc else "-" for c in concs]

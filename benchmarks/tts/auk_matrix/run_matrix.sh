@@ -25,10 +25,13 @@ HOST=127.0.0.1
 ARMS=${ARMS:-"base E B V EB EV BV EBV"}
 CKPTS=${CKPTS:-"flash base"}
 TASKS=${TASKS:-"voice_clone default_voice"}
-WORKLOADS=${WORKLOADS:-"uniform mixed"}
+WORKLOADS=${WORKLOADS:-"uniform mixed"}   # uniform | mixed (text-derived) | random (seeded)
 CONCS=${CONCS:-"1 2 4 8 16"}
 REPEATS=${REPEATS:-3}
 NUM_PROMPTS=${NUM_PROMPTS:-20}
+DURATION_SEED=${DURATION_SEED:-0}
+# Stage-1 enforce_eager override for every arm (empty = keep the arm yaml).
+STAGE1_ENFORCE_EAGER=${STAGE1_ENFORCE_EAGER:-}
 NUM_WARMUPS=${NUM_WARMUPS:-2}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-1200}
 
@@ -56,8 +59,21 @@ start_server() {
   [ -d "$checkout/vllm_omni" ] || { log "missing checkout $checkout"; return 1; }
   # setsid: own process group, so stop_server can kill the whole stage tree
   # without pattern-matching process names.
+  local deploy=()
+  if [ -n "$STAGE1_ENFORCE_EAGER" ]; then
+    "$PY" - "$checkout/vllm_omni/deploy/auk.yaml" "$(dirname "$logfile")/deploy.yaml" "$STAGE1_ENFORCE_EAGER" <<'PYEOF'
+import sys, yaml
+src, dst, flag = sys.argv[1:]
+cfg = yaml.safe_load(open(src))
+for st in cfg["stages"]:
+    if st["stage_id"] == 1:
+        st["enforce_eager"] = flag.lower() == "true"
+yaml.safe_dump(cfg, open(dst, "w"), sort_keys=False)
+PYEOF
+    deploy=(--deploy-config "$(dirname "$logfile")/deploy.yaml")
+  fi
   PYTHONPATH="$checkout" setsid "$PY" -m vllm_omni.entrypoints.cli.main serve "$(ckpt_path "$ckpt")" \
-    --omni --host "$HOST" --port "$PORT" --trust-remote-code \
+    --omni --host "$HOST" --port "$PORT" --trust-remote-code "${deploy[@]}" \
     >"$logfile" 2>&1 &
   SERVER_PID=$!
   log "server pid=$SERVER_PID arm=$arm ckpt=$ckpt log=$logfile"
@@ -104,12 +120,13 @@ stop_server() {
 
 start_sidecar() {
   local csv=$1
-  echo "ts,gpu_mem_used_mib,stage1_peak_mb" >"$csv"
+  echo "ts,gpu_mem_used_mib,stage1_peak_mb,proc_used_mib" >"$csv"
   (
     while true; do
       used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 2>/dev/null | head -1)
       peak=$(curl -sf "http://$HOST:$PORT/metrics" 2>/dev/null | awk '/^vllm_omni:peak_memory_mb\{.*stage="1"/ {print $2; exit}')
-      printf '%s,%s,%s\n' "$(date +%s.%N)" "${used:-}" "${peak:-}" >>"$csv"
+      procs=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | tr '\n' ';')
+      printf '%s,%s,%s,%s\n' "$(date +%s.%N)" "${used:-}" "${peak:-}" "${procs:-}" >>"$csv"
       sleep 0.25
     done
   ) &
@@ -161,9 +178,10 @@ run_bench() {
   fi
   local mode=""
   [ "$workload" = mixed ] && mode=text
+  [ "$workload" = random ] && mode=random
   local t0 t1
   t0=$(date +%s.%N)
-  VLLM_OMNI_BENCH_TTS_DURATION_MODE="$mode" PYTHONPATH="$CLIENT" "$PY" -m vllm_omni.entrypoints.cli.main bench serve --omni \
+  VLLM_OMNI_BENCH_TTS_DURATION_MODE="$mode" VLLM_OMNI_BENCH_TTS_DURATION_SEED="$DURATION_SEED" PYTHONPATH="$CLIENT" "$PY" -m vllm_omni.entrypoints.cli.main bench serve --omni \
     --host "$HOST" --port "$PORT" --model "$model" \
     --backend openai-audio-speech --endpoint /v1/audio/speech \
     --dataset-name "$dataset_name" --dataset-path "$DATASET" --seed-tts-locale en --seed 0 \

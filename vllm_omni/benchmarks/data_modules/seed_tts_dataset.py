@@ -160,9 +160,26 @@ _DURATION_MIN_S = 2.0
 _DURATION_MAX_S = 12.0
 
 
+_DURATION_SEED_ENV = "VLLM_OMNI_BENCH_TTS_DURATION_SEED"
+_random_durations: random.Random | None = None
+
+
 def _text_duration_seconds(text: str, locale: str) -> float | None:
-    """Estimate speaking time for ``text``; ``None`` unless mixed mode is on."""
-    if os.environ.get(_DURATION_MODE_ENV, "") != "text":
+    """Per-row ``duration_seconds``; ``None`` unless a duration mode is on.
+
+    ``text``: estimate speaking time from the target text. ``random``: draw
+    uniformly from [min, max] in 0.5 s steps from a generator seeded by
+    ``VLLM_OMNI_BENCH_TTS_DURATION_SEED`` (default 0), so every run of a
+    dataset sees the same length sequence regardless of the text.
+    """
+    global _random_durations
+    mode = os.environ.get(_DURATION_MODE_ENV, "")
+    if mode == "random":
+        if _random_durations is None:
+            _random_durations = random.Random(int(os.environ.get(_DURATION_SEED_ENV, "0")))
+        steps = int((_DURATION_MAX_S - _DURATION_MIN_S) * 2)
+        return _DURATION_MIN_S + _random_durations.randint(0, steps) / 2
+    if mode != "text":
         return None
     if locale == "zh":
         raw = len(text.replace(" ", "")) / _CHARS_PER_SEC
