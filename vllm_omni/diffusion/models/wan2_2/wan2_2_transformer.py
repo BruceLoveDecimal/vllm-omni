@@ -1195,138 +1195,149 @@ class WanTransformer3DModel(nn.Module):
         return Transformer2DModelOutput(sample=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """
-        Load weights from a pretrained model, handling the mapping from
-        separate Q/K/V projections to fused QKV projections for self-attention.
+        """Load Diffusers-format Wan weights; see :func:`load_wan_transformer_weights`."""
+        return load_wan_transformer_weights(self, weights)
 
-        Diffusers weight names:
-        - blocks.N.attn1.to_q/to_k/to_v -> fused to blocks.N.attn1.to_qkv (self-attention)
-        - blocks.N.attn2.to_q/to_k/to_v -> kept separate (cross-attention)
-        - blocks.N.attn1.norm_q/norm_k -> QK normalization for self-attention
 
-        Returns:
-            Set of parameter names that were successfully loaded.
-        """
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-        # Stacked params mapping for self-attention QKV fusion.
-        # Format: (param_name, shard_name, shard_id)
-        # Note: Only fuse attn1 (self-attention), NOT attn2 (cross-attention)
-        stacked_params_mapping = [
-            # self-attention QKV fusion
-            (".attn1.to_qkv", ".attn1.to_q", "q"),
-            (".attn1.to_qkv", ".attn1.to_k", "k"),
-            (".attn1.to_qkv", ".attn1.to_v", "v"),
-        ]
-        # Expose packed shard mappings for LoRA handling of fused projections.
-        self.stacked_params_mapping = stacked_params_mapping
+def load_wan_transformer_weights(model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    """Load Diffusers ``WanTransformer3DModel``-style weights into ``model``.
 
-        # Remap scale_shift_table to new module location
-        weight_name_remapping = {
-            "scale_shift_table": "output_scale_shift_prepare.scale_shift_table",
-        }
+    Handles the mapping from separate Q/K/V projections to the fused
+    self-attention QKV projection, TP sharding of the QK norms, PP-missing
+    layers and the small set of Diffusers-vs-module naming differences.
+    Shared by every Wan-derived transformer whose blocks follow the
+    ``attn1``/``attn2``/``ffn`` layout; variants with other checkpoint
+    spellings rename their keys first (for example through a vLLM
+    ``WeightsMapper``) and then delegate here.
 
-        params_dict = dict(self.named_parameters())
-        single_scale_prefixes = {
-            name
-            for name, module in self.named_modules()
-            if isinstance(getattr(module, "quant_method", None), NPUMxfp4LinearMethod)
-        }
+    Diffusers weight names:
+    - blocks.N.attn1.to_q/to_k/to_v -> fused to blocks.N.attn1.to_qkv (self-attention)
+    - blocks.N.attn2.to_q/to_k/to_v -> kept separate (cross-attention)
+    - blocks.N.attn1.norm_q/norm_k -> QK normalization for self-attention
 
-        def reject_dualscale_tensor(name: str) -> None:
-            if name.endswith(".weight_dual_scale") and name.rsplit(".", 1)[0] in single_scale_prefixes:
-                raise ValueError(
-                    f"Single-scale mxfp4 cannot load DualScale tensor {name}; "
-                    "changing quant_method does not convert a checkpoint."
-                )
+    Returns:
+        Set of parameter names that were successfully loaded.
+    """
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    # Stacked params mapping for self-attention QKV fusion.
+    # Format: (param_name, shard_name, shard_id)
+    # Note: Only fuse attn1 (self-attention), NOT attn2 (cross-attention)
+    stacked_params_mapping = [
+        # self-attention QKV fusion
+        (".attn1.to_qkv", ".attn1.to_q", "q"),
+        (".attn1.to_qkv", ".attn1.to_k", "k"),
+        (".attn1.to_qkv", ".attn1.to_v", "v"),
+    ]
+    # Expose packed shard mappings for LoRA handling of fused projections.
+    model.stacked_params_mapping = stacked_params_mapping
 
-        loaded_params: set[str] = set()
-        loaded_qkv_shards: dict[str, set[str]] = {}
-        qkv_smooth_scales: dict[str, torch.Tensor] = {}
+    # Remap scale_shift_table to new module location
+    weight_name_remapping = {
+        "scale_shift_table": "output_scale_shift_prepare.scale_shift_table",
+    }
 
-        for name, loaded_weight in weights:
-            name = weight_name_remapping.get(name, name)
-            original_name = name
-            lookup_name = name
+    params_dict = dict(model.named_parameters())
+    single_scale_prefixes = {
+        name
+        for name, module in model.named_modules()
+        if isinstance(getattr(module, "quant_method", None), NPUMxfp4LinearMethod)
+    }
 
-            # Handle QKV fusion for weight tensors (separate to_q/k/v → fused to_qkv).
-            # Pre-fused to_qkv tensors (from offline MXFP8 merged checkpoint) fall
-            # through to the else branch and are loaded directly.
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if f"{weight_name}." not in original_name:
-                    continue
-                lookup_name = original_name.replace(f"{weight_name}.", f"{param_name}.", 1)
-                reject_dualscale_tensor(lookup_name)
-                # Skip weights that belong to PP stages other than this one
-                if is_pp_missing_parameter(lookup_name, self) or lookup_name not in params_dict:
-                    break
-                param = params_dict[lookup_name]
-                if lookup_name.endswith(".mul_scale"):
-                    previous_scale = qkv_smooth_scales.get(lookup_name)
-                    if previous_scale is not None and not torch.equal(previous_scale, loaded_weight):
-                        raise ValueError(f"Fused Q/K/V must share the same Smooth tensor: {lookup_name}")
-                    if previous_scale is None:
-                        qkv_smooth_scales[lookup_name] = loaded_weight.clone()
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(original_name)
-                if getattr(param, "output_dim", None) is None and not getattr(param, "needs_scalar_to_array", False):
-                    # Shared input-channel Smooth is a complete tensor even
-                    # when supplied under a single Q/K/V source name.
-                    loaded_params.add(lookup_name)
-                else:
-                    shards = loaded_qkv_shards.setdefault(lookup_name, set())
-                    shards.add(shard_id)
-                    if shards == {"q", "k", "v"}:
-                        loaded_params.add(lookup_name)
+    def reject_dualscale_tensor(name: str) -> None:
+        if name.endswith(".weight_dual_scale") and name.rsplit(".", 1)[0] in single_scale_prefixes:
+            raise ValueError(
+                f"Single-scale mxfp4 cannot load DualScale tensor {name}; "
+                "changing quant_method does not convert a checkpoint."
+            )
+
+    loaded_params: set[str] = set()
+    loaded_qkv_shards: dict[str, set[str]] = {}
+    qkv_smooth_scales: dict[str, torch.Tensor] = {}
+
+    for name, loaded_weight in weights:
+        name = weight_name_remapping.get(name, name)
+        original_name = name
+        lookup_name = name
+
+        # Handle QKV fusion for weight tensors (separate to_q/k/v → fused to_qkv).
+        # Pre-fused to_qkv tensors (from offline MXFP8 merged checkpoint) fall
+        # through to the else branch and are loaded directly.
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            if f"{weight_name}." not in original_name:
+                continue
+            lookup_name = original_name.replace(f"{weight_name}.", f"{param_name}.", 1)
+            reject_dualscale_tensor(lookup_name)
+            # Skip weights that belong to PP stages other than this one
+            if is_pp_missing_parameter(lookup_name, model) or lookup_name not in params_dict:
                 break
+            param = params_dict[lookup_name]
+            if lookup_name.endswith(".mul_scale"):
+                previous_scale = qkv_smooth_scales.get(lookup_name)
+                if previous_scale is not None and not torch.equal(previous_scale, loaded_weight):
+                    raise ValueError(f"Fused Q/K/V must share the same Smooth tensor: {lookup_name}")
+                if previous_scale is None:
+                    qkv_smooth_scales[lookup_name] = loaded_weight.clone()
+            weight_loader = param.weight_loader
+            weight_loader(param, loaded_weight, shard_id)
+            loaded_params.add(original_name)
+            if getattr(param, "output_dim", None) is None and not getattr(param, "needs_scalar_to_array", False):
+                # Shared input-channel Smooth is a complete tensor even
+                # when supplied under a single Q/K/V source name.
+                loaded_params.add(lookup_name)
             else:
-                # diffusers: ffn.net.0.proj.weight -> our: ffn.net_0.proj.weight
-                if ".ffn.net.0." in lookup_name:
-                    lookup_name = lookup_name.replace(".ffn.net.0.", ".ffn.net_0.")
-                elif ".ffn.net.2." in lookup_name:
-                    lookup_name = lookup_name.replace(".ffn.net.2.", ".ffn.net_2.")
+                shards = loaded_qkv_shards.setdefault(lookup_name, set())
+                shards.add(shard_id)
+                if shards == {"q", "k", "v"}:
+                    loaded_params.add(lookup_name)
+            break
+        else:
+            # diffusers: ffn.net.0.proj.weight -> our: ffn.net_0.proj.weight
+            if ".ffn.net.0." in lookup_name:
+                lookup_name = lookup_name.replace(".ffn.net.0.", ".ffn.net_0.")
+            elif ".ffn.net.2." in lookup_name:
+                lookup_name = lookup_name.replace(".ffn.net.2.", ".ffn.net_2.")
 
-                if ".to_out.0." in lookup_name:
-                    lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+            if ".to_out.0." in lookup_name:
+                lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
 
-                # Compatibility: some Wan conversion pipelines still keep
-                # block modulation keys as `blocks.N.modulation` instead of
-                # `blocks.N.scale_shift_table`.
-                if lookup_name.endswith(".modulation"):
-                    modulation_alias = lookup_name[: -len(".modulation")] + ".scale_shift_table"
-                    if modulation_alias in params_dict:
-                        lookup_name = modulation_alias
+            # Compatibility: some Wan conversion pipelines still keep
+            # block modulation keys as `blocks.N.modulation` instead of
+            # `blocks.N.scale_shift_table`.
+            if lookup_name.endswith(".modulation"):
+                modulation_alias = lookup_name[: -len(".modulation")] + ".scale_shift_table"
+                if modulation_alias in params_dict:
+                    lookup_name = modulation_alias
 
-                # Skip weights that belong to PP stages other than this one
-                if is_pp_missing_parameter(lookup_name, self):
-                    continue
+            # Skip weights that belong to PP stages other than this one
+            if is_pp_missing_parameter(lookup_name, model):
+                continue
 
-                reject_dualscale_tensor(lookup_name)
-                if lookup_name not in params_dict:
-                    logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
-                    continue
+            reject_dualscale_tensor(lookup_name)
+            if lookup_name not in params_dict:
+                logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
+                continue
 
-                param = params_dict[lookup_name]
+            param = params_dict[lookup_name]
 
-                # Handle RMSNorm weights that need to be sharded for TP
-                # These norms are applied after ColumnParallelLinear outputs,
-                # so their weights must be sharded to match the sharded hidden dim
-                if tp_size > 1 and any(
-                    norm_name in lookup_name
-                    for norm_name in [
-                        ".attn1.norm_q.",
-                        ".attn1.norm_k.",
-                        ".attn2.norm_q.",
-                        ".attn2.norm_k.",
-                        ".attn2.norm_added_k.",
-                    ]
-                ):
-                    shard_size = loaded_weight.shape[0] // tp_size
-                    loaded_weight = loaded_weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
+            # Handle RMSNorm weights that need to be sharded for TP
+            # These norms are applied after ColumnParallelLinear outputs,
+            # so their weights must be sharded to match the sharded hidden dim
+            if tp_size > 1 and any(
+                norm_name in lookup_name
+                for norm_name in [
+                    ".attn1.norm_q.",
+                    ".attn1.norm_k.",
+                    ".attn2.norm_q.",
+                    ".attn2.norm_k.",
+                    ".attn2.norm_added_k.",
+                ]
+            ):
+                shard_size = loaded_weight.shape[0] // tp_size
+                loaded_weight = loaded_weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
 
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.update((original_name, lookup_name))
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.update((original_name, lookup_name))
 
-        return loaded_params
+    return loaded_params

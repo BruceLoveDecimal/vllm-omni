@@ -344,17 +344,17 @@ def test_reference_grid_must_match_the_generation_grid_spatially():
     "original,expected",
     [
         ("blocks.0.self_attn.to_q.weight", "blocks.0.attn1.to_q.weight"),
-        ("blocks.7.self_attn.to_out.0.bias", "blocks.7.attn1.to_out.bias"),
+        ("blocks.7.self_attn.to_out.0.bias", "blocks.7.attn1.to_out.0.bias"),
         ("blocks.3.self_attn.norm_k.weight", "blocks.3.attn1.norm_k.weight"),
         ("blocks.1.cross_attn.add_k_proj.weight", "blocks.1.attn2.add_k_proj.weight"),
         ("blocks.1.cross_attn.norm_added_k.weight", "blocks.1.attn2.norm_added_k.weight"),
-        ("blocks.2.cross_attn.to_out.0.weight", "blocks.2.attn2.to_out.weight"),
-        ("blocks.2.ffn.0.weight", "blocks.2.ffn.net_0.proj.weight"),
-        ("blocks.2.ffn.2.bias", "blocks.2.ffn.net_2.bias"),
+        ("blocks.2.cross_attn.to_out.0.weight", "blocks.2.attn2.to_out.0.weight"),
+        ("blocks.2.ffn.0.weight", "blocks.2.ffn.net.0.proj.weight"),
+        ("blocks.2.ffn.2.bias", "blocks.2.ffn.net.2.bias"),
         ("blocks.4.norm3.weight", "blocks.4.norm2.weight"),
-        ("blocks.5.modulation", "blocks.5.scale_shift_table"),
+        ("blocks.5.modulation", "blocks.5.modulation"),
         ("head.head.weight", "proj_out.weight"),
-        ("head.modulation", "output_scale_shift_prepare.scale_shift_table"),
+        ("head.modulation", "scale_shift_table"),
         ("text_embedding.0.weight", "condition_embedder.text_embedder.linear_1.weight"),
         ("time_embedding.2.bias", "condition_embedder.time_embedder.linear_2.bias"),
         ("time_projection.1.weight", "condition_embedder.time_proj.weight"),
@@ -364,7 +364,22 @@ def test_reference_grid_must_match_the_generation_grid_spatially():
     ],
 )
 def test_weight_name_remapping(original, expected):
+    """The mapper only bridges Animate-2's spelling to the Diffusers *Wan*
+    spelling; ``to_out.0`` / ``ffn.net.N`` / ``modulation`` are the shared Wan
+    loader's business."""
     assert WanAnimate2Transformer3DModel.remap_weight_name(original) == expected
+
+
+def _module_name(diffusers_wan_name: str) -> str:
+    """The final renames the shared Wan loader applies on top of the mapper."""
+    name = diffusers_wan_name
+    if name == "scale_shift_table":
+        return "output_scale_shift_prepare.scale_shift_table"
+    name = name.replace(".ffn.net.0.", ".ffn.net_0.").replace(".ffn.net.2.", ".ffn.net_2.")
+    name = name.replace(".to_out.0.", ".to_out.")
+    if name.endswith(".modulation"):
+        name = name[: -len(".modulation")] + ".scale_shift_table"
+    return name
 
 
 def _diffusers_checkpoint_names(num_layers: int) -> list[str]:
@@ -397,7 +412,7 @@ def test_remapped_names_cover_every_parameter():
     params = set(dict(model.named_parameters()))
 
     remapped = {
-        WanAnimate2Transformer3DModel.remap_weight_name(name)
+        _module_name(WanAnimate2Transformer3DModel.remap_weight_name(name))
         for name in _diffusers_checkpoint_names(_TINY_CONFIG.num_layers)
     }
     fused = {name for name in remapped if ".attn1.to_q" in name or ".attn1.to_k" in name or ".attn1.to_v" in name}
@@ -422,7 +437,7 @@ def test_load_weights_populates_every_parameter():
         shapes[name] = param.shape
     weights = []
     for name in _diffusers_checkpoint_names(_TINY_CONFIG.num_layers):
-        target = WanAnimate2Transformer3DModel.remap_weight_name(name)
+        target = _module_name(WanAnimate2Transformer3DModel.remap_weight_name(name))
         if ".attn1.to_q" in target or ".attn1.to_k" in target or ".attn1.to_v" in target:
             fused_shape = shapes[target.replace("to_q", "to_qkv").replace("to_k", "to_qkv").replace("to_v", "to_qkv")]
             shape = (fused_shape[0] // 3,) + tuple(fused_shape[1:])
@@ -431,13 +446,16 @@ def test_load_weights_populates_every_parameter():
         weights.append((name, torch.ones(shape)))
 
     loaded = model.load_weights(weights)
-    assert loaded == set(shapes)
+    # The shared loader reports checkpoint names alongside parameter names.
+    assert set(shapes) <= loaded
+    # LoRA derives its packed-module map from what the loader recorded.
+    assert model.stacked_params_mapping[0] == (".attn1.to_qkv", ".attn1.to_q", "q")
 
 
-def test_load_weights_rejects_unknown_keys():
+def test_load_weights_skips_unknown_keys():
+    """Same contract as every other Wan transformer: log and skip, never raise."""
     model = _tiny_model()
-    with pytest.raises(KeyError, match="unexpected weight"):
-        model.load_weights([("blocks.0.mystery.weight", torch.zeros(1))])
+    assert model.load_weights([("blocks.0.mystery.weight", torch.zeros(1))]) == set()
 
 
 def test_distilled_log_scale_changes_the_output():

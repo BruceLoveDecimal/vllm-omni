@@ -19,6 +19,11 @@ Per segment the pipeline runs
 2. the ordinary denoising loop, where every block attends the frame-aligned
    slice of that cache;
 3. a VAE decode whose trailing frame seeds the next segment.
+
+The checkpoint's components (UMT5, CLIP, Wan VAE) are the Wan2.2-I2V set, so
+the pipeline subclasses :class:`Wan22I2VPipeline` for loading, prompt and
+image encoding, and overrides only the transformer factory, the scheduler and
+the request loop.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -36,39 +41,22 @@ import torch
 from diffusers import DPMSolverMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
-from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import (
-    ReferenceVideoDecodeSpec,
-    SupportImageInput,
-    SupportsComponentDiscovery,
-)
-from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.diffusion.models.schedulers import FlowMatchEulerDiscreteScheduler
 from vllm_omni.diffusion.models.utils import _load_json
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
-    _WAN_TEXT_ENCODER_OFFLOAD_PLAN,
-    load_transformer_config,
-    retrieve_latents,
-)
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import get_wan22_i2v_post_process_func
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import resolve_wan_transformer_quant_config, retrieve_latents
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import Wan22I2VPipeline, get_wan22_i2v_post_process_func
 from vllm_omni.diffusion.models.wan_animate2.reference_kv_cache import ReferenceKVCache
 from vllm_omni.diffusion.models.wan_animate2.wan_animate2_transformer import (
     WanAnimate2Transformer3DModel,
     WanAnimate2TransformerConfig,
 )
 from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, selected_offload_components
-from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.entrypoints.openai.video_api_utils import decode_video_path
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -222,22 +210,6 @@ def get_frame_indices(frame_count: int, video_fps: float, target_count: int, tar
     return np.clip(indices, 0, frame_count - 1).tolist()
 
 
-def decode_video_file(path: str) -> tuple[list[np.ndarray], float]:
-    """Decode every frame of ``path`` to uint8 RGB arrays, plus the source fps."""
-    import av
-
-    with av.open(path) as container:
-        stream = container.streams.video[0]
-        rate = stream.average_rate or stream.guessed_rate
-        if not rate:
-            raise ValueError(f"could not determine the frame rate of {path!r}")
-        frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(stream)]
-
-    if not frames:
-        raise ValueError(f"driving video {path!r} contains no frames")
-    return frames, float(rate)
-
-
 def resample_frames(frames: Sequence[np.ndarray], video_fps: float, target_fps: float) -> list[np.ndarray]:
     """Pick the frames of a ``video_fps`` clip that fall on a ``target_fps`` grid."""
     target_count = int(len(frames) / video_fps * target_fps)
@@ -340,7 +312,8 @@ class Animate2Request:
     negative_prompt: str
     prompt_ref: str
     image: PIL.Image.Image
-    video: str | list[PIL.Image.Image]
+    video: str | list[str] | list[PIL.Image.Image]
+    video_fps: float | None
     width: int
     height: int
     fps: float
@@ -350,15 +323,7 @@ class Animate2Request:
     guidance_scale: float
 
 
-class Wan22Animate2Pipeline(
-    nn.Module,
-    SupportImageInput,
-    CFGParallelMixin,
-    DenoiseProgressMixin,
-    ProgressBarMixin,
-    DiffusionPipelineProfilerMixin,
-    SupportsComponentDiscovery,
-):
+class Wan22Animate2Pipeline(Wan22I2VPipeline):
     """Wan2.2-Animate-2 character animation.
 
     One request produces an arbitrarily long video by chaining fixed-length
@@ -373,119 +338,50 @@ class Wan22Animate2Pipeline(
 
     supports_request_batch = False
 
+    # Single expert: no ``transformer_2`` to offload.
     _dit_modules: ClassVar[list[str]] = ["transformer"]
-    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
-    _vae_modules: ClassVar[list[str]] = ["vae"]
-    _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
     dummy_run_num_frames: ClassVar[int] = 0
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
-        super().__init__()
-        self.od_config = od_config
-        self.device = get_local_device()
-        dtype = getattr(od_config, "dtype", torch.bfloat16)
+        super().__init__(od_config=od_config, prefix=prefix)
 
         model = od_config.model
         local_files_only = os.path.exists(model)
 
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=model,
-                subfolder="transformer",
-                revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
-            ),
-        ]
-
-        subfolders = ["tokenizer", "text_encoder", "vae", "image_processor", "image_encoder", "scheduler"]
-        prefetch_subfolders(model, subfolders, local_files_only=local_files_only)
-
-        self.tokenizer = from_pretrained_with_prefetch(
-            AutoTokenizer.from_pretrained,
-            model,
-            subfolder="tokenizer",
-            prefetch_list=subfolders,
-            local_files_only=local_files_only,
-        )
-        self.text_encoder = from_pretrained_with_prefetch(
-            UMT5EncoderModel.from_pretrained,
-            model,
-            subfolder="text_encoder",
-            prefetch_list=subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
-        self.image_processor = from_pretrained_with_prefetch(
-            CLIPImageProcessor.from_pretrained,
-            model,
-            subfolder="image_processor",
-            prefetch_list=subfolders,
-            local_files_only=local_files_only,
-        )
-        self.image_encoder = from_pretrained_with_prefetch(
-            CLIPVisionModel.from_pretrained,
-            model,
-            subfolder="image_encoder",
-            prefetch_list=subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
-        self.vae = from_pretrained_with_prefetch(
-            DistributedAutoencoderKLWan.from_pretrained,
-            model,
-            subfolder="vae",
-            prefetch_list=subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
-
-        self.is_distilled = _is_distilled_checkpoint(model, local_files_only)
-        log_scale = ANIMATE2_DISTILLED_LOG_SCALE if self.is_distilled else 0.0
-        transformer_config = WanAnimate2TransformerConfig.from_dict(
-            load_transformer_config(model, "transformer", local_files_only), log_scale=log_scale
-        )
-        self.transformer = WanAnimate2Transformer3DModel(
-            transformer_config, quant_config=getattr(od_config, "quantization_config", None)
-        )
-
+        # The base constructor installs Wan's UniPC default; Animate-2 ships
+        # its own scheduler class per release.
         self.flow_shift = ANIMATE2_DEFAULT_FLOW_SHIFT if od_config.flow_shift is None else od_config.flow_shift
         self.scheduler = _load_scheduler(model, local_files_only, self.flow_shift)
 
-        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal
-        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial
         # VAE spatial stride x transformer patch stride.
-        self.resolution_divisor = self.vae_scale_factor_spatial * transformer_config.patch_size[1]
+        self.resolution_divisor = self.vae_scale_factor_spatial * self.transformer.config.patch_size[1]
         latent_shape = (1, self.vae.config.z_dim, 1, 1, 1)
         self.latents_mean = torch.tensor(self.vae.config.latents_mean).view(latent_shape)
         self.latents_std = torch.tensor(self.vae.config.latents_std).view(latent_shape)
 
-        self._guidance_scale = None
-        self._num_timesteps = None
-        self._current_timestep = None
-        self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
-        )
+    def _create_transformer(self, config: dict, component: str = "transformer") -> WanAnimate2Transformer3DModel:
+        """Build the Animate-2 DiT; called by the base constructor.
+
+        The distilled release shares ``transformer/config.json`` with the base
+        one and differs only in a constant attention bias, so the flag is
+        resolved here from ``modular_model_index.json``.
+        """
+        if component != "transformer":
+            raise ValueError(f"Wan2.2-Animate-2 has a single transformer, got component {component!r}")
+        model = self.od_config.model
+        self.is_distilled = _is_distilled_checkpoint(model, os.path.exists(model))
+        log_scale = ANIMATE2_DISTILLED_LOG_SCALE if self.is_distilled else 0.0
+        transformer_config = WanAnimate2TransformerConfig.from_dict(config, log_scale=log_scale)
+
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        if getattr(self.od_config, "quantization_config_is_auto_detected", False):
+            quant_config = None
+        quant_config = resolve_wan_transformer_quant_config(config, quant_config, component)
+        return WanAnimate2Transformer3DModel(transformer_config, quant_config=quant_config)
 
     # ------------------------------------------------------------------
-    # Properties and request-level contracts
+    # Request-level contracts
     # ------------------------------------------------------------------
-
-    @property
-    def guidance_scale(self):
-        return self._guidance_scale
-
-    @property
-    def do_classifier_free_guidance(self):
-        return self._guidance_scale is not None and self._guidance_scale > 1.0
-
-    @property
-    def num_timesteps(self):
-        return self._num_timesteps
-
-    @property
-    def current_timestep(self):
-        return self._current_timestep
 
     @classmethod
     def reference_video_decode_spec(
@@ -543,42 +439,12 @@ class Wan22Animate2Pipeline(
 
         return video[:, :, :num_frames].to(dtype=self.transformer.dtype)
 
-    def encode_prompt(self, prompt: str, max_sequence_length: int = 512) -> torch.Tensor:
-        """Encode one prompt into ``[1, 512, 4096]`` UMT5 embeddings.
-
-        Same contract as the Wan2.2-I2V encoder: truncate to the true token
-        count and right-pad with zeros, which is what ``text_embedding`` sees.
-        """
-        text_inputs = self.tokenizer(
-            [" ".join(prompt.strip().split())],
-            padding="max_length",
-            max_length=max_sequence_length,
-            truncation=True,
-            add_special_tokens=True,
-            return_attention_mask=True,
-            return_tensors="pt",
-        )
-        ids = text_inputs.input_ids.to(self.device)
-        mask = text_inputs.attention_mask.to(self.device)
-        seq_len = int(mask.gt(0).sum(dim=1)[0])
-
-        embeds = self.text_encoder(ids, mask).last_hidden_state.to(dtype=self.transformer.dtype)
-        padded = embeds.new_zeros(1, max_sequence_length, embeds.shape[-1])
-        padded[:, :seq_len] = embeds[:, :seq_len]
-        return padded
-
-    def encode_image(self, image: np.ndarray) -> torch.Tensor:
-        """CLIP-encode one ``[H, W, 3]`` uint8 frame (penultimate layer, as in Wan I2V)."""
-        pixel_values = self.image_processor(images=PIL.Image.fromarray(image), return_tensors="pt").pixel_values
-        pixel_values = pixel_values.to(device=self.device, dtype=self.image_encoder.dtype)
-        image_embeds = self.image_encoder(pixel_values, output_hidden_states=True)
-        return image_embeds.hidden_states[-2].to(dtype=self.transformer.dtype)
-
     # ------------------------------------------------------------------
     # Denoising
     # ------------------------------------------------------------------
 
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs) -> torch.Tensor:
+        """Upstream keeps the latents in float32 and runs the DiT under autocast."""
         if current_model is None:
             current_model = self.transformer
         param_dtype = next(current_model.parameters()).dtype
@@ -638,7 +504,7 @@ class Wan22Animate2Pipeline(
                     negative_kwargs=negative_kwargs,
                     cfg_normalize=False,
                 )
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False, generator=generator)[0]
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg, generator=generator)
                 progress_bar.update()
 
         self._current_timestep = None
@@ -688,12 +554,14 @@ class Wan22Animate2Pipeline(
                 guidance_scale,
             )
 
+        video_fps = additional.get("video_fps")
         return Animate2Request(
             prompt=prompt_data.get("prompt") or ANIMATE2_DEFAULT_PROMPT,
             negative_prompt=prompt_data.get("negative_prompt") or ANIMATE2_DEFAULT_NEGATIVE_PROMPT,
             prompt_ref=additional.get("prompt_ref") or ANIMATE2_DEFAULT_PROMPT_REF,
             image=multi_modal_data["image"],
             video=multi_modal_data["video"],
+            video_fps=float(video_fps) if video_fps else None,
             width=width,
             height=height,
             fps=params.resolved_frame_rate or ANIMATE2_DEFAULT_FPS,
@@ -703,21 +571,34 @@ class Wan22Animate2Pipeline(
             guidance_scale=guidance_scale,
         )
 
-    def _load_driving_frames(self, request: Animate2Request) -> list[np.ndarray]:
+    def _load_driving_frames(self, request: Animate2Request, extra_args: dict[str, object]) -> list[np.ndarray]:
         """Driving frames at the output frame rate, letterboxed like the reference.
 
-        A path is decoded here and resampled to the request fps.  A frame list
-        (what ``/v1/videos`` hands over after ``reference_video_decode_spec``)
-        is taken as already being at the request fps: the serving layer keeps
-        no source frame rate.
+        A path is decoded with the same loader the video API uses for uploads,
+        under the same frame cap (:meth:`reference_video_decode_spec`).  A frame
+        list is what ``/v1/videos`` hands over after decoding; its source frame
+        rate travels as ``additional_information["video_fps"]``.  Whenever the
+        source rate is known and differs from the request's, the frames are
+        resampled; otherwise they are taken to be at the request rate already.
         """
-        if isinstance(request.video, str):
-            frames, source_fps = decode_video_file(request.video)
-            frames = resample_frames(frames, source_fps, request.fps)
+        video = request.video
+        if isinstance(video, list) and len(video) == 1 and isinstance(video[0], str):
+            video = video[0]
+
+        source_fps = request.video_fps
+        if isinstance(video, str):
+            spec = self.reference_video_decode_spec(num_frames=request.max_frames, extra_args=extra_args)
+            decoded = decode_video_path(video, max_frames=spec.max_frames, keep=spec.keep)
+            source_fps = decoded.fps
+            frames = [np.asarray(frame) for frame in decoded]
+        elif isinstance(video, list) and all(isinstance(item, str) for item in video):
+            raise ValueError("Wan2.2-Animate-2 takes a single driving video, got several paths")
         else:
-            frames = [np.asarray(frame.convert("RGB")) for frame in request.video]
+            frames = [np.asarray(frame.convert("RGB")) for frame in video]
         if not frames:
             raise ValueError("driving video contains no frames")
+        if source_fps is not None and not math.isclose(source_fps, request.fps):
+            frames = resample_frames(frames, source_fps, request.fps)
         if request.max_frames is not None and request.max_frames > 0:
             frames = frames[: request.max_frames]
 
@@ -737,6 +618,7 @@ class Wan22Animate2Pipeline(
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Animate the reference image with the driving video's motion."""
         request = self._resolve_request(req)
+        extra_args = req.sampling_params_list[0].extra_args or {}
         device = self.device
         dtype = self.transformer.dtype
         segment_frames = request.segment_frames
@@ -745,7 +627,7 @@ class Wan22Animate2Pipeline(
         reference_image, letterbox = resize_by_area(
             request.image, request.width * request.height, self.resolution_divisor
         )
-        driving_frames = self._load_driving_frames(request)
+        driving_frames = self._load_driving_frames(request, extra_args)
         source_frame_count = len(driving_frames)
         # Pad so the trailing segment is well formed; trimmed back after decode.
         driving_frames = zigzag_padding(driving_frames, get_padding_len(source_frame_count, segment_frames))
@@ -758,16 +640,20 @@ class Wan22Animate2Pipeline(
         generators = req.collate_request_generators(1, None)
         generator = generators[0] if isinstance(generators, list) else generators
 
-        prompt_embeds = self.encode_prompt(request.prompt)
-        reference_prompt_embeds = self.encode_prompt(request.prompt_ref)
         self._guidance_scale = request.guidance_scale
-        negative_prompt_embeds = None
-        if request.guidance_scale > 1.0:
-            negative_prompt_embeds = self.encode_prompt(request.negative_prompt)
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            request.prompt,
+            request.negative_prompt,
+            do_classifier_free_guidance=request.guidance_scale > 1.0,
+            dtype=dtype,
+        )
+        reference_prompt_embeds, _ = self.encode_prompt(
+            request.prompt_ref, do_classifier_free_guidance=False, dtype=dtype
+        )
 
         reference_pixels = self._pixels_to_tensor([reference_image])  # [1, 3, 1, H, W]
         reference_latents = self._encode_pixels(reference_pixels)  # [1, 16, 1, lat_h, lat_w]
-        reference_image_embeds = self.encode_image(reference_image)
+        reference_image_embeds = self.encode_image(PIL.Image.fromarray(reference_image)).to(dtype)
         reference_mask = get_i2v_mask(1, lat_h, lat_w, 1, device, dtype)
         reference_condition = torch.cat([reference_mask.unsqueeze(0), reference_latents], dim=1)
 
@@ -809,7 +695,7 @@ class Wan22Animate2Pipeline(
             driving_latents = self._encode_pixels(driving_pixels)
             driving_mask = get_i2v_mask(driving_latents.shape[2], lat_h, lat_w, clip_len, device, dtype)
             driving_condition = torch.cat([driving_mask.unsqueeze(0), driving_latents], dim=1)
-            driving_image_embeds = self.encode_image(driving_frames[start])
+            driving_image_embeds = self.encode_image(PIL.Image.fromarray(driving_frames[start])).to(dtype)
 
             patch_h = lat_h // self.transformer.config.patch_size[1]
             patch_w = lat_w // self.transformer.config.patch_size[2]
@@ -905,9 +791,6 @@ class Wan22Animate2Pipeline(
                 transformer.reshard()
             if moved_to_gpu:
                 transformer.to("cpu")
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(weights)
 
 
 def _is_distilled_checkpoint(model: str, local_files_only: bool) -> bool:

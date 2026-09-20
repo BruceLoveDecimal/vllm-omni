@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Numerical core of Wan2.2-Animate-2 in-context reference attention.
 
-Kept free of any vLLM import so the parity tests that guard it (the riskiest
-part of the port) can run on a bare CPU box with nothing but PyTorch.
+The CPU path needs nothing but PyTorch (plus the torch-only ring LSE helper),
+so the parity tests that guard it (the riskiest part of the port) run on a
+bare CPU box.  On CUDA the same code borrows the ring-attention kernel
+selection, which is the one place in the repo that already knows how to get
+an attention output *and* its log-sum-exp from FA2/FA3/FA4/AITER.
 
 Upstream (``Wan-Video/Wan-Animate-2``) expresses the joint attention over
 generated and reference tokens as one flex-attention call with a compiled
@@ -17,10 +20,14 @@ chunks are recombined by log-sum-exp.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cache
 
 import torch
 import torch.nn as nn
+
+from vllm_omni.diffusion.attention.backends.ring.ring_utils import update_out_and_lse
 
 
 @dataclass(frozen=True)
@@ -103,6 +110,22 @@ class ReferenceGridInfo:
             raise ValueError(f"a segment needs at least 2 latent frames, got {self.num_frames}")
 
 
+@cache
+def _flash_lse_kernel(device: torch.device) -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | None:
+    """The LSE-returning flash kernel ring attention would pick for ``device``.
+
+    Imported lazily: the resolver lives next to the distributed strategies, and
+    the CPU path must stay importable without vLLM's distributed stack.
+    """
+    from vllm_omni.diffusion.attention.backends.ring.ring_selector import select_flash_attn_impl
+    from vllm_omni.diffusion.attention.parallel.ring import resolve_flash_attn_type
+
+    attn_type = resolve_flash_attn_type(device)
+    if attn_type is None:
+        return None
+    return select_flash_attn_impl(attn_type, stage="fwd-only")
+
+
 def attention_with_lse(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -112,9 +135,10 @@ def attention_with_lse(
     """Dense attention returning both the output and its log-sum-exp.
 
     ``torch.nn.functional.scaled_dot_product_attention`` does not expose the
-    log-sum-exp, so this calls the fused kernels behind it directly.  They are
-    the same kernels SDPA dispatches to and are what makes the branch merge
-    possible without materialising the score matrix.
+    log-sum-exp.  On CUDA this goes through the same FA2/FA3/FA4/AITER wrappers
+    ring attention uses (``ring_kernels``), which is what makes the branch merge
+    possible without materialising the score matrix; the fused SDPA kernels are
+    the fallback when no flash kernel fits the device or dtype.
 
     Args:
         query: ``[B, Sq, H, D]``.
@@ -127,22 +151,30 @@ def attention_with_lse(
         log-sum-exp of the *scaled* logits, which is what
         :func:`merge_attention_branches` consumes.
     """
-    q = query.transpose(1, 2)
-    k = key.transpose(1, 2)
-    v = value.transpose(1, 2)
+    kernel = None
+    if query.is_cuda and query.dtype in (torch.float16, torch.bfloat16):
+        kernel = _flash_lse_kernel(query.device)
 
-    if q.is_cuda:
-        out, lse = torch.ops.aten._scaled_dot_product_efficient_attention(
-            q, k, v, attn_bias=None, compute_log_sumexp=True, dropout_p=0.0, is_causal=False, scale=softmax_scale
-        )[:2]
+    if kernel is not None:
+        out, lse = kernel(query, key, value, dropout_p=0.0, softmax_scale=softmax_scale, causal=False)
     else:
-        out, lse = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu(
-            q, k, v, dropout_p=0.0, is_causal=False, scale=softmax_scale
-        )[:2]
+        q = query.transpose(1, 2)
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+        if q.is_cuda:
+            out, lse = torch.ops.aten._scaled_dot_product_efficient_attention(
+                q, k, v, attn_bias=None, compute_log_sumexp=True, dropout_p=0.0, is_causal=False, scale=softmax_scale
+            )[:2]
+        else:
+            out, lse = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu(
+                q, k, v, dropout_p=0.0, is_causal=False, scale=softmax_scale
+            )[:2]
+        out = out.transpose(1, 2)
 
-    out = out.transpose(1, 2).to(query.dtype)
-    # `lse` is [B, H, Sq] (some kernels pad Sq); trim then match `out`'s layout.
-    lse = lse[..., : q.shape[2]].transpose(1, 2).to(torch.float32)
+    out = out.to(query.dtype)
+    # Every kernel above returns `lse` as [B, H, Sq] (some pad Sq); trim then
+    # match `out`'s [B, Sq, H] layout.
+    lse = lse[..., : query.shape[1]].transpose(1, 2).to(torch.float32)
     return out, lse
 
 
@@ -153,48 +185,40 @@ def merge_attention_branches(
 
     Splitting the key/value axis into disjoint chunks and merging the per-chunk
     results by log-sum-exp reproduces the single dense softmax over their
-    concatenation exactly::
-
-        out = sum_i out_i * exp(lse_i - lse_total),  lse_total = log sum_i exp(lse_i)
-
-    The ring-attention helper ``update_out_and_lse`` accumulates one
-    ``(out, lse)`` block at a time and needs an output tensor for every block;
-    the zero-key branches here carry only a log-sum-exp, so the merge is
-    written out directly.
+    concatenation exactly.  The accumulation is the ring-attention update
+    (:func:`update_out_and_lse`), applied block by block.
 
     Args:
-        branches: ``(out, lse)`` pairs.  ``out`` may be ``None`` for a branch
-            whose keys and values are all zero: such a branch contributes
-            nothing to the numerator but still widens the denominator, which is
-            precisely how upstream's zero-padded key slots behave.  A branch
-            that does not apply to some query rows carries ``-inf`` there.
+        branches: ``(out, lse)`` pairs with ``lse`` shaped ``[B, S, H]``.
+            ``out`` may be ``None`` for a branch whose keys and values are all
+            zero: such a branch contributes nothing to the numerator but still
+            widens the denominator, which is precisely how upstream's
+            zero-padded key slots behave, so only the log-sum-exp is updated.
+            A branch that does not apply to some query rows carries ``-inf``
+            there.  The first branch must carry an output and be finite
+            everywhere.
 
     Returns:
-        The merged output, in the dtype of the first non-``None`` branch.
+        The merged output, in the dtype of the first branch.
     """
     if not branches:
         raise ValueError("merge_attention_branches() needs at least one branch")
+    first_out, first_lse = branches[0]
+    if first_out is None:
+        raise ValueError("the first branch must carry an output tensor")
 
-    template = None
-    for out, _ in branches:
-        if out is not None:
-            template = out
-            break
-    if template is None:
-        raise ValueError("at least one branch must carry an output tensor")
-
-    stacked_lse = torch.stack([lse for _, lse in branches], dim=0)
-    max_lse = stacked_lse.amax(dim=0)
-    weights = torch.exp(stacked_lse - max_lse.unsqueeze(0))
-    denominator = weights.sum(dim=0)
-
-    numerator = torch.zeros(template.shape, dtype=torch.float32, device=template.device)
-    for idx, (out, _) in enumerate(branches):
-        if out is None:
+    out, lse = update_out_and_lse(None, None, first_out, first_lse, lse_layout="bsh")
+    for block_out, block_lse in branches[1:]:
+        if block_out is not None:
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse, lse_layout="bsh")
             continue
-        numerator = numerator + out.to(torch.float32) * weights[idx].unsqueeze(-1)
+        # Zero-valued keys: the ring update with `block_out == 0`, written out
+        # so no zero tensor has to be materialised.
+        block_lse = block_lse.unsqueeze(-1)
+        out = out - torch.sigmoid(block_lse - lse) * out
+        lse = lse - torch.nn.functional.logsigmoid(lse - block_lse)
 
-    return (numerator / denominator.unsqueeze(-1)).to(template.dtype)
+    return out.to(first_out.dtype)
 
 
 def reference_context_attention(

@@ -90,10 +90,15 @@ class ReferenceImage:
 
 @dataclass
 class ReferenceVideo:
-    """Reference video frames for video-conditioned generation."""
+    """Reference video frames for video-conditioned generation.
+
+    ``fps`` is the source frame rate when the frames were decoded here; it is
+    ``None`` for paths, which the pipeline decodes itself.
+    """
 
     data: list[Image.Image] | list[str]
     cleanup_paths: tuple[str, ...] = ()
+    fps: float | None = None
 
 
 @dataclass
@@ -383,6 +388,10 @@ class OmniOpenAIServingVideo:
             )
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
+        if reference_video is not None and reference_video.fps:
+            # Decoded frames carry no frame rate of their own; pipelines that
+            # resample a driving video (Wan2.2-Animate-2) read it from here.
+            prompt.setdefault("additional_information", {})["video_fps"] = float(reference_video.fps)
         if vp.width is not None and vp.height is not None:
             gen_params.width = vp.width
             gen_params.height = vp.height

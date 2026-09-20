@@ -244,6 +244,19 @@ def test_model_metadata_allows_image_plus_video_references():
     assert metadata.final_output_type == "video"
 
 
+def test_pipeline_builds_on_wan22_i2v():
+    """Component loading, prompt/image encoding and weight loading come from
+    the I2V pipeline; only the transformer factory, scheduler and request loop
+    are Animate-2's own."""
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import Wan22I2VPipeline
+
+    assert issubclass(Wan22Animate2Pipeline, Wan22I2VPipeline)
+    for inherited in ("encode_prompt", "encode_image", "load_weights", "guidance_scale"):
+        assert inherited not in Wan22Animate2Pipeline.__dict__, f"{inherited} should not be re-implemented"
+    for own in ("_create_transformer", "forward", "diffuse", "_extract_reference"):
+        assert own in Wan22Animate2Pipeline.__dict__
+
+
 def test_pipeline_declares_offload_components():
     assert Wan22Animate2Pipeline._dit_modules == ["transformer"]
     assert Wan22Animate2Pipeline._encoder_modules == ["text_encoder", "image_encoder"]

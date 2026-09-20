@@ -65,6 +65,26 @@ def _can_use_fa2(device: torch.device) -> bool:
     return major in (8, 9)
 
 
+def resolve_flash_attn_type(device: torch.device) -> AttnType | None:
+    """Pick the LSE-returning flash kernel for ``device``, or ``None``.
+
+    Shared by ring sequence parallelism and by models that merge attention
+    branches by log-sum-exp themselves (Wan2.2-Animate-2).  Prefer FA4 on
+    Blackwell: an importable Hopper-only FA3 wheel can otherwise be selected
+    and fail at launch with "no kernel image".  Prefer FA3 over FA2 on
+    Ampere/Ada/Hopper.  On ROCm, use AITER.
+    """
+    if _can_use_fa4(device):
+        return AttnType.FA4
+    if _can_use_fa3(device):
+        return AttnType.FA3
+    if HAS_AITER:
+        return AttnType.AITER
+    if _can_use_fa2(device):
+        return AttnType.FA
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class _RingCtx(ParallelAttentionContext):
     """Per-forward context for Ring sequence-parallel attention."""
@@ -217,10 +237,8 @@ class RingParallelAttention:
                 )
             return _run_sdpa()
 
-        can_use_fa4 = _can_use_fa4(query.device)
-        can_use_fa3 = _can_use_fa3(query.device)
-        can_use_fa2 = _can_use_fa2(query.device)
-        if not can_use_fa4 and not can_use_fa3 and not can_use_fa2 and not HAS_AITER:
+        attn_type = resolve_flash_attn_type(query.device)
+        if attn_type is None:
             if self.attn_backend_explicit:
                 raise RuntimeError(
                     f"{self.attn_backend_pref} was explicitly selected, but no compatible ring kernel "
@@ -233,20 +251,6 @@ class RingParallelAttention:
             return _run_sdpa()
 
         from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
-
-        # Prefer FA4 on Blackwell. An importable Hopper-only FA3 wheel can
-        # otherwise be selected and fail at launch with "no kernel image".
-        if can_use_fa4:
-            attn_type = AttnType.FA4
-        # Prefer FA3 over FA2 on Ampere/Ada/Hopper. On ROCm, use AITER.
-        elif can_use_fa3:
-            attn_type = AttnType.FA3
-        elif HAS_AITER:
-            attn_type = AttnType.AITER
-        elif can_use_fa2:
-            attn_type = AttnType.FA
-        else:
-            raise RuntimeError("No compatible Flash Attention backend is available for ring attention.")
 
         return ring_flash_attn_func(
             query,

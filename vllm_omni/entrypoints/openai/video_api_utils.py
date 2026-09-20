@@ -191,6 +191,30 @@ def _decode_video_bytes(
     return VideoFrames(frames, fps=fps, source_path=source_path)
 
 
+def decode_video_path(
+    path: str,
+    *,
+    max_frames: int | None = None,
+    keep: Literal["first", "last"] = "first",
+) -> VideoFrames:
+    """Decode a local video file with the loader the video API uses for uploads.
+
+    Pipelines that receive a driving or source video as a path (offline
+    inference, or an upload the API persisted to disk) go through here so the
+    decoder, its colour conversion and the frame cap match the request path.
+    The result carries the source frame rate in ``fps``.
+    """
+    with open(path, "rb") as handle:
+        video_bytes = handle.read()
+    return _decode_video_bytes(
+        video_bytes,
+        source=f"video file {path!r}",
+        max_frames=max_frames,
+        keep=keep,
+        source_path=path,
+    )
+
+
 def _decode_media_bytes(
     media_bytes: bytes,
     *,

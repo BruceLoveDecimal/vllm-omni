@@ -38,14 +38,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
@@ -56,6 +53,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     WanCrossAttention,
     WanFeedForward,
     WanTimeTextImageEmbedding,
+    load_wan_transformer_weights,
 )
 from vllm_omni.diffusion.models.wan_animate2.reference_attention import (
     ReferenceGridInfo,
@@ -591,96 +589,47 @@ class WanAnimate2Transformer3DModel(nn.Module):
             return (output,)
         return Transformer2DModelOutput(sample=output)
 
-    # Diffusers checkpoint name -> module path.  Longest / most specific
-    # patterns first; the first match wins.
-    _BLOCK_RENAMES: tuple[tuple[str, str], ...] = (
-        (".self_attn.to_out.0.", ".attn1.to_out."),
-        (".self_attn.", ".attn1."),
-        (".cross_attn.to_out.0.", ".attn2.to_out."),
-        (".cross_attn.", ".attn2."),
-        (".ffn.0.", ".ffn.net_0.proj."),
-        (".ffn.2.", ".ffn.net_2."),
-        (".norm3.", ".norm2."),
-        (".modulation", ".scale_shift_table"),
-    )
-
-    _TOPLEVEL_RENAMES: tuple[tuple[str, str], ...] = (
-        ("text_embedding.0.", "condition_embedder.text_embedder.linear_1."),
-        ("text_embedding.2.", "condition_embedder.text_embedder.linear_2."),
-        ("time_embedding.0.", "condition_embedder.time_embedder.linear_1."),
-        ("time_embedding.2.", "condition_embedder.time_embedder.linear_2."),
-        ("time_projection.1.", "condition_embedder.time_proj."),
-        ("img_emb.proj.0.", "condition_embedder.image_embedder.norm1."),
-        ("img_emb.proj.1.", "condition_embedder.image_embedder.ff.net.0.proj."),
-        ("img_emb.proj.3.", "condition_embedder.image_embedder.ff.net.2."),
-        ("img_emb.proj.4.", "condition_embedder.image_embedder.norm2."),
-        ("head.head.", "proj_out."),
-        ("head.modulation", "output_scale_shift_prepare.scale_shift_table"),
-    )
-
-    # RMSNorms that sit on a column-parallel output and must be sharded to match.
-    _TP_SHARDED_NORMS: tuple[str, ...] = (
-        ".attn1.norm_q.",
-        ".attn1.norm_k.",
-        ".attn2.norm_q.",
-        ".attn2.norm_k.",
-        ".attn2.norm_added_k.",
+    # The Diffusers ``WanAnimate2Transformer3DModel`` keeps upstream's module
+    # spelling (``self_attn`` / ``cross_attn`` / ``ffn.0`` / ``modulation`` /
+    # ``head`` / ``img_emb``).  Renaming it to the Diffusers *Wan* spelling is
+    # all that separates it from the shared Wan loader, which then handles the
+    # QKV fusion, ``to_out.0``, ``ffn.net.N`` and the TP-sharded norms.
+    #
+    # Note the cross-attention norm: Animate-2 calls it ``norm3`` where Wan
+    # calls it ``norm2``, and the block here follows Wan.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".self_attn.": ".attn1.",
+            ".cross_attn.": ".attn2.",
+            ".ffn.0.": ".ffn.net.0.proj.",
+            ".ffn.2.": ".ffn.net.2.",
+            ".norm3.": ".norm2.",
+        },
+        orig_to_new_prefix={
+            "text_embedding.0.": "condition_embedder.text_embedder.linear_1.",
+            "text_embedding.2.": "condition_embedder.text_embedder.linear_2.",
+            "time_embedding.0.": "condition_embedder.time_embedder.linear_1.",
+            "time_embedding.2.": "condition_embedder.time_embedder.linear_2.",
+            "time_projection.1.": "condition_embedder.time_proj.",
+            "img_emb.proj.0.": "condition_embedder.image_embedder.norm1.",
+            "img_emb.proj.1.": "condition_embedder.image_embedder.ff.net.0.proj.",
+            "img_emb.proj.3.": "condition_embedder.image_embedder.ff.net.2.",
+            "img_emb.proj.4.": "condition_embedder.image_embedder.norm2.",
+            "head.head.": "proj_out.",
+            "head.modulation": "scale_shift_table",
+        },
     )
 
     @classmethod
     def remap_weight_name(cls, name: str) -> str:
-        """Translate a Diffusers ``WanAnimate2Transformer3DModel`` key to a module path."""
-        if name.startswith("blocks."):
-            for src, dst in cls._BLOCK_RENAMES:
-                if src in name:
-                    return name.replace(src, dst)
-            return name
+        """Translate an Animate-2 checkpoint key to the Diffusers Wan spelling.
 
-        for src, dst in cls._TOPLEVEL_RENAMES:
-            if name.startswith(src):
-                return dst + name[len(src) :]
-        return name
+        This is the *intermediate* name the shared loader consumes, so
+        ``to_out.0`` and ``ffn.net.0.proj`` are still in Diffusers form here.
+        """
+        mapped = cls.hf_to_vllm_mapper._map_name(name)
+        return name if mapped is None else mapped
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load Diffusers-format Animate-2 weights, fusing self-attention QKV."""
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-
-        stacked_params_mapping = [
-            (".attn1.to_qkv", ".attn1.to_q", "q"),
-            (".attn1.to_qkv", ".attn1.to_k", "k"),
-            (".attn1.to_qkv", ".attn1.to_v", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for original_name, loaded_weight in weights:
-            name = self.remap_weight_name(original_name)
-
-            stacked = None
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name in name:
-                    stacked = (name.replace(weight_name, param_name), shard_id)
-                    break
-
-            if stacked is not None:
-                lookup_name, shard_id = stacked
-                if lookup_name not in params_dict:
-                    raise KeyError(f"unexpected weight {original_name} -> {lookup_name}")
-                param = params_dict[lookup_name]
-                param.weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(lookup_name)
-                continue
-
-            if name not in params_dict:
-                raise KeyError(f"unexpected weight {original_name} -> {name}")
-            if tp_size > 1 and any(norm in name for norm in self._TP_SHARDED_NORMS):
-                shard_size = loaded_weight.shape[0] // tp_size
-                loaded_weight = loaded_weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
-
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
+        """Load Diffusers-format Animate-2 weights through the shared Wan loader."""
+        return load_wan_transformer_weights(self, self.hf_to_vllm_mapper.apply(weights))

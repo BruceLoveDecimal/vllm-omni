@@ -1071,6 +1071,7 @@ async def _parse_video_form(
                 image_data.append(media_data)
 
             video_frames: list[Image.Image] | None = None
+            video_fps: float | None = None
             for item in video_items:
                 media_data = await decode_input_reference(
                     None,
@@ -1089,6 +1090,7 @@ async def _parse_video_form(
                             "multiple video URL references must be downloadable source videos"
                         )
                     video_frames = list(media_data)
+                    video_fps = media_data.fps
 
             if input_reference_bytes is not None:
                 media_data = await decode_input_reference(
@@ -1105,13 +1107,14 @@ async def _parse_video_form(
                         video_paths.append(media_data.source_path)
                     else:
                         video_frames = list(media_data)
+                        video_fps = media_data.fps
 
             if image_data:
                 reference_image = ReferenceImage(data=image_data if len(image_data) > 1 else image_data[0])
             if video_paths:
                 reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
             elif video_frames is not None:
-                reference_video = ReferenceVideo(data=video_frames)
+                reference_video = ReferenceVideo(data=video_frames, fps=video_fps)
         except InvalidInputReferenceError as exc:
             for path in video_paths:
                 if os.path.exists(path):
