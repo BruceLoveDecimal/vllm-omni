@@ -182,7 +182,7 @@ def collect(results: Path) -> list[dict]:
                     values = [e[col] for e in entries if e.get(col) is not None]
                     if not values:
                         row[col] = None
-                    elif col in _MAX_IS_BEST or col.endswith("_mb") or col.endswith("_mib"):
+                    elif col in _MAX_IS_BEST or col.endswith("_mb") or col.endswith("_mib") or col.endswith("_gb"):
                         row[col] = max(values)
                     else:
                         row[col] = min(values)
