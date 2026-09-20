@@ -1,5 +1,16 @@
 # Wan2.2-Animate-2 接入 vLLM-Omni 调研与架构设计
 
+> **勘误(2026-09-20,依据 [wan_animate2_integration_spec.md](wan_animate2_integration_spec.md) §1 的核实)**:
+> 1. §1 第 1 点 / §2.1 / §4.3 / §8 风险 4:Diffusers 仓库**带标准 `model_index.json`**
+>    (`_class_name: WanAnimate2Pipeline`),组件布局与 Wan2.1-I2V 相同;注册键为 `WanAnimate2Pipeline`,
+>    自动探测,无需 `--model-class-name`,也不需要兼容 `modular_model_index.json`。
+> 2. §3.2 第 4 点:蒸馏版 `log_scale` 偏置作用于**生成侧 latent 帧 1 的 key 块**,不是参考 token;
+>    零填充的 key 槽位不被掩码,参与 softmax 分母。
+> 3. §4.4 / §8 风险 2:基础版仓库 scheduler 为 diffusers `DPMSolverMultistepScheduler`(flow sigmas,
+>    shift 5.0),蒸馏版为 `FlowMatchEulerDiscreteScheduler(shift 5.0)`;不移植官方 solver,差异见 spec A1.2。
+> 4. §4.4 批处理决策:首版 `supports_request_batch=False`,不做 `batch_compatibility_key`。
+> 5. §4.2:原始格式 checkpoint 降为可选(spec M6)。
+>
 > 状态:调研 / 设计提案(尚未实现)。调研日期:2026-08-26。
 > 目标模型:**Wan-AI/Wan2.2-Animate-2-14B**(含 Distilled 蒸馏版)。
 > 依据:官方推理仓库 `Wan-Video/Wan-Animate-2`(源码逐行核对)、diffusers v0.40.0
