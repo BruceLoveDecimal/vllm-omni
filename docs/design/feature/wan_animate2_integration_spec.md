@@ -305,7 +305,14 @@ KV cache、transformer 骨架与上游数值等价,并满足 §2 代码规则。
 
 ---
 
-## 8. 风险项收敛对照
+## 8. 进度记录
+
+| 里程碑 | 状态 | 证据 |
+|---|---|---|
+| M0 | **完成**(2026-09-20,提交 `a86b0c5f6`) | `tests/diffusion/models/wan_animate2/` 74 项全绿:RTX PRO 6000(sm_120)+ vllm 0.29.0 + torch 2.13,`pytest -o addopts=""`;A0.1–A0.7 逐项对应 `test_wan_animate2_attention.py` / `test_wan_animate2_transformer.py`;核心文件改动 = 无(`registry.py` / `model_metadata.py` 只加注册项)。已知环境限制:在 CUDA 机器上用 `CUDA_VISIBLE_DEVICES=""` 强制 CPU 时,vLLM 的 CustomOp 仍按 cuda 平台分发并触发 `torch._C._cuda_init`,这是测试环境问题而非代码问题;真正的 CPU runner 走 cpu 平台 |
+| M1 | 进行中 | 权重下载中(`pro-7898d133824f`);运行脚本 `/root/autodl-tmp/runs/m1_distilled_smoke.sh`,基线脚本 `ref_base_diffusers.sh` |
+
+## 9. 风险项收敛对照
 
 | 风险(设计文档 §8) | 状态 | 收敛于 |
 |---|---|---|
