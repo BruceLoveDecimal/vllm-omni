@@ -177,7 +177,8 @@ def _text_duration_seconds(text: str, locale: str) -> float | None:
     if mode == "random":
         if _random_durations is None:
             _random_durations = random.Random(int(os.environ.get(_DURATION_SEED_ENV, "0")))
-        steps = int((_DURATION_MAX_S - _DURATION_MIN_S) * 2)
+        max_s = float(os.environ.get("VLLM_OMNI_BENCH_TTS_DURATION_MAX", _DURATION_MAX_S))
+        steps = int((max_s - _DURATION_MIN_S) * 2)
         return _DURATION_MIN_S + _random_durations.randint(0, steps) / 2
     if mode != "text":
         return None
