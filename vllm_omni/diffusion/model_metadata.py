@@ -96,6 +96,15 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    # Animate-2 takes a reference image *and* a driving video on the existing
+    # reference channels, so mixed reference inputs must be allowed through.
+    "WanAnimate2Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        supports_mixed_reference_inputs=True,
+        attention_mask_free=True,
+        final_output_type="video",
+    ),
     "WanT2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "WanI2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
     "LTX2Pipeline": DiffusionModelMetadata(final_output_type="video"),
