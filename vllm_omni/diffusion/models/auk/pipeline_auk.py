@@ -173,6 +173,16 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.vae = AuKVAE.from_config(vae_config["model_init_kwargs"]).to(device=self.device, dtype=torch.float32)
         self.vae.load_weights(os.path.join(model_dir, "vae.safetensors"))
         self.vae = self.vae.eval()
+        # Bench-only diagnostic switches (never committed to the PR): flip the
+        # decode fast paths before any CUDA graph is captured.
+        _snake = os.environ.get("AUK_BENCH_FUSED_SNAKE")
+        _filters = os.environ.get("AUK_BENCH_CACHED_FILTERS")
+        if _snake is not None or _filters is not None:
+            self.vae.set_decode_fast_paths(
+                fused_snake=None if _snake is None else _snake == "1",
+                cached_filters=None if _filters is None else _filters == "1",
+            )
+            logger.info("AuK bench: fused_snake=%s cached_filters=%s", _snake, _filters)
         self.vae.requires_grad_(False)
         self._check_vae_geometry()
 
