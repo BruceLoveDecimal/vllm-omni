@@ -45,6 +45,10 @@ EXCLUDED_MODELS = [
     "StableAudioPipeline",
     "WanImageToVideoPipeline",
     "WanS2VPipeline",
+    # Needs a driving video in addition to the reference image, which the common
+    # task set does not model; covered by tests/diffusion/models/wan_animate2 and
+    # the real-checkpoint E2E smoke instead.
+    "WanAnimate2Pipeline",
     "WanT2VDMD2Pipeline",
     "WanI2VDMD2Pipeline",
     "LongCatVideoAvatarPipeline",

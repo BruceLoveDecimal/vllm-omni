@@ -88,6 +88,10 @@ from vllm_omni.model_extras.vace import (
     build_image_to_video_prompt as build_vace_image_to_video_prompt,
 )
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
+from vllm_omni.model_extras.wan_animate2 import (
+    WAN_ANIMATE2_EXTRA_BODY_PARAMS,
+    get_wan_animate2_video_generation_defaults,
+)
 
 TextToImagePromptBuilder = Callable[
     [str, str | None, int | None, int | None],
@@ -280,6 +284,15 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     },
     "SanaImageToVideoPipeline": {
         "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
+    },
+    "WanAnimate2Pipeline": {
+        "extra_body_params": WAN_ANIMATE2_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_wan_animate2_video_generation_defaults,
+        # Animate-2 letterboxes the reference image itself, to the source
+        # aspect ratio at the requested area, and crops the padding back off
+        # the output. Pre-resizing it to height x width would distort the
+        # subject and desynchronise that crop.
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,

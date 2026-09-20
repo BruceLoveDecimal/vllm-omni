@@ -24,6 +24,7 @@
 | R5 | 零填充的 key 槽位会被掩码掉 | 上游 `create_mask` 把填充窗口内全部槽位标为有效;零 key 对任意 query 打分为 0,只扩大 softmax 分母。填充来源两处:末段短于 `origin_len`;letterbox 后真实网格小于 `origin_area` | 注意力必须建模"零 key 分母项",否则每一帧都会静默偏移 |
 | R6 | 首版走 `supports_request_batch=True` + 严格 `batch_compatibility_key` | 上游有效 batch=1;仓库现有 `supports_request_batch=False` 即可让引擎不合批 | 首版 `supports_request_batch=False`,少一套 key 逻辑 |
 | R7 | 分支从 `8dc3d504d` 出发 | 本分支落后 main 547 个提交;main 已改 `attention/layer.py`、`registry.py`、`model_metadata.py`、S2V 管线(新增 `ChunkedVideoMP4Session` 逐段编码、`_should_release_dit_before_decode`) | 开工第一步是 rebase 到 main,所有复用引用以 main 为准 |
+| R9 | diffusers modular 实现可作为蒸馏版的对拍基线 | diffusers 0.40 的 `transformer_wan_animate_2.py` 与 modular blocks **完全没有 `log_scale`**(蒸馏版仓库的 `transformer/config.json` 也不含该键),即 diffusers 对蒸馏版不加注意力偏置,与官方实现不一致;其 letterbox 用 lanczos + `round` 取整,官方用 cv2 `INTER_AREA` + 向下取整 | A1.3 的跨实现对拍**用基础版**(`log_scale=0`,两边语义一致);蒸馏版的 `log_scale` 路径只能对拍官方仓库(A0.2 已在 CPU 上逐点对拍 mask+score_mod);像素级差异中有一部分来自重采样核,阈值仍按 SSIM ≥ 0.94 |
 | R8 | 从零实现 | 兄弟 worktree `wan-animate2-model-integration-1e7870` 里有一版**未提交**的首轮移植(模型代码约 2.5k 行 + L1 测试 1.1k 行),含与上游 flex-attention 的数值对拍测试 | M0 的任务从"新写"改为"迁移 + 按 §2 的代码规则重构 + 删除因 R1–R3 而多余的部分" |
 
 ## 2. 本次接入遵守的代码规则(每个里程碑的 review 清单)

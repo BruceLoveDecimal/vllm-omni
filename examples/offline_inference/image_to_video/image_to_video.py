@@ -149,6 +149,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--last-image", help="Path to a last-frame condition (used by models such as VACE).")
     parser.add_argument("--mask-image", help="Path to an inpainting mask (used by models such as VACE).")
     parser.add_argument(
+        "--video",
+        help=(
+            "Path to a conditioning video, passed through as multi_modal_data['video'] "
+            "(e.g. the driving video for Wan2.2-Animate-2)."
+        ),
+    )
+    parser.add_argument(
         "--reference-image",
         action="append",
         default=None,
@@ -536,6 +543,10 @@ def main():
         media_inputs["last_image"] = last_image.resize((width, height), PIL.Image.Resampling.LANCZOS)
     if mask_image is not None:
         media_inputs["mask"] = mask_image.resize((width, height), PIL.Image.Resampling.NEAREST)
+    if args.video is not None:
+        # Passed as a path: the pipeline owns frame-rate resampling and
+        # letterboxing, which need the source video rather than resized frames.
+        media_inputs["video"] = args.video
     if reference_images is not None:
         media_inputs["reference_images"] = [
             reference.resize((width, height), PIL.Image.Resampling.LANCZOS) for reference in reference_images

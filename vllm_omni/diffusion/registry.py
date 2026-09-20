@@ -154,6 +154,13 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_s2v",
         "Wan22S2VPipeline",
     ),
+    # Both the base and the distilled Diffusers releases carry this
+    # `_class_name`; the pipeline tells them apart by `modular_model_index.json`.
+    "WanAnimate2Pipeline": (
+        "wan_animate2",
+        "pipeline_wan_animate2",
+        "Wan22Animate2Pipeline",
+    ),
     "WanT2VDMD2Pipeline": (
         "wan2_2",
         "pipeline_wan2_2",
@@ -413,6 +420,10 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
+    # Animate-2 runs a reference-extraction pass and a K/V-cache-conditioned
+    # denoising pass through the same blocks; the residual-cache assumptions
+    # of cache_dit / tea_cache do not hold across the two.
+    "WanAnimate2Pipeline",
 }
 
 
@@ -608,6 +619,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
+    "WanAnimate2Pipeline": "get_wan_animate2_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
@@ -676,6 +688,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
     "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
+    "WanAnimate2Pipeline": "get_wan_animate2_pre_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
     "LingBotWorldCausalDMDPipeline": "get_lingbot_world_pre_process_func",
