@@ -13,7 +13,7 @@ from torch.nn import functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_batch_flow_profile
-from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
+from vllm_omni.model_executor.models.cosyvoice3.utils import build_dit_attention_mask, make_pad_mask
 
 logger = init_logger(__name__)
 
@@ -175,6 +175,7 @@ class ConditionalCFM(BASECFM):
             # references to the cast buffers alive until execute completes (a bare
             # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
             io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
+            attn_mask = self._trt_attention_mask(mask, streaming)
             [estimator, stream], trt_engine = self.estimator.acquire_estimator()
             caller_stream = torch.cuda.current_stream(x.device)
             stream.wait_stream(caller_stream)
@@ -185,27 +186,29 @@ class ConditionalCFM(BASECFM):
                 t_e = t.to(io_dtype).contiguous()
                 spks_e = spks.to(io_dtype).contiguous()
                 cond_e = cond.to(io_dtype).contiguous()
-                out_e = torch.empty_like(x_e)
-                estimator.set_input_shape("x", tuple(x_e.shape))
-                estimator.set_input_shape("mask", tuple(mask_e.shape))
-                estimator.set_input_shape("mu", tuple(mu_e.shape))
-                estimator.set_input_shape("t", tuple(t_e.shape))
-                estimator.set_input_shape("spks", tuple(spks_e.shape))
-                estimator.set_input_shape("cond", tuple(cond_e.shape))
-                data_ptrs = [
-                    x_e.data_ptr(),
-                    mask_e.data_ptr(),
-                    mu_e.data_ptr(),
-                    t_e.data_ptr(),
-                    spks_e.data_ptr(),
-                    cond_e.data_ptr(),
-                    out_e.data_ptr(),
-                ]
-                for i, j in enumerate(data_ptrs):
-                    estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
+                out_e = torch.empty_like(x_e, dtype=getattr(self.estimator, "out_dtype", io_dtype))
+                inputs = {
+                    "x": x_e,
+                    "mask": mask_e,
+                    "mu": mu_e,
+                    "t": t_e,
+                    "spks": spks_e,
+                    "cond": cond_e,
+                }
+                if attn_mask is not None:
+                    inputs["attn_mask"] = attn_mask
+                # Bind only what the engine declares: an exporter prunes
+                # inputs the graph never reads.
+                declared = getattr(self.estimator, "input_names", None)
+                if declared:
+                    inputs = {name: tensor for name, tensor in inputs.items() if name in declared}
+                for name, tensor in inputs.items():
+                    estimator.set_input_shape(name, tuple(tensor.shape))
+                    estimator.set_tensor_address(name, tensor.data_ptr())
+                estimator.set_tensor_address("estimator_out", out_e.data_ptr())
                 # run trt engine
                 assert estimator.execute_async_v3(stream.cuda_stream) is True
-                for tensor in (x_e, mask_e, mu_e, t_e, spks_e, cond_e, out_e):
+                for tensor in (*inputs.values(), out_e):
                     if tensor.is_cuda:
                         tensor.record_stream(stream)
             caller_stream.wait_stream(stream)
@@ -213,6 +216,35 @@ class ConditionalCFM(BASECFM):
                 out_e.record_stream(caller_stream)
             self.estimator.release_estimator(estimator, stream)
             return out_e.to(x.dtype)
+
+    def _trt_attention_mask(self, mask: torch.Tensor, streaming: bool) -> torch.Tensor | None:
+        """The query-key map for a chunk-mask TensorRT engine, or None.
+
+        A legacy engine (no ``attn_mask`` input) was traced with full
+        attention and cannot honour ``streaming``; say so once rather than
+        silently diverging from upstream's streaming semantics. The map is
+        step-invariant within a solve, so the last one is reused across the
+        Euler steps.
+        """
+        estimator = self.estimator
+        if not getattr(estimator, "supports_attn_mask", False):
+            if streaming and not getattr(self, "_warned_trt_no_chunk_mask", False):
+                self._warned_trt_no_chunk_mask = True
+                logger.warning(
+                    "The TensorRT flow estimator has no attn_mask input, so streaming chunks run with full "
+                    "attention instead of upstream's chunk-causal mask. Rebuild it with "
+                    "build_chunk_mask_flow_estimator_trt to align with upstream."
+                )
+            return None
+        key = (tuple(mask.shape), bool(streaming), mask.device)
+        cached = getattr(self, "_trt_attn_mask_cache", None)
+        if cached is not None and cached[0] == key and torch.equal(cached[1], mask):
+            return cached[2]
+        attn_mask = build_dit_attention_mask(
+            mask.bool(), streaming=streaming, static_chunk_size=int(getattr(estimator, "static_chunk_size", 0))
+        ).contiguous()
+        self._trt_attn_mask_cache = (key, mask.clone(), attn_mask)
+        return attn_mask
 
 
 # Upstream CosyVoice draws the flow's initial noise from one fixed buffer,

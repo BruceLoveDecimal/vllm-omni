@@ -465,7 +465,10 @@ class CosyVoice3Code2Wav(nn.Module):
                     embedding=embeddings,
                     n_timesteps=n_timesteps,
                     token_offset_tokens=0,
-                    streaming=True,
+                    # Upstream's last streaming chunk runs the flow with its
+                    # default ``stream=False``: full bidirectional attention
+                    # over the (windowed) history, which keeps the tail intact.
+                    streaming=not finalize,
                     finalize=finalize,
                     token_lens=token_lens,
                     prompt_token_lens=prompt_token_lens,
@@ -527,7 +530,10 @@ class CosyVoice3Code2Wav(nn.Module):
             embedding=embedding,
             n_timesteps=n_timesteps,
             token_offset_tokens=token_offset_tokens,
-            streaming=True,
+            # Upstream's last streaming chunk runs the flow with its default
+            # ``stream=False``: full bidirectional attention over the
+            # (windowed) history, which keeps the tail intact.
+            streaming=not finalize,
             finalize=finalize,
             noise_offset_tokens=self._stream_noise_offset(cache_state, token_offset_tokens),
         )
