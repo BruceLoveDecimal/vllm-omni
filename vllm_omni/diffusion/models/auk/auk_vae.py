@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import math
 import warnings
+from fractions import Fraction
 from pathlib import Path
 
 import torch
@@ -354,6 +355,51 @@ class AmpBlock(nn.Module):
         return x
 
 
+def _conv_context(conv: Conv) -> tuple[Fraction, Fraction]:
+    """(left, right) input samples a causal or same-padded convolution reaches."""
+    if conv.causal:
+        return Fraction(conv.left_padding), Fraction(0)
+    reach = Fraction(conv.dilation[0] * (conv.kernel_size[0] - 1), 2)
+    return reach, reach
+
+
+def _transpose_context(up: ConvTranspose) -> tuple[Fraction, Fraction]:
+    """(left, right) input frames a transposed convolution reaches, in its input's units."""
+    if up.causal:
+        return Fraction(1), Fraction(0)
+    reach = Fraction(up.kernel_size[0], 2 * up.stride[0])
+    return reach, reach
+
+
+def _activation_context(act: AliasFreeActivation) -> tuple[Fraction, Fraction]:
+    """(left, right) samples an alias-free activation reaches, in its input's units.
+
+    The upsampler's taps reach half a kernel each side, and the low-pass
+    behind the activation runs at the oversampled rate, so its padding
+    counts at ``1 / ratio``.
+    """
+    upsample, lowpass = act.upsample, act.downsample.lowpass
+    reach = Fraction(upsample.filter.shape[-1], 2 * upsample.ratio)
+    left = reach + Fraction(lowpass.pad_left, upsample.ratio)
+    right = reach + Fraction(lowpass.pad_right, upsample.ratio)
+    return left, right
+
+
+def _block_context(block: AmpBlock) -> tuple[Fraction, Fraction]:
+    """(left, right) samples one AMP block reaches: its convolutions and activations run in series."""
+    left = Fraction(0)
+    right = Fraction(0)
+    for conv in list(block.convs1) + list(block.convs2):
+        conv_left, conv_right = _conv_context(conv)
+        left += conv_left
+        right += conv_right
+    for act in block.activations:
+        act_left, act_right = _activation_context(act)
+        left += act_left
+        right += act_right
+    return left, right
+
+
 class AuKVAE(nn.Module):
     """AuK's audio codec: :meth:`encode` waveform to normalized latents, :meth:`decode` back.
 
@@ -524,6 +570,36 @@ class AuKVAE(nn.Module):
                 latents = mean
             latents = latents.transpose(1, 2).float()
             return (latents - self.global_mean.float()) / torch.sqrt(self.global_log_std.float())
+
+    def decode_context_frames(self) -> tuple[int, int]:
+        """Latent frames of (left, right) context a decoded frame can depend on.
+
+        Summed layer by layer from the modules' own padding and kernel
+        geometry, so it is an upper bound that holds for any weights: a
+        window decoded on its own reproduces the full decode exactly except
+        within these many frames of a window edge that is not a true clip
+        edge. The decoder is causal apart from ``conv_pre`` and the
+        band-limited upsamplers, so the right context is a few frames while
+        the left one is dominated by the dilated convolutions of the first
+        (lowest-rate) stage.
+        """
+        left, right = _conv_context(self.conv_pre)
+        rate = Fraction(1)  # samples per latent frame at the current depth
+        for i in range(self.num_upsamples):
+            for up in self.ups[i]:
+                up_left, up_right = _transpose_context(up)
+                left += up_left / rate
+                right += up_right / rate
+                rate *= up.stride[0]
+            first = i * self.num_kernels
+            blocks = [_block_context(self.resblocks[first + j]) for j in range(self.num_kernels)]
+            left += max(block_left for block_left, _ in blocks) / rate
+            right += max(block_right for _, block_right in blocks) / rate
+        act_left, act_right = _activation_context(self.activation_post)
+        post_left, post_right = _conv_context(self.conv_post)
+        left += (act_left + post_left) / rate
+        right += (act_right + post_right) / rate
+        return math.ceil(left), math.ceil(right)
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode normalized ``[B, Np, latent_dim]`` latents into a ``[B, Np * hop_size]`` waveform in [-1, 1]."""

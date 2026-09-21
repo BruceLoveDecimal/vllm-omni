@@ -157,6 +157,10 @@ class _StubVAE(nn.Module):
         self.decode_calls += 1
         return torch.zeros(1, latents.shape[1] * HOP, device=latents.device)
 
+    def decode_context_frames(self) -> tuple[int, int]:
+        # A stateless stub: no context, so any tile size is valid.
+        return 0, 0
+
 
 def _stub_sampler(calls: list[dict[str, Any]]):
     """Record the ODE arguments and return noise drawn from the request generator."""

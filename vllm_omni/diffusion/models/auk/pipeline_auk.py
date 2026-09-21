@@ -193,6 +193,8 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             vae_decode_kwargs["compile_shapes"] = [int(size) for size in model_config["auk_vae_compile_shapes"]]
         if model_config.get("auk_vae_max_graphs") is not None:
             vae_decode_kwargs["max_graphs"] = int(model_config["auk_vae_max_graphs"])
+        if model_config.get("auk_vae_tile_frames") is not None:
+            vae_decode_kwargs["tile_frames"] = int(model_config["auk_vae_tile_frames"])
         self.vae_decode = AuKVAEDecodeGraph(self.vae, enabled=not od_config.enforce_eager, **vae_decode_kwargs)
 
         logger.info(

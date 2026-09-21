@@ -2,17 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The AuK codec's decode fast paths keep the reference numerics.
 
-Four paths are checked against the plain eager decode: the Snake activation
+Five paths are checked against the plain eager decode: the Snake activation
 with precomputed exponent caches, the per-channel FIR filter cache, the
-per-length CUDA graph tier and the torch.compile bucket tier (both fall back
-to eager off CUDA).
+per-length CUDA graph tier, the torch.compile bucket tier (both fall back to
+eager off CUDA) and the tiled decode of long clips.
 """
 
 import pytest
 import torch
 
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE, LowPass, SnakeBeta, Upsample
-from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph
+from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph, plan_tiles
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -119,6 +119,73 @@ def test_compiled_bucket_is_the_smallest_captured_one_that_fits() -> None:
     assert wrapper.compiled_bucket(6) == 16
 
 
+def test_plan_tiles_covers_the_clip_once_with_full_context() -> None:
+    assert plan_tiles(40, 64, 10, 3) == [(0, 40, 0, 40)]
+    windows = plan_tiles(1000, 512, 53, 9)
+    assert windows == [(0, 512, 0, 503), (450, 512, 503, 953), (488, 512, 953, 1000)]
+    # Every emitted frame sits at least the context away from a window edge
+    # that is not the clip's own edge, and the emitted ranges tile the clip.
+    emitted = 0
+    for start, width, emit_start, emit_end in windows:
+        assert emit_start == emitted and start + width <= 1000
+        assert start == 0 or emit_start - start >= 53
+        assert start + width == 1000 or start + width - emit_end >= 9
+        emitted = emit_end
+    assert emitted == 1000
+    # With the compiled buckets known, the last window shrinks to the smallest
+    # one that holds the remainder plus the left context: 600 frames cost a
+    # 512 and a 256 window instead of two 512s.
+    assert plan_tiles(600, 512, 53, 9, sizes=(128, 256, 512)) == [(0, 512, 0, 503), (344, 256, 503, 600)]
+    assert plan_tiles(1000, 512, 53, 9, sizes=(128, 256, 512))[-1] == (872, 128, 953, 1000)
+    with pytest.raises(ValueError, match="must exceed"):
+        plan_tiles(100, 60, 53, 9)
+
+
+@torch.inference_mode()
+def test_decode_context_bounds_the_measured_receptive_field() -> None:
+    vae = _small_vae()
+    left, right = vae.decode_context_frames()
+    # The production geometry: causal stack, conv_pre and the upsamplers look ahead a little.
+    assert (left, right) == (53, 9)
+    frames, start, end = 240, 70, 190
+    latents = torch.randn(1, frames, vae.latent_dim)
+    whole = vae.decode(latents)[:, start * vae.hop_size : end * vae.hop_size]
+    window = vae.decode(latents[:, start:end])
+    per_frame = (window - whole).abs().reshape(-1, vae.hop_size).amax(dim=1)
+    differing = (per_frame > 1e-5).nonzero().flatten().tolist()
+    # Only frames within the context of a fake edge may differ, and some do:
+    # the bound is tight enough that the halo is not wasted.
+    assert differing and all(index < left or end - start - index <= right for index in differing)
+
+
+@torch.inference_mode()
+def test_tiled_decode_matches_the_whole_decode() -> None:
+    vae = _small_vae()
+    # Off the accelerator every window decodes eagerly, so this isolates the stitching.
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(64,), tile_frames=64)
+    assert wrapper.tile_frames == 64 and wrapper.context_frames == (53, 9)
+    for frames in (64, 65, 200, 331):
+        latents = torch.randn(1, frames, vae.latent_dim)
+        whole = vae.decode(latents)
+        tiled = wrapper(latents)
+        assert tiled.shape == whole.shape
+        torch.testing.assert_close(tiled, whole, atol=1e-5, rtol=0.0)
+        assert wrapper.last_mode == ("eager" if frames == 64 else "tiled")
+    # The streaming form yields the same audio in order.
+    latents = torch.randn(1, 200, vae.latent_dim)
+    pieces = [(start, chunk.clone()) for start, chunk in wrapper.decode_tiles(latents)]
+    # With a 64-frame tile and a 62-frame halo each interior tile adds two frames.
+    assert [start for start, _ in pieces] == [emit for _, _, emit, _ in plan_tiles(200, 64, 53, 9)]
+    assert [start for start, _ in pieces][:3] == [0, 55, 57]
+    torch.testing.assert_close(
+        torch.cat([chunk for _, chunk in pieces], dim=1), vae.decode(latents), atol=1e-5, rtol=0.0
+    )
+    # tile_frames=0 turns tiling off; a tile smaller than the context is refused.
+    assert AuKVAEDecodeGraph(vae, tile_frames=0).tile_frames == 0
+    with pytest.raises(ValueError, match="must exceed"):
+        AuKVAEDecodeGraph(vae, tile_frames=60)
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
@@ -177,6 +244,25 @@ def test_compiled_buckets_replay_within_fusion_tolerance_and_leave_longer_clips_
     assert wrapper.last_mode == "compiled" and padded.shape == (1, 5 * vae.hop_size)
     torch.testing.assert_close(padded, vae.decode(short), atol=0.1, rtol=0.0)
 
+    # An 8-frame bucket cannot hold the decoder context, so tiling is off and
+    # a longer clip gets its own plain graph.
+    assert wrapper.tile_frames == 0
     long = torch.randn(1, 12, vae.latent_dim, device="cuda")
     assert torch.equal(wrapper(long), vae.decode(long))
     assert wrapper.last_mode == "graph" and list(wrapper._cache) == [12]
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA graph capture requires CUDA")
+@torch.inference_mode()
+def test_tiles_replay_the_compiled_bucket_for_long_clips() -> None:
+    vae = _small_vae().to("cuda")
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(72,))
+    wrapper.warmup(torch.device("cuda"))
+    assert wrapper.tile_frames == 72 and list(wrapper._compiled) == [72]
+
+    latents = torch.randn(1, 150, vae.latent_dim, device="cuda")
+    tiled = wrapper(latents)
+    assert wrapper.last_mode == "tiled" and not wrapper._cache
+    assert tiled.shape == (1, 150 * vae.hop_size)
+    torch.testing.assert_close(tiled, vae.decode(latents), atol=1e-4, rtol=0.0)

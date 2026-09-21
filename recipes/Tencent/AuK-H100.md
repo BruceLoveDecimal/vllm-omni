@@ -144,9 +144,10 @@ diffusion stage (about a minute on a cold Inductor cache, ~30 s warm).
 - Key flags: `enforce_eager` on the encoder stage (it walks the decoder
   layers itself for the layer fusion); the diffusion stage runs with
   `enforce_eager: false` so the codec decode is compiled into bucketed CUDA
-  graphs at startup (128/256/512/768 latent frames, i.e. up to 15.4 s;
-  longer clips get a plain per-length graph; override with
-  `model_config.auk_vae_compile_shapes`). The DiT itself stays eager unless
+  graphs at startup (128/256/512 latent frames, i.e. up to 10.24 s; longer
+  clips are decoded in overlapping 512-frame tiles of the same graph;
+  override with `model_config.auk_vae_compile_shapes` and
+  `auk_vae_tile_frames`). The DiT itself stays eager unless
   `diffusion_compile_granularity: full`. `enable_prefix_caching` must stay off
   for the encoder: a cache hit skips prompt positions that the fused
   condition needs. `enable_chunked_prefill` is off by default: forcing it
