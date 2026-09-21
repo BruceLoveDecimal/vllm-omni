@@ -20,7 +20,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_batch_flow_profile
-from vllm_omni.model_executor.models.cosyvoice3.utils import add_optional_chunk_mask
+from vllm_omni.model_executor.models.cosyvoice3.utils import build_dit_attention_mask
 
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -445,12 +445,28 @@ class DiT(nn.Module):
         self.static_chunk_size = static_chunk_size
         self.num_decoding_left_chunks = num_decoding_left_chunks
 
-    def forward(self, x, mask, mu, t, spks=None, cond=None, streaming: bool = False):
+    def forward(
+        self,
+        x,
+        mask,
+        mu,
+        t,
+        spks=None,
+        cond=None,
+        streaming: bool = False,
+        attn_mask: torch.Tensor | None = None,
+    ):
         """Forward CosyVoice3 DiT.
 
         When ``streaming=True``, attention uses a static chunk mask
         (``static_chunk_size``) so each frame only attends within the allowed
         causal chunk window — required for CosyVoice3 streaming flow matching.
+
+        ``attn_mask`` (``(B, 1, T, T)`` or ``(B, T, T)`` bool) overrides that
+        computation with an explicit query-key map. It is how the module is
+        exported to ONNX/TensorRT: the engine cannot evaluate ``streaming`` at
+        run time, so the mask becomes an engine input built by
+        ``build_dit_attention_mask`` on the host side.
         """
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_prepare_inputs"):
             x = x.transpose(1, 2)
@@ -467,12 +483,14 @@ class DiT(nn.Module):
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_rope_and_mask"):
             rope = self.rotary_embed.forward_from_seq_len(seq_len)
-            # Streaming: full QK chunk mask. Non-streaming: keep a padding mask so
-            # the default accelerated DiffusionAttention path can still run.
-            if streaming is True:
-                attn_mask = add_optional_chunk_mask(x, mask.bool(), False, False, 0, self.static_chunk_size, -1)
-                if attn_mask.dim() == 3 and attn_mask.shape[-1] == attn_mask.shape[-2]:
+            # Explicit map (export / TensorRT) > streaming chunk map > padding
+            # vector. Only the padding vector can take the accelerated
+            # DiffusionAttention path; the full maps go through SDPA.
+            if attn_mask is not None:
+                if attn_mask.dim() == 3:
                     attn_mask = attn_mask.unsqueeze(dim=1)
+            elif streaming is True:
+                attn_mask = build_dit_attention_mask(mask, streaming=True, static_chunk_size=self.static_chunk_size)
             else:
                 attn_mask = mask[:, 0].bool() if mask.dim() == 3 and mask.shape[1] == 1 else mask.bool()
 
