@@ -402,10 +402,24 @@ class TestRequestParsing:
     def test_setup_compile_warms_the_decode_buckets_on_the_pipeline_device(self, build_pipeline, mocker):
         pipeline, _ = build_pipeline()
         warmup = mocker.patch.object(pipeline.vae_decode, "warmup")
+        compile_dit = mocker.patch.object(pipeline.dit, "compile")
 
         pipeline.setup_compile()
 
         warmup.assert_called_once_with(pipeline.device)
+        # Regional is the default and a no-op for the DiT, which has no repeated blocks.
+        compile_dit.assert_not_called()
+
+    def test_setup_compile_honours_full_dit_granularity(self, build_pipeline, mocker):
+        pipeline, _ = build_pipeline()
+        pipeline.od_config.diffusion_compile_granularity = "full"
+        pipeline.od_config.diffusion_compile_dynamic = False
+        mocker.patch.object(pipeline.vae_decode, "warmup")
+        compile_dit = mocker.patch.object(pipeline.dit, "compile")
+
+        pipeline.setup_compile()
+
+        compile_dit.assert_called_once_with(dynamic=False)
 
     def test_latent_output_type_skips_the_decoder(self, build_pipeline):
         pipeline, _ = build_pipeline()

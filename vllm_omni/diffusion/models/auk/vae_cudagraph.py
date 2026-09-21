@@ -34,9 +34,11 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
-# Latent-frame buckets for the compiled graphs, at 50 Hz: 2.56 s, 5.12 s, 10.24 s.
-# Each bucket costs one Inductor compilation (tens of seconds) at startup.
-DEFAULT_COMPILE_SHAPES: tuple[int, ...] = (128, 256, 512)
+# Latent-frame buckets for the compiled graphs, at 50 Hz: 2.56, 5.12, 10.24
+# and 15.36 s. Each bucket costs one Inductor compilation (tens of seconds)
+# at startup and one private CUDA graph pool. Deployments override them with
+# ``model_config.auk_vae_compile_shapes`` on the diffusion stage.
+DEFAULT_COMPILE_SHAPES: tuple[int, ...] = (128, 256, 512, 768)
 
 
 @dataclass

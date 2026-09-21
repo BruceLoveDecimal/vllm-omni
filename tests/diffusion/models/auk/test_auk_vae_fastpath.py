@@ -119,6 +119,7 @@ def test_compiled_bucket_is_the_smallest_captured_one_that_fits() -> None:
     assert wrapper.compiled_bucket(6) == 16
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 def test_graph_replay_matches_eager_per_length() -> None:
@@ -135,6 +136,7 @@ def test_graph_replay_matches_eager_per_length() -> None:
     assert len(wrapper._cache) == 2
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 def test_bucketed_graph_only_disturbs_the_tail() -> None:
@@ -153,6 +155,7 @@ def test_bucketed_graph_only_disturbs_the_tail() -> None:
     torch.testing.assert_close(replay, eager, atol=0.1, rtol=0.0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA graph capture requires CUDA")
 @torch.inference_mode()
 def test_compiled_buckets_replay_within_fusion_tolerance_and_leave_longer_clips_to_plain_graphs() -> None:
