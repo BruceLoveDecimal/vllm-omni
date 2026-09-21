@@ -200,22 +200,21 @@ class Encoder(nn.Module):
 class SnakeBeta(_SharedSnakeBeta):
     """x + sin^2(alpha * x) / beta with per-channel learned alpha and beta (log-scale in AuK).
 
-    Built on the shared speech-decoder activation: exp(alpha) and
-    1 / (exp(beta) + eps) are materialised once instead of on every call,
-    and on CUDA the whole expression runs as one fused Triton kernel. The
-    eager path keeps the reference's operation order, so fused=False
-    reproduces it bit for bit; the fused kernel differs only in the last ULPs
-    of sin.
+    Built on the shared speech-decoder activation for its precomputed
+    exp(alpha) and 1 / (exp(beta) + eps) buffers, which are materialised once
+    instead of on every call. The forward always uses the eager formula in
+    the reference's operation order, so it reproduces the reference bit for
+    bit; the shared class's fused Triton kernel is not used, because inside
+    the compiled decode buckets Inductor fuses the formula itself and on the
+    remaining eager paths (the reference-audio encode and clips longer than
+    the largest bucket) the kernel measured slower than eager.
     """
 
     def __init__(self, channels: int, alpha_logscale: bool = False) -> None:
         super().__init__(channels, alpha_logscale=alpha_logscale)
-        self.fused = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.fused:
-            return self._eager_forward(x)
-        return super().forward(x)
+        return self._eager_forward(x)
 
 
 class _CachedFilter:
@@ -491,20 +490,17 @@ class AuKVAE(nn.Module):
             if isinstance(module, SnakeBeta):
                 module.precompute_exp_cache()
 
-    def set_decode_fast_paths(self, *, fused_snake: bool | None = None, cached_filters: bool | None = None) -> None:
-        """Toggle the decoder's fused Snake kernel and per-channel filter caching.
+    def set_decode_fast_paths(self, *, cached_filters: bool) -> None:
+        """Toggle the FIR modules' per-channel filter caching.
 
-        Both default to on. They exist as switches so a parity check can pin
-        the bit-exact eager formula, and so each path's cost can be measured on
-        its own. Flip them before any CUDA graph is captured: passing
-        cached_filters reallocates the cached taps, and a captured graph
+        On by default. The switch exists so the cache's cost can be measured
+        against the plain expand-per-call path. Flip it before any CUDA graph
+        is captured: it reallocates the cached taps, and a captured graph
         keeps reading the old buffers.
         """
 
         for module in self.modules():
-            if fused_snake is not None and isinstance(module, SnakeBeta):
-                module.fused = fused_snake
-            if cached_filters is not None and isinstance(module, _CachedFilter):
+            if isinstance(module, _CachedFilter):
                 module.cache_filters = cached_filters
                 module._expanded = None
 

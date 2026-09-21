@@ -131,10 +131,9 @@ class AuKVAEDecodeGraph:
             return
 
         # The traced graph must read exp(alpha) from a buffer, not recompute it.
-        snakes = [module for module in self.vae.modules() if isinstance(module, SnakeBeta)]
-        for module in snakes:
-            module.precompute_exp_cache()
-        was_fused = any(module.fused for module in snakes)
+        for module in self.vae.modules():
+            if isinstance(module, SnakeBeta):
+                module.precompute_exp_cache()
 
         try:
             self._compiled_decode = torch.compile(self.vae.decode, mode="default", fullgraph=False, dynamic=False)
@@ -143,23 +142,17 @@ class AuKVAEDecodeGraph:
             self._compiled_decode = None
             return
 
-        # Inductor fuses the plain Snake formula with the ops around it. The
-        # hand-written Triton kernel would split the traced graph instead, so
-        # it is switched off while tracing and restored afterwards.
-        self.vae.set_decode_fast_paths(fused_snake=False)
-        try:
-            for size in self.compile_shapes:
-                try:
-                    self._compiled[size] = self._capture(size, device, self._compiled_decode, warm_iters=5)
-                    logger.info("Compiled and captured AuK codec decode: latent_frames=%d", size)
-                except Exception:
-                    logger.warning(
-                        "Compiled AuK codec decode failed for latent_frames=%d; falling back to plain CUDA graphs",
-                        size,
-                        exc_info=True,
-                    )
-        finally:
-            self.vae.set_decode_fast_paths(fused_snake=was_fused)
+        # Inductor fuses the plain Snake formula with the ops around it.
+        for size in self.compile_shapes:
+            try:
+                self._compiled[size] = self._capture(size, device, self._compiled_decode, warm_iters=5)
+                logger.info("Compiled and captured AuK codec decode: latent_frames=%d", size)
+            except Exception:
+                logger.warning(
+                    "Compiled AuK codec decode failed for latent_frames=%d; falling back to plain CUDA graphs",
+                    size,
+                    exc_info=True,
+                )
         logger.info(
             "AuK codec decode compile warmup done: %d/%d buckets", len(self._compiled), len(self.compile_shapes)
         )
@@ -174,9 +167,9 @@ class AuKVAEDecodeGraph:
     ) -> _GraphEntry:
         """Capture one graph of decode on zero latents of bucket frames.
 
-        The warm iterations let cuDNN pick its algorithms, the Triton Snake
-        kernel compile and, for the compiled decode, Inductor finish tracing
-        and autotuning before anything is recorded.
+        The warm iterations let cuDNN pick its algorithms and, for the
+        compiled decode, Inductor finish tracing and autotuning before
+        anything is recorded.
         """
         static_latents = torch.zeros(1, bucket, self.vae.latent_dim, device=device, dtype=torch.float32)
         with torch.inference_mode():

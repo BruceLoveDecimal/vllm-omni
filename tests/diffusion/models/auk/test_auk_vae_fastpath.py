@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The AuK codec's decode fast paths keep the reference numerics.
 
-Four paths are checked against the plain eager decode: the shared Snake
-activation with precomputed exponent caches, the per-channel FIR filter cache,
-the per-length CUDA graph tier and the torch.compile bucket tier (both fall
-back to eager off CUDA).
+Four paths are checked against the plain eager decode: the Snake activation
+with precomputed exponent caches, the per-channel FIR filter cache, the
+per-length CUDA graph tier and the torch.compile bucket tier (both fall back
+to eager off CUDA).
 """
 
 import pytest
@@ -54,10 +54,6 @@ def test_eager_snake_matches_the_reference_formula() -> None:
     module.precompute_exp_cache()
     x = torch.randn(2, 6, 17)
 
-    module.fused = False
-    assert torch.equal(module(x), _reference_snake(module, x))
-    # On CPU the fused flag has no kernel to reach and takes the same path.
-    module.fused = True
     assert torch.equal(module(x), _reference_snake(module, x))
 
 
@@ -85,11 +81,11 @@ def test_decode_fast_paths_reproduce_the_plain_decode() -> None:
     vae = _small_vae()
     latents = torch.randn(1, 6, vae.latent_dim)
 
-    vae.set_decode_fast_paths(fused_snake=False, cached_filters=False)
+    vae.set_decode_fast_paths(cached_filters=False)
     plain = vae.decode(latents)
     assert plain.shape == (1, 6 * vae.hop_size)
 
-    vae.set_decode_fast_paths(fused_snake=True, cached_filters=True)
+    vae.set_decode_fast_paths(cached_filters=True)
     fast = vae.decode(latents)
     assert torch.equal(fast, plain)
     assert all(module._cached for module in vae.modules() if isinstance(module, SnakeBeta))
@@ -164,8 +160,6 @@ def test_compiled_buckets_replay_within_fusion_tolerance_and_leave_longer_clips_
     wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(8,))
     wrapper.warmup(torch.device("cuda"))
     assert list(wrapper._compiled) == [8]
-    # The fused Triton Snake is only disabled while Inductor traces.
-    assert all(module.fused for module in vae.modules() if isinstance(module, SnakeBeta))
 
     exact = torch.randn(1, 8, vae.latent_dim, device="cuda")
     eager = vae.decode(exact)
