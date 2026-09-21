@@ -692,8 +692,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if not native_rows or len(native_rows) != logits.shape[0]:
             return None
 
+        chunk_terminators = self._minicpmo45_chunk_terminator_token_ids(token_ids)
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
         sampled_ids: list[int] = []
         for row_idx in range(logits.shape[0]):
+            accepted = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
+            last_accepted = next((int(t) for t in reversed(accepted) if isinstance(t, int) and t >= 0), None)
+            if last_accepted in chunk_terminators:
+                # Async scheduling runs one lookahead frame after the chunk
+                # terminator was sampled but before the scheduler observes
+                # the segment stop. The scheduler discards this frame's
+                # token, so decide nothing here: re-emit the terminator and
+                # leave the model-owned policy state exactly as the accepted
+                # history left it. The next append re-injects that terminator.
+                sampled_ids.append(last_accepted)
+                continue
             row_logits = logits[row_idx : row_idx + 1].clone()
             sampled = self._sample_minicpmo45_native_duplex_row(
                 row_logits,
@@ -922,7 +935,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         segment before the next streaming update, but the official duplex
         format feeds it (terminator + </unit>) into the KV at every unit
         boundary, and the model's listen/speak policy depends on seeing its own
-        past decisions. Non-terminators clear the turn-ended latch."""
+        past decisions. Text clears the turn-ended latch; <|turn_eos|> sets it
+        without becoming pending, because it was forwarded in this unit."""
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         if state is None:
             return
@@ -930,17 +944,25 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
         listen_id = token_ids.get("listen_token_id", -1)
         tts_bos_id = token_ids.get("tts_bos_token_id", -1)
-        chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
-        chunk_tts_eos_id = token_ids.get("chunk_tts_eos_token_id", -1)
         turn_eos_id = token_ids.get("turn_eos_token_id", -1)
-        terminators = {listen_id, chunk_eos_id, chunk_tts_eos_id, turn_eos_id}
-        if sampled in terminators:
+        if sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids):
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
-            if sampled == turn_eos_id or (sampled == listen_id and force_listen):
+            if sampled == listen_id and force_listen:
                 state.current_turn_ended = True
                 with suppress(Exception):
                     state.pending_speech_response_open = False
+            return
+        if sampled == turn_eos_id:
+            # Official streaming_generate feeds <|turn_eos|> like text (its
+            # hidden state conditions the Talker) and keeps sampling until a
+            # chunk terminator, so nothing is pending for the next append;
+            # only the turn-ended latch flips.
+            state.pending_terminator_token = None
+            state.last_terminator_token = int(sampled)
+            state.current_turn_ended = True
+            with suppress(Exception):
+                state.pending_speech_response_open = False
             return
         if (
             sampled == tts_bos_id
@@ -959,6 +981,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         state.pending_terminator_token = None
         state.last_terminator_token = None
         state.current_turn_ended = False
+
+    @staticmethod
+    def _minicpmo45_chunk_terminator_token_ids(token_ids: dict[str, int]) -> set[int]:
+        """Official ``chunk_terminator_token_ids``: the tokens that close a unit.
+
+        <|turn_eos|> is deliberately absent. It ends the turn but not the
+        unit: the model forwards it and keeps sampling until one of these.
+        """
+        return {
+            int(token_id)
+            for token_id in (
+                token_ids.get("listen_token_id", -1),
+                token_ids.get("chunk_eos_token_id", -1),
+                token_ids.get("chunk_tts_eos_token_id", -1),
+            )
+            if token_id is not None and int(token_id) >= 0
+        }
 
     def _minicpmo45_tokenizer(self):
         if hasattr(self, "_minicpmo45_tokenizer_cache"):

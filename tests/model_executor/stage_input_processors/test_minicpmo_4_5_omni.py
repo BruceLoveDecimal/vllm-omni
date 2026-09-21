@@ -240,8 +240,143 @@ def test_native_duplex_rejects_missing_forwarded_terminal_token() -> None:
     )
     context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
 
-    with pytest.raises(ValueError, match="no forwarded span"):
+    with pytest.raises(ValueError, match="missing own-token hidden states"):
         llm2tts([source], prompt=[{}], _streaming_context=context)
+
+
+_NATIVE_META = {
+    "tts_bos_token_id": 9301,
+    "tts_eos_token_id": 9302,
+    "listen_token_id": 9303,
+    "speak_token_id": 9304,
+    "chunk_eos_token_id": 9308,
+    "chunk_tts_eos_token_id": 9309,
+    "turn_eos_token_id": 9310,
+}
+
+
+def _native_source(prompt_ids, output_ids, row_ids, positions=None):
+    latent = torch.arange(len(row_ids) * 4, dtype=torch.float32).reshape(-1, 4)
+    positions = list(range(len(row_ids))) if positions is None else positions
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "latent_input_ids": torch.tensor(row_ids).reshape(-1, 1),
+            "latent_positions": torch.tensor(positions).reshape(-1, 1),
+            "meta": dict(_NATIVE_META),
+        },
+    )
+    return source, latent
+
+
+def _native_handoff(source):
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+    return llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+
+def test_native_duplex_ledger_tolerates_async_lookahead_row_after_terminator() -> None:
+    """An async scheduler forwards the sampled chunk terminator in one extra
+    frame before the segment stop lands; its row trails the unit's rows and
+    must not shift the Talker slice."""
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 22, 9308],
+        row_ids=[101, 102, 9304, 21, 22, 9308],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[3:5])
+
+
+def test_native_duplex_ledger_without_forwarded_terminator() -> None:
+    """Synchronous scheduling never forwards the chunk terminator."""
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 22, 9308],
+        row_ids=[101, 102, 9304, 21, 22],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[3:5])
+
+
+def test_native_duplex_turn_eos_row_is_handed_to_talker() -> None:
+    """<|turn_eos|> is forwarded (it is not a stop token) and the model keeps
+    sampling until a chunk terminator; the Talker gets the turn_eos row and
+    nothing after it."""
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 9310, 77, 9308],
+        row_ids=[101, 102, 9304, 21, 9310, 77],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 9310]
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[3:5])
+    assert info["meta"]["turn_end"] is True
+
+
+def test_native_duplex_ledger_anchors_on_unit_after_reinjected_listens() -> None:
+    """Listens from earlier units sit at the head of the segment delta but
+    were re-injected as prompt tokens, so they are not contiguous with this
+    unit's decode rows in the ledger. Anchor on the unit, not the segment."""
+    unit_end, unit, audio = 2, 1, 11
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9303, 9303, 9304, 21, 22, 9308],
+        row_ids=[9303, unit_end, unit, audio, 9303, unit_end, unit, audio, 9304, 21, 22],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[9:11])
+
+
+def test_native_duplex_ledger_prefers_latest_repeat_of_the_unit() -> None:
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 22, 9308],
+        row_ids=[9304, 21, 22, 555, 9304, 21, 22],
+        positions=[0, 1, 2, 3, 10, 11, 12],
+    )
+
+    info = _native_handoff(source)
+
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[5:7])
+
+
+def test_native_duplex_ledger_rejects_non_contiguous_positions() -> None:
+    source, _ = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 22, 9308],
+        row_ids=[101, 102, 9304, 21, 22],
+        positions=[0, 1, 2, 3, 9],
+    )
+
+    with pytest.raises(ValueError, match="missing own-token hidden states"):
+        _native_handoff(source)
+
+
+def test_native_duplex_mid_turn_tts_bos_slices_after_boundary() -> None:
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9301, 21, 22, 9308],
+        row_ids=[101, 102, 9301, 21, 22],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[3:5])
 
 
 def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
