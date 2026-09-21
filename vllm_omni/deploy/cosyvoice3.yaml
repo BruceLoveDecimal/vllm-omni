@@ -39,6 +39,13 @@ connectors:
 
 stages:
   - stage_id: 0
+    # The talker's sampled tokens depend on which other requests share its
+    # batch, so a seeded request can produce different audio under
+    # concurrency. Uncomment to run the talker with vLLM's batch-invariant
+    # kernels (code2wav is already deterministic). Measured on an RTX PRO
+    # 6000: ~2x talker latency at concurrency 1, ~35% less throughput at 8.
+    # env:
+    #   VLLM_BATCH_INVARIANT: "1"
     max_num_batched_tokens: 32768
     max_num_seqs: 8
     gpu_memory_utilization: 0.4
