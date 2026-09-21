@@ -338,6 +338,37 @@ def add_optional_chunk_mask(
     else:
         chunk_masks = masks
     assert chunk_masks.dtype == torch.bool
-    empty_rows = chunk_masks.sum(dim=-1, keepdim=True) == 0
+    # ``any`` rather than ``sum``: summing a bool tensor first copies it to
+    # int64, eight bytes per element of a batch-by-frames-squared map.
+    empty_rows = ~chunk_masks.any(dim=-1, keepdim=True)
     chunk_masks = torch.where(empty_rows, torch.ones_like(chunk_masks), chunk_masks)
     return chunk_masks
+
+
+def build_dit_attention_mask(pad_mask: torch.Tensor, *, streaming: bool, static_chunk_size: int) -> torch.Tensor:
+    """The DiT's full query-key attention mask, ``(B, 1, T, T)`` bool.
+
+    Upstream CosyVoice3 (``cosyvoice/flow/DiT/dit.py``) builds this inside the
+    DiT from the ``streaming`` flag: chunk-causal blocks of ``static_chunk_size``
+    mel frames (a frame attends to everything up to the end of its own block,
+    all earlier blocks, and nothing after) when streaming, the padding mask
+    alone otherwise. It is factored out so the TensorRT estimator, whose
+    attention is frozen at export time, can receive the same mask as an
+    engine input.
+
+    ``pad_mask`` is ``(B, 1, T)`` or ``(B, T)``; ``True`` marks a valid frame.
+    """
+    if pad_mask.dim() == 2:
+        pad_mask = pad_mask.unsqueeze(1)
+    if pad_mask.dim() != 3:
+        raise ValueError(f"pad_mask must be (B, 1, T) or (B, T), got {tuple(pad_mask.shape)}")
+    masks = pad_mask.bool()
+    size = int(masks.shape[-1])
+    if streaming and static_chunk_size > 0:
+        chunk = subsequent_chunk_mask(size, int(static_chunk_size), -1, masks.device).unsqueeze(0)
+        full = masks & chunk
+    else:
+        full = masks.expand(masks.shape[0], size, size)
+    empty_rows = ~full.any(dim=-1, keepdim=True)
+    full = torch.where(empty_rows, torch.ones_like(full), full)
+    return full.unsqueeze(1)
