@@ -511,7 +511,7 @@ class TestCFM:
                 self.execute_stream = None
 
             def set_input_shape(self, name, shape):
-                pass
+                return True
 
             def set_tensor_address(self, name, address):
                 pass

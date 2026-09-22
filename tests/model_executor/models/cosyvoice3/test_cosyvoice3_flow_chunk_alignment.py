@@ -120,6 +120,7 @@ class _FakeTrtContext:
 
     def set_input_shape(self, name, shape):
         self.shapes[name] = tuple(shape)
+        return True
 
     def set_tensor_address(self, name, address):
         self.addresses[name] = address
@@ -136,17 +137,30 @@ class _FakeStream:
 
 
 class _FakeTrtEstimator:
-    def __init__(self, *, supports_attn_mask: bool):
+    def __init__(self, *, supports_attn_mask: bool, context=None):
         self.io_dtype = torch.float32
         self.supports_attn_mask = supports_attn_mask
         self.static_chunk_size = BLOCK
-        self.context = _FakeTrtContext()
+        self.context = context if context is not None else _FakeTrtContext()
+        self.released = 0
 
     def acquire_estimator(self):
         return [self.context, _FakeStream()], object()
 
     def release_estimator(self, context, stream):
-        pass
+        assert context is self.context
+        self.released += 1
+
+
+class _RejectingShapeContext(_FakeTrtContext):
+    def set_input_shape(self, name, shape):
+        super().set_input_shape(name, shape)
+        return name != "x"  # TRT returns False for a shape outside the profile
+
+
+class _FailingEnqueueContext(_FakeTrtContext):
+    def execute_async_v3(self, stream):
+        return False
 
 
 def _cfm(estimator) -> CausalConditionalCFM:
@@ -186,6 +200,35 @@ class TestTensorRtMaskInput:
             self._run(cfm, monkeypatch, streaming=True)
         assert "attn_mask" not in ctx.shapes
         assert sum("no attn_mask input" in r.message for r in caplog.records) == 1
+
+
+class TestTensorRtContextIsReleased:
+    """A raised error must hand the pooled context back, or the next request
+    blocks on ``acquire_estimator`` forever."""
+
+    def _run(self, cfm, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda device: _FakeStream())
+        monkeypatch.setattr(torch.cuda, "stream", lambda stream: torch.no_grad())
+        frames = BLOCK
+        x = torch.randn(2, 80, frames)
+        cfm.forward_estimator(x, torch.ones(2, 1, frames), x, torch.rand(2), torch.randn(2, 80), x, False)
+
+    def test_out_of_profile_shape_raises_and_releases(self, monkeypatch):
+        est = _FakeTrtEstimator(supports_attn_mask=True, context=_RejectingShapeContext())
+        with pytest.raises(RuntimeError, match="optimization profile"):
+            self._run(_cfm(est), monkeypatch)
+        assert est.released == 1
+
+    def test_failed_enqueue_raises_and_releases(self, monkeypatch):
+        est = _FakeTrtEstimator(supports_attn_mask=True, context=_FailingEnqueueContext())
+        with pytest.raises(RuntimeError, match="execute_async_v3"):
+            self._run(_cfm(est), monkeypatch)
+        assert est.released == 1
+
+    def test_success_releases_once(self, monkeypatch):
+        est = _FakeTrtEstimator(supports_attn_mask=True)
+        self._run(_cfm(est), monkeypatch)
+        assert est.released == 1
 
 
 class TestFinalizeIsBidirectional:
