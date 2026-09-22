@@ -526,6 +526,21 @@ def test_planar_mux_accepts_none_rate_and_defaults_audio_to_44100():
         assert container.streams.audio[0].rate == 44100
 
 
+def test_planar_mux_encodes_odd_dimensions_at_nearest_even_size():
+    frame = np.zeros((3, 5, 3), dtype=np.uint8)
+    video = media_utils.mux_av_video_audio_bytes(
+        video_api_utils._iter_planar_video_frames([frame], frame.dtype),
+        width=5,
+        height=3,
+        video_codec_options={"threads": "1"},
+    )
+
+    with av.open(BytesIO(video), mode="r", format="mp4") as container:
+        stream = container.streams.video[0]
+        assert (stream.width, stream.height) == (6, 4)
+        assert sum(1 for _ in container.decode(stream)) == 1
+
+
 def test_interleaved_video_uses_legacy_fallback_automatically(monkeypatch):
     calls = []
     path_logs = []

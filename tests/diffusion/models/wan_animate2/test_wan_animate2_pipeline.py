@@ -8,6 +8,7 @@ real weights.
 """
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import PIL.Image
@@ -17,6 +18,7 @@ import torch
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.wan_animate2.pipeline_wan_animate2 import (
     ANIMATE2_DEFAULT_MAX_DRIVING_FRAMES,
+    Animate2Request,
     LetterboxInfo,
     Wan22Animate2Pipeline,
     _is_distilled_checkpoint,
@@ -106,6 +108,56 @@ def test_resample_frames_keeps_duration():
     assert len(resampled) == 48
     with pytest.raises(ValueError, match="too short"):
         resample_frames(frames[:1], video_fps=60.0, target_fps=24.0)
+
+
+def test_online_single_path_list_is_decoded_as_driving_video(monkeypatch, tmp_path):
+    """The multipart video API persists uploads and passes ``list[str]``."""
+    video_path = tmp_path / "driving.mp4"
+    source_frames = [np.full((16, 16, 3), value, dtype=np.uint8) for value in range(60)]
+    decoded_paths = []
+
+    def _decode(path):
+        decoded_paths.append(path)
+        return source_frames, 30.0
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan_animate2.pipeline_wan_animate2.decode_video_file",
+        _decode,
+    )
+    request = Animate2Request(
+        prompt="static background.",
+        negative_prompt="",
+        prompt_ref="人物动作的参考视频",
+        image=PIL.Image.new("RGB", (16, 16)),
+        video=[str(video_path)],
+        width=16,
+        height=16,
+        fps=24,
+        max_frames=3,
+        segment_frames=81,
+        num_inference_steps=10,
+        guidance_scale=1.0,
+    )
+
+    pipeline = SimpleNamespace(resolution_divisor=16)
+    frames = Wan22Animate2Pipeline._load_driving_frames(pipeline, request)
+
+    assert decoded_paths == [str(video_path)]
+    assert len(frames) == 3
+    assert all(frame.shape == (16, 16, 3) for frame in frames)
+
+
+def test_multiple_driving_video_paths_are_rejected(tmp_path):
+    request = SimpleNamespace(
+        video=[str(tmp_path / "first.mp4"), str(tmp_path / "second.mp4")],
+        fps=24,
+        max_frames=81,
+        width=16,
+        height=16,
+    )
+
+    with pytest.raises(ValueError, match="exactly one driving video"):
+        Wan22Animate2Pipeline._load_driving_frames(SimpleNamespace(resolution_divisor=16), request)
 
 
 # ---------------------------------------------------------------------------

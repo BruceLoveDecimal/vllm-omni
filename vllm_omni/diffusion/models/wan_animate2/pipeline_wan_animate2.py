@@ -340,7 +340,7 @@ class Animate2Request:
     negative_prompt: str
     prompt_ref: str
     image: PIL.Image.Image
-    video: str | list[PIL.Image.Image]
+    video: str | os.PathLike[str] | list[str | os.PathLike[str]] | list[PIL.Image.Image]
     width: int
     height: int
     fps: float
@@ -711,11 +711,24 @@ class Wan22Animate2Pipeline(
         is taken as already being at the request fps: the serving layer keeps
         no source frame rate.
         """
-        if isinstance(request.video, str):
-            frames, source_fps = decode_video_file(request.video)
+        video = request.video
+        if isinstance(video, (str, os.PathLike)):
+            video_path = os.fspath(video)
+        elif len(video) == 1 and isinstance(video[0], (str, os.PathLike)):
+            # Multipart ``input_references`` are persisted by the online API
+            # and passed to native pipelines as a list of paths, even when the
+            # request contains exactly one driving video.
+            video_path = os.fspath(video[0])
+        else:
+            video_path = None
+
+        if video_path is not None:
+            frames, source_fps = decode_video_file(video_path)
             frames = resample_frames(frames, source_fps, request.fps)
         else:
-            frames = [np.asarray(frame.convert("RGB")) for frame in request.video]
+            if any(isinstance(frame, (str, os.PathLike)) for frame in video):
+                raise ValueError("Wan2.2-Animate-2 requires exactly one driving video")
+            frames = [np.asarray(frame.convert("RGB")) for frame in video]
         if not frames:
             raise ValueError("driving video contains no frames")
         if request.max_frames is not None and request.max_frames > 0:

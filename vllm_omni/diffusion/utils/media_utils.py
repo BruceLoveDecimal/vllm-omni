@@ -446,14 +446,20 @@ def mux_av_video_audio_bytes(
     video_codec_options: dict[str, str] | None = None,
 ) -> bytes:
     """Mux preconstructed video frames and optional audio into MP4 bytes."""
+    # yuv420p requires even dimensions. Native diffusion pipelines can crop
+    # back to the reference aspect ratio and legitimately produce an odd
+    # width or height, so minimally scale the encoded stream up by one pixel
+    # instead of failing only after the full generation has completed.
+    encoded_width = width + width % 2
+    encoded_height = height + height % 2
     buf = io.BytesIO()
     with cast(Any, av.open(buf, mode="w", format="mp4")) as container:
         v_stream = cast(
             av.VideoStream,
             container.add_stream(video_codec, rate=Fraction(fps).limit_denominator(10000)),
         )
-        v_stream.width = width
-        v_stream.height = height
+        v_stream.width = encoded_width
+        v_stream.height = encoded_height
         v_stream.pix_fmt = "yuv420p"
 
         options: dict[str, object] = {"crf": str(crf)}
@@ -477,6 +483,8 @@ def mux_av_video_audio_bytes(
             a_stream.layout = layout
 
         for frame in video_frames:
+            if frame.width != encoded_width or frame.height != encoded_height:
+                frame = frame.reformat(width=encoded_width, height=encoded_height, format="yuv420p")
             for packet in v_stream.encode(frame):
                 container.mux(packet)
         for packet in v_stream.encode():
