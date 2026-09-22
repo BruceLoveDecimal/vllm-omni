@@ -177,44 +177,57 @@ class ConditionalCFM(BASECFM):
             io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
             attn_mask = self._trt_attention_mask(mask, streaming)
             [estimator, stream], trt_engine = self.estimator.acquire_estimator()
-            caller_stream = torch.cuda.current_stream(x.device)
-            stream.wait_stream(caller_stream)
-            with torch.cuda.stream(stream):
-                x_e = x.to(io_dtype).contiguous()
-                mask_e = mask.to(io_dtype).contiguous()
-                mu_e = mu.to(io_dtype).contiguous()
-                t_e = t.to(io_dtype).contiguous()
-                spks_e = spks.to(io_dtype).contiguous()
-                cond_e = cond.to(io_dtype).contiguous()
-                out_e = torch.empty_like(x_e, dtype=getattr(self.estimator, "out_dtype", io_dtype))
-                inputs = {
-                    "x": x_e,
-                    "mask": mask_e,
-                    "mu": mu_e,
-                    "t": t_e,
-                    "spks": spks_e,
-                    "cond": cond_e,
-                }
-                if attn_mask is not None:
-                    inputs["attn_mask"] = attn_mask
-                # Bind only what the engine declares: an exporter prunes
-                # inputs the graph never reads.
-                declared = getattr(self.estimator, "input_names", None)
-                if declared:
-                    inputs = {name: tensor for name, tensor in inputs.items() if name in declared}
-                for name, tensor in inputs.items():
-                    estimator.set_input_shape(name, tuple(tensor.shape))
-                    estimator.set_tensor_address(name, tensor.data_ptr())
-                estimator.set_tensor_address("estimator_out", out_e.data_ptr())
-                # run trt engine
-                assert estimator.execute_async_v3(stream.cuda_stream) is True
-                for tensor in (*inputs.values(), out_e):
-                    if tensor.is_cuda:
-                        tensor.record_stream(stream)
-            caller_stream.wait_stream(stream)
-            if out_e.is_cuda:
-                out_e.record_stream(caller_stream)
-            self.estimator.release_estimator(estimator, stream)
+            # The context comes out of a bounded pool; anything that raises
+            # below (an out-of-profile shape, a failed enqueue) must still
+            # hand it back, or the next request blocks on ``acquire`` forever.
+            try:
+                caller_stream = torch.cuda.current_stream(x.device)
+                stream.wait_stream(caller_stream)
+                with torch.cuda.stream(stream):
+                    x_e = x.to(io_dtype).contiguous()
+                    mask_e = mask.to(io_dtype).contiguous()
+                    mu_e = mu.to(io_dtype).contiguous()
+                    t_e = t.to(io_dtype).contiguous()
+                    spks_e = spks.to(io_dtype).contiguous()
+                    cond_e = cond.to(io_dtype).contiguous()
+                    out_e = torch.empty_like(x_e, dtype=getattr(self.estimator, "out_dtype", io_dtype))
+                    inputs = {
+                        "x": x_e,
+                        "mask": mask_e,
+                        "mu": mu_e,
+                        "t": t_e,
+                        "spks": spks_e,
+                        "cond": cond_e,
+                    }
+                    if attn_mask is not None:
+                        inputs["attn_mask"] = attn_mask
+                    # Bind only what the engine declares: an exporter prunes
+                    # inputs the graph never reads.
+                    declared = getattr(self.estimator, "input_names", None)
+                    if declared:
+                        inputs = {name: tensor for name, tensor in inputs.items() if name in declared}
+                    for name, tensor in inputs.items():
+                        if not estimator.set_input_shape(name, tuple(tensor.shape)):
+                            raise RuntimeError(
+                                f"TensorRT flow estimator rejected shape {tuple(tensor.shape)} for input "
+                                f"'{name}' (outside the engine's optimization profile)"
+                            )
+                        estimator.set_tensor_address(name, tensor.data_ptr())
+                    estimator.set_tensor_address("estimator_out", out_e.data_ptr())
+                    # ``assert`` would vanish under ``python -O`` and leave a
+                    # zero-filled output; check explicitly.
+                    if not estimator.execute_async_v3(stream.cuda_stream):
+                        raise RuntimeError(
+                            "TensorRT flow estimator failed to enqueue (execute_async_v3 returned False)"
+                        )
+                    for tensor in (*inputs.values(), out_e):
+                        if tensor.is_cuda:
+                            tensor.record_stream(stream)
+                caller_stream.wait_stream(stream)
+                if out_e.is_cuda:
+                    out_e.record_stream(caller_stream)
+            finally:
+                self.estimator.release_estimator(estimator, stream)
             return out_e.to(x.dtype)
 
     def _trt_attention_mask(self, mask: torch.Tensor, streaming: bool) -> torch.Tensor | None:
