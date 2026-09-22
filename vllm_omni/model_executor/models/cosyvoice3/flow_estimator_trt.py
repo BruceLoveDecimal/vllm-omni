@@ -32,6 +32,7 @@ read-only, so neither is set here.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import queue
 import uuid
@@ -316,24 +317,52 @@ def export_chunk_mask_estimator_onnx(estimator: torch.nn.Module, onnx_path: str,
     return onnx_path
 
 
+def flow_checkpoint_fingerprint(model_dir: str, weight_file: str = "flow.pt") -> str:
+    """A short digest identifying the flow checkpoint an ONNX was exported from.
+
+    The exported ONNX bakes in the DiT weights, so its cache path must change
+    whenever the checkpoint does: the digest covers the resolved model
+    directory and the size/mtime of its flow weights. Two checkpoints that
+    live at different paths, or one that is re-trained in place, never share
+    an export.
+    """
+    parts = [os.path.realpath(model_dir)]
+    weight_path = os.path.join(model_dir, weight_file)
+    try:
+        st = os.stat(weight_path)
+        parts.append(f"{st.st_size}:{int(st.st_mtime)}")
+    except OSError:
+        parts.append("no-weights")
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
+def chunk_mask_estimator_onnx_path(onnx_dir: str, *, fp16: bool, cache_key: str | None) -> str:
+    tag = "autocast_fp16" if fp16 else "fp32"
+    suffix = f".{cache_key}" if cache_key else ""
+    return os.path.join(onnx_dir, f"flow.decoder.estimator.chunk_mask.{tag}{suffix}.onnx")
+
+
 def build_chunk_mask_flow_estimator_trt(
     estimator: torch.nn.Module,
     onnx_dir: str,
     device: str | torch.device,
     *,
     fp16: bool = True,
+    cache_key: str | None = None,
 ) -> TrtContextWrapper:
     """Build/load a flow-estimator engine that takes the chunk-causal mask.
 
     The ONNX is exported from ``estimator`` (the loaded torch DiT) into
     ``onnx_dir`` on first use and cached there; the plan is cached like the
-    legacy engine's. ``estimator.static_chunk_size`` is copied onto the
-    wrapper so ``forward_estimator`` can build the same mask upstream would.
+    legacy engine's. ``cache_key`` (see ``flow_checkpoint_fingerprint``) is
+    folded into the ONNX name so exports from different checkpoints never
+    collide when ``onnx_dir`` is shared. ``estimator.static_chunk_size`` is
+    copied onto the wrapper so ``forward_estimator`` can build the same mask
+    upstream would.
     """
     import tensorrt as trt
 
-    tag = "autocast_fp16" if fp16 else "fp32"
-    onnx_path = os.path.join(onnx_dir, f"flow.decoder.estimator.chunk_mask.{tag}.onnx")
+    onnx_path = chunk_mask_estimator_onnx_path(onnx_dir, fp16=fp16, cache_key=cache_key)
     if not os.path.exists(onnx_path) or os.path.getsize(onnx_path) == 0:
         os.makedirs(onnx_dir, exist_ok=True)
         export_chunk_mask_estimator_onnx(estimator, onnx_path, fp16=fp16)

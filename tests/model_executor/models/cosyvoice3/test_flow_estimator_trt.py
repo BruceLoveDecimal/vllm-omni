@@ -123,3 +123,40 @@ def test_write_plan_supports_concurrent_publication(tmp_path, monkeypatch):
     assert len(set(source_paths)) == len(payloads)
     assert plan_path.read_bytes() in payloads
     assert _temporary_plans(plan_path) == []
+
+
+class TestExportCacheKey:
+    """Exported ONNX bakes in the checkpoint's weights, so its cache path must
+    change with the checkpoint even when the export directory is shared."""
+
+    def test_fingerprint_differs_across_checkpoint_dirs(self, tmp_path):
+        a, b = tmp_path / "ckpt_a", tmp_path / "ckpt_b"
+        for d in (a, b):
+            d.mkdir()
+            (d / "flow.pt").write_bytes(b"same bytes")
+        assert flow_estimator_trt.flow_checkpoint_fingerprint(str(a)) != flow_estimator_trt.flow_checkpoint_fingerprint(
+            str(b)
+        )
+
+    def test_fingerprint_changes_when_weights_change_in_place(self, tmp_path):
+        d = tmp_path / "ckpt"
+        d.mkdir()
+        (d / "flow.pt").write_bytes(b"v1")
+        before = flow_estimator_trt.flow_checkpoint_fingerprint(str(d))
+        assert before == flow_estimator_trt.flow_checkpoint_fingerprint(str(d))
+        (d / "flow.pt").write_bytes(b"v2 longer")
+        assert flow_estimator_trt.flow_checkpoint_fingerprint(str(d)) != before
+
+    def test_fingerprint_is_stable_without_weights(self, tmp_path):
+        d = tmp_path / "ckpt"
+        d.mkdir()
+        assert flow_estimator_trt.flow_checkpoint_fingerprint(str(d)) == flow_estimator_trt.flow_checkpoint_fingerprint(
+            str(d)
+        )
+
+    def test_onnx_path_carries_the_key(self, tmp_path):
+        keyed = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key="abc123")
+        plain = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key=None)
+        assert keyed != plain
+        assert keyed.endswith(".abc123.onnx") and "chunk_mask.autocast_fp16" in keyed
+        assert plain.endswith("flow.decoder.estimator.chunk_mask.autocast_fp16.onnx")

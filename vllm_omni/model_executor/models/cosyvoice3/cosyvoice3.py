@@ -946,13 +946,20 @@ class CosyVoice3Model(
 
     def _flow_estimator_onnx_dir(self) -> str:
         """Where an exported estimator ONNX is kept: the model dir when it is
-        writable, else the TensorRT plan cache."""
+        writable, else the TensorRT plan cache. The cache is shared by every
+        checkpoint on the box, so the export's file name carries the
+        checkpoint fingerprint (``_flow_estimator_cache_key``)."""
         if os.access(self.model_dir, os.W_OK):
             return self.model_dir
         cache_dir = os.environ.get("COSYVOICE3_TRT_CACHE") or os.path.join(
             os.path.expanduser("~"), ".cache", "vllm_omni", "cosyvoice3_trt"
         )
         return os.path.join(cache_dir, "exported")
+
+    def _flow_estimator_cache_key(self) -> str:
+        from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import flow_checkpoint_fingerprint
+
+        return flow_checkpoint_fingerprint(self.model_dir)
 
     def _resolve_flow_estimator_onnx(self) -> str | None:
         """Locate the flow-decoder estimator ONNX for the TensorRT engine.
@@ -1014,7 +1021,10 @@ class CosyVoice3Model(
                 )
 
                 wrapper = build_chunk_mask_flow_estimator_trt(
-                    self.code2wav.flow_model.decoder.estimator, self._flow_estimator_onnx_dir(), device="cuda"
+                    self.code2wav.flow_model.decoder.estimator,
+                    self._flow_estimator_onnx_dir(),
+                    device="cuda",
+                    cache_key=self._flow_estimator_cache_key(),
                 )
             except Exception as exc:
                 logger.warning(
