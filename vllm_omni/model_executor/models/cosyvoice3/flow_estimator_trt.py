@@ -157,6 +157,9 @@ class TrtContextWrapper:
         # The output buffer must match the engine's output dtype, which an
         # autocast-traced graph can leave different from its inputs.
         self.out_dtype = _engine_tensor_dtype(engine, "estimator_out", io_dtype)
+        # ``(max batch, max frames)`` per optimization profile; the caller
+        # slices a batch wider than any profile takes (see ``max_batch_for``).
+        self.profile_limits = _engine_profile_limits(engine)
         # Filled in by the model when it swaps the estimator, so the host can
         # build the mask with the DiT's block size.
         self.static_chunk_size = 0
@@ -166,6 +169,11 @@ class TrtContextWrapper:
             assert ctx is not None, "failed to create TRT execution context (out of memory?)"
             stream = torch.cuda.Stream(torch.device(device))
             self._pool.put([ctx, stream])
+
+    def max_batch_for(self, frames: int) -> int:
+        """The widest estimator batch (2 rows per request, for CFG) the engine
+        runs at ``frames`` mel frames, or 0 if no profile reaches that length."""
+        return max((batch for batch, max_frames in self.profile_limits if frames <= max_frames), default=0)
 
     def acquire_estimator(self):
         return self._pool.get(), self.trt_engine
@@ -201,6 +209,18 @@ def _engine_tensor_dtype(engine, name: str, fallback: torch.dtype) -> torch.dtyp
         )
     except Exception:
         return fallback
+
+
+def _engine_profile_limits(engine) -> list[tuple[int, int]]:
+    """``(max batch, max frames)`` of ``x`` in each optimization profile."""
+    limits = []
+    try:
+        for index in range(engine.num_optimization_profiles):
+            _min_shape, _opt_shape, max_shape = engine.get_tensor_profile_shape("x", index)
+            limits.append((int(max_shape[0]), int(max_shape[2])))
+    except Exception:
+        return [(_MAX_SHAPES[0][0], _MAX_SHAPES[0][2])]
+    return limits
 
 
 def _engine_io_dtype(engine, fallback: torch.dtype) -> torch.dtype:

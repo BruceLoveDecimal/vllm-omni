@@ -169,14 +169,50 @@ class ConditionalCFM(BASECFM):
                 return self.estimator(x, mask, mu, t, spks, cond, streaming=streaming)
             return self.estimator(x, mask, mu, t, spks, cond)
         else:
-            # TensorRT estimator: bind raw device pointers. The flow runs in
-            # fp32 but the engine may have fp16 I/O (strongly-typed fp16 engine),
-            # so cast inputs/output to the engine's dtype at the boundary. Keep
-            # references to the cast buffers alive until execute completes (a bare
-            # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
-            io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
             attn_mask = self._trt_attention_mask(mask, streaming)
-            [estimator, stream], trt_engine = self.estimator.acquire_estimator()
+            rows = int(x.size(0))
+            max_rows = self.estimator.max_batch_for(int(x.size(2)))
+            # No profile reaches this length: let the engine reject the shape.
+            if max_rows <= 0 or rows <= max_rows:
+                return self._run_trt_estimator(x, mask, mu, t, spks, cond, attn_mask)
+            # Batched flow (``COSYVOICE3_BATCH_FLOW``) hands the engine 2B rows,
+            # more than an engine built for one CFG pair accepts. Every row
+            # attends only to itself, so run the rows in engine-sized slices:
+            # rows and max_rows are both even, so no slice falls below the
+            # profile's two-row minimum.
+            if not getattr(self, "_warned_trt_batch_slices", False):
+                self._warned_trt_batch_slices = True
+                logger.warning(
+                    "The TensorRT flow estimator accepts at most %d rows; running %d-row batched flow calls "
+                    "in slices, so batching gives no speedup on this engine.",
+                    max_rows,
+                    rows,
+                )
+            outputs = []
+            for start in range(0, rows, max_rows):
+                end = start + max_rows
+                outputs.append(
+                    self._run_trt_estimator(
+                        x[start:end],
+                        mask[start:end],
+                        mu[start:end],
+                        t[start:end],
+                        spks[start:end],
+                        cond[start:end],
+                        attn_mask[start:end] if attn_mask is not None else None,
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
+    def _run_trt_estimator(self, x, mask, mu, t, spks, cond, attn_mask):
+        # TensorRT estimator: bind raw device pointers. The flow runs in
+        # fp32 but the engine may have fp16 I/O (strongly-typed fp16 engine),
+        # so cast inputs/output to the engine's dtype at the boundary. Keep
+        # references to the cast buffers alive until execute completes (a bare
+        # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
+        io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
+        [estimator, stream], trt_engine = self.estimator.acquire_estimator()
+        try:
             caller_stream = torch.cuda.current_stream(x.device)
             stream.wait_stream(caller_stream)
             with torch.cuda.stream(stream):
@@ -203,7 +239,11 @@ class ConditionalCFM(BASECFM):
                 if declared:
                     inputs = {name: tensor for name, tensor in inputs.items() if name in declared}
                 for name, tensor in inputs.items():
-                    estimator.set_input_shape(name, tuple(tensor.shape))
+                    if not estimator.set_input_shape(name, tuple(tensor.shape)):
+                        raise RuntimeError(
+                            f"TensorRT flow estimator rejected input '{name}' with shape {tuple(tensor.shape)}; "
+                            "it is outside the engine's optimization profile"
+                        )
                     estimator.set_tensor_address(name, tensor.data_ptr())
                 estimator.set_tensor_address("estimator_out", out_e.data_ptr())
                 # run trt engine
@@ -214,8 +254,9 @@ class ConditionalCFM(BASECFM):
             caller_stream.wait_stream(stream)
             if out_e.is_cuda:
                 out_e.record_stream(caller_stream)
+        finally:
             self.estimator.release_estimator(estimator, stream)
-            return out_e.to(x.dtype)
+        return out_e.to(x.dtype)
 
     def _trt_attention_mask(self, mask: torch.Tensor, streaming: bool) -> torch.Tensor | None:
         """The query-key map for a chunk-mask TensorRT engine, or None.

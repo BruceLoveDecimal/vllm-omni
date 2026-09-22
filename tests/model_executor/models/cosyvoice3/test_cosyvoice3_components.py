@@ -511,7 +511,7 @@ class TestCFM:
                 self.execute_stream = None
 
             def set_input_shape(self, name, shape):
-                pass
+                return True
 
             def set_tensor_address(self, name, address):
                 pass
@@ -538,6 +538,9 @@ class TestCFM:
 
             def release_estimator(self, released_context, released_stream):
                 self.released.append((released_context, released_stream))
+
+            def max_batch_for(self, frames):
+                return 2
 
         estimator_pool = FakeEstimatorPool()
         cfm = ConditionalCFM(

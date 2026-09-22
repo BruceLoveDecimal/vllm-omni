@@ -120,6 +120,7 @@ class _FakeTrtContext:
 
     def set_input_shape(self, name, shape):
         self.shapes[name] = tuple(shape)
+        return True
 
     def set_tensor_address(self, name, address):
         self.addresses[name] = address
@@ -141,6 +142,9 @@ class _FakeTrtEstimator:
         self.supports_attn_mask = supports_attn_mask
         self.static_chunk_size = BLOCK
         self.context = _FakeTrtContext()
+
+    def max_batch_for(self, frames):
+        return 2
 
     def acquire_estimator(self):
         return [self.context, _FakeStream()], object()
