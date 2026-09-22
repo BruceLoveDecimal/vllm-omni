@@ -16,6 +16,7 @@ from typing import Any, TypedDict, cast
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from vllm.logger import init_logger
 
@@ -55,6 +56,12 @@ def _build_dit_estimator(estimator_config: Mapping[str, Any]) -> DiT:
     diffusion_config = OmniDiffusionConfig()
     with set_current_diffusion_config(diffusion_config):
         return DiT(**estimator_config)
+
+
+def _right_pad_cat(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Concatenate ``[1, T_i, ...]`` tensors along dim 0, zero-padding dim 1 to the longest."""
+    width = max(int(tensor.shape[1]) for tensor in tensors)
+    return torch.cat([F.pad(tensor, (0, 0) * (tensor.dim() - 2) + (0, width - tensor.shape[1])) for tensor in tensors])
 
 
 class StreamingFlowItem(TypedDict, total=False):
@@ -207,12 +214,15 @@ class CosyVoice3Code2Wav(nn.Module):
         prompt_token_lens: torch.Tensor | None = None,
         prompt_feat_lens: torch.Tensor | None = None,
         noise_offset_tokens: int | torch.Tensor | None = None,
+        ragged_prompt_lens: list[tuple[int, int]] | None = None,
     ) -> torch.Tensor:
         """Generate mel features via the upstream flow-model inference path.
 
         ``noise_offset_tokens`` is the absolute emitted-token index of the
         first token in ``token`` (per row when batched); the flow turns it into
         a mel offset so its fixed initial noise lines up with the stream.
+        ``ragged_prompt_lens`` marks right-padded prompts of different lengths
+        (see ``CausalMaskedDiffWithDiT.inference``).
         """
         flow_weight = next(self.flow_model.parameters())
         device = flow_weight.device
@@ -251,6 +261,7 @@ class CosyVoice3Code2Wav(nn.Module):
             finalize=finalize,
             n_timesteps=n_timesteps,
             noise_offset=self._noise_offset_mel(noise_offset_tokens),
+            ragged_prompt_lens=ragged_prompt_lens,
         )
 
         trim_mel = max(0, int(token_offset_tokens)) * int(self.token_mel_ratio)
@@ -377,20 +388,20 @@ class CosyVoice3Code2Wav(nn.Module):
     ) -> list[tuple[torch.Tensor, dict[str, torch.Tensor] | None]]:
         """Batch the flow-matching mel path, then run HiFT per request.
 
-        Items are grouped by prompt condition shape and finalization state.
-        Codec tokens may have different lengths; those are padded within the
-        group and passed to the flow as per-row token lengths.
+        Items are grouped by speaker-embedding width and finalization state
+        (the last chunk runs bidirectional attention without the lookahead
+        split). Prompts and codec tokens may have different lengths: each row
+        is laid out as its own prompt followed by its own tokens and
+        right-padded, and the flow gets the per-row lengths.
         """
         results: list[tuple[torch.Tensor, dict[str, torch.Tensor] | None] | None] = [None] * len(items)
-        groups: dict[tuple[int, int, int, bool], list[tuple[int, StreamingFlowItem]]] = {}
+        groups: dict[tuple[int, bool], list[tuple[int, StreamingFlowItem]]] = {}
         for index, item in enumerate(items):
             assert isinstance(item["token"], torch.Tensor)
             assert isinstance(item["prompt_token"], torch.Tensor)
             assert isinstance(item["prompt_feat"], torch.Tensor)
             assert isinstance(item["embedding"], torch.Tensor)
             key = (
-                int(item["prompt_token"].shape[1]),
-                int(item["prompt_feat"].shape[1]),
                 int(item["embedding"].shape[1]),
                 bool(item.get("finalize", False)),
             )
@@ -425,29 +436,16 @@ class CosyVoice3Code2Wav(nn.Module):
                 results[index] = result
                 continue
 
-            token_tensors = [item["token"] for _, item in group]
-            token_lens = torch.tensor(
-                [int(token.shape[1]) for token in token_tensors],
-                dtype=torch.int32,
-            )
-            max_token_len = int(token_lens.max().item())
-            padded_tokens = []
-            for token in token_tensors:
-                if int(token.shape[1]) == max_token_len:
-                    padded_tokens.append(token)
-                else:
-                    pad = torch.zeros(
-                        (token.shape[0], max_token_len - int(token.shape[1])),
-                        device=token.device,
-                        dtype=token.dtype,
-                    )
-                    padded_tokens.append(torch.cat([token, pad], dim=1))
-            tokens = torch.cat(padded_tokens, dim=0)
-            prompt_tokens = torch.cat([item["prompt_token"] for _, item in group], dim=0)
-            prompt_feats = torch.cat([item["prompt_feat"] for _, item in group], dim=0)
+            token_lens = torch.tensor([int(item["token"].shape[1]) for _, item in group], dtype=torch.int32)
+            tokens = _right_pad_cat([item["token"] for _, item in group])
+            ragged_prompt_lens = [
+                (int(item["prompt_token"].shape[1]), int(item["prompt_feat"].shape[1])) for _, item in group
+            ]
+            prompt_tokens = _right_pad_cat([item["prompt_token"] for _, item in group])
+            prompt_feats = _right_pad_cat([item["prompt_feat"] for _, item in group])
             embeddings = torch.cat([item["embedding"] for _, item in group], dim=0)
-            prompt_token_lens = torch.full((len(group),), prompt_tokens.shape[1], dtype=torch.int32)
-            prompt_feat_lens = torch.full((len(group),), prompt_feats.shape[1], dtype=torch.int32)
+            prompt_token_lens = torch.tensor([token_len for token_len, _ in ragged_prompt_lens], dtype=torch.int32)
+            prompt_feat_lens = torch.tensor([feat_len for _, feat_len in ragged_prompt_lens], dtype=torch.int32)
             finalize = bool(group[0][1].get("finalize", False))
             noise_offsets = torch.tensor(
                 [
@@ -474,6 +472,7 @@ class CosyVoice3Code2Wav(nn.Module):
                     prompt_token_lens=prompt_token_lens,
                     prompt_feat_lens=prompt_feat_lens,
                     noise_offset_tokens=noise_offsets,
+                    ragged_prompt_lens=ragged_prompt_lens,
                 )
 
             for row, (index, item) in enumerate(group):

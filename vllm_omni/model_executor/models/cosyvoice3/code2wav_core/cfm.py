@@ -320,7 +320,8 @@ class CausalConditionalCFM(ConditionalCFM):
         one per batch row) is the absolute mel index of the first post-prompt
         frame in the stream. A bounded left context therefore reuses exactly
         the noise its frames were first generated with. Positions past the
-        buffer wrap around.
+        buffer wrap around. ``prompt_len`` is one int, or a tensor with one
+        length per row when the rows carry prompts of different lengths.
         """
         batch, channels, length = mu.shape
         if self.rand_noise.device != mu.device:
@@ -334,7 +335,10 @@ class CausalConditionalCFM(ConditionalCFM):
             noise_offset = torch.as_tensor(noise_offset, dtype=torch.long, device=mu.device).reshape(-1)
             if noise_offset.numel() == 1:
                 noise_offset = noise_offset.expand(batch)
-        prompt_len = max(0, min(int(prompt_len), length))
+        if isinstance(prompt_len, torch.Tensor):
+            prompt_len = prompt_len.to(device=mu.device, dtype=torch.long).clamp(0, length).unsqueeze(1)
+        else:
+            prompt_len = max(0, min(int(prompt_len), length))
         positions = torch.arange(length, device=mu.device).unsqueeze(0).expand(batch, length)
         shifted = positions + noise_offset.clamp(min=0).unsqueeze(1)
         index = torch.where(positions < prompt_len, positions, shifted) % noise.shape[1]
@@ -383,6 +387,18 @@ class CausalConditionalCFM(ConditionalCFM):
 
         with cosyvoice3_batch_flow_profile(f"cosyvoice3_cfm_euler_{max(1, int(n_timesteps))}_steps"):
             return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, streaming=streaming), None
+
+
+def _join_rows(
+    prefix: torch.Tensor, suffix: torch.Tensor, prefix_lens: list[int], suffix_lens: list[int]
+) -> torch.Tensor:
+    """Per row, ``prefix[:p]`` then ``suffix[:s]`` along dim 1, right-padded with zeros."""
+    width = max(p + n for p, n in zip(prefix_lens, suffix_lens))
+    joined = suffix.new_zeros((suffix.shape[0], width, *suffix.shape[2:]))
+    for row, (p, n) in enumerate(zip(prefix_lens, suffix_lens)):
+        joined[row, :p] = prefix[row, :p]
+        joined[row, p : p + n] = suffix[row, :n]
+    return joined
 
 
 class CausalMaskedDiffWithDiT(torch.nn.Module):
@@ -455,18 +471,31 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         finalize: bool = False,
         n_timesteps: int = 10,
         noise_offset=None,
+        ragged_prompt_lens: list[tuple[int, int]] | None = None,
     ):
         """``noise_offset``: absolute mel index (int, or one per row) of the first
         frame after the prompt, so a bounded left context keeps the noise it
-        was first generated with. Defaults to 0, the unbounded stream start."""
+        was first generated with. Defaults to 0, the unbounded stream start.
+
+        ``ragged_prompt_lens``: set when the rows carry prompts of different
+        lengths, right-padded in ``prompt_token``/``prompt_feat``; one
+        ``(token len, feat len)`` per row. Each row is then laid out as its own
+        prompt followed by its own tokens, since positions (RoPE, the chunk
+        mask's block grid, the fixed noise) count from the row's first frame,
+        and the returned mel of every row starts at its first frame after the
+        prompt."""
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_speaker_embedding"):
             embedding = F.normalize(embedding, dim=1)
             embedding = self.spk_embed_affine_layer(embedding)
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_token_embedding_lookahead"):
             # concat text and prompt_text
-            codec_token_len = token_len
-            token, total_token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + codec_token_len
+            total_token_len = prompt_token_len + token_len
+            if ragged_prompt_lens is None:
+                token = torch.concat([prompt_token, token], dim=1)
+            else:
+                prompt_token_lens = [prompt_len for prompt_len, _ in ragged_prompt_lens]
+                token = _join_rows(prompt_token, token, prompt_token_lens, token_len.tolist())
             mask = (~make_pad_mask(total_token_len, max_len=token.shape[1])).unsqueeze(-1).to(embedding)
             token = self.input_embedding(torch.clamp(token, min=0)) * mask
             # text encode
@@ -481,18 +510,24 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             h = h.repeat_interleave(self.token_mel_ratio, dim=1)
 
         batch_size = int(token.shape[0])
+        mel_len = int(h.shape[1])
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cond_prompt_mel"):
-            mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
-
             # get conditions
-            conds = torch.zeros([batch_size, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
-            conds[:, :mel_len1] = prompt_feat
+            conds = torch.zeros([batch_size, mel_len, self.output_size], device=token.device).to(h.dtype)
+            if ragged_prompt_lens is None:
+                prompt_mel_len = prompt_feat.shape[1]
+                conds[:, :prompt_mel_len] = prompt_feat
+            else:
+                prompt_mel_lens = [feat_len for _, feat_len in ragged_prompt_lens]
+                for row, feat_len in enumerate(prompt_mel_lens):
+                    conds[row, :feat_len] = prompt_feat[row, :feat_len]
+                prompt_mel_len = torch.tensor(prompt_mel_lens, dtype=torch.long)
             conds = conds.transpose(1, 2)
 
             lookahead = 0 if finalize else int(self.pre_lookahead_len)
             valid_h_lens = torch.clamp(total_token_len.to(torch.long) - lookahead, min=0)
-            mel_lens = torch.clamp(valid_h_lens * int(self.token_mel_ratio), max=mel_len1 + mel_len2)
-            mask = (~make_pad_mask(mel_lens, max_len=mel_len1 + mel_len2)).to(h)
+            mel_lens = torch.clamp(valid_h_lens * int(self.token_mel_ratio), max=mel_len)
+            mask = (~make_pad_mask(mel_lens, max_len=mel_len)).to(h)
 
         feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
@@ -501,11 +536,17 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             cond=conds,
             n_timesteps=max(1, int(n_timesteps)),
             streaming=streaming,
-            prompt_len=int(mel_len1),
+            prompt_len=prompt_mel_len,
             noise_offset=noise_offset,
         )
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_crop_prompt_mel"):
-            feat = feat[:, :, mel_len1:]
-            assert feat.shape[2] == mel_len2
+            if ragged_prompt_lens is None:
+                feat = feat[:, :, prompt_mel_len:]
+            else:
+                # Shift every row so its mel starts right after its prompt.
+                cropped = feat.new_zeros(batch_size, feat.shape[1], mel_len - min(prompt_mel_lens))
+                for row, feat_len in enumerate(prompt_mel_lens):
+                    cropped[row, :, : mel_len - feat_len] = feat[row, :, feat_len:]
+                feat = cropped
         return feat.float(), None
