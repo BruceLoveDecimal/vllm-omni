@@ -211,11 +211,17 @@ class ConditionalCFM(BASECFM):
                 if declared:
                     inputs = {name: tensor for name, tensor in inputs.items() if name in declared}
                 for name, tensor in inputs.items():
-                    estimator.set_input_shape(name, tuple(tensor.shape))
+                    if not estimator.set_input_shape(name, tuple(tensor.shape)):
+                        raise RuntimeError(
+                            f"TensorRT flow estimator rejected shape {tuple(tensor.shape)} for input "
+                            f"'{name}' (outside the engine's optimization profile)"
+                        )
                     estimator.set_tensor_address(name, tensor.data_ptr())
                 estimator.set_tensor_address("estimator_out", out_e.data_ptr())
-                # run trt engine
-                assert estimator.execute_async_v3(stream.cuda_stream) is True
+                # ``assert`` would vanish under ``python -O`` and leave a
+                # zero-filled output; check explicitly.
+                if not estimator.execute_async_v3(stream.cuda_stream):
+                    raise RuntimeError("TensorRT flow estimator failed to enqueue (execute_async_v3 returned False)")
                 for tensor in (*inputs.values(), out_e):
                     if tensor.is_cuda:
                         tensor.record_stream(stream)
