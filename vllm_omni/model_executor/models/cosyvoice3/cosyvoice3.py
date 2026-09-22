@@ -536,6 +536,8 @@ class CosyVoice3Model(
 
             self.code2wav = CosyVoice3Code2Wav(self.config)
             self.model = self.code2wav.flow_model
+            # Bounds how many requests one batched flow call can carry.
+            self._code2wav_max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
             self.hift = self.code2wav.hift
             # Keep additional information synchronized for async_chunk updates.
             self.enable_update_additional_information = True
@@ -1013,8 +1015,14 @@ class CosyVoice3Model(
                     build_chunk_mask_flow_estimator_trt,
                 )
 
+                # Batched flow runs up to max_num_seqs requests in one call, a
+                # CFG pair each; otherwise the engine only needs one pair.
+                max_batch = 2 * self._code2wav_max_num_seqs if cosyvoice3_batch_flow_enabled() else 2
                 wrapper = build_chunk_mask_flow_estimator_trt(
-                    self.code2wav.flow_model.decoder.estimator, self._flow_estimator_onnx_dir(), device="cuda"
+                    self.code2wav.flow_model.decoder.estimator,
+                    self._flow_estimator_onnx_dir(),
+                    device="cuda",
+                    max_batch=max_batch,
                 )
             except Exception as exc:
                 logger.warning(

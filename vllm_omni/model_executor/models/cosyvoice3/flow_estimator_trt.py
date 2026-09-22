@@ -18,9 +18,16 @@ Shapes mirror the CosyVoice runtime.
 The bundled ONNX was traced with full attention, so upstream's streaming
 chunk-causal mask (``DiT.forward(streaming=True)``) never reaches such an
 engine. ``build_chunk_mask_flow_estimator_trt`` exports the repo's own DiT with
-a seventh input, ``attn_mask`` (``(2, 1, T, T)`` bool), so the host builds the
+a seventh input, ``attn_mask`` (``(B, 1, T, T)`` bool), so the host builds the
 same mask upstream would and the engine honours it; ``supports_attn_mask`` on
 the wrapper tells the caller which kind of engine it holds.
+
+Batch: the solver doubles every request into a CFG pair, so one request is a
+batch of 2, which is all the bundled ONNX takes. The exported ONNX has a
+dynamic batch dim, and with cross-request flow batching on its engine gets a
+second profile for up to ``max_batch`` rows at a shorter maximum length (see
+``_batched_profile_max_frames``); the wrapper keeps one context per profile
+and picks the profile that fits each call.
 
 Precision: TensorRT >= 11 dropped the weakly-typed FP16/INT8 builder flags, so
 fp16 only comes from a STRONGLY_TYPED network built from an fp16 ONNX
@@ -32,6 +39,7 @@ read-only, so neither is set here.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import queue
 import uuid
@@ -47,15 +55,16 @@ from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import (
 
 logger = init_logger(__name__)
 
-# Optimization-profile shapes for the dynamic-length inputs (CFG batch dim = 2,
-# 80 mel channels, time dim min/opt/max). Matches CosyVoice's token2wav.
-_DYNAMIC_INPUTS = ("x", "mask", "mu", "cond")
-_MIN_SHAPES = ((2, 80, 4), (2, 1, 4), (2, 80, 4), (2, 80, 4))
-_OPT_SHAPES = ((2, 80, 500), (2, 1, 500), (2, 80, 500), (2, 80, 500))
-_MAX_SHAPES = ((2, 80, 3000), (2, 1, 3000), (2, 80, 3000), (2, 80, 3000))
+# Optimization-profile shapes for the time-dim inputs (channels, then the time
+# dim's min/opt/max). One CFG pair (batch 2) up to 3000 frames matches
+# CosyVoice's token2wav and is the whole profile of the bundled ONNX.
+_TIME_INPUT_CHANNELS = (("x", 80), ("mask", 1), ("mu", 80), ("cond", 80))
+_PAIR_ROWS = 2
+_MIN_FRAMES, _OPT_FRAMES, _MAX_FRAMES = 4, 500, 3000
 # The chunk-mask engine adds the query-key map, dynamic on both time dims.
 ATTN_MASK_INPUT = "attn_mask"
-_MASK_MIN_SHAPE, _MASK_OPT_SHAPE, _MASK_MAX_SHAPE = (2, 1, 4, 4), (2, 1, 500, 500), (2, 1, 3000, 3000)
+# The batched profile's length is a whole number of the DiT's 50-frame blocks.
+_BATCHED_FRAMES_MULTIPLE = 50
 
 
 def _is_fp16_onnx(onnx_path: str) -> bool:
@@ -85,7 +94,31 @@ def _write_plan_atomically(engine_bytes, plan_path: str) -> None:
         raise
 
 
-def _convert_onnx_to_trt(onnx_path: str, plan_path: str, strongly_typed: bool, with_attn_mask: bool = False) -> None:
+def _batched_profile_max_frames(max_batch: int) -> int:
+    """The longest input of the batched profile.
+
+    An execution context's activation memory is sized by the largest
+    attention map any profile allows, ``rows * T * T``. Capping the batched
+    profile at the single-pair profile's ``2 * 3000 * 3000`` keeps that where
+    it was (1050 frames at 16 rows); the batched profile's own context is the
+    one extra allocation. The streaming chunks batching is for are the prompt
+    plus about 150 frames, and a longer call falls back to single-pair slices.
+    """
+    frames = int(_MAX_FRAMES * math.sqrt(_PAIR_ROWS / max_batch))
+    return frames - frames % _BATCHED_FRAMES_MULTIPLE
+
+
+def _profile_ranges(max_batch: int) -> list[tuple[int, int, int]]:
+    """``(min batch, max batch, max frames)`` per profile, single pair first."""
+    ranges = [(_PAIR_ROWS, _PAIR_ROWS, _MAX_FRAMES)]
+    if max_batch > _PAIR_ROWS:
+        ranges.append((2 * _PAIR_ROWS, max_batch, _batched_profile_max_frames(max_batch)))
+    return ranges
+
+
+def _convert_onnx_to_trt(
+    onnx_path: str, plan_path: str, strongly_typed: bool, with_attn_mask: bool = False, max_batch: int = _PAIR_ROWS
+) -> None:
     import tensorrt as trt
 
     logger.info(
@@ -121,12 +154,28 @@ def _convert_onnx_to_trt(onnx_path: str, plan_path: str, strongly_typed: bool, w
                 config.set_flag(_flag)
                 break
 
-    profile = builder.create_optimization_profile()
-    for name, mn, op, mx in zip(_DYNAMIC_INPUTS, _MIN_SHAPES, _OPT_SHAPES, _MAX_SHAPES):
-        profile.set_shape(name, mn, op, mx)
-    if with_attn_mask:
-        profile.set_shape(ATTN_MASK_INPUT, _MASK_MIN_SHAPE, _MASK_OPT_SHAPE, _MASK_MAX_SHAPE)
-    config.add_optimization_profile(profile)
+    # Only the exported chunk-mask ONNX has a dynamic batch (``t`` and
+    # ``spks`` included); the bundled one keeps the single-pair profile.
+    for min_batch, profile_max_batch, max_frames in _profile_ranges(max_batch if with_attn_mask else _PAIR_ROWS):
+        opt_frames = min(_OPT_FRAMES, max_frames)
+        profile = builder.create_optimization_profile()
+        for name, channels in _TIME_INPUT_CHANNELS:
+            profile.set_shape(
+                name,
+                (min_batch, channels, _MIN_FRAMES),
+                (profile_max_batch, channels, opt_frames),
+                (profile_max_batch, channels, max_frames),
+            )
+        if with_attn_mask:
+            profile.set_shape(
+                ATTN_MASK_INPUT,
+                (min_batch, 1, _MIN_FRAMES, _MIN_FRAMES),
+                (profile_max_batch, 1, opt_frames, opt_frames),
+                (profile_max_batch, 1, max_frames, max_frames),
+            )
+            profile.set_shape("t", (min_batch,), (profile_max_batch,), (profile_max_batch,))
+            profile.set_shape("spks", (min_batch, 80), (profile_max_batch, 80), (profile_max_batch, 80))
+        config.add_optimization_profile(profile)
 
     engine_bytes = builder.build_serialized_network(network, config)
     if engine_bytes is None:
@@ -157,29 +206,47 @@ class TrtContextWrapper:
         # The output buffer must match the engine's output dtype, which an
         # autocast-traced graph can leave different from its inputs.
         self.out_dtype = _engine_tensor_dtype(engine, "estimator_out", io_dtype)
-        # ``(max batch, max frames)`` per optimization profile; the caller
-        # slices a batch wider than any profile takes (see ``max_batch_for``).
+        # ``(min batch, max batch, max frames)`` per optimization profile; the
+        # caller slices a batch wider than any profile takes (see
+        # ``max_batch_for``) and each call runs on a context of the profile
+        # that fits it.
         self.profile_limits = _engine_profile_limits(engine)
         # Filled in by the model when it swaps the estimator, so the host can
         # build the mask with the DiT's block size.
         self.static_chunk_size = 0
-        self._pool: queue.Queue = queue.Queue(maxsize=trt_concurrent)
-        for _ in range(trt_concurrent):
-            ctx = engine.create_execution_context()
-            assert ctx is not None, "failed to create TRT execution context (out of memory?)"
-            stream = torch.cuda.Stream(torch.device(device))
-            self._pool.put([ctx, stream])
+        self._pools: list[queue.Queue] = []
+        self._pool_of_context: dict[int, queue.Queue] = {}
+        for index in range(len(self.profile_limits)):
+            pool: queue.Queue = queue.Queue(maxsize=trt_concurrent)
+            for _ in range(trt_concurrent):
+                ctx = engine.create_execution_context()
+                assert ctx is not None, "failed to create TRT execution context (out of memory?)"
+                stream = torch.cuda.Stream(torch.device(device))
+                if index > 0:
+                    # A new context starts on profile 0.
+                    ctx.set_optimization_profile_async(index, stream.cuda_stream)
+                    stream.synchronize()
+                pool.put([ctx, stream])
+                self._pool_of_context[id(ctx)] = pool
+            self._pools.append(pool)
 
     def max_batch_for(self, frames: int) -> int:
         """The widest estimator batch (2 rows per request, for CFG) the engine
         runs at ``frames`` mel frames, or 0 if no profile reaches that length."""
-        return max((batch for batch, max_frames in self.profile_limits if frames <= max_frames), default=0)
+        return max((max_batch for _, max_batch, max_frames in self.profile_limits if frames <= max_frames), default=0)
 
-    def acquire_estimator(self):
-        return self._pool.get(), self.trt_engine
+    def _profile_for(self, batch: int, frames: int) -> int:
+        for index, (min_batch, max_batch, max_frames) in enumerate(self.profile_limits):
+            if min_batch <= batch <= max_batch and frames <= max_frames:
+                return index
+        # Nothing fits: profile 0's context rejects the shape with a clear error.
+        return 0
+
+    def acquire_estimator(self, batch: int = _PAIR_ROWS, frames: int = _MIN_FRAMES):
+        return self._pools[self._profile_for(batch, frames)].get(), self.trt_engine
 
     def release_estimator(self, context, stream):
-        self._pool.put([context, stream])
+        self._pool_of_context[id(context)].put([context, stream])
 
 
 def _engine_input_names(engine) -> frozenset[str]:
@@ -211,15 +278,15 @@ def _engine_tensor_dtype(engine, name: str, fallback: torch.dtype) -> torch.dtyp
         return fallback
 
 
-def _engine_profile_limits(engine) -> list[tuple[int, int]]:
-    """``(max batch, max frames)`` of ``x`` in each optimization profile."""
+def _engine_profile_limits(engine) -> list[tuple[int, int, int]]:
+    """``(min batch, max batch, max frames)`` of ``x`` in each optimization profile."""
     limits = []
     try:
         for index in range(engine.num_optimization_profiles):
-            _min_shape, _opt_shape, max_shape = engine.get_tensor_profile_shape("x", index)
-            limits.append((int(max_shape[0]), int(max_shape[2])))
+            min_shape, _opt_shape, max_shape = engine.get_tensor_profile_shape("x", index)
+            limits.append((int(min_shape[0]), int(max_shape[0]), int(max_shape[2])))
     except Exception:
-        return [(_MAX_SHAPES[0][0], _MAX_SHAPES[0][2])]
+        return [(_PAIR_ROWS, _PAIR_ROWS, _MAX_FRAMES)]
     return limits
 
 
@@ -297,21 +364,27 @@ def export_chunk_mask_estimator_onnx(estimator: torch.nn.Module, onnx_path: str,
     was_training = estimator.training
     estimator.eval()
     wrapper = _EstimatorWithMaskInput(estimator).to(device).eval()
+    # Traced at four rows, not the two every single-request call uses, so a
+    # shape the trace freezes at the example batch breaks those calls instead
+    # of going unnoticed (``test_export_runs_at_other_batch_sizes``).
+    batch = 2 * _PAIR_ROWS
     frames = 64
-    x = torch.randn(2, 80, frames, device=device)
-    mask = torch.ones(2, 1, frames, device=device)
-    mu = torch.randn(2, 80, frames, device=device)
-    t = torch.rand(2, device=device)
-    spks = torch.randn(2, 80, device=device)
-    cond = torch.randn(2, 80, frames, device=device)
-    attn_mask = torch.ones(2, 1, frames, frames, dtype=torch.bool, device=device)
+    x = torch.randn(batch, 80, frames, device=device)
+    mask = torch.ones(batch, 1, frames, device=device)
+    mu = torch.randn(batch, 80, frames, device=device)
+    t = torch.rand(batch, device=device)
+    spks = torch.randn(batch, 80, device=device)
+    cond = torch.randn(batch, 80, frames, device=device)
+    attn_mask = torch.ones(batch, 1, frames, frames, dtype=torch.bool, device=device)
     dynamic_axes = {
-        "x": {2: "seq_len"},
-        "mask": {2: "seq_len"},
-        "mu": {2: "seq_len"},
-        "cond": {2: "seq_len"},
-        ATTN_MASK_INPUT: {2: "seq_len", 3: "seq_len"},
-        "estimator_out": {2: "seq_len"},
+        "x": {0: "batch", 2: "seq_len"},
+        "mask": {0: "batch", 2: "seq_len"},
+        "mu": {0: "batch", 2: "seq_len"},
+        "t": {0: "batch"},
+        "spks": {0: "batch"},
+        "cond": {0: "batch", 2: "seq_len"},
+        ATTN_MASK_INPUT: {0: "batch", 2: "seq_len", 3: "seq_len"},
+        "estimator_out": {0: "batch", 2: "seq_len"},
     }
     tmp = f"{onnx_path}.tmp.{os.getpid()}"
     logger.info("Exporting chunk-mask flow estimator ONNX to %s (fp16=%s) ...", onnx_path, fp16)
@@ -342,24 +415,26 @@ def build_chunk_mask_flow_estimator_trt(
     device: str | torch.device,
     *,
     fp16: bool = True,
+    max_batch: int = _PAIR_ROWS,
 ) -> TrtContextWrapper:
     """Build/load a flow-estimator engine that takes the chunk-causal mask.
 
     The ONNX is exported from ``estimator`` (the loaded torch DiT) into
     ``onnx_dir`` on first use and cached there; the plan is cached like the
-    legacy engine's. ``estimator.static_chunk_size`` is copied onto the
+    legacy engine's, per ``max_batch``. ``max_batch`` above one CFG pair adds
+    the batched profile. ``estimator.static_chunk_size`` is copied onto the
     wrapper so ``forward_estimator`` can build the same mask upstream would.
     """
     import tensorrt as trt
 
     tag = "autocast_fp16" if fp16 else "fp32"
-    onnx_path = os.path.join(onnx_dir, f"flow.decoder.estimator.chunk_mask.{tag}.onnx")
+    onnx_path = os.path.join(onnx_dir, f"flow.decoder.estimator.chunk_mask.dynamic_batch.{tag}.onnx")
     if not os.path.exists(onnx_path) or os.path.getsize(onnx_path) == 0:
         os.makedirs(onnx_dir, exist_ok=True)
         export_chunk_mask_estimator_onnx(estimator, onnx_path, fp16=fp16)
-    plan_path = _resolve_plan_path(onnx_path, prefix="flow_estimator_chunk_mask")
+    plan_path = _resolve_plan_path(onnx_path, prefix=f"flow_estimator_chunk_mask_b{max_batch}")
     if not os.path.exists(plan_path) or os.path.getsize(plan_path) == 0:
-        _convert_onnx_to_trt(onnx_path, plan_path, strongly_typed=fp16, with_attn_mask=True)
+        _convert_onnx_to_trt(onnx_path, plan_path, strongly_typed=fp16, with_attn_mask=True, max_batch=max_batch)
 
     runtime = trt.Runtime(_trt_logger())
     with open(plan_path, "rb") as f:

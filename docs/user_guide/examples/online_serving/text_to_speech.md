@@ -128,6 +128,8 @@ export COSYVOICE3_BATCH_FLOW=1
 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
 ```
 
+With the TensorRT flow estimator (the default), enabling batching builds the chunk-mask engine with a second optimization profile for up to `2 * max_num_seqs` rows (one CFG pair per request) at a shorter maximum length, sized so each execution context's activation memory stays where it was (the batched profile adds one more context). The engine plan is cached per batch size, and a call longer than that profile allows runs one request per engine call.
+
 Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
 ### CLI client

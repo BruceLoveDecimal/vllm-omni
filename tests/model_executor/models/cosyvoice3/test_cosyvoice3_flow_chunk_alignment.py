@@ -146,7 +146,7 @@ class _FakeTrtEstimator:
     def max_batch_for(self, frames):
         return 2
 
-    def acquire_estimator(self):
+    def acquire_estimator(self, batch, frames):
         return [self.context, _FakeStream()], object()
 
     def release_estimator(self, context, stream):
@@ -240,4 +240,34 @@ def test_export_has_attn_mask_input(tmp_path):
     assert names == ["x", "mask", "mu", "t", "spks", "cond", ATTN_MASK_INPUT]
     mask_input = model.graph.input[-1]
     dims = [d.dim_param or d.dim_value for d in mask_input.type.tensor_type.shape.dim]
-    assert dims[:2] == [2, 1] and dims[2] == dims[3] == "seq_len"
+    assert dims == ["batch", 1, "seq_len", "seq_len"]
+    for graph_input in model.graph.input:
+        assert graph_input.type.tensor_type.shape.dim[0].dim_param == "batch", graph_input.name
+
+
+@pytest.mark.parametrize("rows", [2, 6])
+def test_export_runs_at_other_batch_sizes(tmp_path, rows):
+    """Traced at four rows, the graph must not have frozen that batch size."""
+    ort = pytest.importorskip("onnxruntime")
+
+    from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import export_chunk_mask_estimator_onnx
+
+    dit = _tiny_dit()
+    path = export_chunk_mask_estimator_onnx(dit, str(tmp_path / "est.onnx"), fp16=False)
+    frames = 2 * BLOCK + 7
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn(rows, 80, frames, generator=g)
+    mask = torch.ones(rows, 1, frames)
+    mask[-1, :, -20:] = 0  # one ragged row
+    mu = torch.randn(rows, 80, frames, generator=g)
+    t = torch.rand(rows, generator=g)
+    spks = torch.randn(rows, 80, generator=g)
+    cond = torch.randn(rows, 80, frames, generator=g)
+    attn_mask = build_dit_attention_mask(mask.bool(), streaming=True, static_chunk_size=BLOCK)
+    with torch.inference_mode():
+        expected = dit(x, mask, mu, t, spks, cond, attn_mask=attn_mask) * mask
+
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    feeds = {"x": x, "mask": mask, "mu": mu, "t": t, "spks": spks, "cond": cond, "attn_mask": attn_mask}
+    (got,) = session.run(None, {name: tensor.numpy() for name, tensor in feeds.items()})
+    torch.testing.assert_close(torch.from_numpy(got), expected, rtol=0, atol=1e-4)

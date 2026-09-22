@@ -533,7 +533,7 @@ class TestCFM:
             def __init__(self):
                 self.released = []
 
-            def acquire_estimator(self):
+            def acquire_estimator(self, batch, frames):
                 return [context, estimator_stream], FakeEngine()
 
             def release_estimator(self, released_context, released_stream):

@@ -211,7 +211,7 @@ class ConditionalCFM(BASECFM):
         # references to the cast buffers alive until execute completes (a bare
         # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
         io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
-        [estimator, stream], trt_engine = self.estimator.acquire_estimator()
+        [estimator, stream], trt_engine = self.estimator.acquire_estimator(int(x.size(0)), int(x.size(2)))
         try:
             caller_stream = torch.cuda.current_stream(x.device)
             stream.wait_stream(caller_stream)
