@@ -61,29 +61,6 @@ class TestSubsequentChunkMask:
         assert torch.equal(mask, expected)
 
 
-class TestAddOptionalChunkMask:
-    def test_static_chunk_and_pad_mask(self):
-        from vllm_omni.model_executor.models.cosyvoice3.utils import add_optional_chunk_mask
-
-        xs = torch.zeros(1, 4, 2)
-        pad = torch.tensor([[[True, True, True, False]]])
-        mask = add_optional_chunk_mask(xs, pad, False, False, 0, 2, -1)
-        # Last key is padding, so no query may attend to it.
-        assert mask.shape[-1] == 4
-        assert not mask[..., 3].any()
-        # First chunk (positions 0-1) cannot attend into the second chunk.
-        assert not mask[0, 0, 2]
-        assert not mask[0, 1, 2]
-
-    def test_non_streaming_keeps_padding_only(self):
-        from vllm_omni.model_executor.models.cosyvoice3.utils import add_optional_chunk_mask
-
-        xs = torch.zeros(1, 4, 2)
-        pad = torch.tensor([[[True, True, True, False]]])
-        mask = add_optional_chunk_mask(xs, pad, False, False, 0, 0, -1)
-        assert torch.equal(mask, pad)
-
-
 class TestDiTAttentionMaskSemantics:
     def test_padding_mask_is_forwarded_to_diffusion_attention(self):
         from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiTAttention

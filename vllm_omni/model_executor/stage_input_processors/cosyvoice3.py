@@ -94,23 +94,20 @@ def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
 
 
 # ``static_chunk_size`` (50 mel frames) / ``token_mel_ratio`` (2): the DiT's
-# streaming attention block, in speech tokens.
+# streaming attention block, in speech tokens. Mirrors the checkpoint config,
+# which this stage cannot see.
 _FLOW_CHUNK_TOKENS = 25
-_warned_unaligned: set[str] = set()
 
 
-def _warn_unaligned_chunk(name: str, value: int) -> None:
-    if name in _warned_unaligned:
-        return
-    _warned_unaligned.add(name)
-    logger.warning(
-        "CosyVoice3 %s=%d is not a multiple of the flow's %d-token attention block; "
-        "streaming chunks will recompute a partial block at each boundary. Use a multiple of %d.",
-        name,
-        value,
-        _FLOW_CHUNK_TOKENS,
-        _FLOW_CHUNK_TOKENS,
-    )
+def _warn_if_unaligned(name: str, value: int) -> None:
+    if value > 0 and value % _FLOW_CHUNK_TOKENS != 0:
+        logger.warning_once(
+            "CosyVoice3 %s=%d is not a multiple of the flow's %d-token attention block; "
+            "streaming chunks will recompute a partial block at each boundary.",
+            name,
+            value,
+            _FLOW_CHUNK_TOKENS,
+        )
 
 
 def talker2code2wav_async_chunk(
@@ -139,20 +136,11 @@ def talker2code2wav_async_chunk(
                 f"codec_max_chunk_frames={max_chunk_size}, "
                 f"codec_stream_scale_factor={stream_scale_factor}"
             )
-        # Upstream's flow attention is chunk-causal in blocks of
-        # ``static_chunk_size`` mel frames (50, i.e. 25 tokens) and its
-        # ``token_hop_len`` "must match training static_chunk_size": with the
-        # prompt padded up to a hop multiple, every hop boundary is a block
-        # boundary, so a block recomputed by the next chunk is bit-identical to
-        # the one already emitted. A hop that is not a multiple of the block
-        # leaves a partial block whose emitted half is recomputed with its
-        # other half present, and the seam between them is audible.
-        for name, value in (
-            ("codec_chunk_frames", chunk_size),
-            ("codec_max_chunk_frames", max_chunk_size),
-        ):
-            if value > 0 and value % _FLOW_CHUNK_TOKENS != 0:
-                _warn_unaligned_chunk(name, value)
+        # A hop that is not a whole number of flow attention blocks leaves an
+        # audible seam at every boundary; see the chunk-size note in
+        # vllm_omni/deploy/cosyvoice3.yaml.
+        _warn_if_unaligned("codec_chunk_frames", chunk_size)
+        _warn_if_unaligned("codec_max_chunk_frames", max_chunk_size)
 
         request_state = transfer_manager.request_payload.get(request_id)
         if not isinstance(request_state, dict) or "_cosyvoice3_async_state" not in request_state:
