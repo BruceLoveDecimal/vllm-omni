@@ -1491,7 +1491,9 @@ class CosyVoice3Model(
                     device="cuda",
                     cache_key=self._flow_estimator_cache_key(),
                 )
-            except Exception as exc:
+            # Missing onnx/tensorrt, cache I/O, an export or engine-build
+            # failure; anything else is a bug and should surface.
+            except (ImportError, OSError, RuntimeError, ValueError) as exc:
                 logger.warning(
                     "CosyVoice3 code2wav: chunk-mask TensorRT estimator unavailable (%s); "
                     "falling back to the bundled full-attention engine, which ignores streaming chunk masks",
@@ -1514,7 +1516,6 @@ class CosyVoice3Model(
             # after the requested TRT engine is ready, so a failed build leaves
             # the torch estimator in place.
             decoder = self.code2wav.flow_model.decoder
-            wrapper.static_chunk_size = int(getattr(decoder.estimator, "static_chunk_size", 0))
             del decoder.estimator
             decoder.estimator = wrapper
             logger.info(
