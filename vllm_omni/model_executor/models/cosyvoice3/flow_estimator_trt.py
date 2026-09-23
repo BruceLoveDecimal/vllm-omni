@@ -57,6 +57,9 @@ _MAX_SHAPES = ((2, 80, 3000), (2, 1, 3000), (2, 80, 3000), (2, 80, 3000))
 # The chunk-mask engine adds the query-key map, dynamic on both time dims.
 ATTN_MASK_INPUT = "attn_mask"
 _MASK_MIN_SHAPE, _MASK_OPT_SHAPE, _MASK_MAX_SHAPE = (2, 1, 4, 4), (2, 1, 500, 500), (2, 1, 3000, 3000)
+# Part of the exported ONNX's cache key. Bump it whenever the DiT's forward or
+# the export below changes, so engines traced from older code are not reused.
+_CHUNK_MASK_EXPORT_VERSION = 1
 
 
 def _is_fp16_onnx(onnx_path: str) -> bool:
@@ -321,12 +324,11 @@ def flow_checkpoint_fingerprint(model_dir: str, weight_file: str = "flow.pt") ->
     """A short digest identifying the flow checkpoint an ONNX was exported from.
 
     The exported ONNX bakes in the DiT weights, so its cache path must change
-    whenever the checkpoint does: the digest covers the resolved model
-    directory and the size/mtime of its flow weights. Two checkpoints that
-    live at different paths, or one that is re-trained in place, never share
-    an export.
+    whenever the checkpoint or the export code does: the digest covers
+    ``_CHUNK_MASK_EXPORT_VERSION``, the resolved model directory and the
+    size/mtime of its flow weights.
     """
-    parts = [os.path.realpath(model_dir)]
+    parts = [f"v{_CHUNK_MASK_EXPORT_VERSION}", os.path.realpath(model_dir)]
     weight_path = os.path.join(model_dir, weight_file)
     try:
         st = os.stat(weight_path)

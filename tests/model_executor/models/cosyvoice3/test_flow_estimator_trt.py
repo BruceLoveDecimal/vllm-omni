@@ -154,6 +154,11 @@ class TestExportCacheKey:
             str(d)
         )
 
+    def test_fingerprint_changes_with_export_version(self, tmp_path, monkeypatch):
+        before = flow_estimator_trt.flow_checkpoint_fingerprint(str(tmp_path))
+        monkeypatch.setattr(flow_estimator_trt, "_CHUNK_MASK_EXPORT_VERSION", 999)
+        assert flow_estimator_trt.flow_checkpoint_fingerprint(str(tmp_path)) != before
+
     def test_onnx_path_carries_the_key(self, tmp_path):
         keyed = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key="abc123")
         plain = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key=None)
