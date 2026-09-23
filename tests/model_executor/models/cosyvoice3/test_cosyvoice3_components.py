@@ -529,6 +529,9 @@ class TestCFM:
 
         class FakeEstimatorPool:
             io_dtype = torch.float32
+            out_dtype = torch.float32
+            supports_attn_mask = False
+            input_names = frozenset({"x", "mask", "mu", "t", "spks", "cond"})
 
             def __init__(self):
                 self.released = []

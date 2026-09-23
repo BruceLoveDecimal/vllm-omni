@@ -147,23 +147,29 @@ class TrtContextWrapper:
     """
 
     def __init__(
-        self, engine, device: str | torch.device, io_dtype: torch.dtype = torch.float32, trt_concurrent: int = 1
+        self,
+        engine,
+        device: str | torch.device,
+        io_dtype: torch.dtype = torch.float32,
+        trt_concurrent: int = 1,
+        *,
+        input_names: frozenset[str] = frozenset(),
+        out_dtype: torch.dtype | None = None,
+        static_chunk_size: int = 0,
     ):
         self.trt_engine = engine
         # Engine I/O dtype (fp16 for a strongly-typed fp16 engine). The flow runs
         # in fp32, so forward_estimator casts to/from this at the boundary.
         self.io_dtype = io_dtype
-        # Whether the engine takes the chunk-causal query-key map as an input
-        # (see ``build_chunk_mask_flow_estimator_trt``). A legacy engine runs
-        # full attention whatever the caller's ``streaming`` flag says.
-        self.supports_attn_mask = _engine_has_input(engine, ATTN_MASK_INPUT)
-        self.input_names = _engine_input_names(engine)
-        # The output buffer must match the engine's output dtype, which an
-        # autocast-traced graph can leave different from its inputs.
-        self.out_dtype = _engine_tensor_dtype(engine, "estimator_out", io_dtype)
-        # Filled in by the model when it swaps the estimator, so the host can
-        # build the mask with the DiT's block size.
-        self.static_chunk_size = 0
+        # The inputs the engine declares; an exporter prunes unread ones.
+        self.input_names = input_names
+        # A legacy engine has no ``attn_mask`` input and runs full attention
+        # whatever the caller's ``streaming`` flag says.
+        self.supports_attn_mask = ATTN_MASK_INPUT in input_names
+        # An autocast-traced graph can leave the output dtype unlike the inputs'.
+        self.out_dtype = out_dtype or io_dtype
+        # The DiT's block size, for building the mask on the host.
+        self.static_chunk_size = static_chunk_size
         self._pool: queue.Queue = queue.Queue(maxsize=trt_concurrent)
         for _ in range(trt_concurrent):
             ctx = engine.create_execution_context()
@@ -178,38 +184,30 @@ class TrtContextWrapper:
         self._pool.put([context, stream])
 
 
-def _engine_input_names(engine) -> frozenset[str]:
-    try:
-        import tensorrt as trt
+def _engine_tensor_dtype(engine, name: str) -> torch.dtype:
+    import tensorrt as trt
 
-        return frozenset(
-            engine.get_tensor_name(i)
-            for i in range(engine.num_io_tensors)
-            if engine.get_tensor_mode(engine.get_tensor_name(i)) == trt.TensorIOMode.INPUT
-        )
-    except Exception:
-        return frozenset()
+    dtype = engine.get_tensor_dtype(name)
+    torch_dtype = {trt.float16: torch.float16, trt.float32: torch.float32, trt.bfloat16: torch.bfloat16}.get(dtype)
+    if torch_dtype is None:
+        raise ValueError(f"TensorRT flow estimator tensor '{name}' has unsupported dtype {dtype}")
+    return torch_dtype
 
 
-def _engine_has_input(engine, name: str) -> bool:
-    return name in _engine_input_names(engine)
+def _wrap_engine(engine, device: str | torch.device, static_chunk_size: int = 0) -> TrtContextWrapper:
+    """Read the engine's inputs and I/O dtypes once and pool its contexts."""
+    import tensorrt as trt
 
-
-def _engine_tensor_dtype(engine, name: str, fallback: torch.dtype) -> torch.dtype:
-    try:
-        import tensorrt as trt
-
-        dtype = engine.get_tensor_dtype(name)
-        return {trt.float16: torch.float16, trt.float32: torch.float32, trt.bfloat16: torch.bfloat16}.get(
-            dtype, fallback
-        )
-    except Exception:
-        return fallback
-
-
-def _engine_io_dtype(engine, fallback: torch.dtype) -> torch.dtype:
-    """The dtype of the engine's ``x`` input, which the caller casts to."""
-    return _engine_tensor_dtype(engine, "x", fallback)
+    names = (engine.get_tensor_name(i) for i in range(engine.num_io_tensors))
+    input_names = frozenset(n for n in names if engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT)
+    return TrtContextWrapper(
+        engine,
+        device=device,
+        io_dtype=_engine_tensor_dtype(engine, "x"),
+        input_names=input_names,
+        out_dtype=_engine_tensor_dtype(engine, "estimator_out"),
+        static_chunk_size=static_chunk_size,
+    )
 
 
 class _EstimatorWithMaskInput(torch.nn.Module):
@@ -358,9 +356,8 @@ def build_chunk_mask_flow_estimator_trt(
     ``onnx_dir`` on first use and cached there; the plan is cached like the
     legacy engine's. ``cache_key`` (see ``flow_checkpoint_fingerprint``) is
     folded into the ONNX name so exports from different checkpoints never
-    collide when ``onnx_dir`` is shared. ``estimator.static_chunk_size`` is
-    copied onto the wrapper so ``forward_estimator`` can build the same mask
-    upstream would.
+    collide when ``onnx_dir`` is shared. ``estimator.static_chunk_size`` goes
+    to the wrapper so ``forward_estimator`` can build the mask upstream would.
     """
     import tensorrt as trt
 
@@ -378,10 +375,9 @@ def build_chunk_mask_flow_estimator_trt(
     if engine is None:
         raise RuntimeError(f"Failed to deserialize chunk-mask flow-estimator TensorRT engine {plan_path}")
     logger.info("Loaded chunk-mask flow-estimator TensorRT engine (%s)", plan_path)
-    wrapper = TrtContextWrapper(engine, device=device, io_dtype=_engine_io_dtype(engine, torch.float32))
+    wrapper = _wrap_engine(engine, device, static_chunk_size=int(estimator.static_chunk_size))
     if not wrapper.supports_attn_mask:
         raise RuntimeError(f"chunk-mask engine {plan_path} has no '{ATTN_MASK_INPUT}' input")
-    wrapper.static_chunk_size = int(getattr(estimator, "static_chunk_size", 0))
     return wrapper
 
 
@@ -404,5 +400,4 @@ def build_flow_estimator_trt(onnx_path: str, device: str | torch.device) -> TrtC
     if engine is None:
         raise RuntimeError(f"Failed to deserialize flow-estimator TensorRT engine {plan_path}")
     logger.info("Loaded flow-estimator TensorRT engine (%s)", plan_path)
-    io_dtype = _engine_io_dtype(engine, torch.float16 if strongly_typed else torch.float32)
-    return TrtContextWrapper(engine, device=device, io_dtype=io_dtype)
+    return _wrap_engine(engine, device)

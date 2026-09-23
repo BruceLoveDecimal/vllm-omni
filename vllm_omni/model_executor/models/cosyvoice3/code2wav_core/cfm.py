@@ -195,7 +195,7 @@ class ConditionalCFM(BASECFM):
                     t_e = t.to(io_dtype).contiguous()
                     spks_e = spks.to(io_dtype).contiguous()
                     cond_e = cond.to(io_dtype).contiguous()
-                    out_e = torch.empty_like(x_e, dtype=getattr(self.estimator, "out_dtype", io_dtype))
+                    out_e = torch.empty_like(x_e, dtype=self.estimator.out_dtype)
                     inputs = {
                         "x": x_e,
                         "mask": mask_e,
@@ -208,9 +208,8 @@ class ConditionalCFM(BASECFM):
                         inputs["attn_mask"] = attn_mask
                     # Bind only what the engine declares: an exporter prunes
                     # inputs the graph never reads.
-                    declared = getattr(self.estimator, "input_names", None)
-                    if declared:
-                        inputs = {name: tensor for name, tensor in inputs.items() if name in declared}
+                    declared = self.estimator.input_names
+                    inputs = {name: tensor for name, tensor in inputs.items() if name in declared}
                     for name, tensor in inputs.items():
                         if not estimator.set_input_shape(name, tuple(tensor.shape)):
                             raise RuntimeError(
@@ -245,17 +244,16 @@ class ConditionalCFM(BASECFM):
         there is no cache, whose content check would sync the host per step.
         """
         estimator = self.estimator
-        if not getattr(estimator, "supports_attn_mask", False):
-            if streaming and not getattr(self, "_warned_trt_no_chunk_mask", False):
-                self._warned_trt_no_chunk_mask = True
-                logger.warning(
+        if not estimator.supports_attn_mask:
+            if streaming:
+                logger.warning_once(
                     "The TensorRT flow estimator has no attn_mask input, so streaming chunks run with full "
                     "attention instead of upstream's chunk-causal mask. Rebuild it with "
                     "build_chunk_mask_flow_estimator_trt to align with upstream."
                 )
             return None
         return build_dit_attention_mask(
-            mask.bool(), streaming=streaming, static_chunk_size=int(getattr(estimator, "static_chunk_size", 0))
+            mask.bool(), streaming=streaming, static_chunk_size=estimator.static_chunk_size
         ).contiguous()
 
 
