@@ -309,3 +309,15 @@ def test_export_has_attn_mask_input(tmp_path):
     mask_input = model.graph.input[-1]
     dims = [d.dim_param or d.dim_value for d in mask_input.type.tensor_type.shape.dim]
     assert dims[:2] == [2, 1] and dims[2] == dims[3] == "seq_len"
+
+
+def test_fp32_export_attention_is_scoped_to_the_estimator():
+    from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import _fp32_attention_for_export
+
+    dit, other = _tiny_dit(), _tiny_dit()
+    layers = [m for m in dit.modules() if hasattr(m, "fp32_masked_attention")]
+    assert layers
+    with _fp32_attention_for_export(dit):
+        assert all(m.fp32_masked_attention for m in layers)
+        assert not any(getattr(m, "fp32_masked_attention", False) for m in other.modules())
+    assert not any(m.fp32_masked_attention for m in layers)

@@ -124,6 +124,10 @@ class DiTAttention(nn.Module):
         self.inner_dim = dim_head * heads
         self.dropout = dropout
         self.scale = 1.0 / math.sqrt(dim_head)
+        # Run the full-mask SDPA in fp32 under autocast. Only the fp16 ONNX
+        # export sets it (see ``flow_estimator_trt``), so the engine keeps
+        # the masked softmax in fp32.
+        self.fp32_masked_attention = False
 
         # Q/K/V projections
         self.to_q = nn.Linear(dim, self.inner_dim)
@@ -168,9 +172,15 @@ class DiTAttention(nn.Module):
                 key_h = key.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
                 value_h = value.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
                 attn_mask = mask.unsqueeze(1) if mask.dim() == 3 else mask
-                out = F.scaled_dot_product_attention(
-                    query_h, key_h, value_h, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
-                )
+                if self.fp32_masked_attention:
+                    with torch.autocast(device_type=query_h.device.type, enabled=False):
+                        out = F.scaled_dot_product_attention(
+                            query_h.float(), key_h.float(), value_h.float(), attn_mask=attn_mask
+                        ).to(query_h.dtype)
+                else:
+                    out = F.scaled_dot_product_attention(
+                        query_h, key_h, value_h, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+                    )
                 out = out.transpose(1, 2).reshape(batch_size, seq_len, self.inner_dim)
             else:
                 # Reshape for attention: (batch, seq, heads, head_dim)
