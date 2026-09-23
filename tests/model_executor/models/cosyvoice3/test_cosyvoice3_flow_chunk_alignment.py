@@ -139,7 +139,11 @@ class _FakeStream:
 class _FakeTrtEstimator:
     def __init__(self, *, supports_attn_mask: bool, context=None):
         self.io_dtype = torch.float32
+        self.out_dtype = torch.float32
         self.supports_attn_mask = supports_attn_mask
+        self.input_names = frozenset(
+            {"x", "mask", "mu", "t", "spks", "cond"} | ({"attn_mask"} if supports_attn_mask else set())
+        )
         self.static_chunk_size = BLOCK
         self.context = context if context is not None else _FakeTrtContext()
         self.released = 0
