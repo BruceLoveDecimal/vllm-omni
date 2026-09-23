@@ -168,9 +168,13 @@ def _cfm(estimator) -> CausalConditionalCFM:
 
 
 class TestTensorRtMaskInput:
-    def _run(self, cfm, monkeypatch, *, streaming: bool, frames: int = 2 * BLOCK + 10):
+    @staticmethod
+    def _fake_cuda(monkeypatch):
         monkeypatch.setattr(torch.cuda, "current_stream", lambda device: _FakeStream())
         monkeypatch.setattr(torch.cuda, "stream", lambda stream: torch.no_grad())
+
+    def _run(self, cfm, monkeypatch, *, streaming: bool, frames: int = 2 * BLOCK + 10):
+        self._fake_cuda(monkeypatch)
         x = torch.randn(2, 80, frames)
         mask = torch.ones(2, 1, frames)
         cfm.forward_estimator(x, mask, torch.randn(2, 80, frames), torch.rand(2), torch.randn(2, 80), x, streaming)
@@ -179,19 +183,40 @@ class TestTensorRtMaskInput:
     def test_chunk_mask_engine_receives_the_streaming_map(self, monkeypatch):
         cfm = _cfm(_FakeTrtEstimator(supports_attn_mask=True))
         ctx = self._run(cfm, monkeypatch, streaming=True)
-        assert ctx.shapes["attn_mask"] == (2, 1, 2 * BLOCK + 10, 2 * BLOCK + 10)
+        frames = 2 * BLOCK + 10
+        assert ctx.shapes["attn_mask"] == (2, 1, frames, frames)
         assert "attn_mask" in ctx.addresses and "estimator_out" in ctx.addresses
-        cached = cfm._trt_attn_mask_cache[2]
-        assert cached.dtype == torch.bool
-        assert torch.equal(cached[0, 0], subsequent_chunk_mask(2 * BLOCK + 10, BLOCK))
+        built = cfm._trt_attention_mask(torch.ones(2, 1, frames), True)
+        assert built.dtype == torch.bool
+        assert torch.equal(built[0, 0], subsequent_chunk_mask(frames, BLOCK))
 
-    def test_non_streaming_map_is_all_true_and_cached_per_shape(self, monkeypatch):
+    def test_non_streaming_map_is_all_true(self):
         cfm = _cfm(_FakeTrtEstimator(supports_attn_mask=True))
-        self._run(cfm, monkeypatch, streaming=False)
-        first = cfm._trt_attn_mask_cache[2]
-        assert first.all()
-        self._run(cfm, monkeypatch, streaming=False)
-        assert cfm._trt_attn_mask_cache[2] is first  # the ten Euler steps share one map
+        assert cfm._trt_attention_mask(torch.ones(2, 1, 30), False).all()
+
+    def test_solve_builds_the_map_once_for_all_euler_steps(self, monkeypatch):
+        """The map is step-invariant; rebuilding or re-checking it per step
+        would add work and, with a content check, a host sync per step."""
+        self._fake_cuda(monkeypatch)
+        cfm = _cfm(_FakeTrtEstimator(supports_attn_mask=True))
+        built = []
+        real = cfm._trt_attention_mask
+        monkeypatch.setattr(
+            cfm, "_trt_attention_mask", lambda mask, streaming: built.append(1) or real(mask, streaming)
+        )
+        frames = BLOCK + 6
+        mu = torch.randn(1, 80, frames)
+        cfm.solve_euler(
+            torch.randn(1, 80, frames),
+            t_span=torch.linspace(0, 1, 5),
+            mu=mu,
+            mask=torch.ones(1, 1, frames),
+            spks=torch.randn(1, 80),
+            cond=torch.zeros_like(mu),
+            streaming=True,
+        )
+        assert built == [1]
+        assert cfm.estimator.context.shapes["attn_mask"] == (2, 1, frames, frames)
 
     def test_legacy_engine_gets_no_map_and_warns_once(self, monkeypatch, caplog):
         cfm = _cfm(_FakeTrtEstimator(supports_attn_mask=False))
