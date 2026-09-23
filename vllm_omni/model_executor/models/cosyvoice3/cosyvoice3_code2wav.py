@@ -64,6 +64,25 @@ def _right_pad_cat(tensors: list[torch.Tensor]) -> torch.Tensor:
     return torch.cat([F.pad(tensor, (0, 0) * (tensor.dim() - 2) + (0, width - tensor.shape[1])) for tensor in tensors])
 
 
+# One batched flow call pads every row to its longest, and the estimator's cost
+# grows with that width (attention with its square), so rows whose lengths are
+# further apart than this many mel frames go to separate calls.
+_FLOW_BATCH_LENGTH_SPAN_FRAMES = 128
+
+
+def _split_by_length(entries: list, frames: list[int], span: int) -> list[list]:
+    """Sort ``entries`` by ``frames`` and cut them where a run would span more than ``span``."""
+    order = sorted(range(len(entries)), key=frames.__getitem__)
+    runs: list[list] = []
+    run_start = 0
+    for position in order:
+        if not runs or frames[position] - run_start > span:
+            runs.append([])
+            run_start = frames[position]
+        runs[-1].append(entries[position])
+    return runs
+
+
 class StreamingFlowItem(TypedDict, total=False):
     """One entry of the batched-streaming item list passed to forward_streaming_batch."""
 
@@ -392,10 +411,13 @@ class CosyVoice3Code2Wav(nn.Module):
         (the last chunk runs bidirectional attention without the lookahead
         split). Prompts and codec tokens may have different lengths: each row
         is laid out as its own prompt followed by its own tokens and
-        right-padded, and the flow gets the per-row lengths.
+        right-padded, and the flow gets the per-row lengths. Within a group,
+        rows are sorted by total length and split wherever a call would span
+        more than ``_FLOW_BATCH_LENGTH_SPAN_FRAMES`` mel frames, which bounds
+        the padding each row carries.
         """
         results: list[tuple[torch.Tensor, dict[str, torch.Tensor] | None] | None] = [None] * len(items)
-        groups: dict[tuple[int, bool], list[tuple[int, StreamingFlowItem]]] = {}
+        by_key: dict[tuple[int, bool], list[tuple[int, StreamingFlowItem]]] = {}
         for index, item in enumerate(items):
             assert isinstance(item["token"], torch.Tensor)
             assert isinstance(item["prompt_token"], torch.Tensor)
@@ -405,7 +427,15 @@ class CosyVoice3Code2Wav(nn.Module):
                 int(item["embedding"].shape[1]),
                 bool(item.get("finalize", False)),
             )
-            groups.setdefault(key, []).append((index, item))
+            by_key.setdefault(key, []).append((index, item))
+
+        # Keyed by (speaker width, finalize, shortest row's mel frames).
+        groups: dict[tuple[int, bool, int], list[tuple[int, StreamingFlowItem]]] = {}
+        ratio = int(self.token_mel_ratio)
+        for key, entries in by_key.items():
+            frames = [ratio * (int(item["prompt_token"].shape[1]) + int(item["token"].shape[1])) for _, item in entries]
+            for run in _split_by_length(list(zip(frames, entries)), frames, _FLOW_BATCH_LENGTH_SPAN_FRAMES):
+                groups[(*key, run[0][0])] = [entry for _, entry in run]
 
         if cosyvoice3_batch_flow_debug():
             group_summary = {key: len(group) for key, group in groups.items()}

@@ -10,13 +10,18 @@ from omegaconf import DictConfig
 from torch import nn
 
 from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiT
+from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3_code2wav
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
     CausalConditionalCFM,
     CausalMaskedDiffWithDiT,
     _join_rows,
 )
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
-from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav, _right_pad_cat
+from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import (
+    CosyVoice3Code2Wav,
+    _right_pad_cat,
+    _split_by_length,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -116,6 +121,43 @@ def test_ragged_prompts_batch_into_one_flow_call_and_match_each_request(finalize
         assert batched_mel.shape == individual_mel.shape
         torch.testing.assert_close(batched_mel, individual_mel, rtol=0, atol=1e-4)
         assert batched_state == individual_state
+
+
+def test_rows_further_apart_than_the_span_run_in_separate_calls_and_match(monkeypatch):
+    # Rows are 2 * (prompt + tokens) mel frames: 26, 30, 50 and 54. A 10-frame
+    # span splits them into {26, 30} and {50, 54}, whatever order they come in.
+    monkeypatch.setattr(cosyvoice3_code2wav, "_FLOW_BATCH_LENGTH_SPAN_FRAMES", 10)
+    model = _code2wav()
+    items = [
+        _item(0, prompt_tokens=10, tokens=17),
+        _item(1, prompt_tokens=4, tokens=9),
+        _item(2, prompt_tokens=12, tokens=13),
+        _item(3, prompt_tokens=7, tokens=8),
+    ]
+    widths = []
+    forward_mel = model._forward_mel
+
+    def recording_forward_mel(**kwargs):
+        widths.append(sorted((kwargs["prompt_token_lens"] + kwargs["token_lens"]).tolist()))
+        return forward_mel(**kwargs)
+
+    model._forward_mel = recording_forward_mel
+    with torch.inference_mode():
+        batched = model.forward_streaming_batch(items, n_timesteps=2)
+        assert widths == [[13, 15], [25, 27]]
+        model._forward_mel = forward_mel
+        individual = [_individual(model, item) for item in items]
+
+    for (batched_mel, _), (individual_mel, _) in zip(batched, individual):
+        torch.testing.assert_close(batched_mel, individual_mel, rtol=0, atol=1e-4)
+
+
+def test_split_by_length_sorts_and_cuts_where_a_run_exceeds_the_span():
+    entries = ["a", "b", "c", "d", "e"]
+    frames = [300, 100, 228, 229, 100]
+    assert _split_by_length(entries, frames, span=128) == [["b", "e", "c"], ["d", "a"]]
+    assert _split_by_length(entries, frames, span=1000) == [["b", "e", "c", "d", "a"]]
+    assert _split_by_length(entries, frames, span=0) == [["b", "e"], ["c"], ["d"], ["a"]]
 
 
 def test_join_rows_places_each_suffix_right_after_its_own_prefix():
