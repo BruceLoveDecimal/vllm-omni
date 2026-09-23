@@ -38,7 +38,6 @@ import queue
 import uuid
 
 import torch
-import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import (
@@ -228,35 +227,23 @@ class _EstimatorWithMaskInput(torch.nn.Module):
 
 
 @contextlib.contextmanager
-def _fp32_attention_for_export():
-    """Trace scaled-dot-product attention in fp32 under fp16 autocast.
+def _fp32_attention_for_export(estimator: torch.nn.Module):
+    """Trace the DiT's masked attention in fp32 under fp16 autocast.
 
     The softmax over a masked ``T x T`` score map loses precision in fp16 as
     ``T`` grows (the bundled engine keeps it in fp32 too: its error against
-    the torch DiT is about 4x lower than an all-fp16 trace). Casting q/k/v up
-    and the output back down is recorded into the graph, so the engine runs
-    that one block in fp32 and everything else in fp16.
+    the torch DiT is about 4x lower than an all-fp16 trace). The casts are
+    recorded into the graph, so the engine runs that block in fp32 and
+    everything else in fp16. Scoped to ``estimator``'s own attention layers.
     """
-    original = F.scaled_dot_product_attention
-
-    def fp32_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, **kwargs):
-        with torch.autocast(device_type=query.device.type, enabled=False):
-            out = original(
-                query.float(),
-                key.float(),
-                value.float(),
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
-                **kwargs,
-            )
-        return out.to(query.dtype)
-
-    F.scaled_dot_product_attention = fp32_sdpa
+    layers = [m for m in estimator.modules() if hasattr(m, "fp32_masked_attention")]
+    for layer in layers:
+        layer.fp32_masked_attention = True
     try:
         yield
     finally:
-        F.scaled_dot_product_attention = original
+        for layer in layers:
+            layer.fp32_masked_attention = False
 
 
 def export_chunk_mask_estimator_onnx(estimator: torch.nn.Module, onnx_path: str, *, fp16: bool = True) -> str:
@@ -300,7 +287,7 @@ def export_chunk_mask_estimator_onnx(estimator: torch.nn.Module, onnx_path: str,
     with (
         torch.inference_mode(),
         torch.autocast(device_type=device.type, dtype=torch.float16, enabled=fp16),
-        _fp32_attention_for_export() if fp16 else contextlib.nullcontext(),
+        _fp32_attention_for_export(estimator) if fp16 else contextlib.nullcontext(),
     ):
         torch.onnx.export(
             wrapper,
