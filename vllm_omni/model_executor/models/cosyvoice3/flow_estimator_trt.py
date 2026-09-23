@@ -20,7 +20,9 @@ chunk-causal mask (``DiT.forward(streaming=True)``) never reaches such an
 engine. ``build_chunk_mask_flow_estimator_trt`` exports the repo's own DiT with
 a seventh input, ``attn_mask`` (``(2, 1, T, T)`` bool), so the host builds the
 same mask upstream would and the engine honours it; ``supports_attn_mask`` on
-the wrapper tells the caller which kind of engine it holds.
+the wrapper tells the caller which kind of engine it holds. Its attention is
+exported as the ONNX ``Attention`` op so TensorRT fuses it; an older TensorRT
+that cannot gets the decomposed-attention export instead.
 
 Precision: TensorRT >= 11 dropped the weakly-typed FP16/INT8 builder flags, so
 fp16 only comes from a STRONGLY_TYPED network built from an fp16 ONNX
@@ -246,7 +248,60 @@ def _fp32_attention_for_export(estimator: torch.nn.Module):
             layer.fp32_masked_attention = False
 
 
-def export_chunk_mask_estimator_onnx(estimator: torch.nn.Module, onnx_path: str, *, fp16: bool = True) -> str:
+# Custom domain the SDPA symbolic emits into; rewritten to the standard ONNX
+# ``Attention`` op after export, since the TorchScript exporter stops below
+# the opset (23) that defines it.
+_EXPORT_ATTENTION_DOMAIN = "vllm_omni.export"
+_ATTENTION_OPSET = 23
+
+
+def _sdpa_as_attention_op(
+    g, query, key, value, attn_mask=None, dropout_p=None, is_causal=None, scale=None, enable_gqa=None
+):
+    """TorchScript symbolic: SDPA -> one ``Attention`` node TensorRT fuses."""
+    from torch.onnx import symbolic_helper
+
+    if symbolic_helper._maybe_get_const(is_causal, "b"):
+        raise NotImplementedError("causal SDPA is not exported as an Attention op")
+    kwargs = {}
+    if not symbolic_helper._is_none(scale):
+        kwargs["scale_f"] = symbolic_helper._maybe_get_const(scale, "f")
+    inputs = [query, key, value]
+    if not symbolic_helper._is_none(attn_mask):
+        inputs.append(attn_mask)
+    out = g.op(f"{_EXPORT_ATTENTION_DOMAIN}::Attention", *inputs, **kwargs)
+    out.setType(query.type())
+    return out
+
+
+@contextlib.contextmanager
+def _sdpa_exported_as_attention_op():
+    torch.onnx.register_custom_op_symbolic("aten::scaled_dot_product_attention", _sdpa_as_attention_op, 18)
+    try:
+        yield
+    finally:
+        torch.onnx.unregister_custom_op_symbolic("aten::scaled_dot_product_attention", 18)
+
+
+def _promote_attention_nodes(onnx_path: str) -> None:
+    """Move the exported ``Attention`` nodes into the default ONNX domain at
+    opset 23. The rest of the graph is opset 18, whose ops keep their meaning
+    at 23."""
+    import onnx
+
+    model = onnx.load(onnx_path)
+    for node in model.graph.node:
+        if node.domain == _EXPORT_ATTENTION_DOMAIN:
+            node.domain = ""
+    others = [o for o in model.opset_import if o.domain not in ("", "ai.onnx", _EXPORT_ATTENTION_DOMAIN)]
+    del model.opset_import[:]
+    model.opset_import.extend([*others, onnx.helper.make_opsetid("", _ATTENTION_OPSET)])
+    onnx.save(model, onnx_path)
+
+
+def export_chunk_mask_estimator_onnx(
+    estimator: torch.nn.Module, onnx_path: str, *, fp16: bool = True, fused_attention: bool = False
+) -> str:
     """Export the repo's DiT to ONNX with ``attn_mask`` as a seventh input.
 
     Traced under fp16 autocast when ``fp16`` (the layout of the project's
@@ -254,6 +309,13 @@ def export_chunk_mask_estimator_onnx(estimator: torch.nn.Module, onnx_path: str,
     with attention kept in fp32; plain fp32 otherwise. The result is written
     next to the model's other estimator ONNX files so the plan cache keys off
     it like any other.
+
+    ``fused_attention`` (fp16 only) exports each masked SDPA as one ONNX
+    ``Attention`` node (opset 23) instead of matmuls + softmax, still in fp32:
+    TensorRT runs it as a fused MHA kernel, several times faster than the
+    decomposed graph it cannot fuse. It stays fp32 because some layers of the
+    released checkpoint reach attention scores past 1e6, which a fused fp16
+    kernel overflows (it keeps the scores in the input dtype).
     """
     try:
         import onnx  # noqa: F401
@@ -265,6 +327,7 @@ def export_chunk_mask_estimator_onnx(estimator: torch.nn.Module, onnx_path: str,
     device = next(estimator.parameters()).device
     was_training = estimator.training
     estimator.eval()
+    fused = fp16 and fused_attention
     wrapper = _EstimatorWithMaskInput(estimator).to(device).eval()
     frames = 64
     x = torch.randn(2, 80, frames, device=device)
@@ -283,25 +346,34 @@ def export_chunk_mask_estimator_onnx(estimator: torch.nn.Module, onnx_path: str,
         "estimator_out": {2: "seq_len"},
     }
     tmp = f"{onnx_path}.tmp.{os.getpid()}"
-    logger.info("Exporting chunk-mask flow estimator ONNX to %s (fp16=%s) ...", onnx_path, fp16)
-    with (
-        torch.inference_mode(),
-        torch.autocast(device_type=device.type, dtype=torch.float16, enabled=fp16),
-        _fp32_attention_for_export(estimator) if fp16 else contextlib.nullcontext(),
-    ):
-        torch.onnx.export(
-            wrapper,
-            (x, mask, mu, t, spks, cond, attn_mask),
-            tmp,
-            input_names=["x", "mask", "mu", "t", "spks", "cond", ATTN_MASK_INPUT],
-            output_names=["estimator_out"],
-            dynamic_axes=dynamic_axes,
-            opset_version=18,
-            dynamo=False,
-        )
-    os.replace(tmp, onnx_path)
-    if was_training:
-        estimator.train()
+    logger.info(
+        "Exporting chunk-mask flow estimator ONNX to %s (fp16=%s, fused_attention=%s) ...", onnx_path, fp16, fused
+    )
+    try:
+        with (
+            torch.inference_mode(),
+            torch.autocast(device_type=device.type, dtype=torch.float16, enabled=fp16),
+            _fp32_attention_for_export(estimator) if fp16 else contextlib.nullcontext(),
+            _sdpa_exported_as_attention_op() if fused else contextlib.nullcontext(),
+        ):
+            torch.onnx.export(
+                wrapper,
+                (x, mask, mu, t, spks, cond, attn_mask),
+                tmp,
+                input_names=["x", "mask", "mu", "t", "spks", "cond", ATTN_MASK_INPUT],
+                output_names=["estimator_out"],
+                dynamic_axes=dynamic_axes,
+                opset_version=18,
+                dynamo=False,
+            )
+        if fused:
+            _promote_attention_nodes(tmp)
+        os.replace(tmp, onnx_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        if was_training:
+            estimator.train()
     return onnx_path
 
 
@@ -323,10 +395,39 @@ def flow_checkpoint_fingerprint(model_dir: str, weight_file: str = "flow.pt") ->
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
-def chunk_mask_estimator_onnx_path(onnx_dir: str, *, fp16: bool, cache_key: str | None) -> str:
+def chunk_mask_estimator_onnx_path(
+    onnx_dir: str, *, fp16: bool, cache_key: str | None, fused_attention: bool = False
+) -> str:
     tag = "autocast_fp16" if fp16 else "fp32"
+    if fp16 and fused_attention:
+        tag += "_fused_attn"
     suffix = f".{cache_key}" if cache_key else ""
     return os.path.join(onnx_dir, f"flow.decoder.estimator.chunk_mask.{tag}{suffix}.onnx")
+
+
+def _build_chunk_mask_engine(estimator, onnx_dir, device, *, fp16, cache_key, fused_attention):
+    import tensorrt as trt
+
+    onnx_path = chunk_mask_estimator_onnx_path(
+        onnx_dir, fp16=fp16, cache_key=cache_key, fused_attention=fused_attention
+    )
+    if not os.path.exists(onnx_path) or os.path.getsize(onnx_path) == 0:
+        os.makedirs(onnx_dir, exist_ok=True)
+        export_chunk_mask_estimator_onnx(estimator, onnx_path, fp16=fp16, fused_attention=fused_attention)
+    plan_path = _resolve_plan_path(onnx_path, prefix="flow_estimator_chunk_mask")
+    if not os.path.exists(plan_path) or os.path.getsize(plan_path) == 0:
+        _convert_onnx_to_trt(onnx_path, plan_path, strongly_typed=fp16, with_attn_mask=True)
+
+    runtime = trt.Runtime(_trt_logger())
+    with open(plan_path, "rb") as f:
+        engine = runtime.deserialize_cuda_engine(f.read())
+    if engine is None:
+        raise RuntimeError(f"Failed to deserialize chunk-mask flow-estimator TensorRT engine {plan_path}")
+    logger.info("Loaded chunk-mask flow-estimator TensorRT engine (%s)", plan_path)
+    wrapper = _wrap_engine(engine, device, static_chunk_size=int(estimator.static_chunk_size))
+    if not wrapper.supports_attn_mask:
+        raise RuntimeError(f"chunk-mask engine {plan_path} has no '{ATTN_MASK_INPUT}' input")
+    return wrapper
 
 
 def build_chunk_mask_flow_estimator_trt(
@@ -345,27 +446,22 @@ def build_chunk_mask_flow_estimator_trt(
     folded into the ONNX name so exports from different checkpoints never
     collide when ``onnx_dir`` is shared. ``estimator.static_chunk_size`` goes
     to the wrapper so ``forward_estimator`` can build the mask upstream would.
+
+    An fp16 engine first tries fused attention (ONNX ``Attention``, opset 23);
+    a TensorRT that cannot parse or build it gets the fp32-attention export.
     """
-    import tensorrt as trt
-
-    onnx_path = chunk_mask_estimator_onnx_path(onnx_dir, fp16=fp16, cache_key=cache_key)
-    if not os.path.exists(onnx_path) or os.path.getsize(onnx_path) == 0:
-        os.makedirs(onnx_dir, exist_ok=True)
-        export_chunk_mask_estimator_onnx(estimator, onnx_path, fp16=fp16)
-    plan_path = _resolve_plan_path(onnx_path, prefix="flow_estimator_chunk_mask")
-    if not os.path.exists(plan_path) or os.path.getsize(plan_path) == 0:
-        _convert_onnx_to_trt(onnx_path, plan_path, strongly_typed=fp16, with_attn_mask=True)
-
-    runtime = trt.Runtime(_trt_logger())
-    with open(plan_path, "rb") as f:
-        engine = runtime.deserialize_cuda_engine(f.read())
-    if engine is None:
-        raise RuntimeError(f"Failed to deserialize chunk-mask flow-estimator TensorRT engine {plan_path}")
-    logger.info("Loaded chunk-mask flow-estimator TensorRT engine (%s)", plan_path)
-    wrapper = _wrap_engine(engine, device, static_chunk_size=int(estimator.static_chunk_size))
-    if not wrapper.supports_attn_mask:
-        raise RuntimeError(f"chunk-mask engine {plan_path} has no '{ATTN_MASK_INPUT}' input")
-    return wrapper
+    if fp16:
+        try:
+            return _build_chunk_mask_engine(
+                estimator, onnx_dir, device, fp16=True, cache_key=cache_key, fused_attention=True
+            )
+        except Exception as exc:
+            logger.warning(
+                "CosyVoice3 chunk-mask estimator: fused-attention engine unavailable (%s); "
+                "using fp32 attention, which is slower",
+                exc,
+            )
+    return _build_chunk_mask_engine(estimator, onnx_dir, device, fp16=fp16, cache_key=cache_key, fused_attention=False)
 
 
 def build_flow_estimator_trt(onnx_path: str, device: str | torch.device) -> TrtContextWrapper:

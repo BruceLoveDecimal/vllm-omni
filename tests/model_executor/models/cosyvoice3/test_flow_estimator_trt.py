@@ -165,3 +165,34 @@ class TestExportCacheKey:
         assert keyed != plain
         assert keyed.endswith(".abc123.onnx") and "chunk_mask.autocast_fp16" in keyed
         assert plain.endswith("flow.decoder.estimator.chunk_mask.autocast_fp16.onnx")
+
+
+class TestFusedAttentionFallback:
+    def _patch_builder(self, monkeypatch, fail_fused: bool):
+        calls = []
+
+        def fake_build(estimator, onnx_dir, device, *, fp16, cache_key, fused_attention):
+            calls.append(fused_attention)
+            if fused_attention and fail_fused:
+                raise RuntimeError("UNSUPPORTED_NODE: Attention")
+            return f"engine(fused={fused_attention})"
+
+        monkeypatch.setattr(flow_estimator_trt, "_build_chunk_mask_engine", fake_build)
+        return calls
+
+    def test_fused_engine_is_preferred(self, tmp_path, monkeypatch):
+        calls = self._patch_builder(monkeypatch, fail_fused=False)
+        got = flow_estimator_trt.build_chunk_mask_flow_estimator_trt(object(), str(tmp_path), "cuda")
+        assert got == "engine(fused=True)" and calls == [True]
+
+    def test_unbuildable_fused_engine_falls_back_to_fp32_attention(self, tmp_path, monkeypatch):
+        calls = self._patch_builder(monkeypatch, fail_fused=True)
+        got = flow_estimator_trt.build_chunk_mask_flow_estimator_trt(object(), str(tmp_path), "cuda")
+        assert got == "engine(fused=False)" and calls == [True, False]
+
+    def test_fused_and_fp32_attention_exports_do_not_share_a_file(self, tmp_path):
+        fused = flow_estimator_trt.chunk_mask_estimator_onnx_path(
+            str(tmp_path), fp16=True, cache_key="k", fused_attention=True
+        )
+        plain = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key="k")
+        assert fused != plain and "fused_attn" in fused
