@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import math
-from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -21,12 +20,6 @@ from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_batch_flow_profile
 from vllm_omni.model_executor.models.cosyvoice3.utils import build_dit_attention_mask
-
-try:
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-except ImportError:  # pragma: no cover
-    SDPBackend = None
-    sdpa_kernel = None
 
 logger = init_logger(__name__)
 
@@ -60,13 +53,6 @@ def get_pos_embed_indices(start, length, max_pos, scale=1.0):
     )
     pos = torch.where(pos < max_pos, pos, max_pos - 1)
     return pos
-
-
-def _math_sdpa_context():
-    """Pin MATH so fused FLASH/EFFICIENT kernels cannot ignore ``attn_mask``."""
-    if sdpa_kernel is None or SDPBackend is None:
-        return nullcontext()
-    return sdpa_kernel(SDPBackend.MATH)
 
 
 def _is_full_qk_mask(mask: torch.Tensor | None) -> bool:
@@ -114,9 +100,12 @@ class DiTAttention(nn.Module):
     SageAttention, or SDPA backends automatically.
 
     Padding masks stay on that accelerated path via ``AttentionMetadata``.
-    Streaming chunk masks are full query-key maps; fused FLASH kernels may
-    ignore or reject those, so they use MATH SDPA with ``attn_mask`` applied
-    before softmax.
+    Streaming chunk masks are full query-key maps, which the diffusion
+    backends do not take, so they go to ``F.scaled_dot_product_attention``
+    with ``attn_mask``. SDPA only dispatches to kernels that apply the mask
+    before softmax (FLASH is ineligible with a mask; memory-efficient honours
+    it), so no backend is pinned: MATH would materialize the fp32
+    ``(B, H, T, T)`` score map, which grows with the resent stream history.
     """
 
     def __init__(
@@ -174,15 +163,14 @@ class DiTAttention(nn.Module):
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_backend"):
             if _is_full_qk_mask(mask):
-                # (B, H, L, D) — MATH SDPA honors the chunk map inside softmax.
+                # (B, H, L, D) — SDPA applies the chunk map inside softmax.
                 query_h = query.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
                 key_h = key.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
                 value_h = value.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
                 attn_mask = mask.unsqueeze(1) if mask.dim() == 3 else mask
-                with _math_sdpa_context():
-                    out = F.scaled_dot_product_attention(
-                        query_h, key_h, value_h, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
-                    )
+                out = F.scaled_dot_product_attention(
+                    query_h, key_h, value_h, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+                )
                 out = out.transpose(1, 2).reshape(batch_size, seq_len, self.inner_dim)
             else:
                 # Reshape for attention: (batch, seq, heads, head_dim)
