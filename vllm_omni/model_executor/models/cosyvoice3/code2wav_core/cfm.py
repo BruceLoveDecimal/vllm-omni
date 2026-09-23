@@ -3,7 +3,6 @@
 # Adopted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/flow
 """Conditional Flow Matching (CFM) classes for audio generation."""
 
-import inspect
 from abc import ABC
 from contextlib import nullcontext
 
@@ -140,12 +139,21 @@ class ConditionalCFM(BASECFM):
                 spks_in[:batch_size] = spks
             if cond is not None:
                 cond_in[:batch_size] = cond
+            # The TensorRT attention map follows mask_in, so it is also the
+            # same on every Euler step: build it once per solve rather than
+            # rebuilding (and host-syncing to compare) on each one.
+            attn_mask = None
+            if not isinstance(self.estimator, torch.nn.Module):
+                attn_mask = self._trt_attention_mask(mask_in, streaming)
 
         estimator_session = nullcontext(None)
         if not isinstance(self.estimator, torch.nn.Module):
             session_factory = getattr(self.estimator, "estimation_session", None)
             if session_factory is not None:
-                estimator_session = session_factory(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
+                session_inputs = (x_in, mask_in, mu_in, t_in, spks_in, cond_in)
+                if attn_mask is not None:
+                    session_inputs += (attn_mask,)
+                estimator_session = session_factory(*session_inputs)
 
         with estimator_session as trt_session:
             for step in range(1, len(t_span)):
@@ -164,6 +172,7 @@ class ConditionalCFM(BASECFM):
                         cond_in,
                         estimator_session=trt_session,
                         streaming=streaming,
+                        attn_mask=attn_mask,
                     )
                 with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_combine"):
                     dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
@@ -177,17 +186,17 @@ class ConditionalCFM(BASECFM):
 
         return sol[-1].float()
 
-    def forward_estimator(self, x, mask, mu, t, spks, cond, estimator_session=None, streaming: bool = False):
+    def forward_estimator(
+        self, x, mask, mu, t, spks, cond, estimator_session=None, streaming: bool = False, attn_mask=None
+    ):
+        """One estimator call. ``attn_mask`` is the TensorRT engine's query-key
+        map; ``solve_euler`` builds it once per solve, and it is built here only
+        when a caller passes none."""
         if isinstance(self.estimator, torch.nn.Module):
-            # PyTorch estimator: pass streaming into DiT. Keep TRT unchanged
-            # (chunk mask is baked into the ONNX/engine if present).
-            forward_fn = self.estimator.forward
-            try:
-                params = inspect.signature(forward_fn).parameters
-            except (TypeError, ValueError):
-                params = {}
-            if "streaming" in params:
-                return self.estimator(x, mask, mu, t, spks, cond, streaming=streaming)
+            # The DiT builds its own chunk map from ``streaming``; the flag is
+            # only passed when set, so the default call stays the plain one.
+            if streaming:
+                return self.estimator(x, mask, mu, t, spks, cond, streaming=True)
             return self.estimator(x, mask, mu, t, spks, cond)
         elif estimator_session is not None:
             return estimator_session.run(x, mask, mu, t, spks, cond)
@@ -198,7 +207,8 @@ class ConditionalCFM(BASECFM):
             # references to the cast buffers alive until execute completes (a bare
             # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
             io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
-            attn_mask = self._trt_attention_mask(mask, streaming)
+            if attn_mask is None:
+                attn_mask = self._trt_attention_mask(mask, streaming)
             [estimator, stream], trt_engine = self.estimator.acquire_estimator()
             # The context comes out of a bounded pool; anything that raises
             # below (an out-of-profile shape, a failed enqueue) must still
@@ -259,8 +269,8 @@ class ConditionalCFM(BASECFM):
         A legacy engine (no ``attn_mask`` input) was traced with full
         attention and cannot honour ``streaming``; say so once rather than
         silently diverging from upstream's streaming semantics. The map is
-        step-invariant within a solve, so the last one is reused across the
-        Euler steps.
+        step-invariant within a solve, so ``solve_euler`` calls this once;
+        there is no cache, whose content check would sync the host per step.
         """
         estimator = self.estimator
         if not getattr(estimator, "supports_attn_mask", False):
@@ -272,15 +282,9 @@ class ConditionalCFM(BASECFM):
                     "build_chunk_mask_flow_estimator_trt to align with upstream."
                 )
             return None
-        key = (tuple(mask.shape), bool(streaming), mask.device)
-        cached = getattr(self, "_trt_attn_mask_cache", None)
-        if cached is not None and cached[0] == key and torch.equal(cached[1], mask):
-            return cached[2]
-        attn_mask = build_dit_attention_mask(
+        return build_dit_attention_mask(
             mask.bool(), streaming=streaming, static_chunk_size=int(getattr(estimator, "static_chunk_size", 0))
         ).contiguous()
-        self._trt_attn_mask_cache = (key, mask.clone(), attn_mask)
-        return attn_mask
 
 
 # Upstream CosyVoice draws the flow's initial noise from one fixed buffer,

@@ -146,8 +146,17 @@ class _TrtEstimatorSession:
     """A fixed-shape TensorRT estimator binding reused across Euler steps."""
 
     def __init__(self, context, stream, engine, io_dtype: torch.dtype, inputs: tuple[torch.Tensor, ...]):
-        if len(inputs) != len(_TRT_INPUT_NAMES):
-            raise ValueError(f"expected {len(_TRT_INPUT_NAMES)} estimator inputs, got {len(inputs)}")
+        # A chunk-mask engine takes the query-key map as a seventh input. It is
+        # static within a solve, so the session binds it once and ``run`` keeps
+        # taking only the six per-step tensors.
+        if len(inputs) == len(_TRT_INPUT_NAMES) + 1:
+            self.input_names = (*_TRT_INPUT_NAMES, ATTN_MASK_INPUT)
+        elif len(inputs) == len(_TRT_INPUT_NAMES):
+            self.input_names = _TRT_INPUT_NAMES
+        else:
+            raise ValueError(
+                f"expected {len(_TRT_INPUT_NAMES)} or {len(_TRT_INPUT_NAMES) + 1} inputs, got {len(inputs)}"
+            )
 
         self.context = context
         self.stream = stream
@@ -168,7 +177,7 @@ class _TrtEstimatorSession:
                 memory_format=torch.contiguous_format,
             )
 
-        for name, buffer in zip(_TRT_INPUT_NAMES, self._input_buffers):
+        for name, buffer in zip(self.input_names, self._input_buffers, strict=True):
             context.set_input_shape(name, tuple(buffer.shape))
 
         bound_tensors = (*self._input_buffers, self._engine_output)
@@ -176,16 +185,18 @@ class _TrtEstimatorSession:
             context.set_tensor_address(engine.get_tensor_name(index), tensor.data_ptr())
 
     def _make_input_buffer(self, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.dtype == self.io_dtype and tensor.is_contiguous():
+        # ``attn_mask`` is bool; only the float inputs follow ``io_dtype``.
+        dtype = self.io_dtype if tensor.is_floating_point() else tensor.dtype
+        if tensor.dtype == dtype and tensor.is_contiguous():
             return tensor
         return torch.empty_like(
             tensor,
-            dtype=self.io_dtype,
+            dtype=dtype,
             memory_format=torch.contiguous_format,
         )
 
     def run(self, *inputs: torch.Tensor) -> torch.Tensor:
-        if len(inputs) != len(self._input_buffers):
+        if len(inputs) not in (len(_TRT_INPUT_NAMES), len(self._input_buffers)):
             raise ValueError(f"expected {len(self._input_buffers)} estimator inputs, got {len(inputs)}")
         for tensor, shape in zip(inputs, self._shapes):
             if tuple(tensor.shape) != shape:
