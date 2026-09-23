@@ -116,8 +116,6 @@ class DiTAttention(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("DiTAttention requires PyTorch 2.0+ for SDPA.")
         self.dim = dim
         self.heads = heads
         self.dim_head = dim_head
@@ -487,7 +485,7 @@ class DiT(nn.Module):
             if attn_mask is not None:
                 if attn_mask.dim() == 3:
                     attn_mask = attn_mask.unsqueeze(dim=1)
-            elif streaming is True:
+            elif streaming:
                 attn_mask = build_dit_attention_mask(mask, streaming=True, static_chunk_size=self.static_chunk_size)
             else:
                 attn_mask = mask[:, 0].bool() if mask.dim() == 3 and mask.shape[1] == 1 else mask.bool()
