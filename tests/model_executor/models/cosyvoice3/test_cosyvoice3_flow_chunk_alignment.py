@@ -286,10 +286,10 @@ class TestFinalizeIsBidirectional:
 
 class TestHopAlignmentWarning:
     def test_unaligned_hop_warns_once(self, caplog):
-        processor._warned_unaligned.discard("codec_chunk_frames")
         with caplog.at_level(logging.WARNING):
-            processor._warn_unaligned_chunk("codec_chunk_frames", 15)
-            processor._warn_unaligned_chunk("codec_chunk_frames", 15)
+            processor._warn_if_unaligned("codec_chunk_frames", 15)
+            processor._warn_if_unaligned("codec_chunk_frames", 15)
+            processor._warn_if_unaligned("codec_chunk_frames", 50)
         assert sum("25-token attention block" in r.message for r in caplog.records) == 1
         assert processor._FLOW_CHUNK_TOKENS == 25
 

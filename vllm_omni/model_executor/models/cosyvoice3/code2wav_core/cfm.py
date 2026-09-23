@@ -271,11 +271,8 @@ _FIXED_NOISE_FRAMES = 50 * 300
 class CausalConditionalCFM(ConditionalCFM):
     def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
-        # Same values as upstream's ``set_all_random_seed(0); torch.randn(...)``
-        # without touching the global RNG. Not part of the checkpoint.
-        # Drawn on the CPU so the values match upstream regardless of the
-        # default device the model is built under, then kept on the device
-        # the flow runs on (moved once, on first use, if that differs).
+        # Upstream's seeded draw without touching the global RNG. On the CPU so
+        # the values match whatever device the model is built under.
         generator = torch.Generator(device="cpu").manual_seed(_FIXED_NOISE_SEED)
         noise = torch.randn([1, _FIXED_NOISE_CHANNELS, _FIXED_NOISE_FRAMES], generator=generator, device="cpu")
         self.register_buffer("rand_noise", noise, persistent=False)
@@ -294,7 +291,7 @@ class CausalConditionalCFM(ConditionalCFM):
         batch, channels, length = mu.shape
         if self.rand_noise.device != mu.device:
             self.rand_noise = self.rand_noise.to(mu.device)
-        noise = self.rand_noise[0].to(dtype=mu.dtype)
+        noise = self.rand_noise[0]
         if channels != noise.shape[0]:
             raise ValueError(f"fixed noise has {noise.shape[0]} channels, mu has {channels}")
         if noise_offset is None:
@@ -307,7 +304,8 @@ class CausalConditionalCFM(ConditionalCFM):
         positions = torch.arange(length, device=mu.device).unsqueeze(0).expand(batch, length)
         shifted = positions + noise_offset.clamp(min=0).unsqueeze(1)
         index = torch.where(positions < prompt_len, positions, shifted) % noise.shape[1]
-        return noise[:, index].permute(1, 0, 2) * temperature
+        # Gather first so only the used frames are cast, not the whole buffer.
+        return noise[:, index].permute(1, 0, 2).to(mu.dtype) * temperature
 
     @torch.inference_mode()
     def forward(
