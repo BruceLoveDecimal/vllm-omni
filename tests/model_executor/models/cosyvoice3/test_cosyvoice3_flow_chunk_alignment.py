@@ -320,6 +320,11 @@ class TestTensorRtMaskInput:
         assert cfm.estimator.context.shapes["attn_mask"] == (2, 1, frames, frames)
 
     def test_legacy_engine_gets_no_map_and_warns_once(self, monkeypatch, caplog):
+        from vllm.logger import _print_warning_once
+
+        # warning_once dedupes per process; an earlier test may already have
+        # fired this message.
+        _print_warning_once.cache_clear()
         cfm = _cfm(_FakeTrtEstimator(supports_attn_mask=False))
         with caplog.at_level(logging.WARNING):
             ctx = self._run(cfm, monkeypatch, streaming=True)
@@ -619,6 +624,65 @@ def test_fp32_export_attention_is_scoped_to_the_estimator():
         assert all(m.fp32_masked_attention for m in layers)
         assert not any(getattr(m, "fp32_masked_attention", False) for m in other.modules())
     assert not any(m.fp32_masked_attention for m in layers)
+
+
+def test_fused_export_emits_one_attention_node_per_layer(tmp_path):
+    """Each masked SDPA becomes one opset-23 ``Attention`` node, which TensorRT
+    runs as a fused MHA kernel, instead of matmuls + softmax it cannot fuse."""
+    onnx = pytest.importorskip("onnx")
+
+    from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import export_chunk_mask_estimator_onnx
+
+    path = export_chunk_mask_estimator_onnx(_tiny_dit(), str(tmp_path / "est.onnx"), fp16=True, fused_attention=True)
+    model = onnx.load(path)
+    nodes = [n for n in model.graph.node if n.op_type == "Attention"]
+    assert len(nodes) == 2 and all(n.domain == "" for n in nodes)
+    assert not any(n.op_type == "Softmax" for n in model.graph.node)
+    assert {o.domain: o.version for o in model.opset_import}.get("") == 23
+    assert [i.name for i in model.graph.input] == ["x", "mask", "mu", "t", "spks", "cond", "attn_mask"]
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+def test_fused_export_matches_the_torch_dit(tmp_path, streaming):
+    """The ``Attention`` node must read the bool map with the polarity SDPA
+    uses (True attends) and honour padding, or the chunk mask is inverted."""
+    pytest.importorskip("onnx")
+    ort = pytest.importorskip("onnxruntime")
+
+    from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import export_chunk_mask_estimator_onnx
+
+    dit = _tiny_dit()
+    path = export_chunk_mask_estimator_onnx(dit, str(tmp_path / "est.onnx"), fp16=True, fused_attention=True)
+    frames = 2 * BLOCK + 7
+    g = torch.Generator().manual_seed(5)
+    x, mu, cond = (torch.randn(2, 80, frames, generator=g) for _ in range(3))
+    mask = torch.ones(2, 1, frames)
+    mask[1, :, frames - 20 :] = 0
+    t = torch.rand(2, generator=g)
+    spks = torch.randn(2, 80, generator=g)
+    attn_mask = build_dit_attention_mask(mask, streaming=streaming, static_chunk_size=BLOCK)
+    with torch.inference_mode():
+        expected = dit(x, mask, mu, t, spks, cond, attn_mask=attn_mask) * mask
+        other = (
+            dit(
+                x,
+                mask,
+                mu,
+                t,
+                spks,
+                cond,
+                attn_mask=build_dit_attention_mask(mask, streaming=not streaming, static_chunk_size=BLOCK),
+            )
+            * mask
+        )
+    session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    feeds = {"x": x, "mask": mask, "mu": mu, "t": t, "spks": spks, "cond": cond, "attn_mask": attn_mask}
+    (got,) = session.run(None, {k: v.numpy() for k, v in feeds.items()})
+    got = torch.from_numpy(got).float()
+    err = (got - expected).abs().mean().item()
+    # fp16 elsewhere in the graph; the other mask must be clearly further away.
+    assert err < 0.02
+    assert err < 0.2 * (other - expected).abs().mean().item()
 
 
 @pytest.mark.parametrize("frames", [2 * BLOCK + 7, 3 * BLOCK])
