@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU L1 coverage for CosyVoice3 DiT streaming chunk attention.
 
-These tests exist because FLASH/fused SDPA can ignore a full query-key mask.
-They assert pre-softmax chunk constraints and that the MATH fallback is pinned.
+They assert the chunk map is applied before softmax and that the SDPA path
+matches an explicit masked-softmax reference, whichever kernel SDPA picks.
 """
 
 import pytest
@@ -128,29 +128,23 @@ class TestDiTAttentionMaskSemantics:
         assert out[0, 0].mean().item() < 5.0
         assert torch.allclose(out[0, 0], torch.ones(8), atol=1e-5)
 
-    def test_full_qk_mask_pins_math_sdpa_backend(self, monkeypatch):
-        from torch.nn.attention import SDPBackend
-
-        from vllm_omni.diffusion.models.cosyvoice3_audio import cosyvoice3_dit as dit_mod
-
-        if dit_mod.sdpa_kernel is None:
-            pytest.skip("torch.nn.attention.sdpa_kernel is unavailable")
-
-        seen: list[object] = []
-        real = dit_mod.sdpa_kernel
-
-        def wrapped(backend):
-            seen.append(backend)
-            return real(backend)
-
-        monkeypatch.setattr(dit_mod, "sdpa_kernel", wrapped)
+    def test_full_qk_mask_matches_masked_softmax_reference(self):
+        from vllm_omni.model_executor.models.cosyvoice3.utils import build_dit_attention_mask
 
         attn = _identity_dit_attention(dim=8)
-        x = torch.randn(1, 2, 8)
-        chunk_mask = torch.tensor([[[[True, False], [True, True]]]])
-        attn(x, mask=chunk_mask)
+        torch.manual_seed(0)
+        x = torch.randn(2, 6, 8)
+        pad = torch.tensor([[True] * 6, [True] * 4 + [False] * 2])
+        chunk_mask = build_dit_attention_mask(pad, streaming=True, static_chunk_size=2)
 
-        assert seen == [SDPBackend.MATH]
+        out = attn(x, mask=chunk_mask)
+
+        # Identity projections: q = k = v = x, one head of width 8.
+        scores = x @ x.transpose(1, 2) / 8**0.5
+        scores = scores.masked_fill(~chunk_mask[:, 0], float("-inf"))
+        expected = torch.softmax(scores, dim=-1) @ x
+        expected = expected.masked_fill(~chunk_mask[:, 0, -1].unsqueeze(-1), 0.0)
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
 
 class TestCFMStreamingPassthrough:
