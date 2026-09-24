@@ -86,7 +86,9 @@ def _resolve_talker_streaming_prompt_config(model_config: Any) -> tuple[int, int
         tts_model_type = tts_config.get("model_type")
     else:
         tts_model_type = getattr(tts_config, "model_type", None)
-    if tts_model_type not in {"conditional_chattts", "minicpmtts"}:
+    # ``realtime_venus_omni_tts`` is the renamed MiniCPM-o 4.5 Talker config
+    # of Realtime-Venus-Omni.
+    if tts_model_type not in {"conditional_chattts", "minicpmtts", "realtime_venus_omni_tts"}:
         return max_model_len, 0, False
     tts_max_model_len = (
         tts_config.get("max_position_embeddings", 0)

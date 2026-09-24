@@ -814,9 +814,10 @@ class MiniCPMO45Stage0DuplexRuntime:
 
             def register_image_processor(config_class, *args, **kwargs):
                 # The checkpoint's auto_map already loads this class. Its
-                # legacy string registration is incompatible with some
-                # Transformers versions and is otherwise redundant.
-                if config_class == "MiniCPMVImageProcessor":
+                # legacy string registration (``MiniCPMVImageProcessor`` and
+                # the renamed copies in derived checkpoints) is incompatible
+                # with some Transformers versions and is otherwise redundant.
+                if isinstance(config_class, str):
                     return None
                 return original_register(config_class, *args, **kwargs)
 

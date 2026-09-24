@@ -114,6 +114,7 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
     resolve_qwen3_omni_pipeline,
 )
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
+from vllm_omni.model_executor.models.realtime_venus.pipeline import REALTIME_VENUS_OMNI_PIPELINE
 from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
@@ -198,6 +199,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "moss_tts_realtime": MOSS_TTS_REALTIME_PIPELINE,
     "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
     "minicpmo_4_5": MINICPMO_4_5_PIPELINE,
+    "realtime_venus_omni": REALTIME_VENUS_OMNI_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,
     "higgs_audio_v2": HIGGS_AUDIO_V2_PIPELINE,
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,

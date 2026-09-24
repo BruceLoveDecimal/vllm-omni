@@ -675,6 +675,8 @@ def test_minicpmo_stage0_loads_processor_from_hf_id(monkeypatch):
         def from_pretrained(cls, model_path, *, trust_remote_code):
             load_calls.append((model_path, trust_remote_code))
             _AutoImageProcessor.register("MiniCPMVImageProcessor", object)
+            # Derived checkpoints (Realtime-Venus) register a renamed copy.
+            _AutoImageProcessor.register("RealtimeVenusOmniImageProcessor", object)
             return processor
 
     monkeypatch.setitem(
