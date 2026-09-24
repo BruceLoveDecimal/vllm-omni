@@ -1071,6 +1071,40 @@ def _stage0_vision_runtime():
     return runtime
 
 
+def test_minicpmo_stage0_client_text_closes_the_last_unit_of_an_append():
+    import torch
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="text-append", window_enabled=True)
+
+    # streaming_prefill(audio, text_list): <unit> + audio, then the text, so
+    # the decision is sampled after the text.
+    result = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(8, dtype=np.float32), seq=1, text_token_ids=[40, 41]
+    )
+
+    assert result["input_token_ids"] == [1, 11, 2, 1, 11, 40, 41]
+    assert result["num_input_tokens"] == 7
+    torch.testing.assert_close(result["inputs_embeds"][-2:], runtime._embed_tokens([40, 41]))
+    # The sliding window replays the text with the unit it closed.
+    assert state.pending_window_unit.token_ids == result["input_token_ids"]
+
+
+def test_minicpmo_stage0_reports_delegate_token_ids_only_when_the_tokenizer_has_them():
+    runtime = _stage0_vision_runtime()
+    assert "delegate_start_token_id" not in runtime._special_token_ids()
+
+    ids = {"<delegate>": 60, "</delegate>": 61}
+    convert = runtime.tokenizer.convert_tokens_to_ids
+    runtime.tokenizer.convert_tokens_to_ids = lambda token: ids.get(token) or convert(token)
+    runtime._init_token_ids()
+
+    special = runtime._special_token_ids()
+    assert (special["delegate_start_token_id"], special["delegate_end_token_id"]) == (60, 61)
+
+
 def test_minicpmo_stage0_puts_every_frame_of_an_append_in_one_unit():
     """Official streaming_prefill feeds the whole frame_list into one unit.
 

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
+_MINICPMO45_DELEGATE_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.DELEGATE_TOKEN_FIELDS
 _MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 
 
@@ -81,6 +82,8 @@ class MiniCPMO45Stage0DuplexRuntime:
     audio_placeholder_token_id: int = -1
     image_start_token_id: int = -1
     image_end_token_id: int = -1
+    delegate_start_token_id: int = -1
+    delegate_end_token_id: int = -1
 
     def __init__(self, stage_model: nn.Module, *, model_path: str | None = None, device: str = "cuda") -> None:
         self.stage_model = stage_model
@@ -208,12 +211,18 @@ class MiniCPMO45Stage0DuplexRuntime:
         is_speech: bool = False,
         final: bool = False,
         stage0_window: dict[str, object] | None = None,
+        text_token_ids: list[int] | None = None,
     ) -> dict[str, object]:
         """Build scheduler-owned Stage0 input embeddings for one audio append.
 
         Unlike the legacy worker-control path, this method never calls an eager
         model forward. The normal vLLM runner consumes the returned embeddings
         and owns attention metadata, block tables, KV cache, and sampling.
+
+        ``text_token_ids`` are client text the scheduler already reserved slots
+        for. They close the last unit of this append, after its audio, so the
+        listen/speak decision is sampled after the text (``streaming_prefill``
+        with ``text_list``).
         """
         start_time = time.time()
         processor = self._configure_streaming_processor(state)
@@ -369,6 +378,14 @@ class MiniCPMO45Stage0DuplexRuntime:
                 state.pending_window_unit.embeds.extend(embed_parts[unit_embed_start:])
                 state.pending_window_unit.token_ids.extend(token_ids[unit_token_start:])
             chunk_size = self._streaming_chunk_size(processor)
+        if text_token_ids:
+            # The text closes the last unit of this append.
+            text_embeds = self._embed_tokens(text_token_ids)
+            embed_parts.append(text_embeds)
+            token_ids.extend(int(token_id) for token_id in text_token_ids)
+            if state.window_enabled and state.pending_window_unit is not None:
+                state.pending_window_unit.embeds.append(text_embeds)
+                state.pending_window_unit.token_ids.extend(int(token_id) for token_id in text_token_ids)
         # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
         # turn is opened once at session init; re-emitting the turn-open prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
@@ -504,11 +521,14 @@ class MiniCPMO45Stage0DuplexRuntime:
         return value
 
     def _embed_token(self, token_id: int) -> torch.Tensor:
+        return self._embed_tokens([token_id])
+
+    def _embed_tokens(self, token_ids: list[int]) -> torch.Tensor:
         import torch
 
-        token = torch.tensor([int(token_id)], dtype=torch.long, device=self._model_device())
+        tokens = torch.tensor([int(token_id) for token_id in token_ids], dtype=torch.long, device=self._model_device())
         embedder = self._token_embedder()
-        embeds = embedder(token)
+        embeds = embedder(tokens)
         return self._as_2d_tensor(embeds)
 
     def _token_embedding_dtype(self) -> torch.dtype | None:
@@ -801,6 +821,10 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "turn_eos_token_id": self.turn_eos_token_id,
             }.items()
             if isinstance(value, int) and value >= 0
+        } | {
+            field_name: getattr(self, field_name)
+            for field_name in _MINICPMO45_DELEGATE_TOKEN_FIELDS
+            if getattr(self, field_name, -1) >= 0
         }
 
     @staticmethod
@@ -814,9 +838,10 @@ class MiniCPMO45Stage0DuplexRuntime:
 
             def register_image_processor(config_class, *args, **kwargs):
                 # The checkpoint's auto_map already loads this class. Its
-                # legacy string registration is incompatible with some
-                # Transformers versions and is otherwise redundant.
-                if config_class == "MiniCPMVImageProcessor":
+                # legacy string registration (``MiniCPMVImageProcessor`` and
+                # the renamed copies in derived checkpoints) is incompatible
+                # with some Transformers versions and is otherwise redundant.
+                if isinstance(config_class, str):
                     return None
                 return original_register(config_class, *args, **kwargs)
 
@@ -839,12 +864,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         if self.tokenizer is None:
             for field_name in _MINICPMO45_SPECIAL_TOKEN_FIELDS:
                 setattr(self, field_name, -1)
-            for field_name in _MINICPMO45_OPTIONAL_TOKEN_FIELDS:
+            for field_name in (*_MINICPMO45_OPTIONAL_TOKEN_FIELDS, *_MINICPMO45_DELEGATE_TOKEN_FIELDS):
                 setattr(self, field_name, -1)
         else:
             for field_name, token in _MINICPMO45_SPECIAL_TOKEN_FIELDS.items():
                 setattr(self, field_name, self._resolve_special_token_id(token))
-            for field_name, token in _MINICPMO45_OPTIONAL_TOKEN_FIELDS.items():
+            for field_name, token in {**_MINICPMO45_OPTIONAL_TOKEN_FIELDS, **_MINICPMO45_DELEGATE_TOKEN_FIELDS}.items():
                 setattr(self, field_name, self._resolve_special_token_id(token))
 
     def _resolve_special_token_id(self, token: str) -> int:

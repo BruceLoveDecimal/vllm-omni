@@ -397,6 +397,17 @@ class DuplexModelPlugin(ABC):
         del config, current, item
         return None
 
+    # Optional hook: queue client text that a model-native session reads
+    # in-stream. ``source`` is ``"input_text"``, ``"user_item"`` or
+    # ``"function_call_output"``. Plugins that advertise
+    # ``supports_text_append`` override it.
+    def queue_text_input(self, state: DuplexModelSessionState, text: str, *, source: str) -> None:
+        del state, text, source
+        raise DuplexRuntimeConfigError(
+            "The selected native duplex runtime accepts audio append only",
+            code="native_text_append_unsupported",
+        )
+
 
 def load_duplex_plugin(path: str, encode_audio: EncodeAudio) -> DuplexModelPlugin:
     module_name, separator, attribute_name = path.rpartition(".")

@@ -205,6 +205,12 @@ def duplex_scheduler_token_budget(payload: object, *, default: int = 64, tile_pi
     return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8)) + vision_tokens
 
 
+def duplex_payload_text_token_ids(payload: object) -> list[int]:
+    """Client text token ids that close the last unit of this append."""
+    token_ids = payload.get("text_token_ids") if isinstance(payload, dict) else None
+    return list(token_ids) if isinstance(token_ids, list) else []
+
+
 def duplex_first_append_context_reserve(runtime_config: object) -> int:
     if not isinstance(runtime_config, dict):
         return 48
@@ -255,6 +261,7 @@ def build_duplex_data_plane_prompt(
         token_budget += 1
         # Serving already pads the final residual audio. Stage0 does not
         # append another silent unit, so final must not reserve extra slots.
+    token_budget += len(duplex_payload_text_token_ids(payload))
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
     try:
@@ -892,6 +899,7 @@ __all__ = [
     "duplex_first_append_context_reserve",
     "duplex_first_append_unit_count",
     "duplex_payload_is_exact_chunks",
+    "duplex_payload_text_token_ids",
     "duplex_scheduler_token_budget",
     "normalize_ref_audio",
     "resolve_ref_audio",

@@ -72,8 +72,9 @@ does not switch engines. The Python `Omni` / `AsyncOmni` APIs are unchanged.
     `session.created.session.capabilities` is present before treating the
     connection as full duplex.
 
-**MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`) is the only model
-served over this endpoint today. PersonaPlex and Nemotron VoiceChat still carry
+**MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`) and
+**Realtime-Venus** (`vllm_omni/deploy/realtime_venus_omni.yaml`) are served
+over this endpoint today. PersonaPlex and Nemotron VoiceChat still carry
 their pre-framework duplex code: their pipelines declare no `duplex_plugin`, so
 they run turn-based until the follow-up PRs port them to the plugin contract
 (RFC [vllm-omni#7181](https://github.com/vllm-project/vllm-omni/issues/7181)).
@@ -102,6 +103,40 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
   --ref-audio reference_voice.wav \
   --output-dir /tmp/minicpmo-duplex
 ```
+
+## Realtime-Venus Quick Start
+
+Realtime-Venus is fine-tuned from MiniCPM-o 4.5 without architecture changes,
+so it runs on the same three stages. Its duplex session adds three things:
+
+- **Text in the stream.** `input.text.append`, user text
+  `conversation.item.create` items, and `function_call_output` items are read
+  in-stream: the text closes the model's next one-second input unit, after its
+  audio, and the model decides whether to answer it. The session advertises
+  `supports_text_append`. Keep streaming audio (silence included); queued text
+  waits for the next unit.
+- **Delegation as tool calls.** When the model writes
+  `<delegate>query</delegate>`, the span is never spoken; the client receives a
+  `delegate` function call whose arguments are `{"query": "..."}`. Answer it
+  with a `function_call_output` item; the model reads the answer as
+  `<backend>...</backend>` and delivers it when it sees fit.
+- **Packaged voice.** Without `ref_audio`, audio output uses the checkpoint's
+  `assets/HT_ref_audio.wav`.
+
+The Hugging Face repository holds both checkpoints in subdirectories, so serve
+a local copy of the one you need:
+
+```bash
+hf download inclusionAI/Realtime-Venus --include 'Realtime-Venus-Omni/*' --local-dir .
+vllm serve ./Realtime-Venus-Omni --omni \
+  --deploy-config vllm_omni/deploy/realtime_venus_omni.yaml \
+  --trust-remote-code \
+  --port 8091
+```
+
+`Realtime-Venus-Audio` reports MiniCPM-o 4.5's `model_type` in its
+`config.json`; the deploy configuration's `pipeline: realtime_venus_omni` key
+selects the Realtime-Venus session policy for it.
 
 ## Realtime Event Lifecycle
 

@@ -386,19 +386,21 @@ with no OpenAI counterpart.
 
 The event vocabulary is uniform, but several surfaces are gated by the
 `capabilities` object the server returns in `session.created`; a client must
-branch on those flags rather than on the model name. MiniCPM-o 4.5 is the
-only model on the plugin contract today; the other two columns record what
-their integrations advertise once the follow-up PRs port them:
+branch on those flags rather than on the model name. MiniCPM-o 4.5 and
+Realtime-Venus are the models on the plugin contract today; the other two
+columns record what their integrations advertise once the follow-up PRs port
+them:
 
-| Capability | MiniCPM-o 4.5 | PersonaPlex | Nemotron VoiceChat | Gated surface |
-| --- | --- | --- | --- | --- |
-| `implementation_level` | `model_native_duplex` | `model_native_duplex` | `model_native_duplex` | model-owned `response.listen` / `response.speak` (constant: every duplex model is model-native) |
-| `chunk_period_ms` | 1000 | 80 | 80 | the model unit that `response.listen` decisions and camera frames align to |
-| `supports_session_resume` | yes | no | yes | `session.resume`, `session.resumed`, `session.replaced`, replay after a transport drop |
-| `supports_barge_in` | yes | no | no | `barge_in`, `turn.signal{event:"barge_in"}`, `overlap_policy=barge_in_on_speech`, `turn_detection.server_vad` |
-| `supports_audio_truncate` | yes | no | no | `conversation.item.truncate` and truncating `playback.ack` adjusting the stored assistant item |
-| video input (`video_frames` on append) | consumed by Stage 0 | ignored | ignored | omni camera track |
-| tool calls | no | no | yes | `response.function_call_arguments.*`, `function_call` items |
+| Capability | MiniCPM-o 4.5 | Realtime-Venus | PersonaPlex | Nemotron VoiceChat | Gated surface |
+| --- | --- | --- | --- | --- | --- |
+| `implementation_level` | `model_native_duplex` | `model_native_duplex` | `model_native_duplex` | `model_native_duplex` | model-owned `response.listen` / `response.speak` (constant: every duplex model is model-native) |
+| `chunk_period_ms` | 1000 | 1000 | 80 | 80 | the model unit that `response.listen` decisions and camera frames align to |
+| `supports_session_resume` | yes | yes | no | yes | `session.resume`, `session.resumed`, `session.replaced`, replay after a transport drop |
+| `supports_barge_in` | yes | yes | no | no | `barge_in`, `turn.signal{event:"barge_in"}`, `overlap_policy=barge_in_on_speech`, `turn_detection.server_vad` |
+| `supports_audio_truncate` | yes | yes | no | no | `conversation.item.truncate` and truncating `playback.ack` adjusting the stored assistant item |
+| `supports_text_append` | no | yes | no | no | `input.text.append` and user text items read in-stream at the next input unit |
+| video input (`video_frames` on append) | consumed by Stage 0 | consumed by Stage 0 | ignored | ignored | omni camera track |
+| tool calls | no | `delegate` | no | yes | `response.function_call_arguments.*`, `function_call` items |
 
 Everything else in the catalogue — session lifecycle, heartbeat and event
 acknowledgement, append/commit/clear, the response envelope, playback
@@ -552,7 +554,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `input.commit` | 3 | Alias of `input_audio_buffer.commit` accepted by the runner. |
 | `input_audio_buffer.clear` | 1 | Drop un-committed input audio. |
 | `input.cancel` | 3 | Cancel pending input; advances `epoch`. |
-| `input.text.append` | 3 | Append text input; model-native sessions reject it with `native_text_append_unsupported`. |
+| `input.text.append` | 3 | Append text input. A model-native session reads it at its next input unit when it advertises `supports_text_append`, and rejects it with `native_text_append_unsupported` otherwise. |
 | `conversation.item.create` | 1 | Add a completed user item (text, audio, or `function_call_output`) to history. |
 | `conversation.item.retrieve` | 1 | Fetch a stored item by id. |
 | `conversation.item.delete` | 1 | Delete a stored item by id. |

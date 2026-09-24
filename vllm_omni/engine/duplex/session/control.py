@@ -302,6 +302,13 @@ class SessionControl:
                     dict(session.runtime_config),
                     item,
                 )
+                if session.capabilities.supports_text_append:
+                    output = item.get("output")
+                    self._ctx.plugin.queue_text_input(
+                        self._ctx.model_state,
+                        output if isinstance(output, str) else "",
+                        source="function_call_output",
+                    )
             except DuplexRuntimeConfigError as exc:
                 self._out.emit_error(exc.code, str(exc))
                 return
@@ -366,10 +373,19 @@ class SessionControl:
                 return
         message = realtime_item_to_history_message(item)
         item_id = item.get("id") if isinstance(item, dict) else None
+        user_text = _user_item_text(item_payload) if session.capabilities.supports_text_append else ""
+        if user_text:
+            # A model-native session reads the text in-stream at its next
+            # input unit; it is context, not a turn for response.create.
+            try:
+                self._ctx.plugin.queue_text_input(self._ctx.model_state, user_text, source="user_item")
+            except DuplexRuntimeConfigError as exc:
+                self._out.emit_error(exc.code, str(exc))
+                return
         if message is not None:
             session.append_history_message(message)
             session.register_history_item(item_id if isinstance(item_id, str) else None, message)
-            if message.get("role") == "user":
+            if message.get("role") == "user" and not user_text:
                 # A later response.create may answer this without any audio.
                 session.notify_new_user_item()
         self._out.emit(
@@ -380,3 +396,17 @@ class SessionControl:
                 "created": message is not None,
             }
         )
+
+
+def _user_item_text(item: dict[str, object] | None) -> str:
+    """Concatenated text parts of a user message item, or ``""``."""
+    if item is None or item.get("type", "message") != "message" or item.get("role") != "user":
+        return ""
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        part["text"]
+        for part in content
+        if isinstance(part, dict) and part.get("type") in {"input_text", "text"} and isinstance(part.get("text"), str)
+    )

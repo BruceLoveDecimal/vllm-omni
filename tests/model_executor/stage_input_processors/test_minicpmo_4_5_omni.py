@@ -337,3 +337,75 @@ def test_llm2tts_does_not_alias_live_thinker_token_list() -> None:
     live_tokens.append(13)
 
     assert converted["model_intermediate_buffer"]["ids"]["output"] == [11, 12]
+
+
+_DELEGATE_META = {
+    "tts_bos_token_id": 9301,
+    "tts_eos_token_id": 9302,
+    "listen_token_id": 9303,
+    "speak_token_id": 9304,
+    "chunk_eos_token_id": 9308,
+    "chunk_tts_eos_token_id": 9309,
+    "turn_eos_token_id": 9310,
+    "delegate_start_token_id": 9401,
+    "delegate_end_token_id": 9402,
+}
+
+
+def _delegate_segment(output_ids: list[int], prompt_ids: list[int]):
+    rows = len(prompt_ids) + len(output_ids)
+    return _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4),
+        multimodal_output={"duplex_prompt_token_ids": prompt_ids, "meta": _DELEGATE_META},
+    )
+
+
+def test_native_duplex_delegate_span_never_conditions_the_talker() -> None:
+    prompt_ids = [101, 102]
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 0, "model_turn_id": 1}})
+    first_ids = [9304, 21, 9401, 30, 31, 9308]
+
+    first = llm2tts([_delegate_segment(first_ids, prompt_ids)], prompt=[{}], _streaming_context=context)[0]
+    info = first["model_intermediate_buffer"]
+    assert info["ids"]["tts"] == [21]
+    # The kept row is the hidden state of token 21 (prompt rows come first).
+    torch.testing.assert_close(torch.as_tensor(info["hidden_states"]["tts"]), torch.tensor([[12.0, 13.0, 14.0, 15.0]]))
+    assert info["meta"]["next_stage_prompt_len"] == 2
+
+    # The span straddles the unit boundary; speech resumes after </delegate>.
+    second_ids = [*first_ids, 32, 9402, 22, 23, 9308]
+    second = llm2tts([_delegate_segment(second_ids, prompt_ids)], prompt=[{}], _streaming_context=context)[0]
+    assert second["model_intermediate_buffer"]["ids"]["tts"] == [22, 23]
+    assert second["model_intermediate_buffer"]["meta"]["turn_start"] is False
+
+
+def test_native_duplex_muted_turn_start_is_deferred_to_the_first_spoken_segment() -> None:
+    prompt_ids = [101, 102]
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 0, "model_turn_id": 1}})
+    first_ids = [9304, 9401, 30, 31, 9308]
+
+    assert llm2tts([_delegate_segment(first_ids, prompt_ids)], prompt=[{}], _streaming_context=context) == []
+
+    second_ids = [*first_ids, 9402, 22, 9310]
+    second = llm2tts([_delegate_segment(second_ids, prompt_ids)], prompt=[{}], _streaming_context=context)[0]
+    info = second["model_intermediate_buffer"]
+    assert info["ids"]["tts"] == [22, 9310]
+    assert info["meta"]["turn_start"] is True
+    assert info["meta"]["replace_streaming_prompt"] is True
+    assert info["meta"]["turn_end"] is True
+
+
+def test_native_duplex_turn_eos_closes_an_unterminated_delegate_span() -> None:
+    prompt_ids = [101, 102]
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 0, "model_turn_id": 1}})
+    first_ids = [9304, 21, 9401, 30, 9310]
+
+    first = llm2tts([_delegate_segment(first_ids, prompt_ids)], prompt=[{}], _streaming_context=context)[0]
+    # The Talker still receives its stop signal.
+    assert first["model_intermediate_buffer"]["ids"]["tts"] == [21, 9310]
+
+    second_ids = [*first_ids, 9304, 22, 9308]
+    second = llm2tts([_delegate_segment(second_ids, prompt_ids)], prompt=[{}], _streaming_context=context)[0]
+    assert second["model_intermediate_buffer"]["ids"]["tts"] == [22]

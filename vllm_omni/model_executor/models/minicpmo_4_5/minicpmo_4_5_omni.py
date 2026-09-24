@@ -49,6 +49,14 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+def _payload_text_token_ids(payload: dict[str, Any]) -> list[int] | None:
+    """Client text token ids the serving plugin attached to this append."""
+    token_ids = payload.get("text_token_ids")
+    if not isinstance(token_ids, list) or not token_ids:
+        return None
+    return [int(token_id) for token_id in token_ids]
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     MiniCPMO45OmniLLMMultiModalProcessor,
     info=MiniCPMO45OmniLLMProcessingInfo,
@@ -372,6 +380,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             is_speech=bool(payload.get("is_speech", False)),
             final=bool(duplex.get("final")),
             stage0_window=(duplex.get("stage0_window") if isinstance(duplex.get("stage0_window"), dict) else None),
+            text_token_ids=_payload_text_token_ids(payload),
         )
         update_result = dict(result)
         if result.get("stage0_window_replaced") is True:

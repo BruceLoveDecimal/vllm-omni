@@ -70,6 +70,7 @@ from vllm_omni.engine.duplex.events import (
 from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
     DuplexModelSessionState,
+    DuplexRuntimeConfigError,
     PcmAppendReservation,
 )
 from vllm_omni.engine.duplex.realtime_events import (
@@ -557,11 +558,10 @@ class DuplexSessionRunner:
             await self._on_append_audio(command.payload())
         elif isinstance(command, AppendText):
             session.mark_user_input_activity()
-            self._emit_error(
-                "native_text_append_unsupported",
-                "The selected native duplex runtime accepts audio append only",
-                event_id=command.event_id,
-            )
+            try:
+                self.plugin.queue_text_input(self.model_state, command.text, source="input_text")
+            except DuplexRuntimeConfigError as exc:
+                self._emit_error(exc.code, str(exc), event_id=command.event_id)
         elif isinstance(command, Commit):
             session.release_pending_turn()
             resolved = resolve_commit(projector, command)

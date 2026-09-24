@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import struct
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -46,6 +47,7 @@ from vllm_omni.engine.duplex.messages import (
     DuplexSessionEventMessage,
     OpenDuplexSessionMessage,
 )
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
 from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
@@ -204,8 +206,9 @@ async def open_harness(
     stage_count: int = 2,
     clock: Any = None,
     log_stats: bool = False,
+    plugin: DuplexModelPlugin | None = None,
 ) -> Harness:
-    plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
+    plugin = plugin or MiniCPMO45DuplexPlugin(_fake_encode_audio)
     port = RecordingStagePort(stage_count=stage_count)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
@@ -496,6 +499,96 @@ async def test_text_append_is_not_supported_by_the_native_runtime() -> None:
         assert types(events) == ["error"]
         assert events[0].code == "native_text_append_unsupported"
         assert events[0].related_event_id == "evt-text"
+    finally:
+        await close_harness(h)
+
+
+class _CharTokenizer:
+    """Characters map to ``1000 + ord(c)``; delegation markers are single tokens."""
+
+    special = {"<backend>": 9501, "</backend>": 9502, "<delegate>": 9503, "</delegate>": 9504}
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        ids: list[int] = []
+        index = 0
+        while index < len(text):
+            for token, token_id in self.special.items():
+                if text.startswith(token, index):
+                    ids.append(token_id)
+                    index += len(token)
+                    break
+            else:
+                ids.append(1000 + ord(text[index]))
+                index += 1
+        return ids
+
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
+        del skip_special_tokens
+        return "".join(chr(token_id - 1000) for token_id in token_ids if 1000 <= token_id < 9000)
+
+
+async def _open_realtime_venus_harness(monkeypatch) -> Harness:
+    from vllm_omni.model_executor.models.realtime_venus.duplex.plugin import RealtimeVenusDuplexPlugin
+
+    async def tokenizer_for(self, model_config):
+        del model_config
+        return _CharTokenizer()
+
+    monkeypatch.setattr(RealtimeVenusDuplexPlugin, "_tokenizer_for", tokenizer_for)
+    return await open_harness(plugin=RealtimeVenusDuplexPlugin(_fake_encode_audio))
+
+
+def _appended_text_ids(submission: DuplexStageSubmission) -> list[int] | None:
+    return submission.prompt["model_intermediate_buffer"]["duplex"]["payload"].get("text_token_ids")
+
+
+@pytest.mark.asyncio
+async def test_text_append_closes_the_next_unit_when_the_model_reads_text(monkeypatch) -> None:
+    h = await _open_realtime_venus_harness(monkeypatch)
+    try:
+        assert h.session.capabilities.supports_text_append is True
+        assert await h.run(commands.AppendText(text="hi", event_id="evt-text")) == []
+        item = {"id": "item_q", "type": "message", "role": "user", "content": [{"type": "input_text", "text": "?"}]}
+        await h.run(commands.CreateItem(item=item))
+        assert h.session.unanswered_user_items() == 0
+
+        await h.run(append_audio())
+        await h.run(append_audio())
+
+        assert _appended_text_ids(h.port.submissions[0]) == _CharTokenizer().encode("hi?")
+        assert _appended_text_ids(h.port.submissions[1]) is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_delegate_function_call_output_returns_as_backend_text(monkeypatch) -> None:
+    h = await _open_realtime_venus_harness(monkeypatch)
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        output_ids = [1, 9503, *_CharTokenizer().encode("weather"), 9504, 2]
+        segment = SimpleNamespace(
+            request_id=request_id,
+            finished=False,
+            outputs=[
+                SimpleNamespace(text="", token_ids=output_ids[-1:], cumulative_token_ids=output_ids),
+            ],
+            multimodal_output={"meta.delegate_start_token_id": 9503, "meta.delegate_end_token_id": 9504},
+        )
+        events = await h.deliver_and_settle(segment, stage_id=0, segment_finished=True)
+        done = find(events, "response.function_call_arguments.done").to_realtime()
+        assert json.loads(done["arguments"]) == {"query": "weather"}
+
+        output = {"id": "item_out", "type": "function_call_output", "call_id": done["call_id"], "output": "sunny"}
+        await h.run(commands.CreateItem(item=output))
+        await h.run(append_audio())
+
+        # The output offers the model another unit right away; the backend
+        # answer closes that unit, and only that one.
+        text_ids = [_appended_text_ids(submission) for submission in h.port.submissions]
+        assert text_ids == [None, _CharTokenizer().encode("<backend>sunny</backend>"), None]
     finally:
         await close_harness(h)
 

@@ -141,6 +141,14 @@ class MiniCPMO45DuplexPolicy:
         "slice_start_token_id": "<slice>",
         "slice_end_token_id": "</slice>",
     }
+    # In-stream delegation markers of checkpoints fine-tuned from MiniCPM-o 4.5
+    # for asynchronous tool use (Realtime-Venus). The span between them is a
+    # request for an external backend and is never spoken. Tokenizers without
+    # these tokens resolve them to -1, which disables span handling.
+    DELEGATE_TOKEN_FIELDS: dict[str, str] = {
+        "delegate_start_token_id": "<delegate>",
+        "delegate_end_token_id": "</delegate>",
+    }
 
     @classmethod
     def token_ids_from_tokenizer(cls, tokenizer: PreTrainedTokenizerBase) -> dict[str, int]:

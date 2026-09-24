@@ -120,6 +120,10 @@ class DuplexCapabilities:
     #: seeded turn must be given to generate on -- it still speaks per unit.
     supports_image_input: bool = False
     supports_text_only_turn: bool = False
+    #: Whether ``input.text.append``, user text items and function-call
+    #: outputs reach a model-native session in-stream: the model reads the
+    #: text at the end of its next input unit instead of as a separate turn.
+    supports_text_append: bool = False
     supports_chat_completions: bool = False
     text_turn_priming_units: int = 0
     requires_model_runner_kv: bool = False
@@ -163,6 +167,7 @@ class DuplexCapabilities:
             "supports_audio_truncate": self.supports_audio_truncate,
             "supports_image_input": self.supports_image_input,
             "supports_text_only_turn": self.supports_text_only_turn,
+            "supports_text_append": self.supports_text_append,
             "requires_model_runner_kv": self.requires_model_runner_kv,
             "requires_native_stage_role": self.requires_native_stage_role,
             "implementation_level": (

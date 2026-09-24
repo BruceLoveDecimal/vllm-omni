@@ -1,0 +1,7 @@
+# Realtime-Venus full duplex on one large-memory GPU.
+# Realtime-Venus is fine-tuned from MiniCPM-o 4.5 without architecture changes,
+# so it reuses the MiniCPM-o 4.5 three-stage deployment. The explicit pipeline
+# key also selects Realtime-Venus for the Realtime-Venus-Audio checkpoint,
+# whose config.json reports MiniCPM-o 4.5's model_type.
+base_config: minicpmo_4_5.yaml
+pipeline: realtime_venus_omni

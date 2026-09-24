@@ -655,6 +655,8 @@ def _native_duplex_segment_output_ids(
             # others keep returning cumulative ids. Detect restart from the
             # token prefix instead of clearing the cursor at turn_eos.
             sent_len = 0
+    if sent_len == 0:
+        state["delegate_open"] = False
     turn_start = sent_len == 0 or previous_turn_id != turn_id
     segment_ids = output_ids[sent_len:]
     decoded_segment_text = _decode_native_duplex_token_ids(
@@ -679,6 +681,47 @@ def _native_duplex_segment_output_ids(
     state["sent_output_ids"] = list(output_ids)
     state["turn_id"] = turn_id
     return segment_ids, segment_text, turn_start
+
+
+def _native_delegate_speakable(
+    output_ids: Sequence[int],
+    special_token_ids: Mapping[str, int],
+    streaming_context,
+) -> list[bool] | None:
+    """Per-token flags: whether each segment token may condition the Talker.
+
+    Checkpoints trained for in-stream delegation (Realtime-Venus) write a
+    request for an external backend between ``<delegate>`` and
+    ``</delegate>``. The span reaches the client as a function call and is
+    never spoken. It can straddle units, so the open state lives in the
+    request-local handoff state. ``<|turn_eos|>`` always stays speakable: it
+    is the Talker's trained stop signal, and it also closes an unterminated
+    span so the next turn is not muted. Returns None when the checkpoint has
+    no delegation tokens.
+    """
+    start_id = special_token_ids.get("delegate_start_token_id")
+    end_id = special_token_ids.get("delegate_end_token_id")
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
+    if start_id is None or end_id is None or not isinstance(state, dict):
+        return None
+    turn_eos_id = special_token_ids.get("turn_eos_token_id")
+    inside = bool(state.get("delegate_open", False))
+    speakable: list[bool] = []
+    for token_id in output_ids:
+        if token_id == start_id:
+            inside = True
+            speakable.append(False)
+        elif token_id == end_id:
+            inside = False
+            speakable.append(False)
+        elif token_id == turn_eos_id:
+            inside = False
+            speakable.append(True)
+        else:
+            speakable.append(not inside)
+    state["delegate_open"] = inside
+    return speakable
 
 
 def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] | None:
@@ -785,6 +828,7 @@ def llm2tts(
         llm_output_ids = list(llm_output_ids)
         thinker_text = getattr(output, "text", "") or ""
         native_turn_start = False
+        delegate_speakable = None
         if _has_native_duplex_prompt_metadata(mm_output):
             # The thinker's resumable duplex request reports cumulative
             # output ids/text, but earlier segments are already folded into
@@ -800,6 +844,7 @@ def llm2tts(
                 _streaming_context,
                 request_id=str(llm_output.request_id),
             )
+            delegate_speakable = _native_delegate_speakable(llm_output_ids, special_token_ids, _streaming_context)
         prompt_token_ids_len = len(prompt_token_ids)
 
         is_native_duplex_handoff = _has_native_duplex_prompt_metadata(mm_output)
@@ -856,6 +901,8 @@ def llm2tts(
                     break
 
         tts_token_ids_slice = tts_hidden_slice = None
+        # Index of the native handoff slice's first token in llm_output_ids.
+        native_slice_start = None
         native_segment_end = False
         if tts_bos_idx is not None and thinker_hidden_states.shape[0] > tts_bos_idx:
             end_idx = tts_eos_idx if tts_eos_idx is not None else thinker_hidden_states.shape[0]
@@ -875,6 +922,7 @@ def llm2tts(
                 out_end = tts_eos_idx - prompt_token_ids_len if tts_eos_idx is not None else len(llm_output_ids)
                 hidden_base = int(thinker_hidden_states.shape[0]) - len(llm_output_ids)
                 if hidden_base >= 0 and out_end > out_start:
+                    native_slice_start = out_start
                     tts_token_ids_slice = torch.tensor(llm_output_ids[out_start:out_end], dtype=torch.long)
                     tts_hidden_slice = (
                         thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
@@ -925,6 +973,7 @@ def llm2tts(
                 # tensor's last len(out_ids) rows are the delta's rows.
                 hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids)
                 if hidden_base >= 0 and out_end > out_start:
+                    native_slice_start = out_start
                     tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
                     tts_hidden_slice = (
                         thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
@@ -953,12 +1002,30 @@ def llm2tts(
                         break
                 hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids)
                 if hidden_base >= 0 and out_end > out_start:
+                    native_slice_start = out_start
                     tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
                     tts_hidden_slice = (
                         thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
                         .to(torch.float32)
                         .contiguous()
                     )
+        delegate_masked = False
+        if (
+            delegate_speakable is not None
+            and native_slice_start is not None
+            and tts_token_ids_slice is not None
+            and tts_hidden_slice is not None
+        ):
+            keep = [
+                index
+                for index in range(int(tts_token_ids_slice.shape[0]))
+                if delegate_speakable[native_slice_start + index]
+            ]
+            if len(keep) != int(tts_token_ids_slice.shape[0]):
+                delegate_masked = True
+                keep_index = torch.tensor(keep, dtype=torch.long)
+                tts_token_ids_slice = tts_token_ids_slice[keep_index]
+                tts_hidden_slice = tts_hidden_slice[keep_index]
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(
@@ -979,6 +1046,16 @@ def llm2tts(
             stream_output=is_native_duplex_handoff,
             native_duplex=is_native_duplex_handoff,
         )
+        handoff_state = None
+        deferred_turn_start = False
+        if is_native_duplex_handoff:
+            bridge_states = getattr(_streaming_context, "bridge_states", None)
+            handoff_state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
+            if isinstance(handoff_state, dict):
+                # The turn's first speech segment was a muted delegate span:
+                # this is the first Talker condition of the turn.
+                deferred_turn_start = bool(handoff_state.pop("deferred_turn_start", False))
+                native_turn_start = native_turn_start or deferred_turn_start
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             meta = model_intermediate_buffer.setdefault("meta", {})
@@ -1013,6 +1090,8 @@ def llm2tts(
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
             if not handoff_ids:
+                if isinstance(handoff_state, dict) and native_turn_start and (delegate_masked or deferred_turn_start):
+                    handoff_state["deferred_turn_start"] = True
                 continue
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
         if native_turn_end_handoff:
