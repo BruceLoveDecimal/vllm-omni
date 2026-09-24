@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The causal flow draws its initial noise from a fixed, position-indexed buffer."""
 
-import types
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 import pytest
 import torch
@@ -110,26 +110,58 @@ def test_forward_is_deterministic_and_does_not_touch_global_rng():
 PRE_LOOKAHEAD = 3
 
 
-def _stubbed_code2wav(calls: list) -> CosyVoice3Code2Wav:
+class _FlowStub(nn.Module):
+    token_mel_ratio = 2
+    pre_lookahead_len = PRE_LOOKAHEAD
+
+
+@dataclass
+class _Connector:
+    config: dict[str, dict[str, int]]
+
+
+@dataclass
+class _TransferManager:
+    connector: _Connector
+    code_prompt_token_ids: defaultdict[str, list[int]] = field(default_factory=lambda: defaultdict(list))
+    request_payload: dict[str, dict[str, object]] = field(default_factory=dict)
+
+
+@dataclass
+class _Request:
+    external_req_id: str
+    output_token_ids: list[int] = field(default_factory=list)
+    additional_information: dict[str, object] = field(default_factory=dict)
+
+    def is_finished(self) -> bool:
+        return False
+
+
+def _stubbed_code2wav(calls: list[int | torch.Tensor]) -> CosyVoice3Code2Wav:
     """Code2wav with the flow and HiFT replaced by shape-only fakes."""
     model = object.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)
-    model.flow_model = types.SimpleNamespace(token_mel_ratio=2, pre_lookahead_len=PRE_LOOKAHEAD)
+    model.flow_model = _FlowStub()
 
     def fake_forward_mel(token, prompt_token, prompt_feat, embedding, **kw):
         calls.append(kw["noise_offset_tokens"])
-        valid = int(token.shape[1]) - (0 if kw["finalize"] else PRE_LOOKAHEAD) - int(kw["token_offset_tokens"])
+        lookahead = 0
+        if not kw["finalize"]:
+            lookahead = PRE_LOOKAHEAD
+        valid = int(token.shape[1]) - lookahead - int(kw["token_offset_tokens"])
         return torch.zeros(int(token.shape[0]), 80, 2 * valid)
 
     def fake_hift(feat, *, cache_state=None, finalize=False):
-        return feat, (None if finalize else {"mel": feat})
+        if finalize:
+            return feat, None
+        return feat, {"mel": feat}
 
     model._forward_mel = fake_forward_mel
     model._stream_hift_from_feat = fake_hift
     return model
 
 
-def _prompt(batch: int = 1) -> dict:
+def _prompt(batch: int = 1) -> dict[str, torch.Tensor]:
     return {
         "prompt_token": torch.zeros(batch, 2, dtype=torch.int32),
         "prompt_feat": torch.zeros(batch, 4, 80),
@@ -139,23 +171,36 @@ def _prompt(batch: int = 1) -> dict:
 
 def test_streaming_tracks_the_absolute_offset_across_windows():
     """emitted-so-far minus the resent left context is the first token's position."""
-    calls: list = []
+    calls: list[int | torch.Tensor] = []
     model = _stubbed_code2wav(calls)
 
     # Chunk 1: 15 new tokens + 3 lookahead, nothing resent.
-    _, state = model.forward_streaming(token=torch.zeros(1, 18, dtype=torch.int32), **_prompt(), token_offset_tokens=0)
+    _, state = model.forward_streaming(
+        token=torch.zeros(1, 18, dtype=torch.int32),
+        **_prompt(),
+        token_offset_tokens=0,
+    )
+    assert state is not None
     assert state["flow_emitted_tokens"] == 15
     # Chunk 2: resend all 15 as left context (window not yet full), 30 new.
     _, state = model.forward_streaming(
-        token=torch.zeros(1, 48, dtype=torch.int32), **_prompt(), cache_state=state, token_offset_tokens=15
+        token=torch.zeros(1, 48, dtype=torch.int32),
+        **_prompt(),
+        cache_state=state,
+        token_offset_tokens=15,
     )
+    assert state is not None
     assert state["flow_emitted_tokens"] == 45
     # Chunk 3: window of 25 slides; the first resent token is absolute 20.
     _, state = model.forward_streaming(
-        token=torch.zeros(1, 28, dtype=torch.int32), **_prompt(), cache_state=state, token_offset_tokens=25
+        token=torch.zeros(1, 28, dtype=torch.int32),
+        **_prompt(),
+        cache_state=state,
+        token_offset_tokens=25,
     )
+    assert state is not None
     assert calls == [0, 0, 20]
-    assert state["flow_emitted_tokens"] == 45  # 28 - 3 lookahead - 25 context: no new tokens yet
+    assert state["flow_emitted_tokens"] == 45
     # Finalize releases the lookahead and returns no state.
     _, state = model.forward_streaming(
         token=torch.zeros(1, 28, dtype=torch.int32),
@@ -169,7 +214,7 @@ def test_streaming_tracks_the_absolute_offset_across_windows():
 
 
 def test_batched_streaming_tracks_offsets_per_row():
-    calls: list = []
+    calls: list[int | torch.Tensor] = []
     model = _stubbed_code2wav(calls)
     items = [
         # Fresh stream: 10 new tokens + lookahead.
@@ -184,16 +229,15 @@ def test_batched_streaming_tracks_offsets_per_row():
     results = model.forward_streaming_batch([{**item, **_prompt()} for item in items])
 
     assert len(calls) == 1  # both rows went through one batched flow call
+    assert isinstance(calls[0], torch.Tensor)
     assert calls[0].tolist() == [0, 15]
     assert [state["flow_emitted_tokens"] for _, state in results] == [10, 45]
 
 
 def test_code2wav_offset_matches_the_processor_window():
     """The offset code2wav rebuilds from its state is the processor's window start."""
-    transfer_manager = types.SimpleNamespace(
-        code_prompt_token_ids=defaultdict(list),
-        request_payload={},
-        connector=types.SimpleNamespace(
+    transfer_manager = _TransferManager(
+        connector=_Connector(
             config={
                 "extra": {
                     "codec_chunk_frames": 4,
@@ -202,20 +246,18 @@ def test_code2wav_offset_matches_the_processor_window():
                     "codec_stream_scale_factor": 2,
                     "codec_left_context_frames": 5,
                     "codec_vocab_size": 6561,
-                }
-            }
+                },
+            },
         ),
     )
     total = 40
     # Token ``k`` of the stream has value ``k + 1``, so a payload's first code
     # tells which absolute position the processor's window starts at.
-    request = types.SimpleNamespace(
-        external_req_id="rid", output_token_ids=[], additional_information={}, is_finished=lambda: False
-    )
-    calls: list = []
+    request = _Request(external_req_id="rid")
+    calls: list[int | torch.Tensor] = []
     model = _stubbed_code2wav(calls)
     state = None
-    window_starts = []
+    window_starts: list[int] = []
     emitted_frames = 0
     for count in range(1, total + 1):
         request.output_token_ids = list(range(1, count + 1))

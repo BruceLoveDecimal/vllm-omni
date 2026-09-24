@@ -243,7 +243,9 @@ class CausalConditionalCFM(ConditionalCFM):
             self.rand_noise = self.rand_noise.to(mu.device)
         offset = torch.as_tensor(noise_offset, dtype=torch.long, device=mu.device).reshape(-1, 1)
         positions = torch.arange(length, device=mu.device)
-        index = torch.where(positions < prompt_len, positions, positions + offset) % self.rand_noise.shape[-1]
+        post_prompt_positions = positions + offset
+        noise_positions = torch.where(positions < prompt_len, positions, post_prompt_positions)
+        index = noise_positions % self.rand_noise.shape[-1]
         noise = self.rand_noise[0][:, index.expand(batch, length)]
         return noise.permute(1, 0, 2).to(mu.dtype) * temperature
 

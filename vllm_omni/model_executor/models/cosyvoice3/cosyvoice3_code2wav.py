@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
+from typing_extensions import NotRequired
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none, set_current_diffusion_config
@@ -57,9 +58,13 @@ def _build_dit_estimator(estimator_config: Mapping[str, Any]) -> DiT:
         return DiT(**estimator_config)
 
 
-# Per-request streaming state carried between chunks: HiFT's mel history and
-# phase, plus the flow's emitted-token count (ints and tensors mixed).
-StreamCacheState = dict[str, torch.Tensor | int | None]
+class StreamCacheState(TypedDict):
+    """HiFT history and the number of flow tokens emitted for one stream."""
+
+    mel: torch.Tensor
+    mel_offset: int
+    phase_acc: torch.Tensor | None
+    flow_emitted_tokens: NotRequired[int]
 
 
 class StreamingFlowItem(TypedDict, total=False):
@@ -157,9 +162,7 @@ class CosyVoice3Code2Wav(nn.Module):
         self.mel_cache_len = 20
         self.source_cache_len = int(self.mel_cache_len * 256)
         self.speech_window = np.hamming(2 * self.source_cache_len)
-        # Must cover decode()'s own causal receptive field, not just the F0
-        # margin; window_len=48 already passes
-        # test_incremental_hift_bounded_window_is_close, so 64 has headroom.
+        # Cover decode()'s causal receptive field as well as the F0 margin.
         self._hift_window_len = 64
 
     @property
@@ -347,7 +350,9 @@ class CosyVoice3Code2Wav(nn.Module):
     @staticmethod
     def _stream_noise_offset(cache_state: StreamCacheState | None, token_offset_tokens: int) -> int:
         """Absolute index of the first token resent to the flow: emitted so far minus the left context."""
-        emitted = int(cache_state.get("flow_emitted_tokens", 0)) if cache_state else 0
+        emitted = 0
+        if cache_state is not None:
+            emitted = cache_state.get("flow_emitted_tokens", 0)
         return max(0, emitted - token_offset_tokens)
 
     @torch.inference_mode()
@@ -508,7 +513,6 @@ class CosyVoice3Code2Wav(nn.Module):
         )
         speech, new_state = self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
         if new_state is not None:
-            # Finalize returns no state, so the lookahead is always held back here.
             valid_tokens = int(token.shape[1]) - int(self.flow_model.pre_lookahead_len)
             new_state["flow_emitted_tokens"] = noise_offset + valid_tokens
         return speech, new_state
