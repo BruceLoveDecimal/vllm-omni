@@ -46,6 +46,18 @@ def _reference_snake(module: SnakeBeta, x: torch.Tensor) -> torch.Tensor:
 
 
 @torch.inference_mode()
+def test_window_padding_decodes_to_raw_zero() -> None:
+    """Bucket padding is the normalized latent whose denormalized value is zero."""
+    vae = _small_vae()
+    with torch.no_grad():
+        vae.global_mean.normal_()
+        vae.global_log_std.uniform_(0.5, 2.0)
+    pad = AuKVAEDecodeGraph(vae)._pad_for(torch.device("cpu"))
+    raw = pad * torch.sqrt(vae.global_log_std) + vae.global_mean
+    torch.testing.assert_close(raw, torch.zeros_like(raw), atol=1e-6, rtol=0.0)
+
+
+@torch.inference_mode()
 def test_eager_snake_matches_the_reference_formula() -> None:
     module = SnakeBeta(6, alpha_logscale=True)
     with torch.no_grad():
@@ -192,15 +204,20 @@ def test_tiled_decode_matches_the_whole_decode() -> None:
 def test_graph_replay_matches_eager_per_length() -> None:
     vae = _small_vae().to("cuda")
     wrapper = AuKVAEDecodeGraph(vae, max_graphs=2)
-    for frames in (6, 9, 6, 12):
+    pools = []
+    for frames in (6, 9, 6, 12, 6):
         latents = torch.randn(1, frames, vae.latent_dim, device="cuda")
         eager = vae.decode(latents)
         replay = wrapper(latents)
-        # Exact-length graphs replay the very same kernels: bit-identical.
+        # Exact-length graphs replay the very same kernels: bit-identical,
+        # including after the generation was retired.
         assert torch.equal(replay, eager), frames
-    # LRU: three distinct lengths seen, two graphs kept, the oldest evicted.
-    assert list(wrapper._cache) == [6, 12] or list(wrapper._cache) == [9, 12]
-    assert len(wrapper._cache) == 2
+        pools.append(wrapper._plain_pool)
+    # The third distinct length found the cache full, so the whole generation
+    # (6 and 9) was retired together with its pool rather than one graph at a
+    # time; 12 and the re-captured 6 share the new pool.
+    assert list(wrapper._cache) == [12, 6]
+    assert pools[0] is pools[2] and pools[3] is pools[4] and pools[2] is not pools[3]
 
 
 @pytest.mark.cuda
@@ -213,10 +230,11 @@ def test_bucketed_graph_only_disturbs_the_tail() -> None:
     eager = vae.decode(latents)
     replay = wrapper(latents)
     assert replay.shape == eager.shape and list(wrapper._cache) == [8]
-    # The zero padding leaks in through the non-causal conv_pre and the
-    # alias-free upsamplers, whose lookahead accumulates through the stack, so
-    # a bucketed replay is close to but not identical with the eager decode.
-    # That is why frame_alignment defaults to 1.
+    # The padding decodes to raw zero, which is what the eager conv_pre pads
+    # with, but it still leaks in through the alias-free upsamplers, whose
+    # lookahead accumulates through the stack, so a bucketed replay is close
+    # to but not identical with the eager decode. That is why frame_alignment
+    # defaults to 1.
     assert torch.isfinite(replay).all()
     assert not torch.equal(replay, eager)
     torch.testing.assert_close(replay, eager, atol=0.1, rtol=0.0)

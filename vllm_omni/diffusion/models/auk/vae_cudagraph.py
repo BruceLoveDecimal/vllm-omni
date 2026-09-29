@@ -9,10 +9,11 @@ whole decode as CUDA graphs, in three tiers:
 Compiled bucket graphs are built at startup by warmup(): decode is passed
 through torch.compile so Inductor fuses the elementwise chains, then one
 graph is captured per bucket in compile_shapes. Shorter clips are
-right-padded with zeros to their bucket. The padding leaks slightly into
-the last frames through the non-causal conv_pre, and the fused kernels
-differ from eager in rounding order, so these graphs are close to but not
-bit-identical with the eager decode.
+right-padded to their bucket with the normalized latent that decodes to
+raw zero, which is what the eager decode's own convolution padding sees,
+so the padding only reaches the last frames through the upsamplers'
+lookahead. The fused kernels differ from eager in rounding order, so these
+graphs are close to but not bit-identical with the eager decode.
 
 Clips longer than tile_frames are decoded in tiles of that many frames
 (by default the largest bucket, so every tile replays the same compiled
@@ -27,7 +28,10 @@ they finish so a caller can stream them.
 Plain graphs are captured on demand, one per exact latent length, for
 windows no compiled bucket serves (tiling off, or a bucket whose compile
 failed). They replay the same kernels as eager and are bit-identical with
-it.
+it. They share one wrapper-private graph pool, so they are never evicted
+one at a time: when max_graphs is reached the whole generation is retired
+and a fresh pool is started, and no surviving graph can hold an address
+that a destroyed graph released.
 """
 
 from __future__ import annotations
@@ -127,8 +131,12 @@ class AuKVAEDecodeGraph:
         self.tile_frames = max(0, int(tile_frames))
         if self.tile_frames and self.tile_frames <= sum(self.context_frames):
             raise ValueError(f"tile_frames={self.tile_frames} must exceed the decoder context {self.context_frames}")
-        # Plain graphs keyed by latent length, least recently used first.
+        # Plain graphs keyed by latent length. They all live in _plain_pool and
+        # are retired together (see _retire_plain_graphs).
         self._cache: OrderedDict[int, _GraphEntry] = OrderedDict()
+        self._plain_pool = None
+        # Normalized latent that decodes to raw zero, per device; pads short windows.
+        self._pad_latent: torch.Tensor | None = None
         # Compiled graphs keyed by bucket, filled by warmup().
         self._compiled: dict[int, _GraphEntry] = {}
         self._compiled_decode: Callable[[torch.Tensor], torch.Tensor] | None = None
@@ -190,21 +198,37 @@ class AuKVAEDecodeGraph:
             bucket = round_up(frames, self.frame_alignment)
             entry = self._cache.get(bucket)
             if entry is None:
-                entry = self._capture(bucket, latents.device, self.vae.decode, warm_iters=2)
                 if len(self._cache) >= self.max_graphs:
-                    self._cache.popitem(last=False)
+                    self._retire_plain_graphs()
+                if self._plain_pool is None:
+                    self._plain_pool = torch.cuda.graph_pool_handle()
+                entry = self._capture(bucket, latents.device, self.vae.decode, warm_iters=2, pool=self._plain_pool)
                 self._cache[bucket] = entry
-            else:
-                self._cache.move_to_end(bucket)
             self.last_mode = "graph"
 
         if bucket == frames:
             entry.static_latents.copy_(latents)
         else:
-            entry.static_latents.zero_()
             entry.static_latents[:, :frames].copy_(latents)
+            entry.static_latents[:, frames:].copy_(self._pad_for(latents.device).expand(1, bucket - frames, -1))
         entry.graph.replay()
         return entry.static_wav[:, : frames * self.vae.hop_size]
+
+    def _retire_plain_graphs(self) -> None:
+        """Drop every plain graph and their shared pool; the next capture starts a new one."""
+        logger.info("AuK codec decode: retiring %d plain CUDA graphs", len(self._cache))
+        self._cache.clear()
+        self._plain_pool = None
+
+    def _pad_for(self, device: torch.device) -> torch.Tensor:
+        """The [latent_dim] normalized latent that AuKVAE.decode maps to raw zero."""
+        pad = self._pad_latent
+        if pad is None or pad.device != device:
+            mean = self.vae.global_mean.detach().float().to(device)
+            scale = torch.sqrt(self.vae.global_log_std.detach().float().to(device))
+            pad = -mean / scale
+            self._pad_latent = pad
+        return pad
 
     def compiled_bucket(self, frames: int) -> int | None:
         """The smallest compiled bucket that holds frames latents, or None past the largest."""
@@ -261,6 +285,7 @@ class AuKVAEDecodeGraph:
         decode: Callable[[torch.Tensor], torch.Tensor],
         *,
         warm_iters: int,
+        pool=None,
     ) -> _GraphEntry:
         """Capture one graph of decode on zero latents of bucket frames.
 
@@ -275,7 +300,9 @@ class AuKVAEDecodeGraph:
                 decode(static_latents)
             torch.accelerator.synchronize(device)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=current_omni_platform.get_global_graph_pool()):
+            if pool is None:
+                pool = current_omni_platform.get_global_graph_pool()
+            with torch.cuda.graph(graph, pool=pool):
                 static_wav = decode(static_latents)
         logger.info("Captured AuK codec decode CUDA graph: latent_frames=%d", bucket)
         return _GraphEntry(graph=graph, static_latents=static_latents, static_wav=static_wav)
