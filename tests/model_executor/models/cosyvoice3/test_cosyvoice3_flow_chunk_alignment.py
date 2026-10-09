@@ -176,6 +176,7 @@ class _FakeTrtContext:
     def set_input_shape(self, name, shape):
         self.shapes[name] = tuple(shape)
         return True
+        return True
 
     def set_tensor_address(self, name, address):
         self.addresses[name] = address
@@ -216,7 +217,7 @@ class _FakeTrtEstimator:
 
 class _RejectingShapeContext(_FakeTrtContext):
     def set_input_shape(self, name, shape):
-        super().set_input_shape(name, shape)
+        return super().set_input_shape(name, shape)
         return name != "x"  # TRT returns False for a shape outside the profile
 
 
