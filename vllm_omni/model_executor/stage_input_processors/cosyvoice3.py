@@ -17,6 +17,7 @@ from vllm_omni.data_entry_keys import (
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_flow_left_context
 from vllm_omni.model_executor.models.cosyvoice3.utils import unpad_prompt_conditioning
 
 logger = init_logger(__name__)
@@ -126,7 +127,12 @@ def talker2code2wav_async_chunk(
         # ``left_context_size`` trim only keeps regenerated context from being
         # emitted as new audio; it does not make the new frames identical.
         # Widen the window if you hear seams, at the cost of latency and memory.
-        flow_left_context = int(cfg.get("codec_left_context_frames", 25))
+        #
+        # Packed streaming must run unbounded (0): its chunk-causal flow with
+        # position-fixed noise recomputes the prefix exactly, and a window
+        # shifts both the chunk grid and the noise. Stage 1 rejects the
+        # combination at startup, since only stage 1 sees that profile's env.
+        flow_left_context = cosyvoice3_flow_left_context(cfg)
         if chunk_size <= 0 or pre_lookahead_len < 0 or max_chunk_size <= 0 or stream_scale_factor <= 0:
             raise ValueError(
                 f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "

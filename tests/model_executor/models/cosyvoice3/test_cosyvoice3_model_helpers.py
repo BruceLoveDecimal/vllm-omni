@@ -1120,3 +1120,44 @@ def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owne
     if stage == "cosyvoice3_code2wav":
         model.code2wav = SimpleNamespace(owns_generation_output_storage=owned)
     assert model.owns_generation_output_storage is (stage == "cosyvoice3_code2wav" and owned)
+
+
+@pytest.mark.parametrize(
+    ("packed_streaming", "extra", "raises"),
+    [
+        (True, {"codec_left_context_frames": 25}, True),
+        # The window defaults on, so a connector that omits the key is bounded too.
+        (True, {"codec_chunk_frames": 25}, True),
+        (True, {"codec_left_context_frames": 0}, False),
+        # Without a connector no async-chunk processor applies a window.
+        (True, {}, False),
+        (False, {"codec_left_context_frames": 25}, False),
+    ],
+)
+def test_flow_window_is_exclusive_with_packed_streaming(monkeypatch, packed_streaming, extra, raises):
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_streaming_enabled", lambda: packed_streaming)
+
+    if raises:
+        with pytest.raises(ValueError, match="codec_left_context_frames"):
+            CosyVoice3Model._check_flow_window_vs_packed(extra)
+    else:
+        CosyVoice3Model._check_flow_window_vs_packed(extra)
+
+
+@pytest.mark.parametrize(
+    "deploy",
+    ["cosyvoice3_packed_streaming.yaml", "cosyvoice3_packed_streaming_optimized_standard.yaml"],
+)
+def test_packed_streaming_deploys_disable_flow_window(deploy):
+    from pathlib import Path
+
+    import vllm_omni
+    from vllm_omni.config.stage_config import resolve_deploy_yaml
+    from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_flow_left_context
+
+    deploy_dir = Path(vllm_omni.__file__).parent / "deploy"
+    extra = resolve_deploy_yaml(deploy_dir / deploy)["connectors"]["connector_of_shared_memory"]["extra"]
+
+    assert cosyvoice3_flow_left_context(extra) == 0
+    # The base profile still bounds its window; only the streaming overlay opts out.
+    assert extra["codec_chunk_frames"] == 25
