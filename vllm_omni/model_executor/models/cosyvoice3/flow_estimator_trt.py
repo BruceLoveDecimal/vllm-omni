@@ -181,6 +181,13 @@ class _TrtEstimatorSession:
                 memory_format=torch.contiguous_format,
             )
 
+        # ``run`` only refreshes the per-step inputs, so anything it will not
+        # touch has to hold its data before the first enqueue. A buffer that
+        # aliases its source tensor already does.
+        for index, (buffer, tensor) in enumerate(zip(self._input_buffers, inputs, strict=True)):
+            if index not in _TRT_DYNAMIC_INPUT_INDICES and buffer.data_ptr() != tensor.data_ptr():
+                buffer.copy_(tensor)
+
         for name, buffer in zip(self.input_names, self._input_buffers, strict=True):
             context.set_input_shape(name, tuple(buffer.shape))
 
