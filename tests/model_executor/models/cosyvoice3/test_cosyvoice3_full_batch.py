@@ -186,3 +186,37 @@ def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monke
     monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "0")
     with pytest.raises(ValueError, match="COSYVOICE3_PACKED_STREAMING"):
         model.forward_batch(items[:1], n_timesteps=3, stream_items=True)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_streaming_batch_mixed_references_match_independent_flow(monkeypatch):
+    """The default streaming path used to group on the reference length, so
+    each distinct speaker ran alone. Mixed references now share one flow call
+    and each row must still get its own conditioning and crop point."""
+    monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "0")
+    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "0")
+    model = tiny_flow(monkeypatch)
+    monkeypatch.setattr(
+        model, "_stream_hift_from_feat", lambda mel, cache_state, finalize: (mel, None if finalize else cache_state)
+    )
+    items = [
+        dict(
+            token=torch.randint(0, 64, (1, generated), device="cuda"),
+            prompt_token=torch.randint(0, 64, (1, prompt)),
+            prompt_feat=torch.randn(1, prompt * 2, 80, device="cuda"),
+            embedding=torch.randn(1, 192, device="cuda"),
+            token_offset_tokens=offset,
+            finalize=index % 2 == 0,
+            cache_state=None,
+        )
+        for index, (prompt, generated, offset) in enumerate(
+            [(7, 31, 0), (13, 31, 3), (3, 17, 0), (13, 44, 3), (29, 31, 0)]
+        )
+    ]
+    expected = [model.forward_streaming_batch([item], n_timesteps=3)[0] for item in items]
+    for ordered, reference in [(items, expected), (items[::-1], expected[::-1])]:
+        actual = model.forward_streaming_batch(ordered, n_timesteps=3)
+        for (mel, _), (ref_mel, _) in zip(actual, reference, strict=True):
+            assert mel.shape == ref_mel.shape
+            torch.testing.assert_close(mel, ref_mel, rtol=0.04, atol=0.04)

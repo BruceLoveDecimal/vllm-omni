@@ -153,3 +153,26 @@ def test_streaming_tracks_the_absolute_offset_across_windows():
     )
     assert calls[-1] == 20
     assert state is None
+
+
+def test_prompt_boundary_can_differ_per_row():
+    """Rows carrying references of different lengths each keep their own
+    prompt/stream boundary, so a mixed-reference batch draws the same noise
+    each of its requests would draw alone."""
+    cfm = _cfm()
+    mu = torch.zeros(3, 80, 24)
+    prompt_lens = [4, 10, 0]
+    offsets = [0, 7, 13]
+
+    batched = cfm.fixed_noise(mu, prompt_len=torch.tensor(prompt_lens), noise_offset=torch.tensor(offsets))
+    for row, (prompt_len, offset) in enumerate(zip(prompt_lens, offsets)):
+        alone = cfm.fixed_noise(mu[:1], prompt_len=prompt_len, noise_offset=offset)
+        torch.testing.assert_close(batched[row : row + 1], alone)
+
+
+def test_scalar_prompt_boundary_still_broadcasts():
+    cfm = _cfm()
+    mu = torch.zeros(2, 80, 16)
+    scalar = cfm.fixed_noise(mu, prompt_len=5, noise_offset=2)
+    per_row = cfm.fixed_noise(mu, prompt_len=torch.tensor([5, 5]), noise_offset=2)
+    torch.testing.assert_close(scalar, per_row)

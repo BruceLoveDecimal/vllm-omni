@@ -15,6 +15,7 @@ from torch import nn
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiT
+from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3_code2wav as code2wav_module
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
 from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 from vllm_omni.model_executor.models.cosyvoice3.utils import build_dit_attention_mask, subsequent_chunk_mask
@@ -447,6 +448,64 @@ class TestStreamingBatch:
         # Row 2 drops its lookahead and its 25 resent tokens: 25 new tokens.
         assert results[2][1]["mel_frames"] == 2 * 25
         assert results[0][1]["mel_frames"] == 2 * 25
+
+    @staticmethod
+    def _ragged_item(index: int, tokens: int, prompt: int, *, finalize: bool = False):
+        item = TestStreamingBatch._item(index, tokens, finalize=finalize)
+        item["prompt_token"] = torch.zeros(1, prompt, dtype=torch.int32)
+        item["prompt_feat"] = torch.zeros(1, 2 * prompt, 80)
+        return item
+
+    def test_different_reference_lengths_share_one_flow_call(self):
+        """Grouping on the reference length made every distinct speaker its own
+        group of one, so a batched engine never saw a batched shape. The flow
+        takes per-row lengths instead."""
+        calls: list = []
+        model = self._model(calls)
+        prompts = [25, 37, 25, 112]
+        items = [self._ragged_item(i, 28, prompt) for i, prompt in enumerate(prompts)]
+
+        model.forward_streaming_batch(items, n_timesteps=2)
+
+        assert len(calls) == 1
+        call = calls[0]
+        assert call["prompt_token_lens"].tolist() == prompts
+        assert call["prompt_feat_lens"].tolist() == [2 * p for p in prompts]
+
+    def test_finalization_still_splits_the_batch(self):
+        calls: list = []
+        model = self._model(calls)
+        items = [
+            self._ragged_item(0, 28, 25),
+            self._ragged_item(1, 28, 37, finalize=True),
+        ]
+
+        model.forward_streaming_batch(items, n_timesteps=2)
+
+        assert sorted(c["finalize"] for c in calls) == [False, True]
+        assert all(c["prompt_token_lens"].numel() == 1 for c in calls)
+
+
+class TestPadAndCat:
+    def test_pads_the_named_axis_to_the_widest_row(self):
+        rows = [torch.ones(1, 3, dtype=torch.int32), torch.full((1, 5), 2, dtype=torch.int32)]
+        out = code2wav_module._pad_and_cat(rows, dim=1)
+        assert out.shape == (2, 5)
+        assert out.dtype == torch.int32
+        assert out[0].tolist() == [1, 1, 1, 0, 0]
+        assert out[1].tolist() == [2, 2, 2, 2, 2]
+
+    def test_pads_an_inner_axis_without_moving_the_others(self):
+        rows = [torch.ones(1, 4, 80), torch.full((1, 10, 80), 2.0)]
+        out = code2wav_module._pad_and_cat(rows, dim=1)
+        assert out.shape == (2, 10, 80)
+        assert torch.equal(out[0, :4], torch.ones(4, 80))
+        assert torch.count_nonzero(out[0, 4:]) == 0
+
+    def test_equal_widths_are_a_plain_concat(self):
+        rows = [torch.ones(1, 6), torch.zeros(1, 6)]
+        out = code2wav_module._pad_and_cat(rows, dim=1)
+        assert torch.equal(out, torch.cat(rows, dim=0))
 
 
 class TestHopAlignmentWarning:
