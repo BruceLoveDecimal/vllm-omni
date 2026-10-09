@@ -495,6 +495,7 @@ def test_context_session_binds_once_for_repeated_steps(monkeypatch):
 
         def set_input_shape(self, name, shape):
             self.shape_calls.append((name, shape))
+            return True
 
         def set_tensor_address(self, name, address):
             self.address_calls.append((name, address))
@@ -605,6 +606,7 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
 
         def set_input_shape(self, name, shape):
             self.shapes[name] = shape
+            return True
 
         def set_optimization_profile_async(self, profile_index, stream_handle):
             return True
@@ -742,7 +744,7 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
 def test_dynamic_session_selects_profile_or_preserves_serial_fallback(monkeypatch, cfg_batch, length, expected_profile):
     class Context(_FakeContext):
         def set_input_shape(self, name, shape):
-            pass
+            return True
 
         def set_tensor_address(self, name, address):
             pass
@@ -889,7 +891,7 @@ class TestChunkMaskDynamicBatch:
     def test_session_arity_follows_the_engine_inputs(self, monkeypatch, supports_attn_mask):
         class Context(_FakeContext):
             def set_input_shape(self, name, shape):
-                pass
+                return True
 
             def set_tensor_address(self, name, address):
                 pass
@@ -931,7 +933,7 @@ class TestChunkMaskDynamicBatch:
     def test_session_output_buffer_matches_the_engine_output_dtype(self, monkeypatch):
         class Context(_FakeContext):
             def set_input_shape(self, name, shape):
-                pass
+                return True
 
             def set_tensor_address(self, name, address):
                 pass
@@ -959,3 +961,66 @@ class TestChunkMaskDynamicBatch:
         )
         with wrapper.estimation_session(*inputs) as session:
             assert session._engine_output.dtype == torch.float32
+
+
+class TestSessionSurfacesTensorRTFailures:
+    """The session reuses one output buffer across Euler steps, so a dropped
+    enqueue or a rejected shape must raise instead of returning stale mel."""
+
+    @staticmethod
+    def _wrapper(monkeypatch, context):
+        class Engine(_DynamicEngine):
+            @staticmethod
+            def get_tensor_name(index):
+                return ("x", "mask", "mu", "t", "spks", "cond", "out")[index]
+
+        monkeypatch.setattr(torch.cuda, "Stream", lambda device: _FakeStream())
+        return flow_estimator_trt.TrtContextWrapper(
+            Engine(context),
+            device="cpu",
+            input_names=frozenset({"x", "mask", "mu", "t", "spks", "cond"}),
+        )
+
+    @staticmethod
+    def _inputs(length=8, batch=4):
+        return (
+            torch.zeros(batch, 80, length),
+            torch.ones(batch, 1, length),
+            torch.zeros(batch, 80, length),
+            torch.zeros(batch),
+            torch.zeros(batch, 80),
+            torch.zeros(batch, 80, length),
+        )
+
+    def test_rejected_input_shape_raises(self, monkeypatch):
+        class Context(_FakeContext):
+            def set_input_shape(self, name, shape):
+                return name != "cond"
+
+            def set_tensor_address(self, name, address):
+                return True
+
+        wrapper = self._wrapper(monkeypatch, Context())
+        with pytest.raises(RuntimeError, match="rejected shape"):
+            with wrapper.estimation_session(*self._inputs()):
+                pass
+        # The context still goes back to the pool for the next request.
+        assert wrapper._pool.qsize() == 1
+
+    def test_failed_enqueue_raises(self, monkeypatch):
+        class Context(_FakeContext):
+            def set_input_shape(self, name, shape):
+                return True
+
+            def set_tensor_address(self, name, address):
+                return True
+
+            def execute_async_v3(self, stream):
+                return False
+
+        wrapper = self._wrapper(monkeypatch, Context())
+        inputs = self._inputs()
+        with wrapper.estimation_session(*inputs) as session:
+            with pytest.raises(RuntimeError, match="failed to enqueue"):
+                session.run(inputs[0], inputs[3])
+        assert wrapper._pool.qsize() == 1
