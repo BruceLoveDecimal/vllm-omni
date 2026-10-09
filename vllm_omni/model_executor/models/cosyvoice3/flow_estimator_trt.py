@@ -275,7 +275,11 @@ class _TrtEstimatorSession:
             )
 
         for name, buffer in zip(_TRT_INPUT_NAMES, self._input_buffers):
-            context.set_input_shape(name, tuple(buffer.shape))
+            if not context.set_input_shape(name, tuple(buffer.shape)):
+                raise RuntimeError(
+                    f"TensorRT flow estimator rejected shape {tuple(buffer.shape)} for input "
+                    f"'{name}' (outside the selected optimization profile)"
+                )
 
         bound_tensors = (*self._input_buffers, self._engine_output)
         for index, tensor in enumerate(bound_tensors):
@@ -315,7 +319,11 @@ class _TrtEstimatorSession:
                 if tensor.data_ptr() != buffer.data_ptr():
                     buffer.copy_(tensor)
 
-            assert self.context.execute_async_v3(self.stream.cuda_stream) is True
+            # An ``assert`` here vanishes under ``python -O``, and because the
+            # session reuses one output buffer across Euler steps, a dropped
+            # enqueue would return the previous step's mel instead of failing.
+            if not self.context.execute_async_v3(self.stream.cuda_stream):
+                raise RuntimeError("TensorRT flow estimator failed to enqueue (execute_async_v3 returned False)")
             self._initialized = True
 
             for tensor in (*self._input_buffers, self._engine_output):
@@ -357,7 +365,8 @@ class TrtContextWrapper:
         self._active_profile_by_context: dict[int, int] = {}
         for _ in range(trt_concurrent):
             ctx = engine.create_execution_context()
-            assert ctx is not None, "failed to create TRT execution context (out of memory?)"
+            if ctx is None:
+                raise RuntimeError("failed to create a TensorRT execution context (out of memory?)")
             stream = torch.cuda.Stream(self._device)
             self._active_profile_by_context[id(ctx)] = 0
             self._pool.put([ctx, stream])
