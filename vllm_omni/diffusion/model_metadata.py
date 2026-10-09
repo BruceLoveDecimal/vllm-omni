@@ -27,8 +27,11 @@ class DiffusionModelMetadata:
 FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
 MAGE_FLOW_MAX_INPUT_IMAGES = 3
+# Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
+QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
+JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
@@ -45,6 +48,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=MAGE_FLOW_MAX_INPUT_IMAGES,
     ),
+    "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
     "Flux2KleinPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=FLUX2_KLEIN_MAX_INPUT_IMAGES,
@@ -52,6 +56,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "QwenImageEditPlusPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
+    ),
+    # Qwen-Image 2.1 handles both text-to-image (no image) and
+    # image-conditioned requests through the same pipeline class.
+    "QwenImage21Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=QWEN_IMAGE_21_MAX_INPUT_IMAGES,
     ),
     "HunyuanImage3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -63,6 +73,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "BooguImagePipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=BOOGU_IMAGE_MAX_INPUT_IMAGES,
+    ),
+    "JoyImageEditPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=JOY_IMAGE_EDIT_MAX_INPUT_IMAGES,
     ),
     "MiniMaxH3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -88,6 +102,15 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
     ),
     "Magi2Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
+    # Joint text/image-to-video-and-audio, same shape as MiniMaxH3Pipeline
+    # above (an MP4 with both tracks) — declared "video" for the same reason:
+    # the final container is a video file, so /v1/videos* is the right API
+    # surface even though the model also produces audio.
+    "Kandinsky6TI2VAPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         final_output_type="video",

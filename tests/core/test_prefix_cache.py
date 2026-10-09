@@ -513,15 +513,20 @@ def test_policy_from_model_shim():
     class M:
         requires_full_prefix_cached_hidden_states = False
         deferred_prefix_cache_mm_keys = {"codes.audio"}
+        mm_outputs_written_in_sample = True
 
     p = ModelCachePolicy.from_model(M())
     assert p.needs_full_hidden_states is False
     assert p.hidden_key is None
     assert p.deferred_keys == frozenset({"codes.audio"})
+    assert p.mm_outputs_written_in_sample is True
     assert p.get_hit_keys([HIDDEN_KEY, "codes.audio"]) == ["codes.audio"]
     assert p.skip_immediate_mm("codes.audio")
     d = ModelCachePolicy.from_model(object())
     assert d.needs_full_hidden_states is True and not d.deferred_keys
+    assert d.mm_outputs_written_in_sample is False
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="mm_outputs_written_in_sample"):
+        ModelCachePolicy(mm_outputs_written_in_sample=True)
     assert d.hidden_key == HIDDEN_KEY
     assert d.get_hit_keys(["talker.h", HIDDEN_KEY]) == [HIDDEN_KEY, "talker.h"]
 
@@ -1361,6 +1366,43 @@ def test_same_step_hit_prefetch_starts_at_save(caplog):
     assert torch.equal(fut.result()[:8], expected_rows(view.slots_for("b", 0, 8)))
     outs = mgr.materialize(sid, ["a", "b"])
     assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
+
+
+@pytest.mark.parametrize("reuse_blocks", [False, True], ids=["fresh", "reused"])
+@pytest.mark.parametrize("deferred_mm", [False, True], ids=["immediate", "deferred"])
+def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm):
+    policy = ModelCachePolicy(deferred_keys=frozenset({"mm"}) if deferred_mm else frozenset())
+    mgr, view = make_manager(policy=policy)
+    try:
+        blocks = [0, 1] if reuse_blocks else [8, 9]
+        sid = run_step(mgr, view, {"old": (blocks, 0, 8)}, mm={"mm": torch.full((8, 2), 100.0)})
+        mgr.materialize(sid, ["old"])
+        mgr.new_step_starts(FakeSchedOut(finished=["old"]))
+
+        mgr.new_step_starts(
+            FakeSchedOut(
+                new_reqs=[FakeNewReq("a", 0, [[0, 1]]), FakeNewReq("b", 8, [[0, 1, 2]])],
+                num_scheduled={"a": 8, "b": 4},
+            )
+        )
+        old_prefetch = dict(mgr._hit_prefetch["b"])
+        # Complete the early reads before A publishes the prefix B actually hits.
+        for future in old_prefetch.values():
+            future.result(timeout=5)
+
+        view.order = ["a", "b"]
+        view.req_blocks.update(a=[0, 1], b=[0, 1, 2])
+        view.computed.update(a=0, b=8)
+        hidden = torch.cat([torch.full((8, HIDDEN), 20.0), torch.full((4, HIDDEN), 30.0)])
+        mm = torch.cat([torch.full((8, 2), 200.0), torch.full((4, 2), 300.0)])
+        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12)
+        outs = mgr.materialize(sid, ["a", "b"])
+
+        assert torch.equal(outs.hidden_states["b"][:8], hidden[:8])
+        assert torch.equal(outs.hidden_states["b"][8:], hidden[8:])
+        assert torch.equal(outs.mm_outputs["mm"]["b"], mm)
+    finally:
+        mgr.shutdown()
 
 
 def test_delayed_read_of_reassigned_hit_raises():

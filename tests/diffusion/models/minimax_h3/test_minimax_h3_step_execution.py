@@ -88,10 +88,10 @@ def _make_branch(*, text_len: int, latent_t: int, latent_h: int, latent_w: int, 
     return branch, video_rows, audio_rows
 
 
-def _sigmas(num_points: int, shift: float) -> list[float]:
+def _sigmas(num_steps: int, shift: float) -> list[float]:
     from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
-    return minimax_h3_time_shift_sigmas(num_steps=num_points, shift_scale=shift)
+    return minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=shift)
 
 
 def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio):
@@ -102,7 +102,11 @@ def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_v
     state.latents = video_rows.clone()
     state.timesteps = torch.tensor([1.0 - sigma for sigma in sigmas_video[:-1]], dtype=torch.float32)
     state.step_index = 0
+    from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
+
     state.extra = {
+        mod._STEP_VIDEO_SOLVER: create_h3_sample_solver("euler", sigmas_video),
+        mod._STEP_AUDIO_SOLVER: create_h3_sample_solver("euler", sigmas_audio),
         mod._STEP_BRANCH: branch,
         # Co-batched requests must share one DiT instance, or denoise_step()
         # treats the batch as mixed-task and falls back to one forward each.
@@ -130,15 +134,16 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     return pipeline
 
 
-def test_step_execution_matches_request_mode_denoise_loop():
+@pytest.mark.parametrize("num_steps", [1, 8, 50])
+def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     """Stepping through the contract must reproduce the request-mode loop."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
 
-    model = _SegmentMeanModel()
+    model = mocker.Mock(wraps=_SegmentMeanModel())
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=5)
-    sigmas_video = _sigmas(6, 12.0)
-    sigmas_audio = _sigmas(6, 3.0)
+    sigmas_video = _sigmas(num_steps, 12.0)
+    sigmas_audio = _sigmas(num_steps, 3.0)
 
     reference_video, reference_audio = minimax_h3_denoise_loop(
         model=model,
@@ -151,6 +156,8 @@ def test_step_execution_matches_request_mode_denoise_loop():
         device=torch.device("cpu"),
     )
 
+    assert model.call_count == num_steps
+    model.reset_mock()
     pipeline = _step_pipeline(model)
     state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
     input_batch = SimpleNamespace(states=(state,))
@@ -161,10 +168,46 @@ def test_step_execution_matches_request_mode_denoise_loop():
         pipeline.step_scheduler(state, noise_pred)
         steps += 1
 
-    assert steps == len(sigmas_video) - 1
+    assert steps == num_steps
+    assert model.call_count == num_steps
     assert state.total_steps == steps
     torch.testing.assert_close(state.latents, reference_video)
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
+
+
+def test_request_mode_cancellation_stops_before_next_denoise_step(monkeypatch):
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry, request_cancellation_scope
+    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+    from vllm_omni.platforms import current_omni_platform
+
+    # This test runs real packing/Euler updates on CPU with the small DiT above.
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
+    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=5)
+    registry = RequestCancellationRegistry()
+    signal = registry.create("request")
+    steps = []
+
+    def cancel_after_first_step(step, video, audio):
+        steps.append(step)
+        registry.cancel(["request"])
+
+    try:
+        with request_cancellation_scope([signal]), pytest.raises(DiffusionRequestAbortedError):
+            minimax_h3_denoise_loop(
+                model=_SegmentMeanModel(),
+                positive=branch,
+                initial_video_rows=video_rows,
+                initial_audio_rows=audio_rows,
+                keyframe_cond_rows=None,
+                sigmas_video=_sigmas(6, 12.0),
+                sigmas_audio=_sigmas(6, 3.0),
+                device=torch.device("cpu"),
+                on_step=cancel_after_first_step,
+            )
+    finally:
+        registry.close()
+    assert steps == [0]
 
 
 def test_step_execution_matches_request_mode_with_latent_edits():
@@ -416,7 +459,7 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
         "_prepare_encoder_conditioning_inputs",
-        lambda self, value, sampling: context,
+        lambda self, value, sampling: context if value is conditioning else pytest.fail("wrong encoder handoff"),
     )
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,

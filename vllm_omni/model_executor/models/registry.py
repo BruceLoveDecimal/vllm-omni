@@ -9,6 +9,8 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
+    "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",
@@ -423,6 +425,11 @@ _OMNI_MODELS = {
         "ming_flash_omni_thinker",
         "MingFlashOmniThinkerForConditionalGeneration",
     ),
+    "MingImageForConditionalGeneration": (
+        "ming_image",
+        "model",
+        "MingImageForConditionalGeneration",
+    ),
     "MingFlashOmniTalkerForConditionalGeneration": (
         "ming_flash_omni",
         "ming_flash_omni_talker",
@@ -476,15 +483,11 @@ _OMNI_MODELS = {
         "acoustic",
         "MiniMaxMusic3AcousticForConditionalGeneration",
     ),
-    "BreezeForConditionalGeneration": (
-        "breeze_tts_2",
-        "modeling_breeze_tts_2_talker",
-        "BreezeTTS2TalkerForGeneration",
-    ),
-    "BreezeTTS2MimiCodec": (
-        "breeze_tts_2",
-        "modeling_breeze_tts_2_codec",
-        "BreezeTTS2MimiCodec",
+    ## YuE2-3B (text-to-music; single-stage native-AR with terminal NAR/VAE)
+    "Yue2ForCausalLM": (
+        "yue2",
+        "yue2",
+        "Yue2ForCausalLM",
     ),
 }
 
