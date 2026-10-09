@@ -125,12 +125,12 @@ def _dynamic_batch_onnx_bytes(onnx_path: str) -> bytes:
     return model.SerializeToString()
 
 
-def _cfg_batch_profile(min_batch: int, opt_batch: int, max_batch: int, *, max_t: int):
+def _cfg_batch_profile(min_batch: int, opt_batch: int, max_batch: int, *, max_t: int, with_attn_mask: bool = False):
     if not (2 <= min_batch <= opt_batch <= max_batch):
         raise ValueError(f"invalid CFG batch profile: min={min_batch}, opt={opt_batch}, max={max_batch}")
     if max_t < _OPT_T:
         raise ValueError(f"CFG batch profile max_t must be at least {_OPT_T}, got {max_t}")
-    return {
+    shapes = {
         "x": ((min_batch, 80, _MIN_T), (opt_batch, 80, _OPT_T), (max_batch, 80, max_t)),
         "mask": ((min_batch, 1, _MIN_T), (opt_batch, 1, _OPT_T), (max_batch, 1, max_t)),
         "mu": ((min_batch, 80, _MIN_T), (opt_batch, 80, _OPT_T), (max_batch, 80, max_t)),
@@ -138,13 +138,23 @@ def _cfg_batch_profile(min_batch: int, opt_batch: int, max_batch: int, *, max_t:
         "spks": ((min_batch, 80), (opt_batch, 80), (max_batch, 80)),
         "cond": ((min_batch, 80, _MIN_T), (opt_batch, 80, _OPT_T), (max_batch, 80, max_t)),
     }
+    if with_attn_mask:
+        # The chunk-mask engine's query-key map is (batch, 1, T, T), so its
+        # bounds have to track this profile's batch and length; a map pinned to
+        # the CFG pair would leave a batched shape with no usable profile.
+        shapes[ATTN_MASK_INPUT] = (
+            (min_batch, 1, _MIN_T, _MIN_T),
+            (opt_batch, 1, _OPT_T, _OPT_T),
+            (max_batch, 1, max_t, max_t),
+        )
+    return shapes
 
 
-def _fixed_cfg_batch_profile():
-    return _cfg_batch_profile(2, 2, 2, max_t=_SINGLE_MAX_T)
+def _fixed_cfg_batch_profile(with_attn_mask: bool = False):
+    return _cfg_batch_profile(2, 2, 2, max_t=_SINGLE_MAX_T, with_attn_mask=with_attn_mask)
 
 
-def _dynamic_batch_profile(max_cfg_batch: int):
+def _dynamic_batch_profile(max_cfg_batch: int, with_attn_mask: bool = False):
     if max_cfg_batch < 4:
         raise ValueError(f"dynamic CFG batch must be at least 4, got {max_cfg_batch}")
     return _cfg_batch_profile(
@@ -152,6 +162,7 @@ def _dynamic_batch_profile(max_cfg_batch: int):
         min(8, max_cfg_batch),
         max_cfg_batch,
         max_t=_BATCH_MAX_T,
+        with_attn_mask=with_attn_mask,
     )
 
 
@@ -233,16 +244,15 @@ def _convert_onnx_to_trt(
                 config.set_flag(_flag)
                 break
 
-    if dynamic_batch and with_attn_mask:
-        # The chunk-mask engine's attn_mask profile still pins the CFG pair;
-        # widening it needs the mask bounds to follow each profile's batch.
-        raise ValueError("dynamic CFG batching is not wired up for the chunk-mask estimator yet")
     if dynamic_batch:
         assert max_cfg_batch is not None
         # Profile 0 preserves the single-request specialization while profile 1
         # covers cross-request CFG batches. Keeping both in one engine avoids a
         # second resident copy of the weights and a second execution context.
-        for shape_spec in (_fixed_cfg_batch_profile(), _dynamic_batch_profile(max_cfg_batch)):
+        for shape_spec in (
+            _fixed_cfg_batch_profile(with_attn_mask),
+            _dynamic_batch_profile(max_cfg_batch, with_attn_mask),
+        ):
             profile = builder.create_optimization_profile()
             for name, (mn, op, mx) in shape_spec.items():
                 profile.set_shape(name, mn, op, mx)
@@ -274,7 +284,15 @@ _TRT_DYNAMIC_INPUT_INDICES = (0, 3)
 class _TrtEstimatorSession:
     """A fixed-shape TensorRT estimator binding reused across Euler steps."""
 
-    def __init__(self, context, stream, engine, io_dtype: torch.dtype, inputs: tuple[torch.Tensor, ...]):
+    def __init__(
+        self,
+        context,
+        stream,
+        engine,
+        io_dtype: torch.dtype,
+        inputs: tuple[torch.Tensor, ...],
+        out_dtype: torch.dtype | None = None,
+    ):
         # A chunk-mask engine takes the query-key map as a seventh input. It is
         # static within a solve, so the session binds it once and ``run`` keeps
         # taking only the six per-step tensors.
@@ -294,9 +312,11 @@ class _TrtEstimatorSession:
         self._shapes = tuple(tuple(tensor.shape) for tensor in inputs)
         self._input_buffers = tuple(self._make_input_buffer(tensor) for tensor in inputs)
         self._initialized = False
+        # An autocast-traced graph can declare an output dtype unlike its
+        # inputs', and the bound buffer has to match what the engine writes.
         self._engine_output = torch.empty_like(
             inputs[0],
-            dtype=io_dtype,
+            dtype=out_dtype or io_dtype,
             memory_format=torch.contiguous_format,
         )
         if self._engine_output.dtype == inputs[0].dtype:
@@ -478,8 +498,9 @@ class TrtContextWrapper:
     @contextmanager
     def estimation_session(self, *inputs: torch.Tensor):
         """Hold one pooled TRT context and fixed I/O binding for one flow solve."""
-        if len(inputs) != len(_TRT_INPUT_NAMES):
-            raise ValueError(f"expected {len(_TRT_INPUT_NAMES)} estimator inputs, got {len(inputs)}")
+        expected = len(_TRT_INPUT_NAMES) + (1 if self.supports_attn_mask else 0)
+        if len(inputs) != expected:
+            raise ValueError(f"expected {expected} estimator inputs, got {len(inputs)}")
         batch_size, sequence_length = int(inputs[0].shape[0]), int(inputs[0].shape[2])
         if not self.supports_estimator_shape(batch_size, sequence_length):
             # Let CFM serialize unsupported request groups through CFG2.
@@ -492,6 +513,7 @@ class TrtContextWrapper:
                 stream=stream,
                 engine=engine,
                 io_dtype=self.io_dtype,
+                out_dtype=self.out_dtype,
                 inputs=inputs,
             )
         finally:
@@ -613,7 +635,12 @@ def _promote_attention_nodes(onnx_path: str) -> None:
 
 
 def export_chunk_mask_estimator_onnx(
-    estimator: torch.nn.Module, onnx_path: str, *, fp16: bool = True, fused_attention: bool = False
+    estimator: torch.nn.Module,
+    onnx_path: str,
+    *,
+    fp16: bool = True,
+    fused_attention: bool = False,
+    dynamic_batch: bool = False,
 ) -> str:
     """Export the repo's DiT to ONNX with ``attn_mask`` as a seventh input.
 
@@ -658,6 +685,11 @@ def export_chunk_mask_estimator_onnx(
         ATTN_MASK_INPUT: {2: "seq_len", 3: "seq_len"},
         "estimator_out": {2: "seq_len"},
     }
+    if dynamic_batch:
+        # Cross-request CFG batching needs dimension 0 symbolic in the graph
+        # itself; a profile cannot widen an axis the ONNX pins to 2.
+        for name in ("x", "mask", "mu", "t", "spks", "cond", ATTN_MASK_INPUT, "estimator_out"):
+            dynamic_axes.setdefault(name, {})[0] = "cfg_batch"
     tmp = f"{onnx_path}.tmp.{os.getpid()}"
     logger.info(
         "Exporting chunk-mask flow estimator ONNX to %s (fp16=%s, fused_attention=%s) ...", onnx_path, fp16, fused
@@ -709,27 +741,47 @@ def flow_checkpoint_fingerprint(model_dir: str, weight_file: str = "flow.pt") ->
 
 
 def chunk_mask_estimator_onnx_path(
-    onnx_dir: str, *, fp16: bool, cache_key: str | None, fused_attention: bool = False
+    onnx_dir: str,
+    *,
+    fp16: bool,
+    cache_key: str | None,
+    fused_attention: bool = False,
+    dynamic_batch: bool = False,
 ) -> str:
     tag = "autocast_fp16" if fp16 else "fp32"
     if fp16 and fused_attention:
         tag += "_fused_attn"
+    if dynamic_batch:
+        tag += "_dynbatch"
     suffix = f".{cache_key}" if cache_key else ""
     return os.path.join(onnx_dir, f"flow.decoder.estimator.chunk_mask.{tag}{suffix}.onnx")
 
 
-def _build_chunk_mask_engine(estimator, onnx_dir, device, *, fp16, cache_key, fused_attention):
+def _build_chunk_mask_engine(estimator, onnx_dir, device, *, fp16, cache_key, fused_attention, max_cfg_batch=None):
     import tensorrt as trt
 
+    dynamic_batch = max_cfg_batch is not None and max_cfg_batch > 2
     onnx_path = chunk_mask_estimator_onnx_path(
-        onnx_dir, fp16=fp16, cache_key=cache_key, fused_attention=fused_attention
+        onnx_dir, fp16=fp16, cache_key=cache_key, fused_attention=fused_attention, dynamic_batch=dynamic_batch
     )
     if not os.path.exists(onnx_path) or os.path.getsize(onnx_path) == 0:
         os.makedirs(onnx_dir, exist_ok=True)
-        export_chunk_mask_estimator_onnx(estimator, onnx_path, fp16=fp16, fused_attention=fused_attention)
-    plan_path = _resolve_plan_path(onnx_path, prefix="flow_estimator_chunk_mask")
+        export_chunk_mask_estimator_onnx(
+            estimator, onnx_path, fp16=fp16, fused_attention=fused_attention, dynamic_batch=dynamic_batch
+        )
+    if dynamic_batch:
+        prefix = f"flow_estimator_chunk_mask_dynamic_v{_DYNAMIC_BATCH_PLAN_VERSION}_b{max_cfg_batch}_t{_BATCH_MAX_T}"
+    else:
+        prefix = "flow_estimator_chunk_mask"
+    plan_path = _resolve_plan_path(onnx_path, prefix=prefix)
     if not os.path.exists(plan_path) or os.path.getsize(plan_path) == 0:
-        _convert_onnx_to_trt(onnx_path, plan_path, strongly_typed=fp16, with_attn_mask=True)
+        _convert_onnx_to_trt(
+            onnx_path,
+            plan_path,
+            strongly_typed=fp16,
+            with_attn_mask=True,
+            max_cfg_batch=max_cfg_batch if dynamic_batch else None,
+        )
 
     runtime = trt.Runtime(_trt_logger())
     with open(plan_path, "rb") as f:
@@ -750,6 +802,7 @@ def build_chunk_mask_flow_estimator_trt(
     *,
     fp16: bool = True,
     cache_key: str | None = None,
+    max_cfg_batch: int | None = None,
 ) -> TrtContextWrapper:
     """Build/load a flow-estimator engine that takes the chunk-causal mask.
 
@@ -763,10 +816,18 @@ def build_chunk_mask_flow_estimator_trt(
     An fp16 engine first tries fused attention (ONNX ``Attention``, opset 23);
     a TensorRT that cannot parse or build it gets the fp32-attention export.
     """
+    if max_cfg_batch is not None and max_cfg_batch % 2 != 0:
+        raise ValueError(f"max_cfg_batch must be even, got {max_cfg_batch}")
     if fp16:
         try:
             return _build_chunk_mask_engine(
-                estimator, onnx_dir, device, fp16=True, cache_key=cache_key, fused_attention=True
+                estimator,
+                onnx_dir,
+                device,
+                fp16=True,
+                cache_key=cache_key,
+                fused_attention=True,
+                max_cfg_batch=max_cfg_batch,
             )
         except Exception as exc:
             logger.warning(
@@ -774,7 +835,15 @@ def build_chunk_mask_flow_estimator_trt(
                 "using fp32 attention, which is slower",
                 exc,
             )
-    return _build_chunk_mask_engine(estimator, onnx_dir, device, fp16=fp16, cache_key=cache_key, fused_attention=False)
+    return _build_chunk_mask_engine(
+        estimator,
+        onnx_dir,
+        device,
+        fp16=fp16,
+        cache_key=cache_key,
+        fused_attention=False,
+        max_cfg_batch=max_cfg_batch,
+    )
 
 
 def build_flow_estimator_trt(

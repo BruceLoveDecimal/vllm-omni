@@ -850,3 +850,112 @@ class TestFusedAttentionFallback:
         )
         plain = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key="k")
         assert fused != plain and "fused_attn" in fused
+
+
+class TestChunkMaskDynamicBatch:
+    """The chunk-mask engine is the branch's default, so cross-request CFG
+    batching has to reach it too: its query-key map is a seventh input, which
+    both the optimization profiles and the Euler session must account for."""
+
+    def test_profiles_scale_the_map_with_their_cfg_batch(self):
+        fixed = flow_estimator_trt._fixed_cfg_batch_profile(with_attn_mask=True)
+        dynamic = flow_estimator_trt._dynamic_batch_profile(16, with_attn_mask=True)
+        name = flow_estimator_trt.ATTN_MASK_INPUT
+
+        for spec in (fixed, dynamic):
+            batches = [shape[0] for shape in spec["x"]]
+            lengths = [shape[2] for shape in spec["x"]]
+            assert [shape[0] for shape in spec[name]] == batches
+            # (batch, 1, T, T): the map is square in the mel length.
+            assert [shape[1] for shape in spec[name]] == [1, 1, 1]
+            assert [shape[2] for shape in spec[name]] == lengths
+            assert [shape[3] for shape in spec[name]] == lengths
+
+        assert [shape[0] for shape in dynamic[name]] == [4, 8, 16]
+
+    def test_profiles_omit_the_map_by_default(self):
+        assert flow_estimator_trt.ATTN_MASK_INPUT not in flow_estimator_trt._fixed_cfg_batch_profile()
+        assert flow_estimator_trt.ATTN_MASK_INPUT not in flow_estimator_trt._dynamic_batch_profile(8)
+
+    def test_onnx_name_separates_the_dynamic_batch_export(self, tmp_path):
+        pinned = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key="k")
+        dynamic = flow_estimator_trt.chunk_mask_estimator_onnx_path(
+            str(tmp_path), fp16=True, cache_key="k", dynamic_batch=True
+        )
+        assert pinned != dynamic
+        assert "_dynbatch" in dynamic and "_dynbatch" not in pinned
+
+    @pytest.mark.parametrize("supports_attn_mask", [False, True])
+    def test_session_arity_follows_the_engine_inputs(self, monkeypatch, supports_attn_mask):
+        class Context(_FakeContext):
+            def set_input_shape(self, name, shape):
+                pass
+
+            def set_tensor_address(self, name, address):
+                pass
+
+        class Engine(_DynamicEngine):
+            @staticmethod
+            def get_tensor_name(index):
+                return ("x", "mask", "mu", "t", "spks", "cond", flow_estimator_trt.ATTN_MASK_INPUT, "out")[index]
+
+        context = Context()
+        monkeypatch.setattr(torch.cuda, "Stream", lambda device: _FakeStream())
+        names = {"x", "mask", "mu", "t", "spks", "cond"}
+        if supports_attn_mask:
+            names.add(flow_estimator_trt.ATTN_MASK_INPUT)
+        wrapper = flow_estimator_trt.TrtContextWrapper(Engine(context), device="cpu", input_names=frozenset(names))
+        assert wrapper.supports_attn_mask is supports_attn_mask
+
+        length = 8
+        inputs = [
+            torch.zeros(4, 80, length),
+            torch.ones(4, 1, length),
+            torch.zeros(4, 80, length),
+            torch.zeros(4),
+            torch.zeros(4, 80),
+            torch.zeros(4, 80, length),
+        ]
+        if supports_attn_mask:
+            inputs.append(torch.ones(4, 1, length, length, dtype=torch.bool))
+
+        with wrapper.estimation_session(*inputs) as session:
+            assert session is not None
+            assert len(session.input_names) == len(inputs)
+
+        # The other arity is rejected rather than silently mis-bound.
+        wrong = inputs[:-1] if supports_attn_mask else [*inputs, torch.ones(4, 1, length, length, dtype=torch.bool)]
+        with pytest.raises(ValueError, match="estimator inputs"), wrapper.estimation_session(*wrong):
+            pass
+
+    def test_session_output_buffer_matches_the_engine_output_dtype(self, monkeypatch):
+        class Context(_FakeContext):
+            def set_input_shape(self, name, shape):
+                pass
+
+            def set_tensor_address(self, name, address):
+                pass
+
+        class Engine(_DynamicEngine):
+            @staticmethod
+            def get_tensor_name(index):
+                return ("x", "mask", "mu", "t", "spks", "cond", "out")[index]
+
+        monkeypatch.setattr(torch.cuda, "Stream", lambda device: _FakeStream())
+        wrapper = flow_estimator_trt.TrtContextWrapper(
+            Engine(Context()),
+            device="cpu",
+            io_dtype=torch.float16,
+            out_dtype=torch.float32,
+            input_names=frozenset({"x", "mask", "mu", "t", "spks", "cond"}),
+        )
+        inputs = (
+            torch.zeros(4, 80, 8),
+            torch.ones(4, 1, 8),
+            torch.zeros(4, 80, 8),
+            torch.zeros(4),
+            torch.zeros(4, 80),
+            torch.zeros(4, 80, 8),
+        )
+        with wrapper.estimation_session(*inputs) as session:
+            assert session._engine_output.dtype == torch.float32

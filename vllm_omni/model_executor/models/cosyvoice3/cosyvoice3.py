@@ -1466,6 +1466,11 @@ class CosyVoice3Model(
             return
         if not (_cosyvoice3_trt_enabled() and torch.cuda.is_available()):
             return
+        # Cross-request CFG batching needs the engine to accept a 2N batch;
+        # bound it to what the Stage-1 scheduler can actually hand the flow.
+        max_cfg_batch = (
+            2 * min(self._max_num_seqs, _MAX_TRT_FLOW_BATCH_REQUESTS) if cosyvoice3_batch_flow_enabled() else None
+        )
         wrapper = None
         if _cosyvoice3_trt_chunk_mask_enabled():
             # Preferred: an engine exported from the live torch DiT with the
@@ -1480,6 +1485,7 @@ class CosyVoice3Model(
                     self._flow_estimator_onnx_dir(),
                     device="cuda",
                     cache_key=self._flow_estimator_cache_key(),
+                    max_cfg_batch=max_cfg_batch,
                 )
             # Missing onnx/tensorrt, cache I/O, an export or engine-build
             # failure; anything else is a bug and should surface.
@@ -1499,8 +1505,6 @@ class CosyVoice3Model(
                 if onnx_path is None:
                     logger.warning("CosyVoice3 code2wav: no flow-estimator ONNX available; keeping torch estimator")
                     return
-                batch_flow = cosyvoice3_batch_flow_enabled()
-                max_cfg_batch = 2 * min(self._max_num_seqs, _MAX_TRT_FLOW_BATCH_REQUESTS) if batch_flow else None
                 wrapper = build_flow_estimator_trt(onnx_path, device="cuda", max_cfg_batch=max_cfg_batch)
             # ``estimator`` is a registered nn.Module submodule; delete it only
             # after the requested TRT engine is ready, so a failed build leaves
@@ -1509,8 +1513,9 @@ class CosyVoice3Model(
             del decoder.estimator
             decoder.estimator = wrapper
             logger.info(
-                "CosyVoice3: using TensorRT flow-decoder estimator (code2wav, chunk_mask=%s)",
+                "CosyVoice3: using TensorRT flow-decoder estimator (code2wav, chunk_mask=%s, max_cfg_batch=%s)",
                 wrapper.supports_attn_mask,
+                max_cfg_batch or 2,
             )
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.warning(
