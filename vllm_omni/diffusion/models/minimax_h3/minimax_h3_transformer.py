@@ -547,6 +547,7 @@ class MiniMaxH3Attention(nn.Module):
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
         vdn_window: VDNLayout | None = None,
+        action_block_mask: Any | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -563,6 +564,12 @@ class MiniMaxH3Attention(nn.Module):
             raise ValueError(
                 f"max_seqlen must be within the packed sequence, got {max_seqlen} for length {packed_total}"
             )
+        if action_block_mask is not None:
+            from .world import action_attention
+
+            if num_requests != 1 or q.shape[0] != packed_total or _ring_sequence_parallel_is_active(self.attention):
+                raise ValueError("H3-World directed attention requires one unsharded request")
+            return action_attention(q, k, v, action_block_mask, self.attention.softmax_scale)
         attn_mask = None
         mask_free_packed_padding = False
         use_ring = _ring_sequence_parallel_is_active(self.attention)
@@ -665,6 +672,7 @@ class MiniMaxH3Attention(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         vdn_window: VDNLayout | None = None,
+        action_block_mask: Any | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -729,6 +737,7 @@ class MiniMaxH3Attention(nn.Module):
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
             vdn_window=vdn_window,
+            action_block_mask=action_block_mask,
         )
         if self.vdn is not None:
             out = self.vdn.gate_softmax(out, x)
@@ -1038,6 +1047,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         vdn_window: VDNLayout | None = None,
+        action_block_mask: Any | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1075,6 +1085,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             vdn_window=vdn_window,
+            action_block_mask=action_block_mask,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
@@ -1640,10 +1651,10 @@ class MiniMaxH3DiTModel(nn.Module):
 
         Returns (decoder_input [S_local, H] bf16, t_emb [M, t_dim] fp32).
 
-        ``num_requests`` defaults to a single packed request so callers that
-        pre-date the continuous-batching change (e.g. TeaCache's extractor
-        contract) do not silently miss the kwarg. ``forward()`` reads the real
-        value from ``packed_seq_params["num_requests"]``.
+        ``num_requests`` counts independent refiner documents. Usually this
+        equals the packed request count; H3-World instead refines the head and
+        every action sentence as separate documents. The default preserves
+        callers predating continuous batching (e.g. TeaCache's extractor).
         """
         local_start, local_len = local_span
         local_end = local_start + local_len
@@ -1755,6 +1766,7 @@ class MiniMaxH3DiTModel(nn.Module):
         # that omits it is packing a single request.
         num_requests = int(self._psp_optional(psp, "num_requests", 1))
         vsa_prefix_segments = tuple(int(length) for length in self._psp_optional(psp, "vsa_prefix_segments", ()))
+        action_block_mask = self._psp_optional(psp, "action_block_mask", None)
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1803,7 +1815,7 @@ class MiniMaxH3DiTModel(nn.Module):
             text_pos=text_pos.to(device),
             refiner_cu_seqlens=refiner_cu.to(device),
             refiner_max_seqlen=refiner_max,
-            num_requests=num_requests,
+            num_requests=int(self._psp_optional(refiner_psp, "num_requests", num_requests)),
             seq_len=seq_len,
             device=device,
             local_span=local_span,
@@ -1845,6 +1857,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
                 vdn_window=vdn_window,
+                action_block_mask=action_block_mask,
             )
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)

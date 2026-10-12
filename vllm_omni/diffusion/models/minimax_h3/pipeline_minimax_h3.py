@@ -92,6 +92,7 @@ from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encod
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     build_minimax_h3_presentation,
     load_minimax_h3_images,
+    minimax_h3_text_only_ids,
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
@@ -173,6 +174,8 @@ from .time_request import (
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _load_component_config, _VideoVAEPartProxy
 from .vdnh3 import VDNCheckpoint
+from .world import H3_WORLD_ACTIONS_KEY, action_script, append_action_embeddings
+from .world_lora import load_h3_world_lora
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -689,6 +692,9 @@ class MiniMaxH3Pipeline(
         self._clear_adaln_caches()
         self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
         self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
+        if not hasattr(self, "_world_lora_adapter_ids"):
+            self._world_lora_adapter_ids = set()
+        self._world_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
@@ -699,6 +705,16 @@ class MiniMaxH3Pipeline(
                     offload_modes.append("model-level CPU offload")
                 elif resolved_offload.strategy is OffloadStrategy.LAYER_WISE:
                     offload_modes.append("layerwise offload")
+        world_loaded = load_h3_world_lora(
+            partition=self.partition,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
+        )
+        if world_loaded is not None:
+            self._world_lora_adapter_ids.add(lora_request.lora_int_id)
+            return world_loaded
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
@@ -735,6 +751,11 @@ class MiniMaxH3Pipeline(
         lora_model: LoRAModel,
         bound_lora_names: frozenset[str],
     ) -> None:
+        if lora_model.id in getattr(self, "_world_lora_adapter_ids", ()):
+            missing = sorted(set(lora_model.loras) - bound_lora_names)
+            if missing:
+                raise ValueError(f"H3-World LoRA binding is incomplete: {missing[:5]}")
+            return
         if lora_model.id in self._turbo_lora_specs:
             missing = sorted(set(lora_model.loras) - bound_lora_names)
             if missing:
@@ -923,6 +944,7 @@ class MiniMaxH3Pipeline(
             self.partition = "fl2va"
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_adapter_ids: set[int] = set()
+        self._world_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
@@ -1803,6 +1825,7 @@ class MiniMaxH3Pipeline(
         ref_blocks: list[dict[str, Any]] | None = None,
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
+        action_text_spans: tuple[tuple[int, int], ...] | None = None,
         keyframe_frame_indices: list[int] | None = None,
         guide_blocks: list[dict[str, Any]] | None = None,
         pad_seq_len: int | None = None,
@@ -1919,6 +1942,9 @@ class MiniMaxH3Pipeline(
             int(packed["cu_seqlens"][1]),
             int(packed["seq_len"]),
         )
+
+        if action_text_spans is not None:
+            packed["action_text_spans"] = action_text_spans
 
         tags = packed["token_tags"].clone()
         tags[packed["text_pos"]] = text_tags.cpu()
@@ -2091,6 +2117,7 @@ class MiniMaxH3Pipeline(
         ref_blocks: list[dict[str, Any]] | None = None,
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
+        action_text_spans: tuple[tuple[int, int], ...] | None = None,
         keyframe_frame_indices: list[int] | None = None,
         guide_blocks: list[dict[str, Any]] | None = None,
         pad_seq_len: int | None = None,
@@ -2132,6 +2159,7 @@ class MiniMaxH3Pipeline(
             ref_blocks=ref_blocks,
             visual_condition_shapes=visual_condition_shapes,
             audio_condition_lengths=audio_condition_lengths,
+            action_text_spans=action_text_spans,
             keyframe_frame_indices=keyframe_frame_indices,
             guide_blocks=guide_blocks,
             pad_seq_len=pad_seq_len,
@@ -2841,7 +2869,85 @@ class MiniMaxH3Pipeline(
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
 
+    def _validate_world_request(self, raw_prompt: Any, sampling: Any) -> Any:
+        extra = sampling.extra_args or {}
+        actions = extra.get(H3_WORLD_ACTIONS_KEY)
+        lora = sampling.lora_request
+        active = (
+            lora is not None
+            and not math.isclose(float(sampling.lora_scale), 0.0)
+            and lora.lora_int_id in getattr(self, "_world_lora_adapter_ids", ())
+        )
+        if actions is None and not active:
+            return None
+        if actions is None or not active:
+            raise OmniClientError("H3-World requires both h3_world_actions and an active step-10000.safetensors LoRA")
+        if not self.load_text_encoder or not self.load_vae_encoder:
+            raise OmniClientError("H3-World requires a local text and media encoder")
+        if self.device.type != "cuda":
+            raise OmniClientError("H3-World directed attention requires CUDA FlexAttention")
+        if getattr(self.od_config, "step_execution", False):
+            raise OmniClientError("H3-World currently requires request execution")
+        parallel = self.od_config.parallel_config
+        if parallel.sequence_parallel_size != 1:
+            raise OmniClientError("H3-World currently supports tensor parallelism with sequence parallel size 1")
+        if sampling.quality != "lossless" or str(self.od_config.cache_backend or "none").lower() != "none":
+            raise OmniClientError("H3-World requires quality=lossless and cache_backend=None")
+        if self._base_schedule_for_task("fl2va") is not None or any(
+            getattr(self, key, None) is not None for key in ("_fasth3", "_fasth3_checkpoint", "_vdn")
+        ):
+            raise OmniClientError("H3-World requires the original FL2VA base weights")
+        _, media = self._extract_prompt(raw_prompt)
+        task = self._resolve_task(extra.get("task"), media)
+        images = media.get("image", media.get("images"))
+        image_count = len(images) if isinstance(images, (list, tuple)) else int(images is not None)
+        from vllm_omni.model_executor.models.minimax_h3.encoder_processing import _resolve_fl2va_keyframe_indices
+
+        if task != "fl2va" or image_count != 1 or _resolve_fl2va_keyframe_indices(extra, image_count) != [0]:
+            raise OmniClientError("H3-World requires one first-frame image with task=fl2va")
+        if self._extract_text_conditioning(raw_prompt) is not None:
+            raise OmniClientError("H3-World requires local scene and independent action text encoding")
+        if (
+            media.get(MINIMAX_H3_TIMELINE_GUIDES_KEY) is not None
+            or any(extra.get(key) is not None for key in ("latent_refine", "latent_upscale", "continuation_prompts"))
+            or extra.get("long_video_mode", "full") != "full"
+        ):
+            raise OmniClientError("H3-World does not yet support guides, refine/upscale or continuation")
+        if extra.get("audio_mode", "native") != "native" or any(
+            media.get(key) is not None
+            for key in ("source_video", "source_audio", "video_noise_mask", "audio_noise_mask")
+        ):
+            raise OmniClientError("H3-World requires native audio generation without latent editing")
+        # The current H3 solver is CFG-distilled; the official World example
+        # also uses cfg_scale=1. A negative-action branch is not implemented.
+        for key in ("guidance_scale", "guidance_scale_2"):
+            value = getattr(sampling, key, None)
+            if value is not None and not math.isclose(float(value), 1.0):
+                raise OmniClientError("H3-World currently supports guidance_scale=1 only")
+        # Refiner sentences must remain separate even before the DiT mask.
+        refiner = self.transformer.token_refiner
+        if any(not _attention_isolates_packed_requests(block.attn.attention) for block in refiner.blocks):
+            raise OmniClientError("H3-World requires a packed-varlen refiner backend; use FLASH_ATTN on CUDA")
+        return actions
+
+    def _encode_world_sentence(self, sentence: str) -> torch.Tensor:
+        _, rank, _ = _dit_rank_world()
+        ids = hidden = None
+        error = None
+        if rank == 0:
+            try:
+                ids = minimax_h3_text_only_ids(self.tokenizer, sentence)
+            except Exception as exc:
+                error = exc
+        _broadcast_rank0_exception(error)
+        if rank < self.text_encoder_tp_size:
+            vision_kwargs: dict[str, torch.Tensor] = {}
+            ids = self._distribute_encode_inputs(ids, vision_kwargs)
+            hidden = self._encode_text_hidden(ids, vision_kwargs)
+        return _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device)
+
     def _prepare_request_inputs(self, raw_prompt: Any, sampling: Any) -> dict[str, Any]:
+        world_actions = self._validate_world_request(raw_prompt, sampling)
         if (getattr(sampling, "extra_args", None) or {}).get(
             "continuation_prompts"
         ) is not None and not self.load_text_encoder:
@@ -2871,6 +2977,12 @@ class MiniMaxH3Pipeline(
             context["keyframe_images"] = load_minimax_h3_images(images)
             if len(context["keyframe_images"]) != len(context["keyframe_frame_indices"] or ()):
                 raise OmniClientError("MiniMax H3 latent_refine requires the original FL2VA keyframe images")
+        if world_actions is not None:
+            script = action_script(world_actions, context["latent_t"])
+            hidden, tags, spans = append_action_embeddings(
+                context["text_embeddings"], context["text_tags"], script, self._encode_world_sentence
+            )
+            context.update(text_embeddings=hidden, text_tags=tags, action_text_spans=spans)
         if window_text is not None:
             context["continuation_text_conditioning"] = window_text
         return context
@@ -3225,6 +3337,7 @@ class MiniMaxH3Pipeline(
         return {
             **{key: context[key] for key in _MINIMAX_H3_DENOISE_INPUT_KEYS},
             "sampler": context.get("sampler", "euler"),
+            **({"action_text_spans": context["action_text_spans"]} if "action_text_spans" in context else {}),
         }
 
     @torch.no_grad()

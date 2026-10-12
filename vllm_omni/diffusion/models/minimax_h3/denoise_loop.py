@@ -70,6 +70,11 @@ class MiniMaxH3DenoiseBranch:
         token_tags: torch.Tensor,
         device: torch.device,
     ) -> None:
+        action_bounds = None
+        if packed.get("action_text_spans") is not None:
+            from .world import bind_action_spans
+
+            action_bounds = bind_action_spans(packed, packed["action_text_spans"])
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
         self.img_pos = packed["img_pos"].view(-1).to(torch.long)
@@ -127,6 +132,20 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        if packed.get("action_text_spans") is not None:
+            from .world import build_action_block_mask
+
+            spans = packed["action_text_spans"]
+            assert action_bounds is not None
+            bounds = action_bounds
+            self.static_kwargs["refiner_packed_seq_params"] = {
+                "cu_seqlens_q": torch.tensor(bounds, dtype=torch.int32, device=device),
+                "max_seqlen_q": max(b - a for a, b in zip(bounds, bounds[1:])),
+                "num_requests": len(bounds) - 1,
+            }
+            self.static_kwargs["packed_seq_params"]["action_block_mask"] = build_action_block_mask(
+                packed, spans, device
+            )
         # Where the video segment sits in the packed sequence. Resolved to plain
         # ints here so the attention layers never sync on it per step.
         raw_spans = packed.get("video_spans")
