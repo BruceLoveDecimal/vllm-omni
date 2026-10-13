@@ -808,7 +808,7 @@ class CosyVoice3Model(
 
             connector_extra = self._connector_extra(vllm_config)
             self._check_flow_window_vs_packed(connector_extra)
-            self.code2wav = CosyVoice3Code2Wav(self.config, self._flow_graph_config(connector_extra))
+            self.code2wav = CosyVoice3Code2Wav(self.config)
             self.model = self.code2wav.flow_model
             self.hift = self.code2wav.hift
             # Keep additional information synchronized for async_chunk updates.
@@ -858,15 +858,6 @@ class CosyVoice3Model(
                 f"(codec_left_context_frames={window}); set codec_left_context_frames: 0 in the "
                 "connector extra, as cosyvoice3_packed_streaming.yaml does"
             )
-
-    @staticmethod
-    def _flow_graph_config(connector_extra: Mapping[str, object]) -> dict:
-        """Read the flow CUDA-graph settings out of the connector ``extra``."""
-        extra = connector_extra
-        cfg = {"enabled": bool(extra.get("enable_flow_cuda_graph", False))}
-        if extra.get("flow_graph_max_graphs") is not None:
-            cfg["max_graphs"] = int(extra["flow_graph_max_graphs"])
-        return cfg
 
     def _create_llm_vllm_config(self, parent_config: VllmConfig) -> VllmConfig:
         """Create VllmConfig for the inner Qwen2 LLM.
