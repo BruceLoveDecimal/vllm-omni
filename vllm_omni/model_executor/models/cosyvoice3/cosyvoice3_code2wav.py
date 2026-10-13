@@ -705,7 +705,7 @@ class CosyVoice3Code2Wav(nn.Module):
             if stream_items:
                 noise = self._stream_position_noise(width, mu).expand(len(items), -1, -1)
             else:
-                noise = torch.randn(mu.shape, device=mu.device, dtype=mu.dtype)
+                noise = flow.decoder.fixed_noise(mu, prompt_len=prompt_lengths)
             time_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
             if flow.decoder.t_scheduler == "cosine":
                 time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)

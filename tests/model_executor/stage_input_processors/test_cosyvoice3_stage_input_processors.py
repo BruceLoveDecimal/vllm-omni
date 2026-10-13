@@ -378,27 +378,30 @@ def _feed_chunks(transfer_manager, req_id: str, emitted_counts, *, finish_last: 
 
 
 def test_talker2code2wav_async_chunk_slides_flow_window_after_context_cap():
-    transfer_manager = _transfer_manager(left_context_frames=3)
-    payload1, payload2, payload3 = _feed_chunks(transfer_manager, "rid-window", [2, 4, 6])
+    transfer_manager = _transfer_manager(chunk_frames=25, left_context_frames=30)
+    payload1, payload2, payload3, payload4 = _feed_chunks(transfer_manager, "rid-window", [25, 50, 75, 100])
 
     # Before the cap engages the full prefix is sent (legacy behavior).
-    assert payload1.codes.audio.tolist() == [1, 2]
+    assert payload1.codes.audio.tolist() == list(range(1, 26))
     assert payload1.meta.left_context_size == 0
-    assert payload2.codes.audio.tolist() == [1, 2, 3, 4]
-    assert payload2.meta.left_context_size == 2
-    # emitted=4 > cap=3: the window slides, dropping token index 0.
-    assert payload3.codes.audio.tolist() == [2, 3, 4, 5, 6]
-    assert payload3.meta.left_context_size == 3
+    assert payload2.codes.audio.tolist() == list(range(1, 51))
+    assert payload2.meta.left_context_size == 25
+    # emitted=50, cap=30: retaining the whole boundary block delays sliding.
+    assert payload3.codes.audio.tolist() == list(range(1, 76))
+    assert payload3.meta.left_context_size == 50
+    # emitted=75: drop one full block, keeping 50 context tokens (30 + 20).
+    assert payload4.codes.audio.tolist() == list(range(26, 101))
+    assert payload4.meta.left_context_size == 50
 
 
 def test_talker2code2wav_async_chunk_final_flush_respects_flow_window():
-    transfer_manager = _transfer_manager(left_context_frames=3)
-    payload_final = _feed_chunks(transfer_manager, "rid-window-final", [2, 4, 6, 7], finish_last=True)[-1]
+    transfer_manager = _transfer_manager(chunk_frames=25, left_context_frames=30)
+    payload_final = _feed_chunks(transfer_manager, "rid-window-final", [25, 50, 75, 81], finish_last=True)[-1]
 
-    # emitted=6, cap=3: final flush sends 3 context tokens + the new tail.
+    # emitted=75, cap=30: retain the boundary block plus the six-token tail.
     assert payload_final.meta.finished.item() is True
-    assert payload_final.codes.audio.tolist() == [4, 5, 6, 7]
-    assert payload_final.meta.left_context_size == 3
+    assert payload_final.codes.audio.tolist() == list(range(26, 82))
+    assert payload_final.meta.left_context_size == 50
 
 
 def test_talker2code2wav_async_chunk_flow_window_disabled_sends_full_prefix():
@@ -407,6 +410,42 @@ def test_talker2code2wav_async_chunk_flow_window_disabled_sends_full_prefix():
 
     assert payload3.codes.audio.tolist() == [1, 2, 3, 4, 5, 6]
     assert payload3.meta.left_context_size == 4
+
+
+@pytest.mark.parametrize("prompt_len", [7, 17, 25, 38])
+def test_flow_window_preserves_chunk_grid_after_short_first_hop(prompt_len):
+    transfer_manager = _transfer_manager(
+        chunk_frames=25, pre_lookahead_frames=3, stream_scale_factor=2, max_chunk_frames=100, left_context_frames=25
+    )
+    transfer_manager.connector.config["extra"]["codec_first_chunk_frames"] = 15
+    request = SimpleNamespace(
+        external_req_id="rid-window-grid",
+        output_token_ids=list(range(1, 501)),
+        additional_information={"embed": {"speech_token": [torch.tensor([list(range(prompt_len))])]}},
+        is_finished=_never_finished,
+    )
+    emitted = 0
+    new_tokens = []
+    starts = []
+    for chunk_index in range(5):
+        payload = _run_chunk(transfer_manager, request)
+        assert payload is not None
+        codes = payload.codes.audio.tolist()
+        context = payload.meta.left_context_size
+        window_start = codes[0] - 1
+        starts.append(window_start)
+        assert window_start % 25 == 0
+        assert window_start == emitted - context
+        if emitted >= 25:
+            assert 25 <= context < 50
+        # Keep each emitted token exactly once; lookahead is resent next time.
+        new_tokens.extend(codes[context:-3])
+        emitted += len(codes) - context - 3
+        assert new_tokens == list(range(1, emitted + 1))
+        if chunk_index >= 1:
+            # The local estimator sees prompt + window, not the full prefix.
+            assert (prompt_len + len(codes) - 3) % 25 == 0
+    assert any(start > 0 for start in starts)
 
 
 def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio():
