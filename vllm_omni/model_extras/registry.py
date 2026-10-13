@@ -93,6 +93,9 @@ from vllm_omni.model_extras.ming_image import (
     build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
 from vllm_omni.model_extras.qwen_image_21 import (
+    QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
+)
+from vllm_omni.model_extras.qwen_image_21 import (
     build_image_to_image_prompt as build_qwen_image_21_image_to_image_prompt,
 )
 from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
@@ -337,6 +340,7 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "image_to_image_prompt_builder": build_ming_image_image_to_image_prompt,
     },
     "QwenImage21Pipeline": {
+        "extra_body_params": QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
         "image_to_image_prompt_builder": build_qwen_image_21_image_to_image_prompt,
     },
 }
