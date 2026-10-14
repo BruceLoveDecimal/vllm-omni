@@ -385,36 +385,77 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             embedding = F.normalize(embedding, dim=1)
             embedding = self.spk_embed_affine_layer(embedding)
 
+        batch_size = int(token.shape[0])
+        ratio = int(self.token_mel_ratio)
+        lookahead = 0 if finalize else int(self.pre_lookahead_len)
+        # One host sync for the row geometry; the loops below need it anyway,
+        # and the uniform path used to sync on ``prompt_feat.shape[1]``.
+        prompt_lens = [int(v) for v in prompt_token_len.reshape(-1).tolist()]
+        target_lens = [int(v) for v in token_len.reshape(-1).tolist()]
+        prompt_mel_lens = [int(v) for v in prompt_feat_len.reshape(-1).tolist()]
+        combined_lens = [p + t for p, t in zip(prompt_lens, target_lens, strict=True)]
+        # Rows that share a reference length keep the single-tensor path, so a
+        # uniform batch is computed exactly as before.
+        uniform_prompts = len(set(prompt_lens)) <= 1 and len(set(prompt_mel_lens)) <= 1
+        uniform_combined = len(set(combined_lens)) <= 1
+
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_token_embedding_lookahead"):
             # concat text and prompt_text
-            codec_token_len = token_len
-            token, total_token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + codec_token_len
+            total_token_len = prompt_token_len + token_len
+            if uniform_prompts:
+                token = torch.concat([prompt_token, token], dim=1)
+            else:
+                # Each row is prompt-then-generated and padded at the tail, so
+                # a row's own tokens start where its own reference ends.
+                token = torch.nn.utils.rnn.pad_sequence(
+                    [
+                        torch.concat([prompt_token[i, : prompt_lens[i]], token[i, : target_lens[i]]])
+                        for i in range(batch_size)
+                    ],
+                    batch_first=True,
+                )
             mask = (~make_pad_mask(total_token_len, max_len=token.shape[1])).unsqueeze(-1).to(embedding)
             token = self.input_embedding(torch.clamp(token, min=0)) * mask
             # text encode
             if finalize is True:
                 h = self.pre_lookahead_layer(token)
-            else:
+            elif uniform_combined:
                 h = self.pre_lookahead_layer(
                     token[:, : -self.pre_lookahead_len], context=token[:, -self.pre_lookahead_len :]
                 )
+            else:
+                # Rows are left-aligned and padded to the longest, so
+                # ``token[:, -lookahead:]`` would feed a short row its padding
+                # as lookahead context instead of its own last tokens.
+                bodies = [max(length - lookahead, 0) for length in combined_lens]
+                max_body = max(bodies)
+                rows = []
+                for i, length in enumerate(combined_lens):
+                    row = self.pre_lookahead_layer(
+                        token[i : i + 1, : bodies[i]],
+                        context=token[i : i + 1, bodies[i] : length],
+                    )
+                    rows.append(F.pad(row, (0, 0, 0, max_body - int(row.shape[1]))))
+                h = torch.concat(rows, dim=0)
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_repeat_to_mel_axis"):
-            h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+            h = h.repeat_interleave(ratio, dim=1)
 
-        batch_size = int(token.shape[0])
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cond_prompt_mel"):
-            mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
+            mel_width = int(h.shape[1])
 
             # get conditions
-            conds = torch.zeros([batch_size, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
-            conds[:, :mel_len1] = prompt_feat
+            conds = torch.zeros([batch_size, mel_width, self.output_size], device=token.device).to(h.dtype)
+            if uniform_prompts:
+                conds[:, : prompt_mel_lens[0]] = prompt_feat[:, : prompt_mel_lens[0]]
+            else:
+                for i, prompt_mel in enumerate(prompt_mel_lens):
+                    conds[i, :prompt_mel] = prompt_feat[i, :prompt_mel]
             conds = conds.transpose(1, 2)
 
-            lookahead = 0 if finalize else int(self.pre_lookahead_len)
             valid_h_lens = torch.clamp(total_token_len.to(torch.long) - lookahead, min=0)
-            mel_lens = torch.clamp(valid_h_lens * int(self.token_mel_ratio), max=mel_len1 + mel_len2)
-            mask = (~make_pad_mask(mel_lens, max_len=mel_len1 + mel_len2)).to(h)
+            mel_lens = torch.clamp(valid_h_lens * ratio, max=mel_width)
+            mask = (~make_pad_mask(mel_lens, max_len=mel_width)).to(h)
 
         feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
@@ -426,6 +467,18 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         )
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_crop_prompt_mel"):
-            feat = feat[:, :, mel_len1:]
-            assert feat.shape[2] == mel_len2
+            if uniform_prompts:
+                feat = feat[:, :, prompt_mel_lens[0] :]
+            else:
+                # Drop each row's own prompt region, keeping the rows
+                # left-aligned at their first generated frame.
+                widths = [mel_width - prompt_mel for prompt_mel in prompt_mel_lens]
+                max_width = max(widths)
+                feat = torch.concat(
+                    [
+                        F.pad(feat[i : i + 1, :, prompt_mel_lens[i] :], (0, max_width - widths[i]))
+                        for i in range(batch_size)
+                    ],
+                    dim=0,
+                )
         return feat.float(), None
