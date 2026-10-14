@@ -1,0 +1,42 @@
+# Alaya-EVOKE real-time world model (evoke/stage3_post_distillation) for
+# WS /v1/realtime/video and chunked offline generation.
+#
+# One request is one rollout: prepare_encode runs once, then every three
+# pyramid steps stream one 1.5 s chunk (36 frames at 24 fps). Geometry state
+# (ViGeo kv-cache, point-cloud bank, causal-decoder cache) is per session, so
+# the stage serves one session at a time.
+#
+# The model directory is assembled by
+# examples/offline_inference/evoke/download_evoke.py; ViGeo weights are
+# CC-BY-NC-4.0 and the `vigeo` package is installed separately.
+
+pipeline: evoke
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: EvokePipeline
+    step_execution: true
+    streaming_output: true
+    # Pinned by the checkpoint: one UniPC step per pyramid stage, no CFG.
+    default_sampling_params:
+      num_inference_steps: 3
+      guidance_scale: 1.0
+      height: 384
+      width: 640
+      fps: 24
+    model_config:
+      # ViGeo depth weights (file or directory holding vigeo.pt). Defaults to
+      # <model>/vigeo/vigeo.pt when the download script placed it there.
+      # evoke_vigeo_path: /models/ViGeo
+      evoke_preload_vigeo: true
+      # Upstream recipe renders each chunk's warp from every earlier frame.
+      evoke_warp_lag_chunks: 0
+      # 0 keeps every ingested frame (upstream recipe). A positive bound caps
+      # GPU memory for long sessions but changes what the warp can recall.
+      evoke_geometry_max_bank_frames: 0

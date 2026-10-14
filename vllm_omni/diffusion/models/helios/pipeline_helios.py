@@ -219,12 +219,28 @@ class HeliosPipeline(
         ).to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(
-            transformer_config, quant_config=od_config.quantization_config
+        self.transformer = self._create_transformer(transformer_config)
+
+        sched_cfg = load_json_config(model, "scheduler", "scheduler_config.json", local_files_only)
+        self.scheduler = self._create_scheduler(sched_cfg)
+
+        self.is_distilled = self.scheduler.config.scheduler_type == "dmd"
+
+        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
+        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
+
+        self._guidance_scale = None
+        self._num_timesteps = None
+        self._current_timestep = None
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
-        # Read scheduler config to determine scheduler type
-        sched_cfg = load_json_config(model, "scheduler", "scheduler_config.json", local_files_only)
+    def _create_transformer(self, config: dict) -> HeliosTransformer3DModel:
+        return create_transformer_from_config(config, quant_config=self.od_config.quantization_config)
+
+    def _create_scheduler(self, sched_cfg: dict) -> HeliosScheduler:
+        """Build the scheduler from ``scheduler/scheduler_config.json``."""
         scheduler_kwargs = {}
         passthrough_keys = [
             "num_train_timesteps",
@@ -247,20 +263,7 @@ class HeliosPipeline(
         for key in passthrough_keys:
             if key in sched_cfg:
                 scheduler_kwargs[key] = sched_cfg[key]
-
-        self.scheduler = HeliosScheduler(**scheduler_kwargs)
-
-        self.is_distilled = scheduler_kwargs.get("scheduler_type") == "dmd"
-
-        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
-        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
-
-        self._guidance_scale = None
-        self._num_timesteps = None
-        self._current_timestep = None
-        self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
-        )
+        return HeliosScheduler(**scheduler_kwargs)
 
     @property
     def guidance_scale(self):

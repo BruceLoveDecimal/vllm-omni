@@ -837,6 +837,22 @@ class HeliosTransformer3DModel(nn.Module):
         self._cross_attn_kv_cache.put(encoder_hidden_states, key_values)
         return key_values
 
+    def _select_history_tokens(
+        self,
+        tier: str,
+        tokens: torch.Tensor,
+        rotary_emb: torch.Tensor,
+        attention_kwargs: dict[str, Any] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Choose which patchified history tokens of ``tier`` enter attention.
+
+        Helios keeps every token. Subclasses that condition on partially
+        observed history (e.g. Evoke's warped frames) drop tokens here, before
+        the sequence-parallel split, so that every rank agrees on the layout.
+        """
+        del tier, attention_kwargs
+        return tokens, rotary_emb
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -889,6 +905,9 @@ class HeliosTransformer3DModel(nn.Module):
                 device=latents_history_short.device,
             )
             rotary_emb_history_short = rotary_emb_history_short.flatten(2).transpose(1, 2)
+            latents_history_short, rotary_emb_history_short = self._select_history_tokens(
+                "short", latents_history_short, rotary_emb_history_short, attention_kwargs
+            )
             # USP: per-component split
             latents_history_short = self._sp_split_seq(latents_history_short)
             rotary_emb_history_short = self._sp_split_seq(rotary_emb_history_short)
@@ -912,6 +931,9 @@ class HeliosTransformer3DModel(nn.Module):
             rotary_emb_history_mid = pad_for_3d_conv(rotary_emb_history_mid, (2, 2, 2))
             rotary_emb_history_mid = center_down_sample_3d(rotary_emb_history_mid, (2, 2, 2))
             rotary_emb_history_mid = rotary_emb_history_mid.flatten(2).transpose(1, 2)
+            latents_history_mid, rotary_emb_history_mid = self._select_history_tokens(
+                "mid", latents_history_mid, rotary_emb_history_mid, attention_kwargs
+            )
             # USP: per-component split
             latents_history_mid = self._sp_split_seq(latents_history_mid)
             rotary_emb_history_mid = self._sp_split_seq(rotary_emb_history_mid)
@@ -935,6 +957,9 @@ class HeliosTransformer3DModel(nn.Module):
             rotary_emb_history_long = pad_for_3d_conv(rotary_emb_history_long, (4, 4, 4))
             rotary_emb_history_long = center_down_sample_3d(rotary_emb_history_long, (4, 4, 4))
             rotary_emb_history_long = rotary_emb_history_long.flatten(2).transpose(1, 2)
+            latents_history_long, rotary_emb_history_long = self._select_history_tokens(
+                "long", latents_history_long, rotary_emb_history_long, attention_kwargs
+            )
             # USP: per-component split
             latents_history_long = self._sp_split_seq(latents_history_long)
             rotary_emb_history_long = self._sp_split_seq(rotary_emb_history_long)
