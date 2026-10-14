@@ -177,7 +177,6 @@ class _FakeTrtContext:
     def set_input_shape(self, name, shape):
         self.shapes[name] = tuple(shape)
         return True
-        return True
 
     def set_tensor_address(self, name, address):
         self.addresses[name] = address
@@ -208,7 +207,7 @@ class _FakeTrtEstimator:
         self.context = context if context is not None else _FakeTrtContext()
         self.released = 0
 
-    def acquire_estimator(self):
+    def acquire_estimator(self, batch_size=2, sequence_length=None):
         return [self.context, _FakeStream()], object()
 
     def release_estimator(self, context, stream):
@@ -218,7 +217,7 @@ class _FakeTrtEstimator:
 
 class _RejectingShapeContext(_FakeTrtContext):
     def set_input_shape(self, name, shape):
-        return super().set_input_shape(name, shape)
+        super().set_input_shape(name, shape)
         return name != "x"  # TRT returns False for a shape outside the profile
 
 
@@ -243,7 +242,14 @@ class TestTensorRtMaskInput:
         if mask is None:
             mask = torch.ones(2, 1, frames)
         cfm.forward_estimator(
-            x, mask, torch.randn(2, 80, frames), torch.rand(2), torch.randn(2, 80), x, streaming, attn_mask=attn_mask
+            x,
+            mask,
+            torch.randn(2, 80, frames),
+            torch.rand(2),
+            torch.randn(2, 80),
+            x,
+            streaming=streaming,
+            attn_mask=attn_mask,
         )
         return cfm.estimator.context
 
@@ -344,7 +350,7 @@ class TestTensorRtContextIsReleased:
         monkeypatch.setattr(torch.cuda, "stream", lambda stream: torch.no_grad())
         frames = BLOCK
         x = torch.randn(2, 80, frames)
-        cfm.forward_estimator(x, torch.ones(2, 1, frames), x, torch.rand(2), torch.randn(2, 80), x, False)
+        cfm.forward_estimator(x, torch.ones(2, 1, frames), x, torch.rand(2), torch.randn(2, 80), x, streaming=False)
 
     def test_out_of_profile_shape_raises_and_releases(self, monkeypatch):
         est = _FakeTrtEstimator(supports_attn_mask=True, context=_RejectingShapeContext())
@@ -399,7 +405,7 @@ class TestStreamingBatch:
         model.flow_model = types.SimpleNamespace(token_mel_ratio=2, pre_lookahead_len=3)
 
         def fake_forward_mel(self, token, prompt_token, prompt_feat, embedding, **kw):
-            calls.append(kw)
+            calls.append(dict(kw, prompt_token=prompt_token))
             return torch.zeros(token.shape[0], 80, 2 * int(token.shape[1]))
 
         def fake_hift(self, feat, *, cache_state=None, finalize=False):
@@ -483,7 +489,7 @@ class TestStreamingBatch:
         model.forward_streaming_batch(items, n_timesteps=2)
 
         assert sorted(c["finalize"] for c in calls) == [False, True]
-        assert all(c["prompt_token_lens"].numel() == 1 for c in calls)
+        assert all(c["prompt_token"].shape[0] == 1 for c in calls)
 
 
 class TestPadAndCat:
@@ -606,13 +612,13 @@ class TestTensorRtEstimatorSelection:
 
         built: list[str] = []
 
-        def chunk_mask_builder(estimator, onnx_dir, device, cache_key=None):
+        def chunk_mask_builder(estimator, onnx_dir, device, cache_key=None, max_cfg_batch=None):
             built.append("chunk_mask")
             if chunk_mask_error is not None:
                 raise chunk_mask_error
             return self._Wrapper(supports_attn_mask=True)
 
-        def legacy_builder(onnx_path, device):
+        def legacy_builder(onnx_path, device, max_cfg_batch=None):
             built.append("legacy")
             return self._Wrapper(supports_attn_mask=False)
 

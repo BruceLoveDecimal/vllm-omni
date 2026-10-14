@@ -5,6 +5,7 @@ import sys
 import threading
 import types
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -209,6 +210,9 @@ def test_dynamic_batch_profile_rejects_non_batched_limits(max_cfg_batch):
 
 
 class _FakeStream:
+    def wait_stream(self, other):
+        pass
+
     cuda_stream = 1234
 
     def __init__(self):
@@ -359,7 +363,18 @@ def test_dynamic_profiles_reject_concurrent_contexts(monkeypatch):
 
 
 class _BuildEngine:
-    def __init__(self, profile_count: int = 1):
+    def get_tensor_name(self, index):
+        return ("x", "mask", "mu", "t", "spks", "cond", "estimator_out")[index]
+
+    def get_tensor_mode(self, name):
+        return "output" if name == "estimator_out" else "input"
+
+    def get_tensor_dtype(self, name):
+        return self.dtype
+
+    def __init__(self, profile_count: int = 1, dtype=torch.float32):
+        self.dtype = dtype
+        self.num_io_tensors = 7
         self.context = object()
         self.num_optimization_profiles = profile_count
 
@@ -378,6 +393,8 @@ def _fake_tensorrt_module(engine):
 
     module = types.ModuleType("tensorrt")
     setattr(module, "Runtime", Runtime)
+    module.float16, module.float32, module.bfloat16 = torch.float16, torch.float32, torch.bfloat16
+    module.TensorIOMode = types.SimpleNamespace(INPUT="input")
     return module
 
 
@@ -414,7 +431,7 @@ def test_build_flow_estimator_uses_one_mode_specific_plan(
     plan_path = tmp_path / "flow.plan"
     plan_path.write_bytes(b"plan")
     prefixes = []
-    engine = _BuildEngine(2 if dynamic_profiles else 1)
+    engine = _BuildEngine(2 if dynamic_profiles else 1, dtype=expected_dtype)
 
     def resolve_plan_path(onnx_path, prefix="flow_estimator"):
         prefixes.append(prefix)
@@ -588,7 +605,7 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
         return address
 
     monkeypatch.setattr(torch.Tensor, "data_ptr", register_tensor)
-    names = ("x", "mask", "mu", "t", "spks", "cond", "out")
+    names = ("x", "mask", "mu", "t", "spks", "cond", "estimator_out")
 
     class FakeStream:
         cuda_stream = 123
@@ -625,7 +642,7 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
             # Every input affects the result, including the unconditional CFG
             # row, time progression and engine/caller precision boundary.
             out = (0.125 * x + 0.25 * mu + 0.0625 * spks.unsqueeze(-1) + 0.125 * cond + 0.25 * t[:, None, None]) * mask
-            self.bindings["out"].copy_(out)
+            self.bindings["estimator_out"].copy_(out)
             if len(self.calls) == 1 and self.after_first_call is not None:
                 self.after_first_call()
             return True
@@ -654,8 +671,12 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
     session_engine, legacy_engine = FakeEngine(profiles=2), FakeEngine()
-    session_pool = flow_estimator_trt.TrtContextWrapper(session_engine, "cpu", io_dtype=torch.float16)
-    legacy_pool = flow_estimator_trt.TrtContextWrapper(legacy_engine, "cpu", io_dtype=torch.float16)
+    session_pool = flow_estimator_trt.TrtContextWrapper(
+        session_engine, "cpu", io_dtype=torch.float16, input_names=frozenset(names[:-1])
+    )
+    legacy_pool = flow_estimator_trt.TrtContextWrapper(
+        legacy_engine, "cpu", io_dtype=torch.float16, input_names=frozenset(names[:-1])
+    )
     monkeypatch.setattr(legacy_pool, "estimation_session", None)
     entries = exits = 0
     original_session_factory = session_pool.estimation_session
@@ -827,7 +848,7 @@ class TestFusedAttentionFallback:
     def _patch_builder(self, monkeypatch, fail_fused: bool):
         calls = []
 
-        def fake_build(estimator, onnx_dir, device, *, fp16, cache_key, fused_attention):
+        def fake_build(estimator, onnx_dir, device, *, fp16, cache_key, fused_attention, max_cfg_batch=None):
             calls.append(fused_attention)
             if fused_attention and fail_fused:
                 raise RuntimeError("UNSUPPORTED_NODE: Attention")
@@ -1018,6 +1039,8 @@ class TestSessionSurfacesTensorRTFailures:
             def execute_async_v3(self, stream):
                 return False
 
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: _FakeStream())
+        monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
         wrapper = self._wrapper(monkeypatch, Context())
         inputs = self._inputs()
         with wrapper.estimation_session(*inputs) as session:
