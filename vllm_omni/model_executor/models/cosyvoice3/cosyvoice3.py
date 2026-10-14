@@ -818,7 +818,9 @@ class CosyVoice3Model(
 
             connector_extra = self._connector_extra(vllm_config)
             self._check_flow_window_vs_packed(connector_extra)
-            self.code2wav = CosyVoice3Code2Wav(self.config)
+            self.code2wav = CosyVoice3Code2Wav(
+                self.config, flow_left_context_tokens=cosyvoice3_flow_left_context(connector_extra)
+            )
             self.model = self.code2wav.flow_model
             self.hift = self.code2wav.hift
             # Keep additional information synchronized for async_chunk updates.
@@ -859,7 +861,7 @@ class CosyVoice3Model(
         see the stage-1 environment that selects this profile, so the
         conflict can only be caught here.
         """
-        if not connector_extra or not cosyvoice3_packed_streaming_enabled():
+        if not cosyvoice3_packed_streaming_enabled():
             return
         window = cosyvoice3_flow_left_context(connector_extra)
         if window > 0:
