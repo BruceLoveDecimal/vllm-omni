@@ -59,7 +59,7 @@ def _state(**sampling):
         ({"guidance_scale_provided": True, "guidance_scale": 5.0}, {}, "CFG-free"),
         ({"num_inference_steps": 50}, {}, "exactly 3 steps"),
         ({"fps": 30}, {}, "24 fps"),
-        ({}, {"history_sizes": [8, 2, 1]}, "Unsupported Evoke extra_args"),
+        ({}, {"history_sizes": [8, 2, 1]}, "pinned by the checkpoint recipe"),
     ],
 )
 def test_recipe_knobs_are_not_request_tunable(sampling, extra, message):

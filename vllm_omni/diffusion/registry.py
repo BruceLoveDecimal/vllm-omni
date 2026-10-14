@@ -190,8 +190,6 @@ _DIFFUSION_MODELS = {
         "abot_world",
         "pipeline_abot_world",
         "ABotWorldCausalPipeline",
-        # Evoke samples one step per pyramid stage, so there is no step to skip.
-        "EvokePipeline",
     ),
     "LongCatImagePipeline": (
         "longcat_image",
@@ -454,6 +452,8 @@ _NO_CACHE_ACCELERATION = {
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
     "ABotWorldCausalPipeline",
+    # Evoke samples one step per pyramid stage, so there is no step to skip.
+    "EvokePipeline",
     # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
     # branch) across denoising steps, which conflicts with cache_dit / tea_cache
     # step-skipping hooks.

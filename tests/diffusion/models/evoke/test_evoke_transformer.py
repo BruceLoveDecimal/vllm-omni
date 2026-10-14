@@ -112,12 +112,15 @@ BLOCK_KEYS = [
 
 @pytest.fixture(autouse=True)
 def _init_distributed(monkeypatch):
-    from vllm.distributed.parallel_state import (
-        cleanup_dist_env_and_memory,
+    from vllm.config import VllmConfig
+    from vllm.config.vllm import set_current_vllm_config
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        destroy_distributed_env,
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from vllm.model_executor.layers.utils import default_unquantized_gemm
 
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
@@ -125,10 +128,11 @@ def _init_distributed(monkeypatch):
     )
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29514")
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo")
+        initialize_model_parallel(backend="gloo")
+        yield
+        destroy_distributed_env()
 
 
 def _sdpa_config():
@@ -136,7 +140,7 @@ def _sdpa_config():
 
     return SimpleNamespace(
         diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
-        parallel_config=SimpleNamespace(ring_degree=1, allgather_degree=1),
+        parallel_config=SimpleNamespace(ring_degree=1, allgather_degree=1, sequence_parallel_size=1, ulysses_degree=1),
     )
 
 

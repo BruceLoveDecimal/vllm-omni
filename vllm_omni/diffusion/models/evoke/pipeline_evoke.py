@@ -44,6 +44,7 @@ from vllm_omni.diffusion.models.evoke.geometry.session import GeometryRecipe, Ge
 from vllm_omni.diffusion.models.evoke.geometry.vigeo_adapter import ViGeoDepthEstimator
 from vllm_omni.diffusion.models.helios.pipeline_helios import HeliosPipeline, calculate_shift
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState, WanStreamingDecoder
@@ -82,15 +83,20 @@ class EvokeRecipe:
 
 RECIPE = EvokeRecipe()
 
-_SUPPORTED_EXTRA_ARGS = frozenset(
+# Sampling-recipe knobs of Helios-style pipelines. The distilled checkpoint only
+# works with its trained recipe, so these are rejected instead of ignored.
+_RECIPE_EXTRA_ARGS = frozenset(
     {
-        "image",
-        "camera_c2ws",
-        "camera_intrinsics",
-        "camera_hfov_degrees",
-        "geometry",
-        "negative_prompt",
-        "output_type",
+        "history_sizes",
+        "num_latent_frames_per_chunk",
+        "keep_first_frame",
+        "is_enable_stage2",
+        "pyramid_num_stages",
+        "pyramid_num_inference_steps_list",
+        "is_amplify_first_chunk",
+        "use_cfg_zero_star",
+        "use_dmd",
+        "video",
     }
 )
 
@@ -206,10 +212,13 @@ class _EvokeSession:
             self.geometry = None
 
 
-class EvokePipeline(HeliosPipeline):
+class EvokePipeline(HeliosPipeline, SupportImageInput):
     """Evoke real-time pipeline on the Helios step-execution skeleton."""
 
     supports_step_execution: ClassVar[bool] = True
+    # A rollout needs a conditioning image, camera and ViGeo; a generic warmup
+    # request exercises none of that and would fail the pinned-recipe checks.
+    dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -324,10 +333,10 @@ class EvokePipeline(HeliosPipeline):
         return ((latents - mean) * inv_std).to(device=self.device, dtype=torch.float32)
 
     def _validate_request(self, state: StepRequestState, extra: dict[str, Any]) -> None:
-        unknown = sorted(set(extra) - _SUPPORTED_EXTRA_ARGS)
-        if unknown:
-            raise ValueError(f"Unsupported Evoke extra_args {unknown}; supported: {sorted(_SUPPORTED_EXTRA_ARGS)}")
-        if state.sampling.guidance_scale_provided and float(state.sampling.guidance_scale) != 1.0:
+        pinned = sorted(set(extra) & _RECIPE_EXTRA_ARGS)
+        if pinned:
+            raise ValueError(f"Evoke extra_args {pinned} are pinned by the checkpoint recipe (or unsupported).")
+        if state.sampling.guidance_scale_provided and float(state.sampling.guidance_scale) > 1.0:
             raise ValueError("The Evoke real-time checkpoint is distilled CFG-free; guidance_scale must be 1.0.")
         steps = state.sampling.num_inference_steps
         if steps is not None and int(steps) != sum(RECIPE.pyramid_steps):
