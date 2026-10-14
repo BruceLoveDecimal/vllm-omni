@@ -158,7 +158,9 @@ def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monke
     monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
     model = tiny_flow(monkeypatch).bfloat16()
     monkeypatch.setattr(
-        model, "_stream_hift_from_feat", lambda mel, cache_state, finalize: (mel, None if finalize else cache_state)
+        model,
+        "_stream_hift_batch",
+        lambda inputs: [(mel, None if finalize else state) for mel, state, finalize in inputs],
     )
     items = []
     for index, (prompt, generated) in enumerate(([(7, 17), (13, 9), (3, 31)] * 6)[:17]):

@@ -412,7 +412,12 @@ class TestStreamingBatch:
             return feat, (None if finalize else {"mel_frames": int(feat.shape[-1])})
 
         model._forward_mel = types.MethodType(fake_forward_mel, model)
-        model._stream_hift_from_feat = types.MethodType(fake_hift, model)
+        model._stream_hift_batch = types.MethodType(
+            lambda self, inputs: [
+                fake_hift(self, feat, cache_state=state, finalize=finalize) for feat, state, finalize in inputs
+            ],
+            model,
+        )
         return model
 
     @staticmethod

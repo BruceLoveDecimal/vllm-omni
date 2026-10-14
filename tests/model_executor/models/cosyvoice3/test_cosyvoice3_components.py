@@ -789,11 +789,11 @@ def test_code2wav_streaming_batch_pads_codec_tokens_and_preserves_lengths():
         forward_mel_calls.append(kwargs)
         return torch.arange(2 * 80 * 8, dtype=torch.float32).reshape(2, 80, 8)
 
-    def fake_stream_hift(self, feat, *, cache_state=None, finalize=False):
-        return feat, None
+    def fake_stream_hift(self, inputs):
+        return [(feat, None) for feat, _, _ in inputs]
 
     model._forward_mel = types.MethodType(fake_forward_mel, model)
-    model._stream_hift_from_feat = types.MethodType(fake_stream_hift, model)
+    model._stream_hift_batch = types.MethodType(fake_stream_hift, model)
     items = [
         {
             "token": torch.ones(1, 3, dtype=torch.int32),
