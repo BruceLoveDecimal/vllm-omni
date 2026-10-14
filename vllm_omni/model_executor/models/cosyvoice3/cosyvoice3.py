@@ -1690,14 +1690,13 @@ class CosyVoice3Model(
                         len(streaming_flow_items),
                         item_shapes,
                     )
-                if (
-                    (len(streaming_flow_items) > 1 or cosyvoice3_packed_inference_enabled())
-                    and cosyvoice3_batch_flow_enabled()
-                    and hasattr(self.code2wav, "forward_streaming_batch")
+                if (len(streaming_flow_items) > 1 or cosyvoice3_packed_inference_enabled()) and hasattr(
+                    self.code2wav, "forward_streaming_batch"
                 ):
                     streaming_results = self.code2wav.forward_streaming_batch(
                         streaming_flow_items,
                         n_timesteps=10,
+                        batch_flow=cosyvoice3_batch_flow_enabled(),
                     )
                 else:
                     streaming_results = [

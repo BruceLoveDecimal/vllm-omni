@@ -66,7 +66,8 @@ class _DummyCode2Wav:
             }
         return audio, new_state
 
-    def forward_streaming_batch(self, items, *, n_timesteps: int = 10):
+    def forward_streaming_batch(self, items, *, n_timesteps: int = 10, batch_flow: bool = True):
+        self.last_batch_flow = batch_flow
         self.forward_streaming_batch_calls.append(items)
         return [
             self.forward_streaming(
@@ -544,8 +545,9 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
     assert "rid-stream" not in model._stream_vocoder_cache_by_req
 
 
-def test_forward_batches_streaming_flow_items(monkeypatch):
-    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
+@pytest.mark.parametrize("batch_flow", [False, True])
+def test_forward_batches_streaming_flow_items(monkeypatch, batch_flow):
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", str(int(batch_flow)))
     model = _make_code2wav_model()
     runtime_info = [
         {
@@ -583,6 +585,7 @@ def test_forward_batches_streaming_flow_items(monkeypatch):
 
     assert len(out.multimodal_outputs["audio"]) == 2
     assert len(model.code2wav.forward_streaming_batch_calls) == 1
+    assert model.code2wav.last_batch_flow == batch_flow
     batch_items = model.code2wav.forward_streaming_batch_calls[0]
     assert [item["index"] for item in batch_items] == [0, 1]
     assert torch.equal(batch_items[0]["token"], torch.tensor([[0, 1, 2]]))

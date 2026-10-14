@@ -1080,7 +1080,7 @@ class CausalHiFTGenerator(HiFTGenerator):
         return x
 
     @torch.inference_mode()
-    def inference(
+    def prepare_source(
         self,
         speech_feat: torch.Tensor,
         finalize: bool = True,
@@ -1090,6 +1090,7 @@ class CausalHiFTGenerator(HiFTGenerator):
         trim: int = 0,
         f0_margin: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Prepare request-local F0/source and phase before batchable decode."""
         # mel->f0
         # By default keep f0_predictor on the same device as speech_feat (GPU) in FP32
         # with TF32 disabled to prevent causal drift while avoiding CPU syncs and transfers.
@@ -1123,13 +1124,30 @@ class CausalHiFTGenerator(HiFTGenerator):
             s, phase_acc=phase_acc, uv_offset=uv_offset, next_overlap=next_overlap, trim=trim
         )
         s = s.transpose(1, 2)
-        if finalize is True:
-            generated_speech = self.decode(x=speech_feat, s=s, finalize=finalize)
-        else:
-            generated_speech = self.decode(
-                x=speech_feat[:, :, : -self.f0_predictor.condnet[0].causal_padding], s=s, finalize=finalize
-            )
-        return generated_speech, s, new_phase_acc
+        decode_mel = speech_feat if finalize else speech_feat[:, :, : -self.f0_predictor.condnet[0].causal_padding]
+        return decode_mel, s, new_phase_acc
+
+    @torch.inference_mode()
+    def inference(
+        self,
+        speech_feat: torch.Tensor,
+        finalize: bool = True,
+        phase_acc: torch.Tensor | None = None,
+        uv_offset: int = 0,
+        next_overlap: int = 0,
+        trim: int = 0,
+        f0_margin: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        decode_mel, source, new_phase_acc = self.prepare_source(
+            speech_feat,
+            finalize=finalize,
+            phase_acc=phase_acc,
+            uv_offset=uv_offset,
+            next_overlap=next_overlap,
+            trim=trim,
+            f0_margin=f0_margin,
+        )
+        return self.decode(decode_mel, source, finalize=finalize), source, new_phase_acc
 
 
 class CausalConv1dUpsample(torch.nn.Conv1d):
