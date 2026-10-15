@@ -6,12 +6,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from concurrent.futures import Future
 
 import numpy as np
 import torch
 
 from vllm_omni.model_executor.models.fish_speech.dac_encoder import encode_reference_audio_codes
 from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
+
+_FLIGHT_LOCK = threading.Lock()
+_INFLIGHT: dict[tuple[SpeakerEmbeddingCache, tuple[str, str, int]], Future[torch.Tensor]] = {}
 
 
 def encode_reference_audio_codes_cached(
@@ -36,7 +41,8 @@ def encode_reference_audio_codes_cached(
     voice invalidation still works. Inline references use a separate namespace.
     Entries own only CPU codes and share the existing byte-bounded LRU budget.
     Concurrent misses for the same key share one encoding within this cache
-    instance; different voices/inputs have independent flights.
+    instance; different voices/inputs have independent flights. Clearing the
+    cache does not cancel an encoding already in progress.
     """
     if isinstance(wav, torch.Tensor):
         wav = wav.detach().to(device="cpu", dtype=torch.float32).numpy()
@@ -60,8 +66,32 @@ def encode_reference_audio_codes_cached(
         created_at=voice_created_at if speaker_name else 0,
     )
 
-    def encode() -> dict[str, torch.Tensor]:
-        codes = encode_reference_audio_codes(model_path, samples, sample_rate, device=device).cpu()
-        return {"ref_codes_fq": codes}
+    # Coordinate lookup and flight registration, but never encode or wait
+    # under this lock. Cache instances have independent flights.
+    flight_key = (cache, key)
+    with _FLIGHT_LOCK:
+        cached = cache.get(key)
+        if cached is not None:
+            return cached["ref_codes_fq"]
+        flight = _INFLIGHT.get(flight_key)
+        owner = flight is None
+        if owner:
+            flight = Future()
+            _INFLIGHT[flight_key] = flight
+    assert flight is not None
+    if not owner:
+        return flight.result()
 
-    return cache.get_or_compute(key, encode)["ref_codes_fq"]
+    try:
+        codes = encode_reference_audio_codes(model_path, samples, sample_rate, device=device).cpu()
+        cache.put(key, {"ref_codes_fq": codes})
+    except BaseException as exc:
+        # Release followers even if the encoding caller is interrupted.
+        flight.set_exception(exc)
+        raise
+    else:
+        flight.set_result(codes)
+        return codes
+    finally:
+        with _FLIGHT_LOCK:
+            del _INFLIGHT[flight_key]

@@ -14,7 +14,6 @@ import os
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
-from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -240,7 +239,6 @@ class SpeakerEmbeddingCache:
         self._sizes: dict[tuple[str, str, int], int] = {}
         self._total_bytes = 0
         self._lock = threading.Lock()
-        self._inflight: dict[tuple[str, str, int], Future[dict[str, Any]]] = {}
         self._hits = 0
         self._misses = 0
         self._max_bytes = max_bytes
@@ -272,47 +270,6 @@ class SpeakerEmbeddingCache:
         with self._lock:
             self._insert_locked(key, artifacts)
 
-    def get_or_compute(self, key: tuple[str, str, int], compute: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-        """Coalesce concurrent misses for a key within this cache instance.
-
-        Compute and wait outside the cache lock, so unrelated keys progress
-        independently. Failures reach all current waiters and may be retried.
-        Even non-cacheable results (disabled/oversized) reach current waiters.
-        Clearing a key detaches its flight: existing callers still receive its
-        result, but it cannot repopulate the cache or serve new callers.
-        The callback must not recursively request the same key.
-        """
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                self._hits += 1
-                return self._cache[key]
-            self._misses += 1
-            flight = self._inflight.get(key)
-            owner = flight is None
-            if owner:
-                flight = Future()
-                self._inflight[key] = flight
-        assert flight is not None
-        if not owner:
-            return flight.result()
-        try:
-            artifacts = compute()
-            with self._lock:
-                if self._inflight.get(key) is flight:
-                    self._insert_locked(key, artifacts)
-                    del self._inflight[key]
-        except BaseException as exc:
-            # Also release waiters if the owner is interrupted. Never cache
-            # the exception, and never remove a newer flight after clear().
-            with self._lock:
-                if self._inflight.get(key) is flight:
-                    del self._inflight[key]
-            flight.set_exception(exc)
-            raise
-        flight.set_result(artifacts)
-        return artifacts
-
     def _insert_locked(self, key: tuple[str, str, int], artifacts: dict[str, Any]) -> None:
         if self._max_bytes <= 0:
             return
@@ -338,7 +295,6 @@ class SpeakerEmbeddingCache:
             if speaker_name is None:
                 removed = len(self._cache)
                 self._cache.clear()
-                self._inflight.clear()
                 self._sizes.clear()
                 self._total_bytes = 0
                 self._hits = 0
@@ -348,9 +304,6 @@ class SpeakerEmbeddingCache:
             if not speaker_name or not speaker_name.strip():
                 raise ValueError("speaker_name cannot be an empty string")
             normalized = speaker_name.strip().lower()
-            for key in list(self._inflight):
-                if key[1] == normalized:
-                    del self._inflight[key]
             removed = 0
             for k in list(self._cache.keys()):
                 if isinstance(k, tuple) and len(k) >= 2 and k[1] == normalized:

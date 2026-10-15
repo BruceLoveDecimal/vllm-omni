@@ -134,8 +134,8 @@ which returns the exact prompt row count.
   rate, shape, model/revision and device reuses the codes; uploaded voices
   retain name/generation invalidation. Concurrent misses for the same key
   share one encoding within each worker's cache (single-flight); different
-  voice keys remain independent. Clearing a voice also detaches its pending
-  encodings so they cannot refill the cache with stale codes.
+  voice keys remain independent. Clearing the cache does not cancel pending
+  encodings; completed encodings can populate it again.
   A cache miss still encodes in stage 0;
   use `ref_audio_codes` to avoid that first-request encoding cost.
 - Default sampling (model card): temperature 1.0, top_p 0.9, top_k 30,

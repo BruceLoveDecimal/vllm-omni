@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.fish_omni import reference_audio
-from vllm_omni.utils import speaker_cache
 from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -104,7 +103,7 @@ def wait_for_followers(monkeypatch):
                 joined.wait(timeout=5)
                 return super().result(timeout=5)
 
-        monkeypatch.setattr(speaker_cache, "Future", ObservedFuture)
+        monkeypatch.setattr(reference_audio, "Future", ObservedFuture)
         return joined
 
     return install
@@ -175,8 +174,11 @@ def test_concurrent_failure_reaches_waiters_and_can_retry(monkeypatch, wait_for_
     assert len(calls) == 2
 
 
-def test_different_voices_encode_independently(monkeypatch):
+@pytest.mark.parametrize("difference", ["voice", "cache"])
+def test_distinct_references_encode_independently(monkeypatch, difference):
     cache = SpeakerEmbeddingCache(max_bytes=1024)
+    other_cache = SpeakerEmbeddingCache(max_bytes=1024) if difference == "cache" else cache
+    other_voice = "Alice" if difference == "cache" else "Bob"
     wav = np.zeros(4096, dtype=np.float32)
     entered = threading.Barrier(3)
     release = threading.Event()
@@ -188,7 +190,10 @@ def test_different_voices_encode_independently(monkeypatch):
 
     monkeypatch.setattr(reference_audio, "encode_reference_audio_codes", encode)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(_encode, cache, wav, voice_name=name) for name in ("Alice", "Bob")]
+        futures = [
+            pool.submit(_encode, cache, wav, voice_name="Alice"),
+            pool.submit(_encode, other_cache, wav, voice_name=other_voice),
+        ]
         try:
             # Both encoders must enter before either completes.
             entered.wait(timeout=5)
@@ -196,51 +201,3 @@ def test_different_voices_encode_independently(monkeypatch):
             release.set()
         for future in futures:
             future.result(timeout=5)
-
-
-@pytest.mark.parametrize("old_fails", [False, True])
-@pytest.mark.parametrize("clear_all", [False, True])
-def test_clear_detaches_old_flight(monkeypatch, wait_for_followers, old_fails, clear_all):
-    cache = SpeakerEmbeddingCache(max_bytes=1024)
-    wav = np.zeros(4096, dtype=np.float32)
-    entered = [threading.Event(), threading.Event()]
-    release = [threading.Event(), threading.Event()]
-    joined = wait_for_followers(1)
-    calls = []
-    lock = threading.Lock()
-
-    def encode(*args, **kwargs):
-        with lock:
-            index = len(calls)
-            calls.append(1)
-        assert index < 2, "new caller lost the replacement flight"
-        entered[index].set()
-        assert release[index].wait(5)
-        if index == 0 and old_fails:
-            raise ValueError("old encoding failed")
-        return torch.full((2, 10), index + 1, dtype=torch.long)
-
-    monkeypatch.setattr(reference_audio, "encode_reference_audio_codes", encode)
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        old = pool.submit(_encode, cache, wav, voice_name="Alice")
-        try:
-            assert entered[0].wait(5)
-            cache.clear(None if clear_all else "alice")
-            new = pool.submit(_encode, cache, wav, voice_name="Alice")
-            assert entered[1].wait(5)
-            release[0].set()
-            if old_fails:
-                with pytest.raises(ValueError, match="old encoding failed"):
-                    old.result(timeout=5)
-            else:
-                old.result(timeout=5)
-            # The old completion must neither refill the cache nor remove the new flight.
-            assert cache.memory_bytes() == 0
-            follower = pool.submit(_encode, cache, wav, voice_name="Alice")
-            joined.wait(timeout=5)
-            assert len(calls) == 2
-        finally:
-            for event in release:
-                event.set()
-        assert torch.equal(new.result(timeout=5), follower.result(timeout=5))
-    assert torch.equal(_encode(cache, wav, voice_name="Alice"), torch.full((2, 10), 2, dtype=torch.long))
