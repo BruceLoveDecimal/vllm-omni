@@ -8,6 +8,11 @@ connectors:
   connector_of_shared_memory:
     extra:
       codec_chunk_frames: 25
+      # Opt-in Flow prefix cache budget in MiB per codec worker; 0 disables.
+      # Reuses complete causal chunks, including shared reference prefixes.
+      # Finalization still runs full-context Flow. Reserve GPU memory separately
+      # from vLLM KV and HiFT graphs; temporary tensors need additional headroom.
+      flow_prefix_cache_mb: 0
 stages:
   - stage_id: 1
     env:

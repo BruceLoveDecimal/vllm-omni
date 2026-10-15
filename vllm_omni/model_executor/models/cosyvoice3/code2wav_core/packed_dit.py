@@ -18,6 +18,7 @@ import torch._dynamo as dynamo
 import torch.nn.functional as F
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
+from .flow_prefix_cache import FlowPrefixCache
 from .packed_conv import pack_conv_weight, packed_causal_conv_mish
 
 FA3_PAGE_SIZE = 1
@@ -34,6 +35,7 @@ class RaggedRowAttention:
         head_dim: int,
         chunk_size: int | None = None,
         width: int | None = None,
+        prefix_lengths: tuple[int, ...] | None = None,
     ) -> None:
         self.heads, self.head_dim = heads, head_dim
         device = rows.row_ids.device
@@ -47,7 +49,8 @@ class RaggedRowAttention:
                 offsets.append(offsets[-1])
                 continue
             span = chunk_size or length
-            for start in range(0, length, span):
+            prefix = 0 if prefix_lengths is None else prefix_lengths[row]
+            for start in range(prefix, length, span):
                 end = min(start + span, length)
                 segment_rows.append(row)
                 segment_ends.append(end)
@@ -80,6 +83,8 @@ class PackedDiT:
             else None
         )
         self._modulations: dict = {}
+        self.prefix_cache: FlowPrefixCache | None = None
+        self.compiled_prefix_forward = None
 
     @torch.inference_mode()
     def step_modulations(self, time_span: torch.Tensor, key: tuple) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
@@ -539,9 +544,25 @@ def solve_flow_euler_packed(
     cfg_rate: float,
     streaming: bool,
     modulation_key: tuple | None = None,
+    prefix_cache_bytes: int = 0,
 ) -> torch.Tensor:
     """Euler steps over a packed sequence with classifier free guidance: the
     conditional rows and their unconditional twins share one DiT call."""
+    if streaming and prefix_cache_bytes > 0 and modulation_key is not None:
+        from .packed_prefix import solve_flow_euler_prefix
+
+        return solve_flow_euler_prefix(
+            estimator,
+            noise,
+            time_span,
+            mu,
+            spks,
+            cond,
+            rows,
+            cfg_rate=cfg_rate,
+            modulation_key=modulation_key,
+            max_bytes=prefix_cache_bytes,
+        )
     if estimator.graph_runner is not None and modulation_key is not None:
         solved = estimator.graph_runner.run(
             noise, time_span, mu, spks, cond, rows, cfg_rate=cfg_rate, streaming=streaming, key=modulation_key

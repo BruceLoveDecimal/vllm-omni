@@ -97,9 +97,17 @@ class CosyVoice3Code2Wav(nn.Module):
     # the tensors and copy to host without taking another device snapshot.
     owns_generation_output_storage = True
 
-    def __init__(self, config: CosyVoice3Config):
+    def __init__(
+        self,
+        config: CosyVoice3Config,
+        *,
+        flow_prefix_cache_mb: int = 0,
+    ):
         super().__init__()
         self.config = config
+        if flow_prefix_cache_mb < 0:
+            raise ValueError("flow_prefix_cache_mb must be nonnegative")
+        self.flow_prefix_cache_bytes = flow_prefix_cache_mb * 1024 * 1024
 
         # Build flow matching components
         pre_lookahead_layer = PreLookaheadLayer(**config.flow["pre_lookahead_layer"])
@@ -653,6 +661,7 @@ class CosyVoice3Code2Wav(nn.Module):
                     cfg_rate=flow.decoder.inference_cfg_rate,
                     streaming=stream_items and not items[0].get("finalize", False),
                     modulation_key=(n_timesteps, flow.decoder.t_scheduler, mu.dtype, mu.device),
+                    prefix_cache_bytes=self.flow_prefix_cache_bytes if stream_items else 0,
                 )
             feat = scatter_rows(packed, rows, width).transpose(1, 2)
 

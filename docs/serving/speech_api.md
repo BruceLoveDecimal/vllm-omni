@@ -833,6 +833,48 @@ Drama 3 uses `ref_audio` and `ref_text` for voice cloning, like Fish Speech S2 P
 | ------- | ------------- |
 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | Voice cloning from `ref_audio` + `ref_text`. No built-in voice presets — upload a voice or pass `ref_audio`/`ref_text` per request. |
 
+The packed-streaming profile exposes an opt-in Flow prefix cache. In
+`vllm_omni/deploy/cosyvoice3_packed_streaming.yaml`, set the connector budget:
+
+```yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      flow_prefix_cache_mb: 1024  # MiB per codec worker; 0 (default) disables
+```
+
+The derived optimized-standard profile inherits this setting. The cache keeps
+separate K/V and vector fields for each Euler step and both CFG branches, and
+reuses only complete chunk-causal attention blocks. It compares the actual
+noise, encoded conditioning, reference mel and speaker before reuse, including
+across requests with shared reference prefixes. Changed inputs shorten or reject
+a hit; changing the solver schedule clears the cache. LRU eviction bounds retained
+state to the configured budget. Temporary tensors require additional memory,
+separate from vLLM's KV cache and HiFT graphs. The budget is shared across each
+codec batch; a budget too small for a complete chunk falls back to uncached Flow.
+
+Reuse skips prefix transformer work on subsequent streaming chunks. Shared
+reference hits can also reduce work before the first audio chunk of a new
+request. Cold requests still compute their prefix and populate the cache;
+there is no guaranteed cold-TTFA improvement. The input convolutions and input
+comparison still process the prefix. Finalization uses full-context attention
+and bypasses the cache, as does full-response inference. The cached path does not
+use Flow CUDA graphs. Keep the feature disabled until accuracy and latency are
+validated on the target Hopper workload.
+
+For an A/B benchmark, use the same packed-streaming YAML, model revision,
+reference audio, request texts, concurrency and solver steps with budgets `0`
+and `1024`. Warm compilation separately from the reference cache, and report
+cold-reference and repeated-reference TTFA (p50/p95), audio-seconds/s throughput,
+output audio parity and peak GPU memory. Use streaming requests and include
+mixed reference lengths and long continuations; non-stream response latency is
+not TTFA. Run the Hopper regression with:
+
+```bash
+pytest tests/model_executor/models/cosyvoice3/test_cosyvoice3_flow_graph.py \
+  -k packed_prefix_cache
+```
+
 ### Gepard-1.0
 
 | Model | Description |

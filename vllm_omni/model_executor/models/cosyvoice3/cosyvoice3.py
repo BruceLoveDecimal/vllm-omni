@@ -814,7 +814,19 @@ class CosyVoice3Model(
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
-            self.code2wav = CosyVoice3Code2Wav(self.config)
+            connector = getattr(vllm_config.model_config, "stage_connector_config", None)
+            connector_extra = (
+                connector.get("extra", connector)
+                if isinstance(connector, Mapping)
+                else getattr(connector, "extra", None)
+            )
+            prefix_cache_mb = (
+                int(connector_extra.get("flow_prefix_cache_mb", 0)) if isinstance(connector_extra, Mapping) else 0
+            )
+            self.code2wav = CosyVoice3Code2Wav(
+                self.config,
+                flow_prefix_cache_mb=prefix_cache_mb,
+            )
             self.model = self.code2wav.flow_model
             self.hift = self.code2wav.hift
             # Keep additional information synchronized for async_chunk updates.
