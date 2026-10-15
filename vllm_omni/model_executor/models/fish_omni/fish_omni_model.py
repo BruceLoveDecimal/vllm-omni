@@ -44,7 +44,6 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.fish_speech.dac_encoder import (
     _load_dac_codec,
-    encode_reference_audio_codes,
     reference_audio_samples,
 )
 from vllm_omni.utils.speaker_cache import get_speaker_cache
@@ -52,6 +51,7 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 from .codebook_tower import TowerLayer, TowerRotary
 from .configuration_fish_omni import FishOmniConfig
 from .prompt import Reference, build_prompt_frames, prompt_length
+from .reference_audio import encode_reference_audio_codes_cached
 from .sampling import EMPTY_RAS_SLOT, RAS_TOP_K, RAS_WINDOW_FRAMES, FusedFrameSampler
 
 logger = init_logger(__name__)
@@ -304,21 +304,17 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
         wav = _first(info.get("ref_audio_wav"))
         if wav is None:
             return None
-        voice_name = _first(info.get("voice_name"))
-        cache_key = None
-        if isinstance(voice_name, str) and voice_name:
-            cache_key = self._speaker_cache.make_cache_key(
-                voice_name, model_type="fish_omni", created_at=int(_first(info.get("voice_created_at")) or 0)
-            )
-            cached = self._speaker_cache.get(cache_key)
-            if cached is not None:
-                return cached["ref_codes_fq"]
         sample_rate = int(_first(info.get("ref_audio_sr")))
-        wav_np = wav.cpu().numpy() if isinstance(wav, torch.Tensor) else np.asarray(wav, dtype=np.float32)
-        codes = encode_reference_audio_codes(self.model_path, wav_np, sample_rate, device=device).cpu()
-        if cache_key is not None:
-            self._speaker_cache.put(cache_key, {"ref_codes_fq": codes})
-        return codes
+        return encode_reference_audio_codes_cached(
+            self.model_path,
+            wav,
+            sample_rate,
+            device=device,
+            cache=self._speaker_cache,
+            revision=self.vllm_config.model_config.revision,
+            voice_name=_first(info.get("voice_name")),
+            voice_created_at=int(_first(info.get("voice_created_at")) or 0),
+        )
 
     def build_frames(self, info: dict[str, Any], device: torch.device) -> torch.Tensor:
         """CPU int64 prompt rows ``[prompt_len, 1 + num_codebooks]`` of a request."""

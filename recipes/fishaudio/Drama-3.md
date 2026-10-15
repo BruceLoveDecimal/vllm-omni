@@ -129,6 +129,15 @@ which returns the exact prompt row count.
 
 - Memory: stage 0 weights take 36.9 GiB; the default deploy config uses
   0.78 of the GPU for stage 0 and 0.1 for the codec stage.
+- Stage 0 caches reference-audio codes in its bounded CPU speaker cache,
+  including inline `ref_audio` requests. Repeated audio with the same sample
+  rate, shape, model/revision and device reuses the codes; uploaded voices
+  retain name/generation invalidation. Concurrent misses for the same key
+  share one encoding within each worker's cache (single-flight); different
+  voice keys remain independent. Clearing a voice also detaches its pending
+  encodings so they cannot refill the cache with stale codes.
+  A cache miss still encodes in stage 0;
+  use `ref_audio_codes` to avoid that first-request encoding cost.
 - Default sampling (model card): temperature 1.0, top_p 0.9, top_k 30,
   max_tokens 500. The codebook heads use the same values. Sampling runs in
   fused kernels that cap top_k at 64 (`hf_overrides`
