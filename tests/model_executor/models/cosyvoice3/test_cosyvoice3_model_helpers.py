@@ -43,6 +43,7 @@ class _DummyCode2Wav:
         self.forward_calls: list[dict[str, object]] = []
         self.forward_streaming_calls: list[dict[str, object]] = []
         self.forward_streaming_batch_calls: list[list[dict[str, object]]] = []
+        self.released_states: list[dict[str, object] | None] = []
 
     def forward(self, **kwargs):
         self.forward_calls.append(kwargs)
@@ -81,6 +82,9 @@ class _DummyCode2Wav:
             )
             for item in items
         ]
+
+    def release_flow_prefix(self, cache_state):
+        self.released_states.append(cache_state)
 
 
 def _make_code2wav_model(
@@ -1045,13 +1049,17 @@ def test_sampling_mode_preserves_or_merges_control_logits(mode):
 
 
 def test_cancelled_stream_releases_only_its_vocoder_state():
+    cancelled_state = {"mel": torch.ones(2)}
     model = SimpleNamespace(
         _stream_audio_cache_lock=Lock(),
-        _stream_vocoder_cache_by_req={"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}},
+        _stream_vocoder_cache_by_req={"cancelled": cancelled_state, "live": {"mel": torch.zeros(2)}},
+        code2wav=_DummyCode2Wav(vocab_size=4),
     )
+    model._set_stream_state = lambda req_id, state: CosyVoice3Model._set_stream_state(model, req_id, state)
     CosyVoice3Model.on_requests_finished(model, {"cancelled", "unknown"})
     CosyVoice3Model.on_requests_finished(model, {"cancelled"})
     assert set(model._stream_vocoder_cache_by_req) == {"live"}
+    assert model.code2wav.released_states == [cancelled_state]
 
 
 @pytest.mark.parametrize("mrv2,packed", [(False, False), (False, True), (True, False)])

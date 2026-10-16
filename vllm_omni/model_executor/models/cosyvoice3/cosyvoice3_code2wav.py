@@ -12,11 +12,12 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 import os
 from collections import Counter
 from collections.abc import Mapping
-from typing import Any, Literal, TypedDict, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, overload
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from vllm.logger import init_logger
 
@@ -35,11 +36,18 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreL
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_profile,
+    cosyvoice3_flow_prefix_cache_bytes,
     cosyvoice3_full_response_enabled,
     cosyvoice3_packed_inference_enabled,
     cosyvoice3_packed_streaming_enabled,
 )
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.flow_prefix_cache import (
+        FlowPrefixCache,
+        FlowPrefixState,
+    )
 
 logger = init_logger(__name__)
 
@@ -67,6 +75,7 @@ class StreamingHiFTState(TypedDict, total=False):
     mel: torch.Tensor
     mel_offset: int
     phase_acc: torch.Tensor | None
+    flow_prefix: "FlowPrefixState"
 
 
 class StreamingFlowItem(TypedDict, total=False):
@@ -379,6 +388,15 @@ class CosyVoice3Code2Wav(nn.Module):
             results = [None] * len(items)
             for finalize in (False, True):
                 group = [(i, x) for i, x in enumerate(items) if bool(x.get("finalize", False)) == finalize]
+                if finalize:
+                    # The final hop attends over full context, which the
+                    # chunk-causal prefix cache cannot serve.
+                    for _, item in group:
+                        self.release_flow_prefix(item.get("cache_state"))
+                else:
+                    for (i, _), value in zip(group, self._forward_stream_prefix([x for _, x in group], n_timesteps)):
+                        results[i] = value
+                    group = [(i, x) for i, x in group if results[i] is None]
                 if group:
                     values = self.forward_batch([x for _, x in group], n_timesteps=n_timesteps, stream_items=True)
                     for (i, _), value in zip(group, values):
@@ -549,6 +567,123 @@ class CosyVoice3Code2Wav(nn.Module):
         self._position_noise = torch.cat(blocks, dim=-1) if len(blocks) > 1 else blocks[0]
         return self._position_noise[..., :width]
 
+    def _get_packed_estimator(self, dtype: torch.dtype):
+        from .code2wav_core.packed_dit import PackedDiT
+
+        if not hasattr(self, "_packed_estimator"):
+            self._packed_estimator = PackedDiT(self.flow_model.decoder.estimator)
+            self._packed_estimator.compile(dtype)
+        return self._packed_estimator
+
+    def _get_flow_prefix_cache(self, n_timesteps: int) -> "FlowPrefixCache | None":
+        """The request-owned Flow prefix cache, built on first use; None when disabled."""
+        from .code2wav_core.flow_prefix_cache import PAGE_FRAMES, FlowPrefixCache
+
+        cache = getattr(self, "_flow_prefix_cache", None)
+        if cache is None:
+            capacity = cosyvoice3_flow_prefix_cache_bytes()
+            if capacity <= 0:
+                return None
+            weight = next(self.flow_model.parameters())
+            estimator = self._get_packed_estimator(weight.dtype)
+            cache = FlowPrefixCache(
+                estimator,
+                steps=n_timesteps,
+                capacity_bytes=capacity,
+                compiled=weight.is_cuda,
+                graphs=estimator.graph_runner is not None,
+            )
+            if cache.chunk % self.token_mel_ratio != 0:
+                raise ValueError("Flow prefix cache needs attention chunks aligned to codec tokens")
+            logger.info(
+                "CosyVoice3 Flow prefix cache: %d pages of %d frames (%.2f GiB)",
+                cache.num_pages,
+                PAGE_FRAMES,
+                capacity / 2**30,
+            )
+            self._flow_prefix_cache = cache
+        if cache.steps != n_timesteps:
+            raise ValueError(f"Flow prefix cache was built for {cache.steps} Euler steps, got {n_timesteps}")
+        return cache
+
+    def release_flow_prefix(self, cache_state: StreamingHiFTState | None) -> None:
+        """Return the Flow prefix pages held by a request's streaming state."""
+        cache = getattr(self, "_flow_prefix_cache", None)
+        if cache is not None and cache_state:
+            cache.release(cache_state.get("flow_prefix"))
+
+    @torch.inference_mode()
+    def _forward_stream_prefix(
+        self, items: list[StreamingFlowItem], n_timesteps: int
+    ) -> list[tuple[torch.Tensor, StreamingHiFTState | None] | None]:
+        """Non-final hops through the prefix cache: Flow runs only the frames past
+        the cached prefix. Items it cannot serve (pool full) come back as None
+        for the full-recompute path.
+        """
+        from .code2wav_core.flow_prefix_cache import FlowPrefixState, PrefixQuery
+
+        results: list[tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(items)
+        cache = self._get_flow_prefix_cache(n_timesteps)
+        if cache is None:
+            return results
+        flow = self.flow_model
+        weight = next(flow.parameters())
+        ratio = self.token_mel_ratio
+        lookahead = int(flow.pre_lookahead_len)
+        # conv2 of the lookahead layer is causal: new tokens need its left taps.
+        token_context = flow.pre_lookahead_layer.conv2.kernel_size[0] - 1
+        queries, served = [], []
+        for index, item in enumerate(items):
+            cache_state = item.get("cache_state")
+            state = cache_state.get("flow_prefix") if cache_state else None
+            if state is None:
+                state = FlowPrefixState()
+            tokens = torch.cat(
+                tuple(item[key].to(device=weight.device, dtype=torch.long) for key in ("prompt_token", "token")), dim=1
+            )
+            end = (tokens.shape[1] - lookahead) * ratio
+            emit = item["prompt_feat"].shape[1] + max(0, int(item.get("token_offset_tokens", 0))) * ratio
+            start = min(state.committed, emit // cache.chunk * cache.chunk)
+            if end <= start or not cache.reserve(state, end):
+                cache.release(state)
+                continue
+            # mu of tokens [first, end / ratio): their lookahead tokens are all
+            # known, so the values match the full-sequence computation.
+            first = start // ratio
+            left = min(first, token_context)
+            embedded = flow.input_embedding(tokens[:, first - left :].clamp(min=0))
+            if lookahead > 0:
+                hidden = flow.pre_lookahead_layer(embedded[:, :-lookahead], context=embedded[:, -lookahead:])
+            else:
+                hidden = flow.pre_lookahead_layer(embedded)
+            mu = hidden[0, left:].repeat_interleave(ratio, dim=0)
+            cond = torch.zeros_like(mu)
+            prompt = item["prompt_feat"][0, start:end].to(cond)
+            cond[: prompt.shape[0]] = prompt
+            noise = self._stream_position_noise(end, mu)[0, :, start:end].transpose(0, 1)
+            speaker = F.normalize(item["embedding"].to(weight), dim=1)
+            queries.append(PrefixQuery(state, start, end, noise, mu, cond, flow.spk_embed_affine_layer(speaker)))
+            served.append((index, emit))
+        if not queries:
+            return results
+        time_span = torch.linspace(0, 1, n_timesteps + 1, device=weight.device, dtype=weight.dtype)
+        if flow.decoder.t_scheduler == "cosine":
+            time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
+        with torch.autocast("cuda", dtype=weight.dtype, enabled=weight.is_cuda):
+            solved = cache.solve(
+                queries,
+                time_span,
+                cfg_rate=flow.decoder.inference_cfg_rate,
+                modulation_key=(n_timesteps, flow.decoder.t_scheduler, weight.dtype, weight.device),
+            )
+        for (index, emit), query, frames in zip(served, queries, solved):
+            mel = frames[emit - query.start :].transpose(0, 1).unsqueeze(0)
+            speech, new_state = self._stream_hift_from_feat(mel, cache_state=items[index].get("cache_state"))
+            query.state.committed = query.end // cache.chunk * cache.chunk
+            new_state["flow_prefix"] = query.state
+            results[index] = (speech, new_state)
+        return results
+
     @overload
     def forward_batch(
         self, items: list[StreamingFlowItem], *, n_timesteps: int = 10, stream_items: Literal[False] = False
@@ -623,16 +758,13 @@ class CosyVoice3Code2Wav(nn.Module):
         )
         if cosyvoice3_packed_inference_enabled():
             from .code2wav_core.packed_dit import (
-                PackedDiT,
                 gather_rows,
                 pack_rows,
                 scatter_rows,
                 solve_flow_euler_packed,
             )
 
-            if not hasattr(self, "_packed_estimator"):
-                self._packed_estimator = PackedDiT(flow.decoder.estimator)
-                self._packed_estimator.compile(mu.dtype)
+            self._get_packed_estimator(mu.dtype)
             rows = pack_rows(lengths, mu.device)
             if stream_items:
                 noise = self._stream_position_noise(width, mu).expand(len(items), -1, -1)
