@@ -16,7 +16,6 @@ from dataclasses import dataclass
 import torch
 import torch._dynamo as dynamo
 import torch.nn.functional as F
-from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from .packed_conv import pack_conv_weight, packed_causal_conv_mish
 
@@ -192,6 +191,8 @@ def packed_fa3(
     max_seqlen_q: int,
 ) -> torch.Tensor:
     """Alias-free FA3 boundary for the compiled PackedDiT path."""
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
     return flash_attn_varlen_func(
         q,
         k_cache,
