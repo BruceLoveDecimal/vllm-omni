@@ -847,9 +847,23 @@ class CosyVoice3Model(
     def on_requests_finished(self, request_ids: set[str]) -> None:
         """Release per-request vocoder state on completion, cancellation or error."""
         if hasattr(self, "_stream_vocoder_cache_by_req"):
-            with self._stream_audio_cache_lock:
-                for request_id in request_ids:
-                    self._stream_vocoder_cache_by_req.pop(request_id, None)
+            for request_id in request_ids:
+                self._set_stream_state(request_id, None)
+
+    def _set_stream_state(self, req_id: str, state: dict | None) -> None:
+        """Replace (or drop, with None) a request's streaming state.
+
+        The state owns the request's Flow prefix cache pages; return them once
+        no remaining state refers to them.
+        """
+        with self._stream_audio_cache_lock:
+            old = self._stream_vocoder_cache_by_req.pop(req_id, None)
+            if state is not None:
+                self._stream_vocoder_cache_by_req[req_id] = state
+        if old is None:
+            return
+        if state is None or old.get("flow_prefix") is not state.get("flow_prefix"):
+            self.code2wav.release_flow_prefix(old)
 
     def _stitch_stream_audio(self, req_id: str | None, audio: torch.Tensor, stream_finished: bool) -> torch.Tensor:
         """Pass-through stitching for async_chunk.
@@ -859,8 +873,7 @@ class CosyVoice3Model(
         duplicated overlap (if no tail trim) or duration shrink (if tail trim).
         """
         if req_id is not None and stream_finished and hasattr(self, "_stream_vocoder_cache_by_req"):
-            with self._stream_audio_cache_lock:
-                self._stream_vocoder_cache_by_req.pop(req_id, None)
+            self._set_stream_state(req_id, None)
         return audio
 
     @staticmethod
@@ -1599,8 +1612,7 @@ class CosyVoice3Model(
                     )
                 if speech_token is None or speech_feat is None or embedding is None:
                     if stream_finished and req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
-                        with self._stream_audio_cache_lock:
-                            self._stream_vocoder_cache_by_req.pop(req_id, None)
+                        self._set_stream_state(req_id, None)
                     audios[idx] = self._stitch_stream_audio(req_id, empty_audio, stream_finished)
                     if req_ids.numel() > 0 and (
                         (meta and meta.left_context_size is not None) or payload.generated_len is not None
@@ -1719,11 +1731,10 @@ class CosyVoice3Model(
                     req_id = item.get("req_id")
                     stream_finished = bool(item.get("stream_finished", False))
                     if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
-                        with self._stream_audio_cache_lock:
-                            if new_cache_state is None or stream_finished:
-                                self._stream_vocoder_cache_by_req.pop(req_id, None)
-                            else:
-                                self._stream_vocoder_cache_by_req[req_id] = new_cache_state
+                        if stream_finished:
+                            self._set_stream_state(req_id, None)
+                        else:
+                            self._set_stream_state(req_id, new_cache_state)
 
                     audio = tts_speech.reshape(-1).to(dtype=torch.float32)
                     audios[idx] = self._stitch_stream_audio(req_id, audio, stream_finished)

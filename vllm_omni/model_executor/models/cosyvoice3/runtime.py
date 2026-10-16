@@ -49,6 +49,15 @@ def cosyvoice3_packed_streaming_enabled() -> bool:
     )
 
 
+def cosyvoice3_flow_prefix_cache_bytes() -> int:
+    """Pool size of the packed-streaming Flow prefix cache; 0 disables it.
+
+    Every cached frame keeps K/V of all DiT layers for each Euler step and CFG
+    branch (about 1.8 MiB per mel frame for the released 22-layer BF16 DiT).
+    """
+    return int(float(os.environ.get("COSYVOICE3_FLOW_PREFIX_CACHE_GIB", "0")) * 2**30)
+
+
 def cosyvoice3_packed_inference_enabled() -> bool:
     """Either optimized profile needs live conditioning outside CUDA graphs."""
     return cosyvoice3_full_response_enabled() or cosyvoice3_packed_streaming_enabled()
