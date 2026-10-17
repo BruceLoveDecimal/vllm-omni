@@ -1441,6 +1441,7 @@ def _tiny_batch_pipeline(model):
         max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4, image_feature_keys=_EXPECTED_CAMERA_ORDER
     )
     pipeline = object.__new__(Pi05Pipeline)
+    torch.nn.Module.__init__(pipeline)  # ``model`` is a real submodule here
     pipeline.config = config
     pipeline.model = model
     pipeline.processor = Pi05Processor(config, _CharTokenizer(), torch.device("cpu"))
