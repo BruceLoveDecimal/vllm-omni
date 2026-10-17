@@ -6,6 +6,7 @@ Latency benchmarks for π0.5 (`lerobot/pi05_base`) serving, used for the measure
 | --- | --- | --- |
 | `e2e_latency_pi05.py` | Client E2E round trip over the OpenPI websocket: msgpack pack, send, engine, denoise, unpack. Reports p50/p95/min/max and the device memory peak sampled from `nvidia-smi`. | A running server |
 | `bench_pi05.py` | Model-level `sample_actions` latency and output shape over a batch size × camera-view sweep, with no serving stack; `--compare-sequential` also times each batch as back-to-back batch-1 calls. Writes `pi05_sweep.csv` and `pi05_sweep.md`. | A GPU and the checkpoint |
+| `batch_parity_pi05.py` | Request-batch correctness: max \|batched − alone\| per dtype and batch size through `Pi05Pipeline.forward`, and whether a lone request still matches the pre-batching call. Random weights on CPU by default; `--model` for a checkpoint. | CPU (random weights), or a GPU and the checkpoint |
 
 ## Client E2E latency
 
@@ -34,6 +35,17 @@ python benchmarks/pi05/bench_pi05.py --enforce-eager --bs 1 --views 3 --warmup 5
 # batched sample_actions against the same rows run as back-to-back batch-1 calls
 python benchmarks/pi05/bench_pi05.py --enforce-eager --bs 1 2 4 8 16 32 --views 3 --compare-sequential --out pi05_bench_batch/
 ```
+
+## Request-batch parity
+
+```bash
+# random weights at the real widths, two layers per tower, on CPU
+python benchmarks/pi05/batch_parity_pi05.py --out batch_parity.json
+# the checkpoint, eager, on a GPU
+python benchmarks/pi05/batch_parity_pi05.py --model lerobot/pi05_base --batch-sizes 1 2 4 8 16 32 --out batch_parity.json
+```
+
+It exits non-zero when a float32 row exceeds `--atol` (default `1e-4`); bfloat16 rows are reported only.
 
 ## Reference results
 
