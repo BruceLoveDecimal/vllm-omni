@@ -26,6 +26,7 @@ Reference:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -441,6 +442,18 @@ def _extract_images(robot_obs: dict, config) -> dict[str, Any]:
     return {key_map.get(k, k): v for k, v in images.items() if _is_image_like(v)}
 
 
+def observed_camera_keys(robot_obs: dict) -> tuple[str, ...]:
+    """The wire keys of the cameras an observation carries an image for, sorted.
+
+    Read before ``image_key_map`` renaming, so it needs no model config: equal
+    wire keys always rename to equal feature keys.
+    """
+    images = robot_obs.get("images")
+    if not isinstance(images, dict):
+        images = robot_obs
+    return tuple(sorted(key for key, value in images.items() if _is_image_like(value)))
+
+
 def _is_image_like(value: Any) -> bool:
     if isinstance(value, (Image.Image, torch.Tensor)):
         return True
@@ -514,6 +527,21 @@ def _assemble_model_inputs(robot_obs: dict, config, tokenizer, device: torch.dev
     lang_masks = torch.tensor([attn], dtype=torch.bool, device=device)
 
     return images, image_masks, lang_tokens, lang_masks
+
+
+def stack_model_inputs(rows: Sequence[tuple]) -> tuple:
+    """Stack per-observation ``build_model_inputs`` results into one batch.
+
+    Batch row ``i`` is ``rows[i]``. Every row has ``max_cameras`` slots in the
+    same order, so slot ``j`` stacks across rows unchanged.
+    """
+    images, image_masks, lang_tokens, lang_masks = zip(*rows)
+    return (
+        [torch.cat(views) for views in zip(*images)],
+        [torch.cat(masks) for masks in zip(*image_masks)],
+        torch.cat(lang_tokens),
+        torch.cat(lang_masks),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────

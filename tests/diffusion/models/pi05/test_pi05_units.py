@@ -56,8 +56,13 @@ from vllm_omni.diffusion.models.pi05.processor_pi05 import (
     build_norm_stats,
     build_pi05_prompt,
     discretize_state,
+    observed_camera_keys,
     resize_with_pad,
+    stack_model_inputs,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -380,7 +385,7 @@ def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
         request_id="crop-test",
     )
 
-    result = pipeline.forward(request)
+    [result] = pipeline.forward(DiffusionRequestBatch([request]))
 
     assert result.output["actions"].shape == (config.chunk_size, 7)
 
@@ -1246,17 +1251,19 @@ def test_state_rejects_a_multi_row_matrix():
 # Per-request denoising steps reach the model
 # ----------------------------------------------------------------------------
 class _SpyModel:
-    """Records the ``num_steps`` ``forward`` hands to ``sample_actions``."""
+    """Records what each ``sample_actions`` call ``forward`` makes receives."""
 
     def __init__(self):
         self.seen: list = []
         self.generators: list = []
+        self.batch_sizes: list = []
 
     def sample_actions(self, *, images, image_masks, lang_tokens, lang_masks, num_steps, generator):
-        del images, image_masks, lang_tokens, lang_masks
+        del images, image_masks, lang_masks
         self.seen.append(num_steps)
         self.generators.append(generator)
-        return torch.zeros(1, 50, 32)
+        self.batch_sizes.append(lang_tokens.shape[0])
+        return torch.zeros(lang_tokens.shape[0], 50, 32)
 
 
 def _spy_pipeline(spy: _SpyModel):
@@ -1271,19 +1278,24 @@ def _spy_pipeline(spy: _SpyModel):
     return pipeline
 
 
-def _spy_request(num_inference_steps, generator=None):
+def _spy_request(num_inference_steps, generator=None, *, robot_obs=True, prompt=""):
     params = type("_Params", (), {})()
-    params.extra_args = {
-        "robot_obs": {
+    params.extra_args = {}
+    if robot_obs:
+        params.extra_args["robot_obs"] = {
             "state": np.zeros(32, dtype=np.float32),
             "images": {key: np.zeros((4, 4, 3), dtype=np.uint8) for key in _EXPECTED_CAMERA_ORDER},
         }
-    }
     params.num_inference_steps = num_inference_steps
     params.generator = generator
     request = type("_Request", (), {})()
     request.sampling_params = params
+    request.prompt = prompt
     return request
+
+
+def _spy_forward(spy: _SpyModel, *requests):
+    return _spy_pipeline(spy).forward(DiffusionRequestBatch(list(requests)))
 
 
 @pytest.mark.parametrize("requested", [None, 2, 25])
@@ -1291,7 +1303,7 @@ def test_request_denoising_steps_reach_sample_actions(requested):
     """The OpenPI E2E cannot see this: a pipeline that ignored the override and
     ran the static default would still return a finite chunk of the right shape."""
     spy = _SpyModel()
-    output = _spy_pipeline(spy).forward(_spy_request(requested))
+    [output] = _spy_forward(spy, _spy_request(requested))
 
     assert spy.seen == [requested]
     assert output.output["actions"].shape == (50, 32)
@@ -1301,14 +1313,187 @@ def test_request_generator_reaches_sample_actions():
     generator = torch.Generator().manual_seed(42)
     spy = _SpyModel()
 
-    _spy_pipeline(spy).forward(_spy_request(2, generator))
+    _spy_forward(spy, _spy_request(2, generator))
 
-    assert spy.generators == [generator]
+    assert spy.generators == [[generator]]
 
 
 @pytest.mark.parametrize("bad", [0, -1, 2.5, True, "4"])
 def test_request_denoising_steps_must_be_a_positive_integer(bad):
     spy = _SpyModel()
-    with pytest.raises(ValueError, match="num_inference_steps must be a positive integer"):
-        _spy_pipeline(spy).forward(_spy_request(bad))
+    [output] = _spy_forward(spy, _spy_request(bad))
+    assert "num_inference_steps must be a positive integer" in output.error
     assert spy.seen == []
+
+
+# ----------------------------------------------------------------------------
+# Request batches (RFC #6867 R2): one batched sample_actions per wave
+# ----------------------------------------------------------------------------
+def test_batch_runs_valid_requests_together_and_isolates_an_invalid_one():
+    spy = _SpyModel()
+    outputs = _spy_forward(spy, _spy_request(2), _spy_request(0), _spy_request(2))
+
+    assert spy.batch_sizes == [2]
+    assert outputs[0].error is None and outputs[2].error is None
+    assert outputs[0].output["actions"].shape == (50, 32)
+    assert "num_inference_steps must be a positive integer" in outputs[1].error
+
+
+def test_batch_runs_one_sample_actions_per_step_count():
+    """The scheduler never mixes step counts, but a direct caller may."""
+    spy = _SpyModel()
+    outputs = _spy_forward(spy, _spy_request(2), _spy_request(3), _spy_request(2))
+
+    assert spy.seen == [2, 3]
+    assert spy.batch_sizes == [2, 1]
+    assert all(output.error is None for output in outputs)
+
+
+def test_batch_unwraps_a_one_generator_list_and_rejects_more():
+    generator = torch.Generator().manual_seed(0)
+    spy = _SpyModel()
+    outputs = _spy_forward(
+        spy,
+        _spy_request(2, [generator]),
+        _spy_request(2, [torch.Generator(), torch.Generator()]),
+        _spy_request(2),
+    )
+
+    assert spy.generators == [[generator, None]]
+    assert "one generator" in outputs[1].error
+
+
+def test_batch_answers_a_dummy_warmup_request_without_the_model():
+    spy = _SpyModel()
+    outputs = _spy_forward(spy, _spy_request(2, robot_obs=False, prompt="dummy run"), _spy_request(2))
+
+    assert spy.batch_sizes == [1]
+    assert not outputs[0].output["actions"].any()
+    assert outputs[1].error is None
+
+
+def test_stack_model_inputs_keeps_rows_and_camera_slots_in_order():
+    def row(value):
+        return (
+            [torch.full((1, 3, 2, 2), float(value + slot)) for slot in range(3)],
+            [torch.tensor([slot != 1]) for slot in range(3)],
+            torch.full((1, 5), value, dtype=torch.long),
+            torch.ones(1, 5, dtype=torch.bool),
+        )
+
+    images, masks, tokens, token_masks = stack_model_inputs([row(0), row(10)])
+
+    assert [image.shape for image in images] == [(2, 3, 2, 2)] * 3
+    assert images[2][1, 0, 0, 0].item() == 12.0
+    assert [mask.tolist() for mask in masks] == [[True, True], [False, False], [True, True]]
+    assert tokens[:, 0].tolist() == [0, 10]
+    assert token_masks.shape == (2, 5)
+
+
+def _camera_request(cameras):
+    images = {key: np.zeros((4, 4, 3), dtype=np.uint8) for key in cameras}
+    return OmniDiffusionRequest(
+        prompt="",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"robot_obs": {"images": images}}),
+        request_id="camera-key",
+    )
+
+
+def test_pre_process_keys_requests_by_their_camera_layout():
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import get_pi05_pre_process_func
+    from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+
+    pre_process = get_pi05_pre_process_func(None)
+    full = pre_process(_camera_request(_EXPECTED_CAMERA_ORDER))
+    reordered = pre_process(_camera_request(reversed(_EXPECTED_CAMERA_ORDER)))
+    partial = pre_process(_camera_request(_EXPECTED_CAMERA_ORDER[::2]))
+    warmup = pre_process(
+        OmniDiffusionRequest(prompt="dummy run", sampling_params=OmniDiffusionSamplingParams(), request_id="w")
+    )
+
+    assert full.batch_compatibility_key == reordered.batch_compatibility_key
+    assert full.batch_compatibility_key != partial.batch_compatibility_key
+    assert warmup.batch_compatibility_key is None
+    key = build_request_batch_sampling_params_key
+    assert key(full) == key(reordered) != key(partial)
+
+
+def test_observed_camera_keys_reads_top_level_images_and_skips_non_images():
+    observation = {"cam_b": np.zeros((4, 4, 3)), "cam_a": np.zeros((4, 4, 3)), "cam_c": None, "state": [0.0]}
+
+    assert observed_camera_keys(observation) == ("cam_a", "cam_b")
+
+
+class _CharTokenizer:
+    """Tokenizes per character, so different prompts reach the model as different tokens."""
+
+    def __call__(self, text, **kwargs):
+        length = kwargs["max_length"]
+        ids = [1 + ord(char) % 255 for char in text][:length]
+        pad = length - len(ids)
+        return {"input_ids": ids + [0] * pad, "attention_mask": [1] * len(ids) + [0] * pad}
+
+
+def _tiny_batch_pipeline(model):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    config = Pi05Config(
+        max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4, image_feature_keys=_EXPECTED_CAMERA_ORDER
+    )
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline.config = config
+    pipeline.model = model
+    pipeline.processor = Pi05Processor(config, _CharTokenizer(), torch.device("cpu"))
+    return pipeline
+
+
+def _observation_request(seed, prompt, cameras=_EXPECTED_CAMERA_ORDER):
+    """A fresh request every call: its generator is consumed by the run."""
+    rng = np.random.RandomState(seed)
+    robot_obs = {
+        "prompt": prompt,
+        "state": rng.uniform(-1.0, 1.0, 8).astype(np.float32),
+        "images": {key: rng.randint(0, 256, (32, 32, 3), dtype=np.uint8) for key in cameras},
+    }
+    return OmniDiffusionRequest(
+        prompt="",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"robot_obs": robot_obs},
+            num_inference_steps=2,
+            generator=torch.Generator().manual_seed(seed),
+        ),
+        request_id=f"row-{seed}",
+    )
+
+
+_MIXED_ROWS = [(0, "pick up the cup", _EXPECTED_CAMERA_ORDER), (1, "open", _EXPECTED_CAMERA_ORDER[::2])]
+
+
+@pytest.mark.slow
+def test_batched_forward_matches_each_request_served_alone(tiny_model):
+    """Rows differ in prompt, state, images, missing camera and generator."""
+    pipeline = _tiny_batch_pipeline(tiny_model.eval())
+
+    batched = pipeline.forward(DiffusionRequestBatch([_observation_request(*row) for row in _MIXED_ROWS]))
+    alone = [pipeline.forward(DiffusionRequestBatch([_observation_request(*row)]))[0] for row in _MIXED_ROWS]
+
+    for together, single in zip(batched, alone):
+        assert together.error is None
+        np.testing.assert_allclose(together.output["actions"], single.output["actions"], rtol=0, atol=1e-4)
+    assert not np.array_equal(batched[0].output["actions"], batched[1].output["actions"])
+
+
+@pytest.mark.slow
+def test_a_batch_row_does_not_depend_on_its_neighbours(tiny_model):
+    pipeline = _tiny_batch_pipeline(tiny_model.eval())
+
+    first = pipeline.forward(
+        DiffusionRequestBatch([_observation_request(*_MIXED_ROWS[0]), _observation_request(5, "a")])
+    )
+    second = pipeline.forward(
+        DiffusionRequestBatch(
+            [_observation_request(*_MIXED_ROWS[0]), _observation_request(6, "b", _EXPECTED_CAMERA_ORDER[:1])]
+        )
+    )
+
+    np.testing.assert_array_equal(first[0].output["actions"], second[0].output["actions"])

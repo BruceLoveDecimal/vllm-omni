@@ -25,7 +25,9 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
+from typing import Any
 
 import numpy as np
 import torch
@@ -36,9 +38,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
 from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
-from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
+from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor, observed_camera_keys, stack_model_inputs
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -79,6 +82,37 @@ def get_pi05_post_process_func(od_config: OmniDiffusionConfig):
     """π0.5 returns actions directly; post-processing is identity."""
     del od_config
     return _pi05_post_process
+
+
+def _pi05_pre_process(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+    """Key the request by the cameras its observation carries.
+
+    The request scheduler batches only requests with equal keys, so a batch
+    shares one view layout, as RFC #6867 asks of R2. A missing camera is
+    already a masked slot, so mixed layouts would batch correctly too; that
+    stays off until it has its own parity coverage.
+    """
+    robot_obs = (request.sampling_params.extra_args or {}).get("robot_obs")
+    if isinstance(robot_obs, dict):
+        request.batch_compatibility_key = ("pi05_cameras", observed_camera_keys(robot_obs))
+    return request
+
+
+def get_pi05_pre_process_func(od_config: OmniDiffusionConfig):
+    """Engine-side batch keying; see :func:`_pi05_pre_process`."""
+    del od_config
+    return _pi05_pre_process
+
+
+@dataclass
+class _Pi05Row:
+    """One request of a batch, ready to stack."""
+
+    robot_obs: dict
+    # ``Pi05Processor.build_model_inputs`` output for this observation alone.
+    inputs: tuple[Any, ...]
+    num_steps: int | None
+    generator: torch.Generator | None
 
 
 _LEROBOT_FLOAT32_IN_BFLOAT16 = (
@@ -125,6 +159,9 @@ class Pi05Pipeline(nn.Module):
     Registered as ``"Pi05Pipeline"`` in the diffusion registry.
     """
 
+    # A request batch runs as one ``sample_actions`` call (``forward``).
+    supports_request_batch = True
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         self.od_config = od_config
@@ -140,7 +177,8 @@ class Pi05Pipeline(nn.Module):
 
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
-        # OpenPI serving is one observation per call (``max_num_seqs: 1``).
+        # Sized for one observation, the deployed default (``max_num_seqs: 1``).
+        # A larger batch gets a cache of its own size in ``sample_actions``.
         self.model.kv_cache = self.model.new_kv_cache(batch_size=1)
         self._install_cuda_graphs(od_config)
 
@@ -304,17 +342,17 @@ class Pi05Pipeline(nn.Module):
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
-    @torch.inference_mode()
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
-        extra_args = getattr(req.sampling_params, "extra_args", None) or {}
-        robot_obs = extra_args.get("robot_obs")
+    def _prepare_row(self, request: OmniDiffusionRequest) -> _Pi05Row | DiffusionOutput:
+        """One request's model inputs, or the output it gets without running the model."""
+        sampling = request.sampling_params
+        robot_obs = (getattr(sampling, "extra_args", None) or {}).get("robot_obs")
+        num_steps = getattr(sampling, "num_inference_steps", None)
 
         if robot_obs is None:
             # Dummy warmup path (no obs): return zeros so engine warmup/capture
             # doesn't crash. Mirrors DreamZero's dummy-run handling.
-            first_prompt = req.prompts[0] if req.prompts else ""
-            prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-            num_steps = getattr(req.sampling_params, "num_inference_steps", None)
+            prompt = getattr(request, "prompt", None) or ""
+            prompt = prompt if isinstance(prompt, str) else (prompt.get("prompt") or "")
             if prompt == "dummy run" or num_steps == 1:
                 logger.info("Pi05Pipeline: dummy warmup request without robot_obs — returning zeros.")
                 return DiffusionOutput(
@@ -329,23 +367,60 @@ class Pi05Pipeline(nn.Module):
                 error="Pi05Pipeline.forward requires sampling_params.extra_args['robot_obs'].",
             )
 
-        images, image_masks, lang_tokens, lang_masks = self.processor.build_model_inputs(robot_obs)
-
-        num_steps = getattr(req.sampling_params, "num_inference_steps", None)
-        if num_steps is not None and (
-            isinstance(num_steps, bool) or not isinstance(num_steps, (int, np.integer)) or int(num_steps) < 1
-        ):
-            raise ValueError(f"num_inference_steps must be a positive integer, got {num_steps!r}.")
-        if num_steps is not None:
-            num_steps = int(num_steps)
-
-        actions = self.model.sample_actions(
-            images=images,
-            image_masks=image_masks,
-            lang_tokens=lang_tokens,
-            lang_masks=lang_masks,
-            num_steps=num_steps,
-            generator=req.sampling_params.generator,
+        try:
+            if num_steps is not None and (
+                isinstance(num_steps, bool) or not isinstance(num_steps, (int, np.integer)) or int(num_steps) < 1
+            ):
+                raise ValueError(f"num_inference_steps must be a positive integer, got {num_steps!r}.")
+            generator = getattr(sampling, "generator", None)
+            if isinstance(generator, list):
+                if len(generator) != 1:
+                    raise ValueError(f"A π0.5 request takes one generator, got {len(generator)}.")
+                generator = generator[0]
+            inputs = self.processor.build_model_inputs(robot_obs)
+        except ValueError as exc:
+            return DiffusionOutput(error=str(exc))
+        return _Pi05Row(
+            robot_obs=robot_obs,
+            inputs=inputs,
+            num_steps=None if num_steps is None else int(num_steps),
+            generator=generator,
         )
 
-        return DiffusionOutput(output={"actions": self.processor.build_model_outputs(actions, robot_obs)})
+    @torch.inference_mode()
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
+        """Serve every observation in ``req`` through one batched ``sample_actions``.
+
+        The request scheduler only batches requests whose step count and camera
+        layout match (``get_pi05_pre_process_func``). A request whose input is
+        invalid gets its own error output; the others still run. Each row draws
+        its noise from its own request's generator, so its actions match that
+        request served alone.
+        """
+        outputs: list[DiffusionOutput | None] = []
+        groups: dict[int | None, list[tuple[int, _Pi05Row]]] = {}
+        for index, request in enumerate(req.requests):
+            row = self._prepare_row(request)
+            if isinstance(row, DiffusionOutput):
+                outputs.append(row)
+            else:
+                outputs.append(None)
+                groups.setdefault(row.num_steps, []).append((index, row))
+
+        # One group in practice: ``num_inference_steps`` is part of the
+        # scheduler's batch key. Grouping keeps a direct caller correct too.
+        for num_steps, members in groups.items():
+            rows = [row for _, row in members]
+            images, image_masks, lang_tokens, lang_masks = stack_model_inputs([row.inputs for row in rows])
+            actions = self.model.sample_actions(
+                images=images,
+                image_masks=image_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
+                num_steps=num_steps,
+                generator=[row.generator for row in rows],
+            )
+            for batch_row, (index, row) in enumerate(members):
+                chunk = self.processor.build_model_outputs(actions[batch_row : batch_row + 1], row.robot_obs)
+                outputs[index] = DiffusionOutput(output={"actions": chunk})
+        return outputs

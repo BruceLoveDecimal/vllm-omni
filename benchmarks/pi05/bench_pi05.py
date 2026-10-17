@@ -6,9 +6,9 @@
 Runs the real ``lerobot/pi05_base`` weights on GPU and, for every
 (batch_size, num_views) cell, checks that a full 10-step flow-matching
 ``sample_actions`` produces a correctly shaped finite action chunk, then times
-it. Model level on purpose: the OpenPI serving path is B=1 by construction
-(``pi05.yaml`` sets ``max_num_seqs: 1``), so batch behaviour can only be
-exercised here.
+it. Model level on purpose: it isolates ``sample_actions`` from the serving
+stack. With ``--compare-sequential`` each batch is also timed as B back-to-back
+batch-1 calls over the same rows, which is what a request batch replaces.
 
 The model is built by ``Pi05Pipeline`` as the server builds it, from the deploy
 config's ``model_config``: ``--dtype`` sets the serving dtype (bfloat16 is the
@@ -18,6 +18,7 @@ serves batch 1; other batch sizes run eagerly.
 
     python bench_pi05.py --out results/            # full sweep
     python bench_pi05.py --bs 1 --views 3 --iters 5
+    python bench_pi05.py --bs 1 2 4 8 16 32 --views 3 --compare-sequential
 
 Writes ``pi05_sweep.csv`` and ``pi05_sweep.md`` into --out.
 """
@@ -90,7 +91,38 @@ def make_inputs(batch_size: int, num_views: int, device: str, seed: int = 0):
     return images, image_masks, lang_tokens, lang_masks, noise
 
 
-def time_cell(model, batch_size: int, num_views: int, device: str, warmup: int, iters: int) -> dict:
+def _row_kwargs(kwargs: dict, row: int) -> dict:
+    """Batch row ``row`` of ``kwargs`` as a batch-1 call."""
+    sliced = {key: value[row : row + 1] for key, value in kwargs.items() if isinstance(value, torch.Tensor)}
+    return {
+        **kwargs,
+        **sliced,
+        "images": [image[row : row + 1] for image in kwargs["images"]],
+        "image_masks": [mask[row : row + 1] for mask in kwargs["image_masks"]],
+    }
+
+
+def _latencies(run, device: str, warmup: int, iters: int) -> tuple[list[float], torch.Tensor]:
+    """Sorted wall-clock milliseconds of ``iters`` calls of ``run`` after ``warmup``."""
+    with torch.no_grad():
+        for _ in range(warmup):
+            result = run()
+        if device.startswith("cuda"):
+            torch.accelerator.synchronize()
+
+        latencies = []
+        for _ in range(iters):
+            start = time.perf_counter()
+            result = run()
+            if device.startswith("cuda"):
+                torch.accelerator.synchronize()
+            latencies.append((time.perf_counter() - start) * 1000.0)
+    return sorted(latencies), result
+
+
+def time_cell(
+    model, batch_size: int, num_views: int, device: str, warmup: int, iters: int, compare_sequential: bool
+) -> dict:
     images, image_masks, lang_tokens, lang_masks, noise = make_inputs(batch_size, num_views, device)
     kwargs = dict(
         images=images,
@@ -104,25 +136,19 @@ def time_cell(model, batch_size: int, num_views: int, device: str, warmup: int, 
     if device.startswith("cuda"):
         torch.accelerator.reset_peak_memory_stats()
 
-    with torch.no_grad():
-        for _ in range(warmup):
-            actions = model.sample_actions(**kwargs)
-        if device.startswith("cuda"):
-            torch.accelerator.synchronize()
+    latencies, actions = _latencies(lambda: model.sample_actions(**kwargs), device, warmup, iters)
+    peak_mem_gb = round(torch.accelerator.max_memory_allocated() / 2**30, 2) if device.startswith("cuda") else None
 
-        latencies = []
-        for _ in range(iters):
-            start = time.perf_counter()
-            actions = model.sample_actions(**kwargs)
-            if device.startswith("cuda"):
-                torch.accelerator.synchronize()
-            latencies.append((time.perf_counter() - start) * 1000.0)
+    sequential_p50 = None
+    if compare_sequential:
+        rows = [_row_kwargs(kwargs, row) for row in range(batch_size)]
+        sequential, _ = _latencies(lambda: [model.sample_actions(**row) for row in rows], device, warmup, iters)
+        sequential_p50 = round(statistics.median(sequential), 2)
 
     expected = (batch_size, ACTION_HORIZON, ACTION_DIM)
     ok_shape = tuple(actions.shape) == expected
     ok_finite = bool(torch.isfinite(actions).all())
 
-    latencies.sort()
     return {
         "batch_size": batch_size,
         "num_views": num_views,
@@ -137,9 +163,14 @@ def time_cell(model, batch_size: int, num_views: int, device: str, warmup: int, 
         "min_ms": round(latencies[0], 2),
         "max_ms": round(latencies[-1], 2),
         "ms_per_sample": round(statistics.fmean(latencies) / batch_size, 2),
-        "peak_mem_gb": (
-            round(torch.accelerator.max_memory_allocated() / 2**30, 2) if device.startswith("cuda") else None
+        "samples_per_s": round(1000.0 * batch_size / statistics.median(latencies), 2),
+        # B back-to-back batch-1 calls over the same rows, and how much the
+        # batched call saves against them (>1 = faster).
+        "sequential_p50_ms": sequential_p50,
+        "speedup_vs_sequential": (
+            round(sequential_p50 / statistics.median(latencies), 2) if sequential_p50 is not None else None
         ),
+        "peak_mem_gb": peak_mem_gb,
     }
 
 
@@ -189,13 +220,15 @@ def write_reports(rows: list[dict], env: dict, out_dir: Path) -> None:
         json.dumps(env, indent=2),
         "```",
         "",
-        "| bs | views | status | shape | p50 ms | p95 ms | ms/sample | peak GB |",
-        "|---|---|---|---|---|---|---|---|",
+        "| bs | views | status | shape | p50 ms | p95 ms | ms/sample | samples/s | sequential p50 ms "
+        "| speedup vs sequential | peak GB |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in rows:
         lines.append(
             f"| {row['batch_size']} | {row['num_views']} | {row['status']} | {row['shape']} | "
-            f"{row['p50_ms']} | {row['p95_ms']} | {row['ms_per_sample']} | {row['peak_mem_gb']} |"
+            f"{row['p50_ms']} | {row['p95_ms']} | {row['ms_per_sample']} | {row['samples_per_s']} | "
+            f"{row['sequential_p50_ms']} | {row['speedup_vs_sequential']} | {row['peak_mem_gb']} |"
         )
     (out_dir / "pi05_sweep.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"\nwrote {csv_path} and {out_dir / 'pi05_sweep.md'}")
@@ -217,6 +250,11 @@ def main() -> int:
     )
     parser.add_argument("--bs", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--views", type=int, nargs="+", default=[1, 2, 3])
+    parser.add_argument(
+        "--compare-sequential",
+        action="store_true",
+        help="Also time each batch as B back-to-back batch-1 calls over the same rows",
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--out", default="pi05_bench")
@@ -240,7 +278,7 @@ def main() -> int:
         for batch_size in args.bs:
             label = f"bs={batch_size} views={num_views}"
             try:
-                row = time_cell(model, batch_size, num_views, device, args.warmup, args.iters)
+                row = time_cell(model, batch_size, num_views, device, args.warmup, args.iters, args.compare_sequential)
             except Exception as exc:  # a cell that OOMs or errors is a result, not a crash
                 row = {
                     "batch_size": batch_size,
@@ -256,6 +294,9 @@ def main() -> int:
                     "min_ms": None,
                     "max_ms": None,
                     "ms_per_sample": None,
+                    "samples_per_s": None,
+                    "sequential_p50_ms": None,
+                    "speedup_vs_sequential": None,
                     "peak_mem_gb": None,
                 }
                 if device.startswith("cuda"):
