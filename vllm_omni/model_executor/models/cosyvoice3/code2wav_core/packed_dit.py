@@ -7,6 +7,7 @@ Adapted from SGLang-Omni packed_dit.py, commit
 https://github.com/sgl-project/sglang-omni
 Full-context and chunk-causal attention use vLLM's paged FlashAttention:
 FA3 with one-frame pages on Hopper, FA2 with 16-frame pages on other GPUs.
+FA2 full-context rows skip the pages and attend the packed K/V directly.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from ..runtime import cosyvoice3_packed_fa_version
 from .packed_conv import pack_conv_weight, packed_causal_conv_mish
 
 # FA3 pages the packed KV in place. vLLM's FA2 requires pages of a multiple of
-# 16 frames, so every row is gathered onto a page-aligned start.
+# 16 frames, so every chunk-causal row is gathered onto a page-aligned start.
 PAGE_SIZE = {3: 1, 2: 16}
 logger = init_logger(__name__)
 
@@ -57,9 +58,17 @@ def page_metadata(
     return page_table, slot_frames
 
 
+def unpaged_metadata(segments: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Empty page table and KV gather index for attention that reads no pages."""
+    return (
+        torch.zeros((segments, 0), dtype=torch.int32, device=device),
+        torch.zeros(0, dtype=torch.int64, device=device),
+    )
+
+
 @dataclass(frozen=True)
 class RaggedRowAttention:
-    """Paged attention metadata shared by ordinary solves and CUDA graphs.
+    """Row attention metadata shared by ordinary solves and CUDA graphs.
 
     Tensor references are retained without copying. Fields cannot be rebound,
     but graph-owned buffers may be updated in place before replay.
@@ -68,6 +77,7 @@ class RaggedRowAttention:
     heads: int
     head_dim: int
     fa_version: int
+    full_context: bool
     max_seqlen_q: int
     cache_seqlens: torch.Tensor
     cu_seqlens_q: torch.Tensor
@@ -78,6 +88,17 @@ class RaggedRowAttention:
     def page_size(self) -> int:
         """Number of KV frames per page for the selected backend."""
         return PAGE_SIZE[self.fa_version]
+
+    @property
+    def paged(self) -> bool:
+        """Whether KV is read through ``page_table``.
+
+        Chunk-causal segments of one row read overlapping KV prefixes, which
+        only pages express without copies. A full-context segment is its whole
+        row, so FA2 reads the packed K/V at the query offsets instead and
+        ``page_table`` and ``slot_frames`` stay empty.
+        """
+        return self.fa_version == 3 or not self.full_context
 
 
 def build_row_attention(
@@ -114,20 +135,25 @@ def build_row_attention(
     cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32, device=device)
     cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
     max_seqlen_q = max(b - a for a, b in zip(offsets, offsets[1:]))
-    page_table, slot_frames = page_metadata(
-        torch.tensor(rows.lengths, device=device),
-        torch.tensor(segment_rows, device=device),
-        cache_seqlens,
-        rows.row_ids,
-        rows.positions,
-        page_size=page_size,
-        columns=-(-rows.width // page_size),
-        slots=sum(-(-length // page_size) for length in rows.lengths) * page_size,
-    )
+    full_context = chunk_size is None
+    if fa_version == 2 and full_context:
+        page_table, slot_frames = unpaged_metadata(len(segment_ends), device)
+    else:
+        page_table, slot_frames = page_metadata(
+            torch.tensor(rows.lengths, device=device),
+            torch.tensor(segment_rows, device=device),
+            cache_seqlens,
+            rows.row_ids,
+            rows.positions,
+            page_size=page_size,
+            columns=-(-rows.width // page_size),
+            slots=sum(-(-length // page_size) for length in rows.lengths) * page_size,
+        )
     return RaggedRowAttention(
         heads=heads,
         head_dim=head_dim,
         fa_version=fa_version,
+        full_context=full_context,
         max_seqlen_q=max_seqlen_q,
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
@@ -351,6 +377,45 @@ def fake_packed_fa2(
 
 
 @torch.library.custom_op(
+    "vllm_omni_cosyvoice3_perf::packed_fa2_varlen",
+    mutates_args=(),
+    device_types="cuda",
+)
+def packed_fa2_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """FA2 boundary for full-context rows: queries and K/V share one packing."""
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    return flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        max_seqlen_q=max_seqlen,
+        cu_seqlens_q=cu_seqlens,
+        max_seqlen_k=max_seqlen,
+        cu_seqlens_k=cu_seqlens,
+        causal=False,
+        fa_version=2,
+    )
+
+
+@packed_fa2_varlen.register_fake
+def fake_packed_fa2_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+@torch.library.custom_op(
     "vllm_omni_cosyvoice3_perf::native_mish",
     mutates_args=(),
     device_types="cuda",
@@ -467,10 +532,11 @@ def scatter_rows(packed: torch.Tensor, rows: PackedRows, width: int) -> torch.Te
 
 
 def mark_packed_compile_metadata(rows: PackedRows, attention: RaggedRowAttention) -> None:
-    dynamo.mark_dynamic(attention.page_table, (0, 1))
+    if attention.paged:
+        dynamo.mark_dynamic(attention.page_table, (0, 1))
+        dynamo.mark_dynamic(attention.slot_frames, 0)
     dynamo.mark_dynamic(attention.cu_seqlens_q, 0)
     dynamo.mark_dynamic(attention.cache_seqlens, 0)
-    dynamo.mark_dynamic(attention.slot_frames, 0)
     dynamo.mark_dynamic(rows.frames, 0)
     dynamo.mark_dynamic(rows.starts_host, 0)
     dynamo.mark_dynamic(rows.row_ids, 0)
@@ -560,6 +626,9 @@ def ragged_attention_tensor_geometry(
             attention.cu_seqlens_q,
             max_seqlen_q,
         )
+    elif not attention.paged:
+        # Each query row is its own KV row, so the query offsets bound both.
+        output = packed_fa2_varlen(query, key, value, attention.cu_seqlens_q, max_seqlen_q)
     else:
         output = packed_fa2(
             query,
@@ -876,6 +945,15 @@ class FlowGraphRunner:
         channels = noise.shape[-1]
         rows = 2 * (slots + 1)
         page_size = PAGE_SIZE[self.estimator.fa_version]
+        # Like RaggedRowAttention.paged: full-context FA2 graphs read no pages.
+        if self.estimator.fa_version == 3 or key[0]:
+            page_table = torch.zeros((segments, -(-padded_total // page_size)), device=device, dtype=torch.int32)
+            # Each row wastes less than one page: a static bound on the slots.
+            slot_frames = torch.zeros(
+                (2 * padded_total // page_size + rows) * page_size, device=device, dtype=torch.int64
+            )
+        else:
+            page_table, slot_frames = unpaged_metadata(segments, device)
         return _FlowGraph(
             graph=torch.cuda.CUDAGraph(),
             noise=torch.zeros((1, padded_total, channels), device=device, dtype=dtype),
@@ -888,11 +966,8 @@ class FlowGraphRunner:
             positions=torch.zeros(2 * padded_total, device=device, dtype=torch.int64),
             cache_seqlens=torch.zeros(segments, device=device, dtype=torch.int32),
             cu_seqlens_q=torch.zeros(segments + 1, device=device, dtype=torch.int32),
-            page_table=torch.zeros((segments, -(-padded_total // page_size)), device=device, dtype=torch.int32),
-            # Each row wastes less than one page: a static bound on the slots.
-            slot_frames=torch.zeros(
-                (2 * padded_total // page_size + rows) * page_size, device=device, dtype=torch.int64
-            ),
+            page_table=page_table,
+            slot_frames=slot_frames,
             frames=torch.arange(padded_total, device=device),
         )
 
@@ -911,18 +986,19 @@ class FlowGraphRunner:
         ends = state.table[rows + segments : rows + 2 * segments]
         state.cache_seqlens.copy_(ends)
         state.cu_seqlens_q.copy_(state.table[rows + 2 * segments :])
-        page_table, slot_frames = page_metadata(
-            lengths,
-            seg_rows_t,
-            ends,
-            state.row_ids,
-            state.positions,
-            page_size=PAGE_SIZE[self.estimator.fa_version],
-            columns=state.page_table.shape[1],
-            slots=state.slot_frames.shape[0],
-        )
-        state.page_table.copy_(page_table)
-        state.slot_frames.copy_(slot_frames)
+        if state.slot_frames.numel():  # Paged layouts only; see _allocate.
+            page_table, slot_frames = page_metadata(
+                lengths,
+                seg_rows_t,
+                ends,
+                state.row_ids,
+                state.positions,
+                page_size=PAGE_SIZE[self.estimator.fa_version],
+                columns=state.page_table.shape[1],
+                slots=state.slot_frames.shape[0],
+            )
+            state.page_table.copy_(page_table)
+            state.slot_frames.copy_(slot_frames)
         state.noise[:, :total].copy_(noise)
         state.mu[:, :total].copy_(mu)
         state.cond[:, :total].copy_(cond)
@@ -942,6 +1018,7 @@ class FlowGraphRunner:
             heads=self.heads,
             head_dim=self.head_dim,
             fa_version=estimator.fa_version,
+            full_context=not key[0],
             max_seqlen_q=max_seqlen_q,
             cache_seqlens=state.cache_seqlens,
             cu_seqlens_q=state.cu_seqlens_q,
