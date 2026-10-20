@@ -256,7 +256,9 @@ steps:
     steps:
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with H100 · Single-GPU"
-        source_file_dependencies: diffusion_qwen_image_function
+        source_file_dependencies:
+          - diffusion_qwen_image_function
+          - diffusion_mage_flow_function
         timeout_in_minutes: 120
         commands:
           - >-
