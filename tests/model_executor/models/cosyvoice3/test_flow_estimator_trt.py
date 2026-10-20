@@ -147,9 +147,11 @@ def test_context_session_binds_once_for_repeated_steps(monkeypatch):
 
         def set_input_shape(self, name, shape):
             self.shape_calls.append((name, shape))
+            return True
 
         def set_tensor_address(self, name, address):
             self.address_calls.append((name, address))
+            return True
 
         def execute_async_v3(self, stream):
             self.execute_calls += 1
@@ -163,7 +165,7 @@ def test_context_session_binds_once_for_repeated_steps(monkeypatch):
 
         @staticmethod
         def get_tensor_name(index):
-            return ("x", "mask", "mu", "t", "spks", "cond", "out")[index]
+            return ("x", "mask", "mu", "t", "spks", "cond", "estimator_out")[index]
 
     estimator_stream = FakeStream()
     caller_stream = FakeStream()
@@ -240,6 +242,8 @@ def test_cfm_reuses_one_trt_session_across_euler_steps():
             return torch.zeros_like(x)
 
     class FakeEstimatorPool:
+        supports_attn_mask = False
+
         def __init__(self):
             self.session = FakeSession()
             self.entries = 0
@@ -313,7 +317,7 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
         return address
 
     monkeypatch.setattr(torch.Tensor, "data_ptr", register_tensor)
-    names = ("x", "mask", "mu", "t", "spks", "cond", "out")
+    names = ("x", "mask", "mu", "t", "spks", "cond", "estimator_out")
 
     class FakeStream:
         cuda_stream = 123
@@ -330,10 +334,12 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
 
         def set_input_shape(self, name, shape):
             self.shapes[name] = shape
+            return True
 
         def set_tensor_address(self, name, address):
             self.bindings[name] = tensors[address]
             self.bind_count += 1
+            return True
 
         def execute_async_v3(self, stream):
             inputs = tuple(self.bindings[name] for name in names[:-1])
@@ -345,7 +351,7 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
             # Every input affects the result, including the unconditional CFG
             # row, time progression and engine/caller precision boundary.
             out = (0.125 * x + 0.25 * mu + 0.0625 * spks.unsqueeze(-1) + 0.125 * cond + 0.25 * t[:, None, None]) * mask
-            self.bindings["out"].copy_(out)
+            self.bindings["estimator_out"].copy_(out)
             return True
 
     class FakeEngine:
@@ -364,8 +370,12 @@ def test_cfm_trt_session_matches_legacy_nonzero_estimator(monkeypatch, caller_dt
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
     session_engine, legacy_engine = FakeEngine(), FakeEngine()
-    session_pool = flow_estimator_trt.TrtContextWrapper(session_engine, "cpu", io_dtype=torch.float16)
-    legacy_pool = flow_estimator_trt.TrtContextWrapper(legacy_engine, "cpu", io_dtype=torch.float16)
+    session_pool = flow_estimator_trt.TrtContextWrapper(
+        session_engine, "cpu", io_dtype=torch.float16, input_names=frozenset(names[:-1])
+    )
+    legacy_pool = flow_estimator_trt.TrtContextWrapper(
+        legacy_engine, "cpu", io_dtype=torch.float16, input_names=frozenset(names[:-1])
+    )
     monkeypatch.setattr(legacy_pool, "estimation_session", None)
     params = DictConfig(
         {
@@ -438,14 +448,12 @@ class TestExportCacheKey:
         (d / "flow.pt").write_bytes(b"v2 longer")
         assert flow_estimator_trt.flow_checkpoint_fingerprint(str(d)) != before
 
-    def test_fingerprint_is_stable_without_weights(self, tmp_path):
-        d = tmp_path / "ckpt"
-        d.mkdir()
-        assert flow_estimator_trt.flow_checkpoint_fingerprint(str(d)) == flow_estimator_trt.flow_checkpoint_fingerprint(
-            str(d)
-        )
+    def test_missing_weights_cannot_share_an_export_key(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            flow_estimator_trt.flow_checkpoint_fingerprint(str(tmp_path))
 
     def test_fingerprint_changes_with_export_version(self, tmp_path, monkeypatch):
+        (tmp_path / "flow.pt").write_bytes(b"weights")
         before = flow_estimator_trt.flow_checkpoint_fingerprint(str(tmp_path))
         monkeypatch.setattr(flow_estimator_trt, "_CHUNK_MASK_EXPORT_VERSION", 999)
         assert flow_estimator_trt.flow_checkpoint_fingerprint(str(tmp_path)) != before
@@ -487,3 +495,295 @@ class TestFusedAttentionFallback:
         )
         plain = flow_estimator_trt.chunk_mask_estimator_onnx_path(str(tmp_path), fp16=True, cache_key="k")
         assert fused != plain and "fused_attn" in fused
+
+
+@pytest.fixture
+def cached_chunk_builder(tmp_path, monkeypatch):
+    """Exercise real cache keys and file locks without a GPU or TRT install."""
+    import sys
+    from types import SimpleNamespace
+
+    import torch
+
+    exports, builds = [], []
+
+    class Runtime:
+        def __init__(self, logger):
+            pass
+
+        def deserialize_cuda_engine(self, data):
+            return data
+
+    def export(estimator, path, **kwargs):
+        exports.append(path)
+        Path(path).write_text(str(estimator.weight.item()))
+
+    def convert(onnx_path, plan_path, **kwargs):
+        builds.append(plan_path)
+        flow_estimator_trt._write_plan_atomically(Path(onnx_path).read_bytes(), plan_path)
+
+    monkeypatch.setenv("COSYVOICE3_TRT_CACHE", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "tensorrt", SimpleNamespace(Runtime=Runtime, __version__="test"))
+    monkeypatch.setattr(flow_estimator_trt, "_trt_logger", lambda: None)
+    monkeypatch.setattr(flow_estimator_trt, "export_chunk_mask_estimator_onnx", export)
+    monkeypatch.setattr(flow_estimator_trt, "_convert_onnx_to_trt", convert)
+    monkeypatch.setattr(
+        flow_estimator_trt,
+        "_wrap_engine",
+        lambda engine, *args, **kwargs: SimpleNamespace(engine=engine, supports_attn_mask=True),
+    )
+
+    def build(checkpoint, value=1.0, **kwargs):
+        estimator = torch.nn.Linear(1, 1, bias=False)
+        estimator.static_chunk_size = 50
+        with torch.no_grad():
+            estimator.weight.fill_(value)
+        kwargs.setdefault("fp16", False)
+        return flow_estimator_trt.build_chunk_mask_flow_estimator_trt(
+            estimator,
+            str(tmp_path / "exported"),
+            "cpu",
+            cache_key=flow_estimator_trt.flow_checkpoint_fingerprint(str(checkpoint.parent), checkpoint.name),
+            **kwargs,
+        )
+
+    return build, exports, builds
+
+
+def test_chunk_cache_separates_checkpoints_and_reuses_matching_weights(tmp_path, cached_chunk_builder):
+    build, exports, builds = cached_chunk_builder
+    a, b = tmp_path / "a.pt", tmp_path / "b.pt"
+    a.write_bytes(b"checkpoint A")
+    b.write_bytes(b"checkpoint B")
+
+    first = build(a, 1.0)
+    second = build(b, 2.0)
+    repeated = build(a, 1.0)
+
+    assert first.engine == repeated.engine == b"1.0"
+    assert second.engine == b"2.0"
+    assert len(exports) == len(builds) == 2
+    assert exports[0] != exports[1]
+
+
+def test_chunk_cache_detects_same_size_and_mtime_checkpoint_replacement(tmp_path, cached_chunk_builder):
+    import os
+
+    build, exports, builds = cached_chunk_builder
+    checkpoint = tmp_path / "flow.pt"
+    checkpoint.write_bytes(b"original")
+    original_stat = checkpoint.stat()
+    build(checkpoint, 1.0)
+    checkpoint.write_bytes(b"replaced")
+    os.utime(checkpoint, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert build(checkpoint, 2.0).engine == b"2.0"
+    assert len(exports) == len(builds) == 2
+
+
+@pytest.mark.parametrize("change", ["precision", "export_version", "architecture", "profile"])
+def test_chunk_cache_invalidates_export_or_plan_configuration(tmp_path, monkeypatch, cached_chunk_builder, change):
+    build, exports, builds = cached_chunk_builder
+    checkpoint = tmp_path / "flow.pt"
+    checkpoint.write_bytes(b"weights")
+    build(checkpoint)
+
+    kwargs = {}
+    if change == "precision":
+        kwargs["fp16"] = True
+    elif change == "export_version":
+        monkeypatch.setattr(flow_estimator_trt, "_CHUNK_MASK_EXPORT_VERSION", 2)
+    elif change == "architecture":
+        import torch
+
+        monkeypatch.setattr(torch.nn.Linear, "extra_repr", lambda self: "changed architecture")
+    else:
+        monkeypatch.setattr(flow_estimator_trt, "_MASK_MAX_SHAPE", (2, 1, 4000, 4000))
+    build(checkpoint, **kwargs)
+
+    assert len(builds) == 2
+    assert len(exports) == (1 if change == "profile" else 2)
+
+
+def test_concurrent_chunk_builders_publish_one_export_and_plan(tmp_path, monkeypatch, cached_chunk_builder):
+    build, exports, builds = cached_chunk_builder
+    checkpoint = tmp_path / "flow.pt"
+    checkpoint.write_bytes(b"weights")
+    original_export = flow_estimator_trt.export_chunk_mask_estimator_onnx
+    export_started, second_entered = threading.Event(), threading.Event()
+    original_path = flow_estimator_trt._chunk_mask_graph_cache_key
+
+    def export(*args, **kwargs):
+        export_started.set()
+        assert second_entered.wait(timeout=5)
+        return original_export(*args, **kwargs)
+
+    def export_path(*args, **kwargs):
+        path = original_path(*args, **kwargs)
+        if export_started.is_set():
+            second_entered.set()
+        return path
+
+    monkeypatch.setattr(flow_estimator_trt, "export_chunk_mask_estimator_onnx", export)
+    monkeypatch.setattr(flow_estimator_trt, "_chunk_mask_graph_cache_key", export_path)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(build, checkpoint)
+        assert export_started.wait(timeout=5)
+        second = executor.submit(build, checkpoint)
+        assert first.result(timeout=10).engine == second.result(timeout=10).engine
+    assert len(exports) == len(builds) == 1
+
+
+@pytest.mark.parametrize("stage", ["export_chunk_mask_estimator_onnx", "_convert_onnx_to_trt"])
+def test_failed_chunk_build_is_retried(tmp_path, monkeypatch, cached_chunk_builder, stage):
+    build, exports, builds = cached_chunk_builder
+    checkpoint = tmp_path / "flow.pt"
+    checkpoint.write_bytes(b"weights")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("build failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(flow_estimator_trt, stage, fail)
+        with pytest.raises(RuntimeError, match="build failed"):
+            build(checkpoint)
+    assert build(checkpoint).engine == b"1.0"
+    assert len(exports) == len(builds) == 1
+
+
+@pytest.mark.parametrize("failure", ["export", "replace", None])
+def test_onnx_publication_restores_estimator_and_cleans_temporary_files(tmp_path, monkeypatch, failure):
+    import sys
+    from types import ModuleType
+
+    import torch
+
+    monkeypatch.setitem(sys.modules, "onnx", ModuleType("onnx"))
+    estimator = torch.nn.Linear(1, 1).train()
+    onnx_path = tmp_path / "estimator.onnx"
+    onnx_path.write_bytes(b"previous graph")
+
+    def export(wrapper, inputs, path, **kwargs):
+        assert not wrapper.estimator.training
+        Path(path).write_bytes(b"new graph")
+        if failure == "export":
+            raise RuntimeError("export failed")
+
+    def fail_replace(*args):
+        raise RuntimeError("replace failed")
+
+    monkeypatch.setattr(torch.onnx, "export", export)
+    if failure == "replace":
+        monkeypatch.setattr(flow_estimator_trt.os, "replace", fail_replace)
+    if failure:
+        with pytest.raises(RuntimeError, match=f"{failure} failed"):
+            flow_estimator_trt.export_chunk_mask_estimator_onnx(estimator, str(onnx_path), fp16=False)
+    else:
+        flow_estimator_trt.export_chunk_mask_estimator_onnx(estimator, str(onnx_path), fp16=False)
+    assert estimator.training
+    assert onnx_path.read_bytes() == (b"previous graph" if failure else b"new graph")
+    assert _temporary_plans(onnx_path) == []
+
+
+def test_context_creation_failure_raises_runtime_error(monkeypatch):
+    from types import SimpleNamespace
+
+    engine = SimpleNamespace(create_execution_context=lambda: None)
+    with pytest.raises(RuntimeError, match="failed to create TRT execution context"):
+        flow_estimator_trt.TrtContextWrapper(engine, "cpu")
+
+
+@pytest.mark.parametrize("failure", ["shape", "input", "output", "enqueue", "exception"])
+def test_session_failure_returns_context_and_allows_retry(monkeypatch, failure):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import torch
+
+    class Context:
+        def set_input_shape(self, name, shape):
+            return True
+
+        def set_tensor_address(self, name, address):
+            return True
+
+        def execute_async_v3(self, stream):
+            return True
+
+    context = Context()
+    stream = SimpleNamespace(cuda_stream=0, wait_stream=lambda other: None)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device: stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    wrapper = flow_estimator_trt.TrtContextWrapper(SimpleNamespace(create_execution_context=lambda: context), "cpu")
+    inputs = (
+        torch.ones(2, 80, 4),
+        torch.ones(2, 1, 4),
+        torch.ones(2, 80, 4),
+        torch.ones(2),
+        torch.ones(2, 80),
+        torch.ones(2, 80, 4),
+    )
+    with monkeypatch.context() as patch:
+        if failure == "shape":
+            patch.setattr(context, "set_input_shape", lambda *args: False)
+        elif failure in ("input", "output"):
+            target = "x" if failure == "input" else "estimator_out"
+            patch.setattr(context, "set_tensor_address", lambda name, address: name != target)
+        elif failure == "enqueue":
+            patch.setattr(context, "execute_async_v3", lambda *args: False)
+        else:
+
+            def fail(*args):
+                raise RuntimeError("execution error")
+
+            patch.setattr(context, "execute_async_v3", fail)
+        with pytest.raises(RuntimeError):
+            with wrapper.estimation_session(*inputs) as session:
+                session.run(*inputs)
+    assert wrapper._pool.qsize() == 1
+    with wrapper.estimation_session(*inputs) as session:
+        session.run(*inputs)
+    assert wrapper._pool.qsize() == 1
+
+
+def test_optimized_session_still_enqueues_and_uses_engine_output_dtype(monkeypatch):
+    import inspect
+    import textwrap
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import torch
+
+    source = textwrap.dedent(inspect.getsource(flow_estimator_trt._TrtEstimatorSession.run))
+    namespace = dict(vars(flow_estimator_trt))
+    exec(compile(source, "<optimized-trt-session>", "exec", optimize=2), namespace)
+    monkeypatch.setattr(flow_estimator_trt._TrtEstimatorSession, "run", namespace["run"])
+    calls = []
+    context = SimpleNamespace(
+        set_input_shape=lambda *args: True,
+        set_tensor_address=lambda *args: True,
+        execute_async_v3=lambda stream: calls.append(stream) or True,
+    )
+    stream = SimpleNamespace(cuda_stream=0, wait_stream=lambda other: None)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device: stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    wrapper = flow_estimator_trt.TrtContextWrapper(
+        SimpleNamespace(create_execution_context=lambda: context),
+        "cpu",
+        io_dtype=torch.float16,
+        out_dtype=torch.float32,
+    )
+    inputs = (
+        torch.ones(2, 80, 4),
+        torch.ones(2, 1, 4),
+        torch.ones(2, 80, 4),
+        torch.ones(2),
+        torch.ones(2, 80),
+        torch.ones(2, 80, 4),
+    )
+    with wrapper.estimation_session(*inputs) as session:
+        assert session._engine_output.dtype == torch.float32
+        session.run(*inputs)
+    assert calls == [0]

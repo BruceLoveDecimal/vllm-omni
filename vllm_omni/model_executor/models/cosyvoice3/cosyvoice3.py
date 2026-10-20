@@ -1399,12 +1399,7 @@ class CosyVoice3Model(
         return st_out, sf_out, emb_out, stl_out
 
     def _flow_estimator_onnx_dir(self) -> str:
-        """Where an exported estimator ONNX is kept: the model dir when it is
-        writable, else the TensorRT plan cache. The cache is shared by every
-        checkpoint on the box, so the export's file name carries the
-        checkpoint fingerprint (``_flow_estimator_cache_key``)."""
-        if os.access(self.model_dir, os.W_OK):
-            return self.model_dir
+        """Root for automatically exported estimators, including read-only models."""
         cache_dir = os.environ.get("COSYVOICE3_TRT_CACHE") or os.path.join(
             os.path.expanduser("~"), ".cache", "vllm_omni", "cosyvoice3_trt"
         )
@@ -1468,11 +1463,9 @@ class CosyVoice3Model(
             return
         if not (_cosyvoice3_trt_enabled() and torch.cuda.is_available()):
             return
-        wrapper = None
-        if _cosyvoice3_trt_chunk_mask_enabled():
-            # Preferred: an engine exported from the live torch DiT with the
-            # attention map as an input, so streaming honours the chunk mask.
-            try:
+        chunk_mask = _cosyvoice3_trt_chunk_mask_enabled()
+        try:
+            if chunk_mask:
                 from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import (
                     build_chunk_mask_flow_estimator_trt,
                 )
@@ -1483,20 +1476,13 @@ class CosyVoice3Model(
                     device="cuda",
                     cache_key=self._flow_estimator_cache_key(),
                 )
-            # Missing onnx/tensorrt, cache I/O, an export or engine-build
-            # failure; anything else is a bug and should surface.
-            except (ImportError, OSError, RuntimeError, ValueError) as exc:
-                logger.warning(
-                    "CosyVoice3 code2wav: chunk-mask TensorRT estimator unavailable (%s); "
-                    "falling back to the bundled full-attention engine, which ignores streaming chunk masks",
-                    exc,
+                if not wrapper.supports_attn_mask:
+                    raise RuntimeError("chunk-mask TensorRT estimator has no attn_mask input")
+            else:
+                from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import (
+                    build_flow_estimator_trt,
                 )
-        try:
-            from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import (
-                build_flow_estimator_trt,
-            )
 
-            if wrapper is None:
                 onnx_path = self._resolve_flow_estimator_onnx()
                 if onnx_path is None:
                     logger.warning("CosyVoice3 code2wav: no flow-estimator ONNX available; keeping torch estimator")
@@ -1506,6 +1492,7 @@ class CosyVoice3Model(
             # (frees the torch estimator weights) so the TRT wrapper can be set
             # as a plain attribute — nn.Module.__setattr__ rejects non-Modules.
             decoder = self.code2wav.flow_model.decoder
+            wrapper.static_chunk_size = int(getattr(decoder.estimator, "static_chunk_size", 0))
             del decoder.estimator
             decoder.estimator = wrapper
             logger.info(
@@ -1514,8 +1501,9 @@ class CosyVoice3Model(
             )
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.warning(
-                "CosyVoice3 code2wav: TensorRT estimator build failed (%s); keeping torch estimator",
+                "CosyVoice3 code2wav: TensorRT estimator build failed (%s); keeping torch estimator (chunk_mask=%s)",
                 exc,
+                chunk_mask,
             )
 
     def make_omni_output(self, hidden_states: torch.Tensor, **kwargs) -> OmniOutput:

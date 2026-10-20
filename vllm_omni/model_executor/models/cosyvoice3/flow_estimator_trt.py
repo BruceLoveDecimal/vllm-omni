@@ -35,12 +35,14 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import queue
 import uuid
 from contextlib import contextmanager
 
 import torch
+from filelock import FileLock
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import (
@@ -149,7 +151,15 @@ _TRT_DYNAMIC_INPUT_INDICES = (0, 3)
 class _TrtEstimatorSession:
     """A fixed-shape TensorRT estimator binding reused across Euler steps."""
 
-    def __init__(self, context, stream, engine, io_dtype: torch.dtype, inputs: tuple[torch.Tensor, ...]):
+    def __init__(
+        self,
+        context,
+        stream,
+        engine,
+        io_dtype: torch.dtype,
+        inputs: tuple[torch.Tensor, ...],
+        out_dtype: torch.dtype | None = None,
+    ):
         # A chunk-mask engine takes the query-key map as a seventh input. It is
         # static within a solve, so the session binds it once and ``run`` keeps
         # taking only the six per-step tensors.
@@ -170,7 +180,7 @@ class _TrtEstimatorSession:
         self._initialized = False
         self._engine_output = torch.empty_like(
             inputs[0],
-            dtype=io_dtype,
+            dtype=out_dtype or io_dtype,
             memory_format=torch.contiguous_format,
         )
         if self._engine_output.dtype == inputs[0].dtype:
@@ -189,11 +199,12 @@ class _TrtEstimatorSession:
                 buffer.copy_(tensor)
 
         for name, buffer in zip(self.input_names, self._input_buffers, strict=True):
-            context.set_input_shape(name, tuple(buffer.shape))
-
-        bound_tensors = (*self._input_buffers, self._engine_output)
-        for index, tensor in enumerate(bound_tensors):
-            context.set_tensor_address(engine.get_tensor_name(index), tensor.data_ptr())
+            if not context.set_input_shape(name, tuple(buffer.shape)):
+                raise RuntimeError(f"TensorRT flow estimator rejected shape {tuple(buffer.shape)} for input '{name}'")
+            if not context.set_tensor_address(name, buffer.data_ptr()):
+                raise RuntimeError(f"TensorRT flow estimator failed to bind input '{name}'")
+        if not context.set_tensor_address("estimator_out", self._engine_output.data_ptr()):
+            raise RuntimeError("TensorRT flow estimator failed to bind output 'estimator_out'")
 
     def _make_input_buffer(self, tensor: torch.Tensor) -> torch.Tensor:
         # ``attn_mask`` is bool; only the float inputs follow ``io_dtype``.
@@ -217,22 +228,24 @@ class _TrtEstimatorSession:
 
         caller_stream = torch.cuda.current_stream(inputs[0].device)
         self.stream.wait_stream(caller_stream)
-        with torch.cuda.stream(self.stream):
-            input_indices = range(len(inputs)) if not self._initialized else _TRT_DYNAMIC_INPUT_INDICES
-            for index in input_indices:
-                tensor = inputs[index]
-                buffer = self._input_buffers[index]
-                if tensor.data_ptr() != buffer.data_ptr():
-                    buffer.copy_(tensor)
+        try:
+            with torch.cuda.stream(self.stream):
+                # Protect buffers even if copying or enqueue raises.
+                for tensor in (*self._input_buffers, self._engine_output):
+                    if tensor.is_cuda:
+                        tensor.record_stream(self.stream)
+                input_indices = range(len(inputs)) if not self._initialized else _TRT_DYNAMIC_INPUT_INDICES
+                for index in input_indices:
+                    tensor = inputs[index]
+                    buffer = self._input_buffers[index]
+                    if tensor.data_ptr() != buffer.data_ptr():
+                        buffer.copy_(tensor)
 
-            assert self.context.execute_async_v3(self.stream.cuda_stream) is True
-            self._initialized = True
-
-            for tensor in (*self._input_buffers, self._engine_output):
-                if tensor.is_cuda:
-                    tensor.record_stream(self.stream)
-
-        caller_stream.wait_stream(self.stream)
+                if not self.context.execute_async_v3(self.stream.cuda_stream):
+                    raise RuntimeError("TensorRT flow estimator failed to enqueue (execute_async_v3 returned False)")
+                self._initialized = True
+        finally:
+            caller_stream.wait_stream(self.stream)
         if self._output is not self._engine_output:
             if self._engine_output.is_cuda:
                 self._engine_output.record_stream(caller_stream)
@@ -276,7 +289,8 @@ class TrtContextWrapper:
         self._pool: queue.Queue = queue.Queue(maxsize=trt_concurrent)
         for _ in range(trt_concurrent):
             ctx = engine.create_execution_context()
-            assert ctx is not None, "failed to create TRT execution context (out of memory?)"
+            if ctx is None:
+                raise RuntimeError("failed to create TRT execution context (out of memory?)")
             stream = torch.cuda.Stream(torch.device(device))
             self._pool.put([ctx, stream])
 
@@ -297,6 +311,7 @@ class TrtContextWrapper:
                 engine=engine,
                 io_dtype=self.io_dtype,
                 inputs=inputs,
+                out_dtype=self.out_dtype,
             )
         finally:
             self.release_estimator(context, stream)
@@ -443,9 +458,8 @@ def export_chunk_mask_estimator_onnx(
 
     device = next(estimator.parameters()).device
     was_training = estimator.training
-    estimator.eval()
     fused = fp16 and fused_attention
-    wrapper = _EstimatorWithMaskInput(estimator).to(device).eval()
+    wrapper = _EstimatorWithMaskInput(estimator)
     frames = 64
     x = torch.randn(2, 80, frames, device=device)
     mask = torch.ones(2, 1, frames, device=device)
@@ -462,11 +476,12 @@ def export_chunk_mask_estimator_onnx(
         ATTN_MASK_INPUT: {2: "seq_len", 3: "seq_len"},
         "estimator_out": {2: "seq_len"},
     }
-    tmp = f"{onnx_path}.tmp.{os.getpid()}"
+    tmp = f"{onnx_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     logger.info(
         "Exporting chunk-mask flow estimator ONNX to %s (fp16=%s, fused_attention=%s) ...", onnx_path, fp16, fused
     )
     try:
+        wrapper.eval()
         with (
             torch.inference_mode(),
             torch.autocast(device_type=device.type, dtype=torch.float16, enabled=fp16),
@@ -487,29 +502,45 @@ def export_chunk_mask_estimator_onnx(
             _promote_attention_nodes(tmp)
         os.replace(tmp, onnx_path)
     finally:
-        if os.path.exists(tmp):
+        estimator.train(was_training)
+        try:
             os.remove(tmp)
-        if was_training:
-            estimator.train()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Failed to remove temporary estimator ONNX %s", tmp, exc_info=True)
     return onnx_path
 
 
 def flow_checkpoint_fingerprint(model_dir: str, weight_file: str = "flow.pt") -> str:
-    """A short digest identifying the flow checkpoint an ONNX was exported from.
+    """Identify checkpoint contents, including same-size/mtime replacements."""
+    digest = hashlib.sha256()
+    digest.update(f"v{_CHUNK_MASK_EXPORT_VERSION}|{os.path.realpath(model_dir)}|".encode())
+    # Missing/unreadable weights must fail initialization, not share a cache key.
+    with open(os.path.join(model_dir, weight_file), "rb") as checkpoint:
+        for block in iter(lambda: checkpoint.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
-    The exported ONNX bakes in the DiT weights, so its cache path must change
-    whenever the checkpoint or the export code does: the digest covers
-    ``_CHUNK_MASK_EXPORT_VERSION``, the resolved model directory and the
-    size/mtime of its flow weights.
-    """
-    parts = [f"v{_CHUNK_MASK_EXPORT_VERSION}", os.path.realpath(model_dir)]
-    weight_path = os.path.join(model_dir, weight_file)
-    try:
-        st = os.stat(weight_path)
-        parts.append(f"{st.st_size}:{int(st.st_mtime)}")
-    except OSError:
-        parts.append("no-weights")
-    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+def _chunk_mask_graph_cache_key(estimator, cache_key: str | None) -> str:
+    if not cache_key:
+        raise ValueError("A checkpoint cache_key is required for exporting the chunk-mask estimator")
+    graph = {
+        "checkpoint": cache_key,
+        "export_version": _CHUNK_MASK_EXPORT_VERSION,
+        "architecture": repr(estimator),
+        "parameters": [(name, str(param.dtype), tuple(param.shape)) for name, param in estimator.named_parameters()],
+        "torch": torch.__version__,
+        "static_chunk_size": int(estimator.static_chunk_size),
+    }
+    return hashlib.sha256(json.dumps(graph, sort_keys=True).encode()).hexdigest()
+
+
+def _chunk_mask_plan_prefix() -> str:
+    profile = (_MIN_SHAPES, _OPT_SHAPES, _MAX_SHAPES, _MASK_MIN_SHAPE, _MASK_OPT_SHAPE, _MASK_MAX_SHAPE)
+    key = json.dumps((profile, torch.version.cuda))
+    return f"flow_estimator_chunk_mask_{hashlib.sha256(key.encode()).hexdigest()[:16]}"
 
 
 def chunk_mask_estimator_onnx_path(
@@ -526,14 +557,19 @@ def _build_chunk_mask_engine(estimator, onnx_dir, device, *, fp16, cache_key, fu
     import tensorrt as trt
 
     onnx_path = chunk_mask_estimator_onnx_path(
-        onnx_dir, fp16=fp16, cache_key=cache_key, fused_attention=fused_attention
+        onnx_dir,
+        fp16=fp16,
+        cache_key=_chunk_mask_graph_cache_key(estimator, cache_key),
+        fused_attention=fused_attention,
     )
-    if not os.path.exists(onnx_path) or os.path.getsize(onnx_path) == 0:
-        os.makedirs(onnx_dir, exist_ok=True)
-        export_chunk_mask_estimator_onnx(estimator, onnx_path, fp16=fp16, fused_attention=fused_attention)
-    plan_path = _resolve_plan_path(onnx_path, prefix="flow_estimator_chunk_mask")
-    if not os.path.exists(plan_path) or os.path.getsize(plan_path) == 0:
-        _convert_onnx_to_trt(onnx_path, plan_path, strongly_typed=fp16, with_attn_mask=True)
+    os.makedirs(onnx_dir, exist_ok=True)
+    with FileLock(onnx_path + ".lock"):
+        if not os.path.exists(onnx_path) or os.path.getsize(onnx_path) == 0:
+            export_chunk_mask_estimator_onnx(estimator, onnx_path, fp16=fp16, fused_attention=fused_attention)
+    plan_path = _resolve_plan_path(onnx_path, prefix=_chunk_mask_plan_prefix())
+    with FileLock(plan_path + ".lock"):
+        if not os.path.exists(plan_path) or os.path.getsize(plan_path) == 0:
+            _convert_onnx_to_trt(onnx_path, plan_path, strongly_typed=fp16, with_attn_mask=True)
 
     runtime = trt.Runtime(_trt_logger())
     with open(plan_path, "rb") as f:

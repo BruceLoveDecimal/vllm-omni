@@ -179,6 +179,7 @@ class _FakeTrtContext:
 
     def set_tensor_address(self, name, address):
         self.addresses[name] = address
+        return True
 
     def execute_async_v3(self, stream):
         return True
@@ -241,7 +242,14 @@ class TestTensorRtMaskInput:
         if mask is None:
             mask = torch.ones(2, 1, frames)
         cfm.forward_estimator(
-            x, mask, torch.randn(2, 80, frames), torch.rand(2), torch.randn(2, 80), x, streaming, attn_mask=attn_mask
+            x,
+            mask,
+            torch.randn(2, 80, frames),
+            torch.rand(2),
+            torch.randn(2, 80),
+            x,
+            streaming=streaming,
+            attn_mask=attn_mask,
         )
         return cfm.estimator.context
 
@@ -342,7 +350,7 @@ class TestTensorRtContextIsReleased:
         monkeypatch.setattr(torch.cuda, "stream", lambda stream: torch.no_grad())
         frames = BLOCK
         x = torch.randn(2, 80, frames)
-        cfm.forward_estimator(x, torch.ones(2, 1, frames), x, torch.rand(2), torch.randn(2, 80), x, False)
+        cfm.forward_estimator(x, torch.ones(2, 1, frames), x, torch.rand(2), torch.randn(2, 80), x, streaming=False)
 
     def test_out_of_profile_shape_raises_and_releases(self, monkeypatch):
         est = _FakeTrtEstimator(supports_attn_mask=True, context=_RejectingShapeContext())
@@ -538,6 +546,7 @@ class TestTensorRtEstimatorSelection:
         decoder.estimator = _tiny_dit()
         model.code2wav = types.SimpleNamespace(flow_model=types.SimpleNamespace(decoder=decoder))
         model.model_dir = str(tmp_path)
+        (tmp_path / "flow.pt").write_bytes(b"weights")
         model._resolve_flow_estimator_onnx = lambda: str(tmp_path / "flow.decoder.estimator.fp32.onnx")
         return model, decoder
 
@@ -570,14 +579,16 @@ class TestTensorRtEstimatorSelection:
         assert built == ["chunk_mask"]
         assert decoder.estimator.supports_attn_mask is True
 
-    def test_export_failure_falls_back_to_the_bundled_engine(self, tmp_path, monkeypatch):
+    def test_export_failure_preserves_the_torch_chunk_mask(self, tmp_path, monkeypatch):
         monkeypatch.delenv("COSYVOICE3_TRT_CHUNK_MASK", raising=False)
         monkeypatch.delenv("COSYVOICE3_TRT", raising=False)
         built = self._patch(monkeypatch, chunk_mask_error=ImportError("no onnx"))
         model, decoder = self._model(tmp_path)
+        original = decoder.estimator
         model._maybe_enable_code2wav_trt()
-        assert built == ["chunk_mask", "legacy"]
-        assert decoder.estimator.supports_attn_mask is False
+        model._maybe_enable_code2wav_trt()
+        assert built == ["chunk_mask"]
+        assert decoder.estimator is original
 
     @pytest.mark.parametrize("value", ["0", "false"])
     def test_env_off_skips_the_export(self, tmp_path, monkeypatch, value):
@@ -589,9 +600,8 @@ class TestTensorRtEstimatorSelection:
         assert built == ["legacy"]
         assert decoder.estimator.supports_attn_mask is False
 
-    def test_onnx_dir_falls_back_to_the_plan_cache_when_model_dir_is_read_only(self, tmp_path, monkeypatch):
+    def test_onnx_dir_always_uses_the_plan_cache(self, tmp_path, monkeypatch):
         model, _ = self._model(tmp_path)
-        assert model._flow_estimator_onnx_dir() == str(tmp_path)
         monkeypatch.setenv("COSYVOICE3_TRT_CACHE", str(tmp_path / "cache"))
         monkeypatch.setattr("os.access", lambda path, mode: False)
         assert model._flow_estimator_onnx_dir() == str(tmp_path / "cache" / "exported")

@@ -514,7 +514,7 @@ class TestCFM:
                 return True
 
             def set_tensor_address(self, name, address):
-                pass
+                return True
 
             def execute_async_v3(self, stream):
                 self.execute_stream = stream

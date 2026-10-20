@@ -238,23 +238,25 @@ class ConditionalCFM(BASECFM):
                     # inputs the graph never reads.
                     declared = self.estimator.input_names
                     inputs = {name: tensor for name, tensor in inputs.items() if name in declared}
+                    for tensor in (*inputs.values(), out_e):
+                        if tensor.is_cuda:
+                            tensor.record_stream(stream)
                     for name, tensor in inputs.items():
                         if not estimator.set_input_shape(name, tuple(tensor.shape)):
                             raise RuntimeError(
                                 f"TensorRT flow estimator rejected shape {tuple(tensor.shape)} for input "
                                 f"'{name}' (outside the engine's optimization profile)"
                             )
-                        estimator.set_tensor_address(name, tensor.data_ptr())
-                    estimator.set_tensor_address("estimator_out", out_e.data_ptr())
+                        if not estimator.set_tensor_address(name, tensor.data_ptr()):
+                            raise RuntimeError(f"TensorRT flow estimator failed to bind input '{name}'")
+                    if not estimator.set_tensor_address("estimator_out", out_e.data_ptr()):
+                        raise RuntimeError("TensorRT flow estimator failed to bind output 'estimator_out'")
                     # ``assert`` would vanish under ``python -O`` and leave a
                     # zero-filled output; check explicitly.
                     if not estimator.execute_async_v3(stream.cuda_stream):
                         raise RuntimeError(
                             "TensorRT flow estimator failed to enqueue (execute_async_v3 returned False)"
                         )
-                    for tensor in (*inputs.values(), out_e):
-                        if tensor.is_cuda:
-                            tensor.record_stream(stream)
                 caller_stream.wait_stream(stream)
                 if out_e.is_cuda:
                     out_e.record_stream(caller_stream)
