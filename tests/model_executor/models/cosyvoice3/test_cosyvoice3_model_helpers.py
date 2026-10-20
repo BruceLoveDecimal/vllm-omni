@@ -114,6 +114,7 @@ def _make_code2wav_model(
     model._stream_audio_cache_by_req = {}
     model._stream_audio_cache_lock = Lock()
     model._stream_vocoder_cache_by_req = {}
+    model._stream_conditioning_by_req = {}
     return model
 
 
@@ -625,6 +626,85 @@ def test_forward_batches_streaming_flow_items(monkeypatch):
     assert "rid-b" in model._stream_vocoder_cache_by_req
 
 
+@pytest.mark.parametrize("batch_flow", ["0", "1"])
+@pytest.mark.parametrize("different_ids", [False, True])
+def test_mrv2_streaming_slots_preserve_request_state_across_reordered_batches(monkeypatch, batch_flow, different_ids):
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", batch_flow)
+    model = _make_code2wav_model()
+    first_infos = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2]]),
+                "speech_feat": torch.ones(1, 4, 2),
+                "embedding": torch.full((1, 2), float(index)),
+            },
+            "meta": {
+                "req_id": [f"external-{index}" if different_ids else ("internal-a" if index == 0 else "internal-b")],
+                "stream_finished": torch.tensor(False),
+                "left_context_size": 0,
+            },
+        }
+        for index in range(2)
+    ]
+    model.forward(
+        input_ids=torch.tensor([0, 1, 2, 3]),
+        positions=torch.arange(4),
+        seq_token_counts=[2, 2],
+        request_ids=["internal-a", "internal-b"],
+        model_intermediate_buffer=first_infos,
+    )
+    previous_states = dict(model._stream_vocoder_cache_by_req)
+    assert set(previous_states) == {"internal-a", "internal-b"}
+    # The runner released both slots; continuation receives no conditioning.
+    # B continues while A ends exactly at its earlier two-token boundary.
+    result = model.forward(
+        input_ids=torch.tensor([2, 3, 0, 0, 1]),
+        positions=torch.arange(5),
+        seq_token_counts=[3, 2],
+        request_ids=["internal-b", "internal-a"],
+        model_intermediate_buffer=[
+            {"meta": {"stream_finished": torch.tensor(False), "left_context_size": 2}},
+            {"meta": {"stream_finished": torch.tensor(True), "left_context_size": 2}},
+        ],
+    )
+    calls = model.code2wav.forward_streaming_calls[-2:]
+    assert calls[0]["cache_state"] is previous_states["internal-b"]
+    assert calls[1]["cache_state"] is previous_states["internal-a"]
+    assert calls[0]["embedding"].tolist() == [[1.0, 1.0]]
+    assert calls[1]["embedding"].tolist() == [[0.0, 0.0]]
+    assert calls[1]["finalize"] is True
+    assert calls[1]["token_offset_tokens"] == 2
+    assert len(result.multimodal_outputs["audio"]) == 2
+    assert set(model._stream_vocoder_cache_by_req) == {"internal-b"}
+    assert set(model._stream_conditioning_by_req) == {"internal-b"}
+    model.on_requests_finished({"internal-b"})
+    assert not model._stream_vocoder_cache_by_req
+    assert not model._stream_conditioning_by_req
+    # A new utterance after interruption starts without reference/phase state.
+    model.forward(
+        input_ids=torch.tensor([2, 3]),
+        positions=torch.arange(2),
+        seq_token_counts=[2],
+        request_ids=["internal-next"],
+        model_intermediate_buffer=[first_infos[1]],
+    )
+    assert model.code2wav.forward_streaming_calls[-1]["cache_state"] is None
+    assert set(model._stream_conditioning_by_req) == {"internal-next"}
+
+
+@pytest.mark.parametrize("request_ids", [["a"], ["a", "a"]])
+def test_mrv2_code2wav_rejects_misaligned_runner_ids(request_ids):
+    model = _make_code2wav_model()
+    with pytest.raises(ValueError, match="one unique runner request ID"):
+        model.forward(
+            input_ids=torch.tensor([0, 1, 2, 3]),
+            positions=torch.arange(4),
+            seq_token_counts=[2, 2],
+            request_ids=request_ids,
+            model_intermediate_buffer=[{}, {}],
+        )
+
+
 def test_sample_uses_ras_rejection_for_recent_repetition():
     model = _make_talker_model()
     metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
@@ -1083,6 +1163,7 @@ def test_cancelled_stream_releases_only_its_vocoder_state():
     model = SimpleNamespace(
         _stream_audio_cache_lock=Lock(),
         _stream_vocoder_cache_by_req={"cancelled": cancelled_state, "live": {"mel": torch.zeros(2)}},
+        _stream_conditioning_by_req={"cancelled": object(), "live": object()},
         code2wav=_DummyCode2Wav(vocab_size=4),
     )
     model._set_stream_state = lambda req_id, state: CosyVoice3Model._set_stream_state(model, req_id, state)
@@ -1090,6 +1171,7 @@ def test_cancelled_stream_releases_only_its_vocoder_state():
     CosyVoice3Model.on_requests_finished(model, {"cancelled"})
     assert set(model._stream_vocoder_cache_by_req) == {"live"}
     assert model.code2wav.released_states == [cancelled_state]
+    assert set(model._stream_conditioning_by_req) == {"live"}
 
 
 @pytest.mark.parametrize("mrv2,packed", [(False, False), (False, True), (True, False)])

@@ -752,6 +752,15 @@ class CosyVoice3Model(
     _sampling_eps = 1e-5
 
     @property
+    def requires_request_ids(self) -> bool:
+        """Key streaming caches by the same IDs used for runner cleanup."""
+        return self.model_stage == "cosyvoice3_code2wav"
+
+    @property
+    def requires_exact_input_shape(self) -> bool:
+        return self.model_stage == "cosyvoice3_code2wav"
+
+    @property
     def owns_generation_output_storage(self) -> bool:
         """Expose the codec's ownership contract on the model seen by the runner."""
         return self.model_stage == "cosyvoice3_code2wav" and (
@@ -830,6 +839,7 @@ class CosyVoice3Model(
 
             self._stream_audio_cache_lock = Lock()
             self._stream_vocoder_cache_by_req: dict[str, dict[str, torch.Tensor]] = {}
+            self._stream_conditioning_by_req: dict[str, EmbeddingsStruct] = {}
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
@@ -868,6 +878,9 @@ class CosyVoice3Model(
             old = self._stream_vocoder_cache_by_req.pop(req_id, None)
             if state is not None:
                 self._stream_vocoder_cache_by_req[req_id] = state
+            else:
+                # A finished or cancelled request also drops its reference conditioning.
+                self._stream_conditioning_by_req.pop(req_id, None)
         if old is None:
             return
         if state is None or old.get("flow_prefix") is not state.get("flow_prefix"):
@@ -1562,6 +1575,7 @@ class CosyVoice3Model(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         additional_information: dict[str, object] | None = None,
+        request_ids: list[str] | None = None,
         **kwargs: object,
     ) -> torch.Tensor | OmniOutput:
         if self.model_stage == "cosyvoice3_talker":
@@ -1598,6 +1612,9 @@ class CosyVoice3Model(
                 )
 
             num_reqs = max(1, len(request_ids_list))
+            if request_ids is not None:
+                if len(request_ids) != num_reqs or len(set(request_ids)) != num_reqs:
+                    raise ValueError("CosyVoice3 code2wav requires one unique runner request ID per batch row")
             debug_batch_flow = cosyvoice3_batch_flow_debug()
             if debug_batch_flow:
                 logger.info(
@@ -1620,10 +1637,20 @@ class CosyVoice3Model(
                 meta = payload.meta
                 embed = payload.embed
 
-                req_id = meta.req_id[0] if (meta and meta.req_id) else None
+                req_id = (
+                    request_ids[idx]
+                    if request_ids is not None
+                    else (meta.req_id[0] if (meta and meta.req_id) else None)
+                )
                 stream_finished = (
                     bool(meta.stream_finished.item()) if (meta and meta.stream_finished is not None) else False
                 )
+                # MRv2 releases the generation slot after each chunk. Keep
+                # reference conditioning with the request, alongside HiFT
+                # state, so the next slot needs only its current codec prefix.
+                if embed is None and req_id is not None:
+                    with self._stream_audio_cache_lock:
+                        embed = self._stream_conditioning_by_req.get(req_id)
                 speech_token = embed.speech_token if embed else None
                 speech_feat = embed.speech_feat if embed else None
                 embedding = embed.embedding if embed else None
@@ -1678,6 +1705,9 @@ class CosyVoice3Model(
                     if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
                         with self._stream_audio_cache_lock:
                             cache_state = self._stream_vocoder_cache_by_req.get(req_id)
+                            self._stream_conditioning_by_req[req_id] = EmbeddingsStruct(
+                                speech_token=speech_token, speech_feat=speech_feat, embedding=embedding
+                            )
 
                     streaming_flow_items.append(
                         {
