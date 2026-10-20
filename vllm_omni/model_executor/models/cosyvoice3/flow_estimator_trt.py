@@ -26,9 +26,10 @@ that cannot gets the decomposed-attention export instead.
 
 Precision: TensorRT >= 11 dropped the weakly-typed FP16/INT8 builder flags, so
 fp16 only comes from a STRONGLY_TYPED network built from an fp16 ONNX
-(``*autocast_fp16*``, fp16 I/O). An fp32 ONNX is built fp32 + the TF32 matmul
-flag. ``EXPLICIT_BATCH`` is implicit (no flag) and ``ITensor.dtype`` is
-read-only, so neither is set here.
+(``*autocast_fp16*``, fp16 I/O). Chunk-mask graphs retain FP32 Q/K/V projections
+and attention, with TF32 disabled. Legacy fp32 ONNX uses the TF32 matmul flag.
+``EXPLICIT_BATCH`` is implicit (no flag) and ``ITensor.dtype`` is read-only,
+so neither is set here.
 """
 
 from __future__ import annotations
@@ -63,7 +64,7 @@ ATTN_MASK_INPUT = "attn_mask"
 _MASK_MIN_SHAPE, _MASK_OPT_SHAPE, _MASK_MAX_SHAPE = (2, 1, 4, 4), (2, 1, 500, 500), (2, 1, 3000, 3000)
 # Part of the exported ONNX's cache key. Bump it whenever the DiT's forward or
 # the export below changes, so engines traced from older code are not reused.
-_CHUNK_MASK_EXPORT_VERSION = 1
+_CHUNK_MASK_EXPORT_VERSION = 2
 
 
 def _is_fp16_onnx(onnx_path: str) -> bool:
@@ -99,7 +100,9 @@ def _convert_onnx_to_trt(onnx_path: str, plan_path: str, strongly_typed: bool, w
     logger.info(
         "Building flow-estimator TensorRT engine from %s (%s) ...",
         onnx_path,
-        "strongly-typed/fp16" if strongly_typed else "fp32+TF32",
+        ("mixed fp16/fp32" if strongly_typed else "fp32") + ", TF32 disabled"
+        if with_attn_mask
+        else ("strongly-typed/fp16" if strongly_typed else "fp32+TF32"),
     )
     trt_logger = _trt_logger()
     builder = trt.Builder(trt_logger)
@@ -119,7 +122,12 @@ def _convert_onnx_to_trt(onnx_path: str, plan_path: str, strongly_typed: bool, w
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 32)  # 4 GiB
-    if not strongly_typed:
+    if with_attn_mask:
+        # Strong typing fixes tensor dtypes, but TRT still enables TF32 by
+        # default for FP32 matmuls. Keep the sensitive Q/K/V projections and
+        # attention arithmetic in full FP32, including the decomposed fallback.
+        config.clear_flag(trt.BuilderFlag.TF32)
+    elif not strongly_typed:
         # fp32 ONNX: enable the best available reduced-precision matmul flag
         # (FP16 on older TRT, else TF32 on Ampere+/Hopper). For a strongly-typed
         # network the precision is fixed by the graph, so no flag is set.
@@ -364,20 +372,20 @@ class _EstimatorWithMaskInput(torch.nn.Module):
 def _fp32_attention_for_export(estimator: torch.nn.Module):
     """Trace the DiT's masked attention in fp32 under fp16 autocast.
 
-    The softmax over a masked ``T x T`` score map loses precision in fp16 as
-    ``T`` grows (the bundled engine keeps it in fp32 too: its error against
-    the torch DiT is about 4x lower than an all-fp16 trace). The casts are
-    recorded into the graph, so the engine runs that block in fp32 and
-    everything else in fp16. Scoped to ``estimator``'s own attention layers.
+    Q/K/V projections must also stay in fp32: casting their fp16 outputs
+    before softmax cannot undo rounding or overflow. These casts are recorded
+    into the graph; the remaining layers use fp16. Restore each layer's
+    previous flag even after an export failure or a nested context.
     """
     layers = [m for m in estimator.modules() if hasattr(m, "fp32_masked_attention")]
+    previous = [layer.fp32_masked_attention for layer in layers]
     for layer in layers:
         layer.fp32_masked_attention = True
     try:
         yield
     finally:
-        for layer in layers:
-            layer.fp32_masked_attention = False
+        for layer, enabled in zip(layers, previous):
+            layer.fp32_masked_attention = enabled
 
 
 # Custom domain the SDPA symbolic emits into; rewritten to the standard ONNX
@@ -444,8 +452,9 @@ def export_chunk_mask_estimator_onnx(
 
     ``fused_attention`` (fp16 only) exports each masked SDPA as one ONNX
     ``Attention`` node (opset 23) instead of matmuls + softmax, still in fp32:
-    TensorRT runs it as a fused MHA kernel, several times faster than the
-    decomposed graph it cannot fuse. It stays fp32 because some layers of the
+    TensorRT can run it as a fused MHA kernel when that precision and shape
+    are supported; otherwise the builder falls back to the decomposed graph.
+    Q/K/V projections and attention stay fp32 because some layers of the
     released checkpoint reach attention scores past 1e6, which a fused fp16
     kernel overflows (it keeps the scores in the input dtype).
     """
@@ -539,7 +548,7 @@ def _chunk_mask_graph_cache_key(estimator, cache_key: str | None) -> str:
 
 def _chunk_mask_plan_prefix() -> str:
     profile = (_MIN_SHAPES, _OPT_SHAPES, _MAX_SHAPES, _MASK_MIN_SHAPE, _MASK_OPT_SHAPE, _MASK_MAX_SHAPE)
-    key = json.dumps((profile, torch.version.cuda))
+    key = json.dumps((profile, torch.version.cuda, _CHUNK_MASK_EXPORT_VERSION))
     return f"flow_estimator_chunk_mask_{hashlib.sha256(key.encode()).hexdigest()[:16]}"
 
 
@@ -611,7 +620,7 @@ def build_chunk_mask_flow_estimator_trt(
         except Exception as exc:
             logger.warning(
                 "CosyVoice3 chunk-mask estimator: fused-attention engine unavailable (%s); "
-                "using fp32 attention, which is slower",
+                "using decomposed fp32 attention, which is slower",
                 exc,
             )
     return _build_chunk_mask_engine(estimator, onnx_dir, device, fp16=fp16, cache_key=cache_key, fused_attention=False)

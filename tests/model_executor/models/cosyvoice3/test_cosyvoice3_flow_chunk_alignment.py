@@ -310,9 +310,12 @@ class TestTensorRtMaskInput:
         cfm = _cfm(_FakeTrtEstimator(supports_attn_mask=True))
         built = []
         real = cfm._trt_attention_mask
-        monkeypatch.setattr(
-            cfm, "_trt_attention_mask", lambda mask, streaming: built.append(1) or real(mask, streaming)
-        )
+
+        def recorded_mask(mask, streaming):
+            built.append(1)
+            return real(mask, streaming)
+
+        monkeypatch.setattr(cfm, "_trt_attention_mask", recorded_mask)
         frames = BLOCK + 6
         mu = torch.randn(1, 80, frames)
         cfm.solve_euler(
@@ -376,12 +379,12 @@ class TestFinalizeIsBidirectional:
         model = object.__new__(CosyVoice3Code2Wav)
         nn.Module.__init__(model)
         model.flow_model = types.SimpleNamespace(token_mel_ratio=2, pre_lookahead_len=3)
-        model._forward_mel = types.MethodType(
-            lambda self, token, prompt_token, prompt_feat, embedding, **kw: (calls.append(kw), torch.zeros(1, 80, 4))[
-                1
-            ],
-            model,
-        )
+
+        def recorded_mel(self, token, prompt_token, prompt_feat, embedding, **kw):
+            calls.append(kw)
+            return torch.zeros(1, 80, 4)
+
+        model._forward_mel = types.MethodType(recorded_mel, model)
         model._stream_hift_from_feat = types.MethodType(lambda self, feat, **kw: (feat, {}), model)
         common = dict(
             prompt_token=torch.zeros(1, 2, dtype=torch.int32),
@@ -634,6 +637,44 @@ def test_fp32_export_attention_is_scoped_to_the_estimator():
         assert all(m.fp32_masked_attention for m in layers)
         assert not any(getattr(m, "fp32_masked_attention", False) for m in other.modules())
     assert not any(m.fp32_masked_attention for m in layers)
+
+
+def test_fp32_export_attention_restores_nested_flags_after_failure():
+    from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import _fp32_attention_for_export
+
+    dit = _tiny_dit()
+    layers = [m for m in dit.modules() if hasattr(m, "fp32_masked_attention")]
+    layers[0].fp32_masked_attention = True
+    previous = [m.fp32_masked_attention for m in layers]
+    with pytest.raises(RuntimeError, match="export failed"):
+        with _fp32_attention_for_export(dit):
+            with _fp32_attention_for_export(dit):
+                assert all(m.fp32_masked_attention for m in layers)
+            assert all(m.fp32_masked_attention for m in layers)
+            raise RuntimeError("export failed")
+    assert [m.fp32_masked_attention for m in layers] == previous
+
+
+@torch.inference_mode()
+def test_fp32_export_attention_prevents_projection_overflow_under_autocast():
+    from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import _fp32_attention_for_export
+
+    attn = _tiny_dit().transformer_blocks[0].attn
+    # The checkpoint has large Q/K projections. Force overflow before SDPA:
+    # casting an already infinite fp16 projection to fp32 cannot repair it.
+    for projection in (attn.to_q, attn.to_k):
+        projection.weight.fill_(500)
+        projection.bias.zero_()
+    x = torch.full((2, 7, attn.dim), 200.0)
+    mask = torch.ones(2, 1, 7, 7, dtype=torch.bool)
+    expected = attn(x, mask=mask)
+    with torch.autocast("cpu", dtype=torch.float16):
+        broken = attn(x, mask=mask)
+        with _fp32_attention_for_export(attn):
+            actual = attn(x, mask=mask)
+    assert not torch.isfinite(broken).all()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual.float(), expected, rtol=0.002, atol=0.05)
 
 
 def test_fused_export_emits_one_attention_node_per_layer(tmp_path):

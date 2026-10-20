@@ -122,9 +122,9 @@ class DiTAttention(nn.Module):
         self.inner_dim = dim_head * heads
         self.dropout = dropout
         self.scale = 1.0 / math.sqrt(dim_head)
-        # Run the full-mask SDPA in fp32 under autocast. Only the fp16 ONNX
-        # export sets it (see ``flow_estimator_trt``), so the engine keeps
-        # the masked softmax in fp32.
+        # Keep Q/K/V projections and masked SDPA in fp32 during ONNX export.
+        # Casting only the projected tensors cannot recover precision already
+        # lost to fp16 rounding or overflow in the projections.
         self.fp32_masked_attention = False
 
         # Q/K/V projections
@@ -152,9 +152,16 @@ class DiTAttention(nn.Module):
         batch_size, seq_len = x.shape[0], x.shape[1]
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_qkv_projection"):
-            query = self.to_q(x)
-            key = self.to_k(x)
-            value = self.to_v(x)
+            if self.fp32_masked_attention and _is_full_qk_mask(mask):
+                with torch.autocast(device_type=x.device.type, enabled=False):
+                    query, key, value = (
+                        F.linear(x.float(), proj.weight.float(), None if proj.bias is None else proj.bias.float())
+                        for proj in (self.to_q, self.to_k, self.to_v)
+                    )
+            else:
+                query = self.to_q(x)
+                key = self.to_k(x)
+                value = self.to_v(x)
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_rope"):
             if rope is not None:

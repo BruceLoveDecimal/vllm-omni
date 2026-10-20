@@ -16,6 +16,43 @@ def _temporary_plans(plan_path: Path) -> list[Path]:
     return list(plan_path.parent.glob(f"{plan_path.name}.tmp.*"))
 
 
+@pytest.mark.parametrize("strongly_typed", [False, True])
+@pytest.mark.parametrize("with_attn_mask", [False, True])
+def test_chunk_mask_builder_disables_tf32(tmp_path, monkeypatch, strongly_typed, with_attn_mask):
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    builder, parser, config = MagicMock(), MagicMock(), MagicMock()
+    builder.create_builder_config.return_value = config
+    builder.build_serialized_network.return_value = b"engine"
+    parser.parse.return_value = True
+    flags = SimpleNamespace(FP16="fp16", TF32="tf32")
+    trt = SimpleNamespace(
+        Builder=MagicMock(return_value=builder),
+        OnnxParser=MagicMock(return_value=parser),
+        NetworkDefinitionCreationFlag=SimpleNamespace(STRONGLY_TYPED=1),
+        BuilderFlag=flags,
+        MemoryPoolType=SimpleNamespace(WORKSPACE=0),
+    )
+    monkeypatch.setitem(sys.modules, "tensorrt", trt)
+    monkeypatch.setattr(flow_estimator_trt, "_trt_logger", lambda: None)
+    graph = tmp_path / "estimator.onnx"
+    graph.write_bytes(b"graph")
+    flow_estimator_trt._convert_onnx_to_trt(
+        str(graph), str(tmp_path / "estimator.plan"), strongly_typed, with_attn_mask
+    )
+    if with_attn_mask:
+        config.clear_flag.assert_called_once_with(flags.TF32)
+        config.set_flag.assert_not_called()
+    else:
+        config.clear_flag.assert_not_called()
+        if strongly_typed:
+            config.set_flag.assert_not_called()
+        else:
+            config.set_flag.assert_called_once_with(flags.FP16)
+
+
 def test_write_plan_cleans_up_after_replace_failure(tmp_path, monkeypatch):
     plan_path = tmp_path / "flow.plan"
     plan_path.write_bytes(b"existing plan")
@@ -592,7 +629,9 @@ def test_chunk_cache_invalidates_export_or_plan_configuration(tmp_path, monkeypa
     if change == "precision":
         kwargs["fp16"] = True
     elif change == "export_version":
-        monkeypatch.setattr(flow_estimator_trt, "_CHUNK_MASK_EXPORT_VERSION", 2)
+        monkeypatch.setattr(
+            flow_estimator_trt, "_CHUNK_MASK_EXPORT_VERSION", flow_estimator_trt._CHUNK_MASK_EXPORT_VERSION + 1
+        )
     elif change == "architecture":
         import torch
 
@@ -760,10 +799,15 @@ def test_optimized_session_still_enqueues_and_uses_engine_output_dtype(monkeypat
     exec(compile(source, "<optimized-trt-session>", "exec", optimize=2), namespace)
     monkeypatch.setattr(flow_estimator_trt._TrtEstimatorSession, "run", namespace["run"])
     calls = []
+
+    def enqueue(stream):
+        calls.append(stream)
+        return True
+
     context = SimpleNamespace(
         set_input_shape=lambda *args: True,
         set_tensor_address=lambda *args: True,
-        execute_async_v3=lambda stream: calls.append(stream) or True,
+        execute_async_v3=enqueue,
     )
     stream = SimpleNamespace(cuda_stream=0, wait_stream=lambda other: None)
     monkeypatch.setattr(torch.cuda, "Stream", lambda device: stream)
