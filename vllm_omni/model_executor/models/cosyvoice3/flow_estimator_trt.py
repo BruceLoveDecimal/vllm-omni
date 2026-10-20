@@ -597,7 +597,7 @@ def build_chunk_mask_flow_estimator_trt(
     onnx_dir: str,
     device: str | torch.device,
     *,
-    fp16: bool = True,
+    fp16: bool = False,
     cache_key: str | None = None,
 ) -> TrtContextWrapper:
     """Build/load a flow-estimator engine that takes the chunk-causal mask.
@@ -609,8 +609,11 @@ def build_chunk_mask_flow_estimator_trt(
     collide when ``onnx_dir`` is shared. ``estimator.static_chunk_size`` goes
     to the wrapper so ``forward_estimator`` can build the mask upstream would.
 
-    An fp16 engine first tries fused attention (ONNX ``Attention``, opset 23);
-    a TensorRT that cannot parse or build it gets the fp32-attention export.
+    Default to FP32 throughout: FP16 feed-forward/residual rounding can be
+    amplified by the checkpoint's large attention scores even when attention
+    itself is FP32. Explicit ``fp16=True`` opts into mixed precision and first
+    tries fused attention (ONNX ``Attention``, opset 23), falling back to the
+    decomposed mixed-precision graph if TensorRT cannot parse or build it.
     """
     if fp16:
         try:

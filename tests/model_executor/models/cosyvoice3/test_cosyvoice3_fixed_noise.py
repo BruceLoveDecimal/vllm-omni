@@ -54,6 +54,40 @@ def test_buffer_matches_upstream_seed_zero_draw():
     assert "rand_noise" not in cfm.state_dict()  # not a checkpoint key
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fixed_noise_is_independent_of_default_construction_dtype(dtype):
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        cfm = _cfm()
+    finally:
+        torch.set_default_dtype(previous)
+    expected = torch.randn(
+        (1, 80, _FIXED_NOISE_FRAMES), generator=torch.Generator().manual_seed(0), dtype=torch.float32
+    )
+    assert cfm.rand_noise.dtype == torch.float32
+    assert torch.equal(cfm.rand_noise, expected)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_standard_flow_keeps_fp32_under_bfloat16_worker_default(monkeypatch, packed):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
+    from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+
+    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: packed)
+    config = CosyVoice3Config()
+    config.flow["pre_lookahead_layer"]["channels"] = 32
+    config.flow["decoder"]["estimator"].update(dim=32, depth=2, heads=4, dim_head=8)
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        model = CosyVoice3Code2Wav(config)
+    finally:
+        torch.set_default_dtype(previous)
+    assert {p.dtype for p in model.flow_model.parameters()} == {torch.bfloat16 if packed else torch.float32}
+    assert model.flow_model.decoder.rand_noise.dtype == torch.float32
+
+
 def test_default_offset_is_the_buffer_prefix():
     cfm = _cfm()
     mu = torch.zeros(2, 80, 96)

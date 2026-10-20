@@ -131,6 +131,13 @@ class CosyVoice3Code2Wav(nn.Module):
             pre_lookahead_layer=pre_lookahead_layer,
             decoder=decoder,
         )
+        # Worker construction inherits the talker's dtype. Standard Flow needs
+        # FP32 throughout: repeated Euler steps and large Q/K scores amplify
+        # reduced-precision rounding. Promote before loading flow.pt so the
+        # checkpoint is not rounded through BF16 first. Packed kernels retain
+        # their explicitly selected reduced-precision execution path.
+        if not cosyvoice3_packed_inference_enabled():
+            self.flow_model = self.flow_model.float()
         # Build HiFiGAN vocoder
         f0_predictor = CausalConvRNNF0Predictor(
             num_class=config.hift["f0_predictor"]["num_class"],

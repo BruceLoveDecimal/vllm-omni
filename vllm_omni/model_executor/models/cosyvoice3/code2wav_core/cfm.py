@@ -304,7 +304,12 @@ class CausalConditionalCFM(ConditionalCFM):
         # Upstream's seeded draw without touching the global RNG. On the CPU so
         # the values match whatever device the model is built under.
         generator = torch.Generator(device="cpu").manual_seed(_FIXED_NOISE_SEED)
-        noise = torch.randn([1, _FIXED_NOISE_CHANNELS, _FIXED_NOISE_FRAMES], generator=generator, device="cpu")
+        noise = torch.randn(
+            [1, _FIXED_NOISE_CHANNELS, _FIXED_NOISE_FRAMES],
+            generator=generator,
+            device="cpu",
+            dtype=torch.float32,
+        )
         self.register_buffer("rand_noise", noise, persistent=False)
 
     def fixed_noise(self, mu, prompt_len: int = 0, noise_offset=None, temperature: float = 1.0):

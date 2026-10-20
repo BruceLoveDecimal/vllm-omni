@@ -508,7 +508,7 @@ class TestFusedAttentionFallback:
         calls = []
 
         def fake_build(estimator, onnx_dir, device, *, fp16, cache_key, fused_attention):
-            calls.append(fused_attention)
+            calls.append((fp16, fused_attention))
             if fused_attention and fail_fused:
                 raise RuntimeError("UNSUPPORTED_NODE: Attention")
             return f"engine(fused={fused_attention})"
@@ -516,15 +516,20 @@ class TestFusedAttentionFallback:
         monkeypatch.setattr(flow_estimator_trt, "_build_chunk_mask_engine", fake_build)
         return calls
 
-    def test_fused_engine_is_preferred(self, tmp_path, monkeypatch):
+    def test_default_uses_fp32_throughout(self, tmp_path, monkeypatch):
         calls = self._patch_builder(monkeypatch, fail_fused=False)
         got = flow_estimator_trt.build_chunk_mask_flow_estimator_trt(object(), str(tmp_path), "cuda")
-        assert got == "engine(fused=True)" and calls == [True]
+        assert got == "engine(fused=False)" and calls == [(False, False)]
+
+    def test_explicit_fp16_prefers_fused_attention(self, tmp_path, monkeypatch):
+        calls = self._patch_builder(monkeypatch, fail_fused=False)
+        got = flow_estimator_trt.build_chunk_mask_flow_estimator_trt(object(), str(tmp_path), "cuda", fp16=True)
+        assert got == "engine(fused=True)" and calls == [(True, True)]
 
     def test_unbuildable_fused_engine_falls_back_to_fp32_attention(self, tmp_path, monkeypatch):
         calls = self._patch_builder(monkeypatch, fail_fused=True)
-        got = flow_estimator_trt.build_chunk_mask_flow_estimator_trt(object(), str(tmp_path), "cuda")
-        assert got == "engine(fused=False)" and calls == [True, False]
+        got = flow_estimator_trt.build_chunk_mask_flow_estimator_trt(object(), str(tmp_path), "cuda", fp16=True)
+        assert got == "engine(fused=False)" and calls == [(True, True), (True, False)]
 
     def test_fused_and_fp32_attention_exports_do_not_share_a_file(self, tmp_path):
         fused = flow_estimator_trt.chunk_mask_estimator_onnx_path(
