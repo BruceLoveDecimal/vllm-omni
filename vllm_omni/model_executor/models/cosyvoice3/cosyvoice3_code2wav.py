@@ -729,9 +729,9 @@ class CosyVoice3Code2Wav(nn.Module):
     ) -> list[tuple[torch.Tensor, StreamingHiFTState | None]]:
         """HiFT for a group of streaming items, batched across them when enabled.
 
-        Non-final windows run together; a final window emits its tail and runs
-        alone at exact width. Windows the batched step does not cover take the
-        per-request path.
+        Settled windows, final or not, batch right aligned; early non-final
+        windows batch left aligned; an early final window runs alone at exact
+        width. Windows the batched step does not cover take the per-request path.
         """
         if not cosyvoice3_hift_batch_enabled():
             return [
@@ -747,19 +747,23 @@ class CosyVoice3Code2Wav(nn.Module):
                 results[index] = self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
             else:
                 pending.append((index, *prepared))
-        group_size = 1 if finalize else 16
-        for start in range(0, len(pending), group_size):
-            group = pending[start : start + group_size]
-            speeches, carries = batcher.run([window for _, window, _ in group], finalize=finalize)
-            for (index, window, mel_offset), speech, carry in zip(group, speeches, carries):
-                state: StreamingHiFTState | None = None
-                if not finalize:
-                    state = {
-                        "mel": window.mel.detach().clone(),
-                        "mel_offset": mel_offset,
-                        "phase_acc": None if carry is None else carry.detach().clone(),
-                    }
-                results[index] = (speech, state)
+        layouts: dict[str, list] = {}
+        for entry in pending:
+            layouts.setdefault(batcher.layout(entry[1]), []).append(entry)
+        for layout, entries in layouts.items():
+            group_size = 1 if layout == "exact" else 16
+            for start in range(0, len(entries), group_size):
+                group = entries[start : start + group_size]
+                speeches, carries = batcher.run([window for _, window, _ in group], layout=layout)
+                for (index, window, mel_offset), speech, carry in zip(group, speeches, carries):
+                    state: StreamingHiFTState | None = None
+                    if not finalize:
+                        state = {
+                            "mel": window.mel.detach().clone(),
+                            "mel_offset": mel_offset,
+                            "phase_acc": None if carry is None else carry.detach().clone(),
+                        }
+                    results[index] = (speech, state)
         return cast(list[tuple[torch.Tensor, StreamingHiFTState | None]], results)
 
     def _get_hift_batcher(self):
@@ -793,12 +797,13 @@ class CosyVoice3Code2Wav(nn.Module):
             mel = torch.cat([cached_mel[..., history - overlap - f0_margin :], chunk_mel], dim=-1)
         decoded = mel.shape[-1] - f0_margin
         new_frames = chunk_mel.shape[-1]
-        if new_frames == 0 or decoded - batcher.trim - batcher.look_right - 1 <= 0:
+        if new_frames == 0 or decoded - batcher.held_back <= 0:
             return None
         phase_acc = None if not cache_state else cache_state.get("phase_acc")
         if phase_acc is not None:
             phase_acc = phase_acc.to(device=chunk_mel.device, dtype=chunk_mel.dtype)
         emit_start, emit_end = batcher.emit_range(decoded, new_frames, finalize=finalize)
+        left_context = int(self.hift.f0_predictor.left_context_frames)
         window = HiftWindow(
             mel=mel,
             margin=f0_margin,
@@ -807,6 +812,12 @@ class CosyVoice3Code2Wav(nn.Module):
             next_overlap=min(overlap_frames, decoded),
             emit_start=emit_start,
             emit_end=emit_end,
+            final=finalize,
+            settled=(
+                phase_acc is not None
+                and decoded - new_frames == overlap_frames >= batcher.settled_overlap
+                and f0_margin == left_context
+            ),
         )
         return window, window_offset - f0_margin
 
