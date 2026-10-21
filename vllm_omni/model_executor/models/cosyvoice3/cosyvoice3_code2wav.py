@@ -617,6 +617,8 @@ class CosyVoice3Code2Wav(nn.Module):
         sentence's prompt and speech) and, with HiFT batching and decode graphs
         on, every padded HiFT batch up to ``hift_frames`` wide (F0 margin,
         overlap and a 100-token hop). Longer Flow layouts still record on demand.
+        HiFT's cuFFT plans are created here too, for every width up to
+        ``hift_frames``, whether or not decode graphs are on.
         """
         from .code2wav_core.packed_dit import _FLOW_GRAPH_MAX_TOTAL, _FLOW_GRAPH_SLOTS, flow_graph_totals
 
@@ -648,11 +650,14 @@ class CosyVoice3Code2Wav(nn.Module):
         hift_graphs = 0
         if cosyvoice3_hift_batch_enabled():
             hift_graphs = self._get_hift_batcher().capture_decode_graphs(hift_frames)
+        fft_widths = self._get_hift_batcher().warm_fft_plans(hift_frames)
         torch.accelerator.synchronize()
         logger.info(
-            "CosyVoice3 code2wav: recorded %d Flow and %d HiFT CUDA graphs in %.1f s using %.2f GiB",
+            "CosyVoice3 code2wav: recorded %d Flow and %d HiFT CUDA graphs and warmed %d HiFT FFT sizes "
+            "in %.1f s using %.2f GiB",
             flow_graphs,
             hift_graphs,
+            fft_widths,
             time.perf_counter() - start,
             (free_before - torch.accelerator.get_memory_info()[0]) / 2**30,
         )

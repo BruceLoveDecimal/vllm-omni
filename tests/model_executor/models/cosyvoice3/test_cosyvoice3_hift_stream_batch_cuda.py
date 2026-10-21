@@ -118,3 +118,36 @@ def test_captured_batch_graphs_replay_without_recording(monkeypatch):
     for stream_expected, stream_actual in zip(expected, actual):
         for want, got in zip(stream_expected, stream_actual):
             torch.testing.assert_close(got, want, atol=ATOL, rtol=RTOL)
+
+
+@pytest.mark.nvidia_only
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("decode_graphs", [False, True])
+@torch.inference_mode()
+def test_warmed_fft_plans_cover_every_streaming_decode(monkeypatch, decode_graphs):
+    """After warm_fft_plans, streaming creates no cuFFT plan: early final windows
+    decode at their own width, batches at padded widths, and every size is warm.
+    A plan created while serving waits for the GPU's queued work."""
+    monkeypatch.setattr(cosyvoice3_code2wav, "cosyvoice3_packed_streaming_enabled", lambda: True)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    model = _voiced_model(64)
+    model.hift.cuda()
+    model.hift.enable_cached_istft()
+    if decode_graphs:
+        model.hift.enable_decode_graphs()
+        model._get_hift_batcher().capture_decode_graphs(256)
+    plans = torch.backends.cuda.cufft_plan_cache
+    # Widths up to 256 hold every window of STREAMS: 256 single rows, 4 widths for 4 row slots.
+    assert model._get_hift_batcher().warm_fft_plans(256) == 256 + 4 * 4
+    warmed = plans.size
+    with monkeypatch.context() as batched:
+        batched.setattr(cosyvoice3_code2wav, "cosyvoice3_hift_batch_enabled", lambda: True)
+        batched.setattr(model, "_stream_hift", _side_stream_hift(model))
+        actual = _run(model, batched=True)
+        torch.accelerator.synchronize()
+    assert plans.size == warmed
+    expected = _run(_OnCuda(model), batched=False)
+    for stream_expected, stream_actual in zip(expected, actual):
+        for want, got in zip(stream_expected, stream_actual):
+            torch.testing.assert_close(got, want, atol=ATOL, rtol=RTOL)

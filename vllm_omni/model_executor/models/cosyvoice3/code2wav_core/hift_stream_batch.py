@@ -169,6 +169,29 @@ class StreamingHiFTBatcher:
                 count += 1
         return count
 
+    def warm_fft_plans(self, max_frames: int) -> int:
+        """Decode once at every width the streaming step can meet up to
+        ``max_frames`` frames; returns how many decodes ran.
+
+        The decoder's STFT and inverse FFT need a cuFFT plan per input size.
+        Creating one loads a module, which waits for the GPU's queued work:
+        behind a busy step's Flow graphs that took up to ~190 ms, stalling the
+        whole step. Early final windows and the per-request path decode one row
+        at their own width; batches use the padded row-slot widths. Created
+        here on an idle GPU, each plan costs well under a millisecond.
+        """
+        weight = self.hift.m_source.l_linear.weight
+        mels = self.hift.conv_pre.in_channels
+        shapes = [(1, width) for width in range(1, max_frames + 1)]
+        shapes += [
+            (rows, width) for rows in _ROW_SLOTS[1:] for width in range(_FRAME_STEP, max_frames + 1, _FRAME_STEP)
+        ]
+        for rows, width in shapes:
+            mel = weight.new_zeros((rows, mels, width))
+            source = weight.new_zeros((rows, 1, width * self.scale))
+            self.hift.decode(x=mel, s=source, finalize=True)
+        return len(shapes)
+
     def _source(
         self, f0: torch.Tensor, windows: list[HiftWindow], origins: list[int]
     ) -> tuple[torch.Tensor, torch.Tensor]:

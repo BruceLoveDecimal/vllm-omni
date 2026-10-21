@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -144,6 +146,8 @@ def test_captured_flow_graphs_serve_a_stream_without_recording(monkeypatch):
     """Graphs captured at startup serve prefix-cache hops and final hops of
     short streams: nothing records on demand and the mel matches eager Flow."""
     model = _tiny_packed_streaming(monkeypatch, prefix_gib="0.25", graphs="1")
+    # The HiFT stand-in has no FFT plans to warm.
+    monkeypatch.setattr(model, "_get_hift_batcher", lambda: SimpleNamespace(warm_fft_plans=lambda frames: 0))
     # Three requests, 128 frames a row at most: one row slot of 4, up to 512 frames.
     model.capture_graphs(n_timesteps=3, row_frames=128)
     runner = model._packed_estimator.graph_runner
