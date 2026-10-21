@@ -138,16 +138,22 @@ def _plan_views(table64: torch.Tensor, table32: torch.Tensor, sizes: _PlanSizes,
 
 @torch.library.custom_op("vllm_omni_cosyvoice3_perf::prefix_cache_conv_input", mutates_args=())
 def prefix_cache_conv_input(h: torch.Tensor, slots: torch.Tensor, context_slots: torch.Tensor) -> torch.Tensor:
-    """Read the cached convolution context, then store this hop's inputs."""
+    """Read the cached convolution context, store this hop's inputs, and
+    return both: ``[context; h]``.
+
+    The op declares no mutation, so a compiled graph keeps it only for its
+    result. On a request's first hop the context is empty; returning it
+    alone would let Inductor drop the call, and this hop's store with it.
+    """
     pool = _ACTIVE_CACHE.conv_input
     context = pool[context_slots]
     pool[slots] = h
-    return context
+    return torch.cat((context, h))
 
 
 @prefix_cache_conv_input.register_fake
 def _(h: torch.Tensor, slots: torch.Tensor, context_slots: torch.Tensor) -> torch.Tensor:
-    return h.new_empty((context_slots.shape[0], h.shape[1]))
+    return h.new_empty((context_slots.shape[0] + h.shape[0], h.shape[1]))
 
 
 @torch.library.custom_op("vllm_omni_cosyvoice3_perf::prefix_attention", mutates_args=())
@@ -292,8 +298,7 @@ def forward_prefix(
     """One DiT evaluation of the new rows only; mirrors forward_packed_tensor_geometry."""
     dit = estimator.dit
     h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
-    context = prefix_cache_conv_input(h[0], slots, context_slots)
-    window = torch.cat((context, h[0]))[plan.conv_order]
+    window = prefix_cache_conv_input(h[0], slots, context_slots)[plan.conv_order]
     h = conv_pos_embed_windows(estimator, window, plan)[plan.conv_take].unsqueeze(0) + h
     residual = h
     for index, block in enumerate(dit.transformer_blocks):
