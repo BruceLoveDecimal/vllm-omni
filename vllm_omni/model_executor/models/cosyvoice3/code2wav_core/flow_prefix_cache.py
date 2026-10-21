@@ -406,6 +406,25 @@ class FlowPrefixCache:
             outputs += self._solve_group(queries[begin : begin + group_size], time_span, cfg_rate, modulation_key)
         return outputs
 
+    def capture(
+        self,
+        rows: int,
+        total: int,
+        like: torch.Tensor,
+        speaker_dim: int,
+        time_span: torch.Tensor,
+        *,
+        cfg_rate: float,
+        modulation_key: tuple,
+    ) -> None:
+        """Record the solve of ``rows`` row slots and ``total`` query frames (a
+        bucket) before serving; only the padding entry runs, on the scratch page."""
+        global _ACTIVE_CACHE
+        _ACTIVE_CACHE = self
+        empty = like.new_zeros((1, 0, like.shape[-1]))
+        speakers = like.new_zeros((0, speaker_dim))
+        self._replay([], rows, total, empty, empty, empty, speakers, time_span, cfg_rate, modulation_key)
+
     def _solve_group(
         self, queries: list[PrefixQuery], time_span: torch.Tensor, cfg_rate: float, modulation_key: tuple
     ) -> list[torch.Tensor]:

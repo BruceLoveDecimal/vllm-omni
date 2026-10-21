@@ -662,6 +662,14 @@ def flow_graph_total(total: int) -> int:
     return -(-total // step) * step
 
 
+def flow_graph_totals(limit: int) -> list[int]:
+    """Every packed-length bucket up to the one holding ``limit`` frames."""
+    totals = [flow_graph_total(1)]
+    while totals[-1] < limit:
+        totals.append(flow_graph_total(totals[-1] + 1))
+    return totals
+
+
 @dataclass
 class _FlowGraph:
     graph: torch.cuda.CUDAGraph
@@ -805,6 +813,25 @@ class FlowGraphRunner:
             modulations,
             cfg_rate,
         )
+
+    def capture(
+        self,
+        slots: int,
+        total: int,
+        like: torch.Tensor,
+        speaker_dim: int,
+        time_span: torch.Tensor,
+        *,
+        cfg_rate: float,
+        key: tuple,
+    ) -> None:
+        """Record the full-context solve of ``slots`` row slots and ``total``
+        packed frames (a bucket) before serving, from one zero batch in it."""
+        lengths = (total - slots + 1,) + (1,) * (slots - 1)
+        zeros = like.new_zeros((1, total, like.shape[-1]))
+        speakers = like.new_zeros((slots, speaker_dim))
+        rows = pack_rows(lengths, like.device)
+        self.run(zeros, time_span, zeros, speakers, zeros, rows, cfg_rate=cfg_rate, streaming=False, key=key)
 
     def run(
         self,
