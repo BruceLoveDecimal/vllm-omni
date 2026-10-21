@@ -6,6 +6,8 @@
 # holds ~4.6k frames: ~90 s of prompt + generated audio across live requests).
 # Requests the pool cannot hold fall back to full recompute. The pool and the
 # Flow CUDA graphs are allocated outside gpu_memory_utilization.
+# Cached ISTFT removes the host sync of every streaming HiFT row; HiFT decode
+# graphs stay opt-in (COSYVOICE3_HIFT_GRAPH) because they capture lazily.
 # Shared serving settings come from the full-response profile; only chunk
 # boundaries, codec admission capacity, and stage environment differ.
 base_config: cosyvoice3_full_response.yaml
@@ -22,4 +24,5 @@ stages:
       COSYVOICE3_PACKED_STREAMING: "1"
       COSYVOICE3_FLOW_GRAPH: "1"
       COSYVOICE3_FLOW_PREFIX_CACHE_GIB: "8"
+      COSYVOICE3_CACHED_ISTFT: "1"
     max_num_seqs: 16
