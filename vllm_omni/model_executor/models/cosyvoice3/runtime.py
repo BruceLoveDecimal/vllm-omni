@@ -19,6 +19,16 @@ def cosyvoice3_batch_flow_enabled() -> bool:
     return _env_flag("COSYVOICE3_BATCH_FLOW", "0")
 
 
+def cosyvoice3_hift_batch_enabled() -> bool:
+    """Run packed streaming's non-final HiFT windows as one batched call per step."""
+    return _env_flag("COSYVOICE3_HIFT_BATCH", "0")
+
+
+def cosyvoice3_hift_stream_enabled() -> bool:
+    """Run packed streaming's HiFT on its own CUDA stream, overlapping later Flow groups."""
+    return _env_flag("COSYVOICE3_HIFT_STREAM", "0")
+
+
 def cosyvoice3_batch_flow_debug() -> bool:
     """Return whether Stage-1 batching diagnostics are enabled."""
     return _env_flag("COSYVOICE3_BATCH_FLOW_DEBUG", "0")

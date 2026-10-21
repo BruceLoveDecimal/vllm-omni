@@ -38,6 +38,7 @@ from .packed_dit import (
     layer_norm_preserving_eager,
     packed_conv_mish,
     rotate_in_place,
+    to_device_async,
 )
 
 PAGE_FRAMES = 16
@@ -434,7 +435,8 @@ class FlowPrefixCache:
                 width=max(len(entry.pages) for entry in entries),
             )
             table64, table32 = self._build_tables(entries, sizes)
-            plan = _plan_views(table64.to(mu.device), table32.to(mu.device), sizes, self.chunk)
+            table64, table32 = (to_device_async(table, mu.device) for table in (table64, table32))
+            plan = _plan_views(table64, table32, sizes, self.chunk)
             spks = torch.cat((spks, spks.new_zeros((1, spks.shape[1]))))
             modulations = self.estimator.step_modulations(time_span, modulation_key)
             solved = self._euler(plan, noise, mu, cond, spks, time_span, cfg_rate, modulations)
