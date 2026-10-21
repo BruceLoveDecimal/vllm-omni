@@ -10,6 +10,7 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 """
 
 import os
+import time
 from collections import Counter
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -595,6 +596,67 @@ class CosyVoice3Code2Wav(nn.Module):
             raise ValueError(f"Flow prefix cache was built for {cache.steps} Euler steps, got {n_timesteps}")
         return cache
 
+    def _flow_schedule(self, n_timesteps: int) -> tuple[torch.Tensor, float, tuple]:
+        """Euler time span, CFG rate and modulation key of every packed Flow
+        solve; the key also names the solve's CUDA graphs."""
+        flow = self.flow_model
+        weight = next(flow.parameters())
+        time_span = torch.linspace(0, 1, n_timesteps + 1, device=weight.device, dtype=weight.dtype)
+        if flow.decoder.t_scheduler == "cosine":
+            time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
+        key = (n_timesteps, flow.decoder.t_scheduler, weight.dtype, weight.device)
+        return time_span, flow.decoder.inference_cfg_rate, key
+
+    @torch.inference_mode()
+    def capture_graphs(self, n_timesteps: int = 10, row_frames: int = 512, hift_frames: int = 320) -> None:
+        """Record packed streaming's CUDA graphs before the stage serves.
+
+        On demand, a layout records on the step that first meets it and stalls
+        that step for ~200 ms. Recorded here: prefix-cache hops and final hops
+        for every Flow row slot up to ``row_frames`` frames a row (a short
+        sentence's prompt and speech) and, with HiFT batching and decode graphs
+        on, every padded HiFT batch up to ``hift_frames`` wide (F0 margin,
+        overlap and a 100-token hop). Longer Flow layouts still record on demand.
+        """
+        from .code2wav_core.packed_dit import _FLOW_GRAPH_MAX_TOTAL, _FLOW_GRAPH_SLOTS, flow_graph_totals
+
+        flow = self.flow_model
+        weight = next(flow.parameters())
+        if not weight.is_cuda or not cosyvoice3_packed_streaming_enabled():
+            return
+        estimator = self._get_packed_estimator(weight.dtype)
+        prefix = self._get_flow_prefix_cache(n_timesteps)
+        start = time.perf_counter()
+        free_before = torch.accelerator.get_memory_info()[0]
+        time_span, cfg_rate, key = self._flow_schedule(n_timesteps)
+        like = weight.new_zeros((1, 0, self.output_size))
+        speaker_dim = flow.spk_embed_affine_layer.out_features
+        flow_graphs = 0
+        if estimator.graph_runner is not None:
+            with torch.autocast("cuda", dtype=weight.dtype):
+                for slots in _FLOW_GRAPH_SLOTS:
+                    for total in flow_graph_totals(min(slots * row_frames, _FLOW_GRAPH_MAX_TOTAL)):
+                        estimator.graph_runner.capture(
+                            slots, total, like, speaker_dim, time_span, cfg_rate=cfg_rate, key=key
+                        )
+                        flow_graphs += 1
+                        if prefix is not None:
+                            prefix.capture(
+                                slots, total, like, speaker_dim, time_span, cfg_rate=cfg_rate, modulation_key=key
+                            )
+                            flow_graphs += 1
+        hift_graphs = 0
+        if cosyvoice3_hift_batch_enabled():
+            hift_graphs = self._get_hift_batcher().capture_decode_graphs(hift_frames)
+        torch.accelerator.synchronize()
+        logger.info(
+            "CosyVoice3 code2wav: recorded %d Flow and %d HiFT CUDA graphs in %.1f s using %.2f GiB",
+            flow_graphs,
+            hift_graphs,
+            time.perf_counter() - start,
+            (free_before - torch.accelerator.get_memory_info()[0]) / 2**30,
+        )
+
     def release_flow_prefix(self, cache_state: StreamingHiFTState | None) -> None:
         """Return the Flow prefix pages held by a request's streaming state."""
         cache = getattr(self, "_flow_prefix_cache", None)
@@ -876,16 +938,9 @@ class CosyVoice3Code2Wav(nn.Module):
             served.append((index, emit))
         if not queries:
             return results
-        time_span = torch.linspace(0, 1, n_timesteps + 1, device=weight.device, dtype=weight.dtype)
-        if flow.decoder.t_scheduler == "cosine":
-            time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
+        time_span, cfg_rate, modulation_key = self._flow_schedule(n_timesteps)
         with torch.autocast("cuda", dtype=weight.dtype, enabled=weight.is_cuda):
-            solved = cache.solve(
-                queries,
-                time_span,
-                cfg_rate=flow.decoder.inference_cfg_rate,
-                modulation_key=(n_timesteps, flow.decoder.t_scheduler, weight.dtype, weight.device),
-            )
+            solved = cache.solve(queries, time_span, cfg_rate=cfg_rate, modulation_key=modulation_key)
         for (index, emit), query, frames in zip(served, queries, solved):
             query.state.committed = query.end // cache.chunk * cache.chunk
             results[index] = (frames[emit - query.start :].transpose(0, 1).unsqueeze(0), query.state)
@@ -1018,9 +1073,7 @@ class CosyVoice3Code2Wav(nn.Module):
                 noise = self._stream_position_noise(width, mu).expand(len(items), -1, -1)
             else:
                 noise = torch.randn(mu.shape, device=mu.device, dtype=mu.dtype)
-            time_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-            if flow.decoder.t_scheduler == "cosine":
-                time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
+            time_span, cfg_rate, modulation_key = self._flow_schedule(n_timesteps)
             with torch.autocast("cuda", dtype=mu.dtype):
                 packed = solve_flow_euler_packed(
                     self._packed_estimator,
@@ -1030,9 +1083,9 @@ class CosyVoice3Code2Wav(nn.Module):
                     torch.cat(speakers),
                     gather_rows(cond.transpose(1, 2), rows),
                     rows,
-                    cfg_rate=flow.decoder.inference_cfg_rate,
+                    cfg_rate=cfg_rate,
                     streaming=stream_items and not items[0].get("finalize", False),
-                    modulation_key=(n_timesteps, flow.decoder.t_scheduler, mu.dtype, mu.device),
+                    modulation_key=modulation_key,
                 )
             feat = scatter_rows(packed, rows, width).transpose(1, 2)
 

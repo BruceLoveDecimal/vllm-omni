@@ -152,6 +152,23 @@ class StreamingHiFTBatcher:
             speeches.append(speech[row : row + 1, start:end].reshape(1, 1, -1))
         return speeches, self._carry(phase, windows, widths, origins)
 
+    def capture_decode_graphs(self, max_frames: int) -> int:
+        """Record the decoder graph of every padded batch up to ``max_frames``
+        frames wide; returns how many. Does nothing without decode graphs."""
+        graphs = getattr(self.hift, "_decode_graphs", None)
+        if graphs is None:
+            return 0
+        weight = self.hift.m_source.l_linear.weight
+        mels = self.hift.conv_pre.in_channels
+        count = 0
+        for rows in _ROW_SLOTS:
+            for width in range(_FRAME_STEP, max_frames + _FRAME_STEP, _FRAME_STEP):
+                mel = weight.new_zeros((rows, mels, width))
+                source = weight.new_zeros((rows, 1, width * self.scale))
+                graphs.capture(mel, source, finalize=True)
+                count += 1
+        return count
+
     def _source(
         self, f0: torch.Tensor, windows: list[HiftWindow], origins: list[int]
     ) -> tuple[torch.Tensor, torch.Tensor]:

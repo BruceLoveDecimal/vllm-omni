@@ -47,6 +47,16 @@ def _side_stream_hift(model):
     return run
 
 
+class _OnCuda:
+    """Feed _run's CPU chunks to the per-request path on CUDA."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def _stream_hift_from_feat(self, feat, *, cache_state, finalize):
+        return self.inner._stream_hift_from_feat(feat.cuda(), cache_state=cache_state, finalize=finalize)
+
+
 @pytest.mark.nvidia_only
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("decode_graphs", [False, True])
@@ -59,17 +69,7 @@ def test_side_stream_batched_hift_matches_per_request(monkeypatch, decode_graphs
     model = _voiced_model(64)
     model.hift.cuda()
     model.hift.enable_cached_istft()
-
-    class OnCuda:
-        """Feed _run's CPU chunks to the per-request path on CUDA."""
-
-        def __init__(self, inner):
-            self.inner = inner
-
-        def _stream_hift_from_feat(self, feat, *, cache_state, finalize):
-            return self.inner._stream_hift_from_feat(feat.cuda(), cache_state=cache_state, finalize=finalize)
-
-    expected = _run(OnCuda(model), batched=False)
+    expected = _run(_OnCuda(model), batched=False)
     if decode_graphs:
         model.hift.enable_decode_graphs()
     monkeypatch.setattr(cosyvoice3_code2wav, "cosyvoice3_hift_batch_enabled", lambda: True)
@@ -82,3 +82,39 @@ def test_side_stream_batched_hift_matches_per_request(monkeypatch, decode_graphs
         for stream_expected, stream_actual in zip(expected, actual):
             for want, got in zip(stream_expected, stream_actual):
                 torch.testing.assert_close(got, want, atol=ATOL, rtol=RTOL)
+
+
+@pytest.mark.nvidia_only
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_captured_batch_graphs_replay_without_recording(monkeypatch):
+    """Graphs captured up front cover every padded batch: nothing records while
+    streaming, uncaptured shapes run eagerly, and the output stays the same."""
+    monkeypatch.setattr(cosyvoice3_code2wav, "cosyvoice3_packed_streaming_enabled", lambda: True)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    model = _voiced_model(64)
+    model.hift.cuda()
+    model.hift.enable_cached_istft()
+    expected = _run(_OnCuda(model), batched=False)
+    model.hift.enable_decode_graphs()
+    monkeypatch.setattr(cosyvoice3_code2wav, "cosyvoice3_hift_batch_enabled", lambda: True)
+    graphs = model.hift._decode_graphs
+    # Widths 64 to 256 hold every window of STREAMS; five row slots each.
+    assert model._get_hift_batcher().capture_decode_graphs(256) == 5 * 4
+    captured = set(graphs.graphs)
+    monkeypatch.setattr(graphs, "_record", lambda *args: pytest.fail("a layout recorded while streaming"))
+    calls, eager_calls = [], []
+    run, decode = graphs.run, graphs.decode
+    monkeypatch.setattr(graphs, "run", lambda mel, source, finalize: calls.append(1) or run(mel, source, finalize))
+    monkeypatch.setattr(
+        graphs, "decode", lambda mel, source, finalize: eager_calls.append(1) or decode(mel, source, finalize=finalize)
+    )
+    monkeypatch.setattr(model, "_stream_hift", _side_stream_hift(model))
+    actual = _run(model, batched=True)
+    torch.accelerator.synchronize()
+    assert set(graphs.graphs) == captured
+    assert len(eager_calls) < len(calls)
+    for stream_expected, stream_actual in zip(expected, actual):
+        for want, got in zip(stream_expected, stream_actual):
+            torch.testing.assert_close(got, want, atol=ATOL, rtol=RTOL)

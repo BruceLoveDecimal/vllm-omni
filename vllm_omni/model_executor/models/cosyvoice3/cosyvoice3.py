@@ -770,6 +770,11 @@ class CosyVoice3Model(
             return None
         return int(self.config.llm["speech_token_size"]) + 200
 
+    def capture_auxiliary_graphs(self) -> None:
+        """Record the codec's packed streaming CUDA graphs during worker warmup."""
+        if self.model_stage == "cosyvoice3_code2wav":
+            self.code2wav.capture_graphs()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
