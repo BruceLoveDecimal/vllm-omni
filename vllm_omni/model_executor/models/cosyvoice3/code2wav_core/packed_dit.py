@@ -22,6 +22,17 @@ from .packed_conv import pack_conv_weight, packed_causal_conv_mish
 FA3_PAGE_SIZE = 1
 
 
+def to_device_async(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Copy host metadata to ``device`` without waiting for its queued kernels.
+
+    A pageable host-to-device copy blocks the host until every kernel already
+    queued on the stream has run; staging through pinned memory does not.
+    """
+    if torch.device(device).type != "cuda":
+        return host.to(device)
+    return host.pin_memory().to(device, non_blocking=True)
+
+
 class RaggedRowAttention:
     """FA3 page metadata isolating each request and each causal query chunk."""
 
@@ -51,10 +62,10 @@ class RaggedRowAttention:
                 segment_rows.append(row)
                 segment_ends.append(end)
                 offsets.append(offsets[-1] + end - start)
-        self.cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32, device=device)
-        self.cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
+        self.cache_seqlens = to_device_async(torch.tensor(segment_ends, dtype=torch.int32), device)
+        self.cu_seqlens_q = to_device_async(torch.tensor(offsets, dtype=torch.int32), device)
         self.max_seqlen_q = max(b - a for a, b in zip(offsets, offsets[1:]))
-        starts = rows.starts_host[segment_rows].to(device)
+        starts = to_device_async(rows.starts_host[segment_rows], device)
         page = torch.arange(width or max(segment_ends), dtype=torch.int32, device=device)
         self.page_table = torch.where(page[None] < self.cache_seqlens[:, None], starts[:, None] + page[None], 0)
 
@@ -296,11 +307,11 @@ class PackedRows:
 def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
     lengths = tuple(int(length) for length in lengths)
     starts_host = F.pad(torch.tensor(lengths, dtype=torch.int64).cumsum(0), (1, 0))
-    starts = starts_host.to(device)
+    starts = to_device_async(starts_host, device)
     total = int(starts_host[-1])
     row_ids = torch.repeat_interleave(
         torch.arange(len(lengths), device=device),
-        torch.tensor(lengths, dtype=torch.int64, device=device),
+        to_device_async(torch.tensor(lengths, dtype=torch.int64), device),
         output_size=total,
     )
     positions = torch.arange(total, device=device) - starts[row_ids]
