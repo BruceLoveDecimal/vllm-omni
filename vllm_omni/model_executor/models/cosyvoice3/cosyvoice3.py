@@ -87,7 +87,14 @@ def _normalize_request_conditioning(payload: dict) -> dict:
     The code2wav schema consumes one request, so that wrapper carries no
     batch dimension. A multi-item list here is an unsplit batch and must
     fail instead of silently choosing another request's voice.
+
+    On the native MRv2 data plane the per-request buffer also carries the
+    runner's request metadata (``req_id``, ``sampling_params``,
+    ``mm_features``, ...) and the engine's ``global_request_id`` tag next to
+    the stage payload. Only the payload schema's fields are kept; the runner
+    passes request ids separately.
     """
+    payload = {key: value for key, value in payload.items() if key in OmniPayloadStruct.__struct_fields__}
     embed = payload.get("embed")
     if not isinstance(embed, Mapping):
         return payload
@@ -233,6 +240,7 @@ def _ras_mrv2_sample(
     pos: torch.Tensor,
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
+    seq_lens_upper_bound_np: np.ndarray,
     return_logprobs: bool = False,
     *,
     default_top_p: float,
@@ -249,12 +257,27 @@ def _ras_mrv2_sample(
     distribution. History is read from the runner's token table and rejection
     is resolved per row on the device, so no step waits on the host. Penalties
     are not applied, as in V1 RAS. Draws use the request seed and position; the
-    replacement draw uses a disjoint noise stream.
+    replacement draw uses a disjoint noise stream. The positional parameters
+    are those ``Sampler.sample`` receives; only logit bias, of the sampler's
+    logits processors, applies.
     """
     from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+    from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+    from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
 
     logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
-    sampler.logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
+    context = LogitsContext(
+        expanded_idx_mapping=expanded_idx_mapping,
+        idx_mapping=idx_mapping,
+        idx_mapping_np=idx_mapping_np,
+        expanded_local_pos=expanded_local_pos,
+        input_ids=input_ids,
+        pos=pos,
+        seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+    )
+    for processor in sampler.logits_processors:
+        if isinstance(processor, LogitBiasState):
+            logits = processor.apply(logits, context)
     states = sampler.sampling_states
     temperature = states.temperature.gpu
     req_states = sampler.req_states

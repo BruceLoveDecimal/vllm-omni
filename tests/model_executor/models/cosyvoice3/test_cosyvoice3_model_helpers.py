@@ -7,6 +7,7 @@ from collections import OrderedDict
 from threading import Lock
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -1240,3 +1241,101 @@ def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owne
     if stage == "cosyvoice3_code2wav":
         model.code2wav = SimpleNamespace(owns_generation_output_storage=owned)
     assert model.owns_generation_output_storage is (stage == "cosyvoice3_code2wav" and owned)
+
+
+def test_ras_mrv2_sample_takes_the_positional_arguments_of_sampler_sample():
+    """MRv2 calls ``sampler.sample`` positionally, then ``return_logprobs=``;
+    a missing positional parameter shifts the rest onto ``return_logprobs``."""
+    import inspect
+
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    def positional(fn):
+        return [
+            p.name
+            for p in inspect.signature(fn).parameters.values()
+            if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ][1:]
+
+    assert positional(cosyvoice3._ras_mrv2_sample) == positional(Sampler.sample)
+
+
+def test_ras_mrv2_sample_applies_logit_bias_and_no_other_logits_processor(monkeypatch):
+    from vllm.v1.worker.gpu.sample import gumbel
+    from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+
+    vocab = 8
+    seen = []
+
+    class Bias(LogitBiasState):
+        def __init__(self):
+            pass
+
+        def apply(self, logits, ctx):
+            seen.append(ctx)
+            logits[:, 5] += 100.0
+            return logits
+
+    class Penalty:
+        def apply(self, logits, ctx):
+            raise AssertionError("RAS applies no penalties")
+
+    # A deterministic stand-in for the device Gumbel kernel.
+    monkeypatch.setattr(gumbel, "gumbel_sample", lambda logits, *args, **kwargs: logits.argmax(dim=-1))
+    top_k = torch.full((2,), vocab, dtype=torch.int32)
+    top_p = torch.ones(2)
+    states = SimpleNamespace(
+        vocab_size=vocab,
+        temperature=SimpleNamespace(gpu=torch.ones(2)),
+        seeds=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int64)),
+        top_k=SimpleNamespace(gpu=top_k, np=top_k.numpy()),
+        top_p=SimpleNamespace(gpu=top_p, np=top_p.numpy()),
+        get_top_k_top_p=lambda rows, rows_np: (top_k[rows.long()], top_p[rows.long()]),
+    )
+    sampler = SimpleNamespace(
+        logits_processors=[Bias(), Penalty()],
+        sampling_states=states,
+        req_states=SimpleNamespace(
+            all_token_ids=SimpleNamespace(gpu=torch.zeros((2, 16), dtype=torch.int64)),
+            prompt_len=SimpleNamespace(gpu=torch.full((2,), 4)),
+            total_len=SimpleNamespace(gpu=torch.full((2,), 4)),
+        ),
+    )
+    idx = torch.arange(2, dtype=torch.int32)
+    sampled, _ = cosyvoice3._ras_mrv2_sample(
+        sampler,
+        torch.zeros(2, vocab),
+        idx,
+        idx,
+        np.arange(2),
+        torch.zeros(2, dtype=torch.int64),
+        torch.zeros(2, dtype=torch.int64),
+        torch.zeros(2, dtype=torch.int64),
+        np.full(2, 16),
+        return_logprobs=True,
+        default_top_p=0.8,
+        default_top_k=25,
+        win_size=10,
+        tau_r=0.1,
+        eps=1e-5,
+    )
+    assert sampled.tolist() == [5, 5]
+    assert seen[0].seq_lens_upper_bound_np.tolist() == [16, 16]
+
+
+def test_request_conditioning_keeps_only_the_payload_fields():
+    """The MRv2 per-request buffer adds the runner's request metadata and the
+    engine's request tag to the stage payload; the payload schema rejects
+    unknown fields."""
+    raw = {
+        "global_request_id": ["speech-1"],
+        "req_id": "speech-1-0",
+        "sampling_params": object(),
+        "mm_features": [],
+        "prompt_embeds_cpu": torch.zeros(1),
+        "meta": {"left_context_size": 2},
+        "embed": {"speech_token": [torch.tensor([[1, 2]])]},
+    }
+    payload = to_struct(_normalize_request_conditioning(raw))
+    assert payload.meta.left_context_size == 2
+    assert payload.embed.speech_token.tolist() == [[1, 2]]
