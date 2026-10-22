@@ -41,6 +41,7 @@ from .packed_dit import (
     to_device_async,
 )
 
+# FA3 accepts any page size; vLLM's FA2 needs a multiple of 16 frames.
 PAGE_FRAMES = 16
 # Page 0 is never handed out: graph padding rows write and read it.
 _SCRATCH_PAGE = 0
@@ -180,7 +181,7 @@ def prefix_attention(
         seqused_k=cache_seqlens,
         block_table=page_table,
         causal=False,
-        fa_version=3,
+        fa_version=_ACTIVE_CACHE.estimator.fa_version,
     )
 
 
@@ -207,7 +208,7 @@ def paged_attention_reference(
     page_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
 ) -> torch.Tensor:
-    """Eager equivalent of FA3's paged varlen attention, for CPU runs."""
+    """Eager equivalent of FlashAttention's paged varlen attention, for CPU runs."""
     page = key_cache.shape[1]
     keys, values = key_cache.flatten(0, 1), value_cache.flatten(0, 1)
     offsets = torch.arange(page, device=q.device)

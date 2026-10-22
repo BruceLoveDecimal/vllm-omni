@@ -88,3 +88,10 @@ def test_prefix_cache_matches_full_recompute(monkeypatch, hop_tokens, pages):
         torch.testing.assert_close(output, reference, rtol=1e-4, atol=1e-4)
     assert model._flow_prefix_cache.num_pages == pages
     assert model._flow_prefix_cache.used_pages == 0
+
+
+def test_prefix_pages_fit_every_packed_backend():
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.flow_prefix_cache import PAGE_FRAMES
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import PAGE_SIZE
+
+    assert all(PAGE_FRAMES % page_size == 0 for page_size in PAGE_SIZE.values())
