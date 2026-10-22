@@ -57,6 +57,32 @@ def _contains_cuda_tensor(value: Any) -> bool:
     return False
 
 
+def scheduled_cpu_input_ids(scheduler_output: SchedulerOutput, input_batch: Any) -> torch.Tensor | None:
+    """This step's input ids, in batch order, from the scheduler's host-side token lists.
+
+    Generation chunks arrive as new requests (``prefill_token_ids``) or as
+    re-filled cached requests (``prompt_token_ids``), and the device batch is
+    gathered from those same lists. Models that filter tokens by value read
+    this copy so the step does not block on the device one. None when a row's
+    tokens are not in this scheduler output.
+    """
+    tokens: dict[str, list[int]] = {}
+    for request in scheduler_output.scheduled_new_reqs:
+        ids = getattr(request, "prefill_token_ids", None) or request.prompt_token_ids
+        if ids is not None:
+            tokens[request.req_id] = ids
+    tokens.update(getattr(scheduler_output.scheduled_cached_reqs, "prompt_token_ids", None) or {})
+    rows: list[list[int]] = []
+    for row, req_id in enumerate(input_batch.req_ids):
+        ids = tokens.get(req_id)
+        start = int(input_batch.num_computed_tokens_np[row])
+        count = int(input_batch.num_scheduled_tokens[row])
+        if ids is None or start + count > len(ids):
+            return None
+        rows.append(list(ids[start : start + count]))
+    return torch.tensor([token for row in rows for token in row], dtype=torch.int64)
+
+
 def check_exact_input_shape(model: Any, input_ids: torch.Tensor | None, num_tokens: int) -> None:
     """Enforce ``requires_exact_input_shape`` (#6712).
 
@@ -419,6 +445,10 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             # Request-owned model state (e.g. MiniCPM-o's vocoder caches) is
             # keyed by the scheduler request id, in batch order.
             model_inputs["request_ids"] = list(input_batch.req_ids)
+        if getattr(self.model, "requires_cpu_input_ids", False) and not dummy_run:
+            cpu_input_ids = scheduled_cpu_input_ids(scheduler_output, input_batch)
+            if cpu_input_ids is not None:
+                model_inputs["cpu_input_ids"] = cpu_input_ids
         self._add_legacy_forward_inputs(model_inputs, input_batch)
 
         eplb = getattr(self, "eplb", None)
