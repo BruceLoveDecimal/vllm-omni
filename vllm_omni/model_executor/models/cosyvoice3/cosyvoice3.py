@@ -42,6 +42,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import to_device_async
 from vllm_omni.model_executor.models.cosyvoice3.ras_sampler import MAX_FUSED_TOP_K, fused_ras_sample
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
@@ -784,6 +785,8 @@ class CosyVoice3Model(
         # Full-response codec consumes tokens and conditioning, not LLM hidden states.
         self.omni_pooler_payload_include_hidden = not cosyvoice3_packed_inference_enabled()
         self.model_stage = vllm_config.model_config.model_stage
+        # The codec reads its codec tokens from the host copy (see _sanitize_codec_tokens).
+        self.requires_cpu_input_ids = self.model_stage == "cosyvoice3_code2wav"
         model_dir = vllm_config.model_config.model
         if not os.path.isdir(model_dir):
             model_dir = hf_api().snapshot_download(model_dir)
@@ -901,11 +904,19 @@ class CosyVoice3Model(
 
         return [ids]
 
-    def _sanitize_codec_tokens(self, req_ids: torch.Tensor) -> torch.Tensor:
-        """Filter non-code tokens before feeding flow token embedding."""
+    def _sanitize_codec_tokens(self, req_ids: torch.Tensor, cpu_req_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Filter non-code tokens before feeding flow token embedding.
+
+        The filtered length depends on the token values. Filtering the host
+        copy (``cpu_req_ids``) and copying the result asynchronously keeps the
+        host free; masking the device copy waits for all queued GPU work.
+        """
         vocab_size = int(self.code2wav.input_embedding.num_embeddings)
-        valid_mask = (req_ids >= 0) & (req_ids < vocab_size)
-        return req_ids[valid_mask]
+        if cpu_req_ids is None:
+            valid_mask = (req_ids >= 0) & (req_ids < vocab_size)
+            return req_ids[valid_mask]
+        valid = cpu_req_ids[(cpu_req_ids >= 0) & (cpu_req_ids < vocab_size)].to(dtype=req_ids.dtype)
+        return to_device_async(valid, req_ids.device)
 
     @staticmethod
     def _req_scalar(param: torch.Tensor | None, req_idx: int, default: float | int) -> float | int:
@@ -1579,6 +1590,12 @@ class CosyVoice3Model(
             seq_token_counts = kwargs.get("seq_token_counts")
             flat_ids = input_ids.reshape(-1).to(dtype=torch.long)
             request_ids_list = self._split_request_ids(flat_ids, seq_token_counts)
+            cpu_input_ids = kwargs.get("cpu_input_ids")
+            cpu_request_ids_list = None
+            if cpu_input_ids is not None:
+                cpu_request_ids_list = self._split_request_ids(
+                    cpu_input_ids.reshape(-1).to(torch.long), seq_token_counts
+                )
 
             num_reqs = max(1, len(request_ids_list))
             debug_batch_flow = cosyvoice3_batch_flow_debug()
@@ -1633,7 +1650,8 @@ class CosyVoice3Model(
                         )
                     continue
 
-                token = self._sanitize_codec_tokens(req_ids)
+                cpu_req_ids = None if cpu_request_ids_list is None else cpu_request_ids_list[idx]
+                token = self._sanitize_codec_tokens(req_ids, cpu_req_ids)
                 if token.numel() == 0:
                     audios[idx] = self._stitch_stream_audio(req_id, empty_audio, stream_finished)
                     if req_ids.numel() > 0:

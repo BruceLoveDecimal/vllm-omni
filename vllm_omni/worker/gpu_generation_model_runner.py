@@ -427,6 +427,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             model_kwargs["seq_token_counts"] = tokens
             if getattr(self.model, "requires_request_ids", False):
                 model_kwargs["request_ids"] = list(req_ids)
+            if getattr(self.model, "requires_cpu_input_ids", False):
+                # This step's input_ids as staged on the host. Models that split
+                # or filter tokens by value read them here: data-dependent
+                # indexing of the device copy blocks the host until the GPU
+                # finishes the previous step, so steps could not overlap.
+                model_kwargs["cpu_input_ids"] = self.input_ids.cpu[:num_tokens_unpadded]
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
