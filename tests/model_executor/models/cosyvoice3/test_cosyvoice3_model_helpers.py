@@ -348,6 +348,36 @@ def test_forward_prefers_token_offset_when_present():
     assert call["finalize"] is False
 
 
+@pytest.mark.parametrize("with_host_copy", [False, True])
+def test_forward_filters_codec_tokens_from_either_copy(with_host_copy):
+    """Non-code tokens (here 7 with a vocabulary of 4) are dropped the same way
+    whether the runner passes the host copy of the input ids or not."""
+    model = _make_code2wav_model()
+    runtime_info = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 0},
+        }
+    ]
+    input_ids = torch.tensor([1, 7, 2, 3], dtype=torch.long)
+    kwargs = {"cpu_input_ids": input_ids.clone()} if with_host_copy else {}
+
+    model.forward(
+        input_ids=input_ids,
+        positions=torch.arange(4),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[4],
+        **kwargs,
+    )
+
+    call = model.code2wav.forward_streaming_calls[0]
+    assert call["token"].tolist() == [[1, 2, 3]]
+
+
 def test_forward_falls_back_to_left_context_size_for_backward_compat():
     model = _make_code2wav_model()
 
