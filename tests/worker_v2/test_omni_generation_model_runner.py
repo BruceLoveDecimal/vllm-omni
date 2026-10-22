@@ -15,7 +15,11 @@ from vllm.distributed.aux_output_connector.connector import AuxRequestOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner, check_exact_input_shape
+from vllm_omni.worker_v2.omni_generation_model_runner import (
+    OmniGenerationModelRunner,
+    check_exact_input_shape,
+    scheduled_cpu_input_ids,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -399,3 +403,37 @@ def test_exact_input_shape_models_reject_padded_batches(exact):
             check_exact_input_shape(model, torch.zeros(48, dtype=torch.long), 32)
     else:
         check_exact_input_shape(model, torch.zeros(48, dtype=torch.long), 32)
+
+
+def _scheduled(new_reqs, cached_ids):
+    return SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id=req_id, prefill_token_ids=ids, prompt_token_ids=None) for req_id, ids in new_reqs
+        ],
+        scheduled_cached_reqs=SimpleNamespace(prompt_token_ids=cached_ids),
+    )
+
+
+def test_scheduled_cpu_input_ids_follow_batch_order_and_scheduled_spans():
+    """New chunks and re-filled cached chunks both contribute their scheduled
+    span, in batch order (not scheduler order)."""
+    scheduler_output = _scheduled([("a", [1, 2, 3])], {"b": [7, 8, 9, 10]})
+    input_batch = SimpleNamespace(
+        req_ids=["b", "a"],
+        num_computed_tokens_np=np.array([1, 0]),
+        num_scheduled_tokens=np.array([3, 3]),
+    )
+    assert scheduled_cpu_input_ids(scheduler_output, input_batch).tolist() == [8, 9, 10, 1, 2, 3]
+
+
+@pytest.mark.parametrize("missing", ["request", "span"])
+def test_scheduled_cpu_input_ids_give_up_when_a_row_is_not_covered(missing):
+    """Without every row's tokens the model must keep using the device ids."""
+    scheduler_output = _scheduled([("a", [1, 2])], {})
+    req_ids = ["a", "b"] if missing == "request" else ["a"]
+    input_batch = SimpleNamespace(
+        req_ids=req_ids,
+        num_computed_tokens_np=np.zeros(len(req_ids), dtype=np.int64),
+        num_scheduled_tokens=np.array([2, 1] if missing == "request" else [3]),
+    )
+    assert scheduled_cpu_input_ids(scheduler_output, input_batch) is None
