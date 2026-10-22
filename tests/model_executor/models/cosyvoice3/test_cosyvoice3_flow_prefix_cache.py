@@ -21,7 +21,8 @@ def _tiny_streaming_flow(monkeypatch):
     monkeypatch.setattr(module, "cosyvoice3_packed_streaming_enabled", lambda: True)
     monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
     # The full-recompute baseline runs the packed path eagerly on CPU, with a
-    # page-size-1 reference attention in place of FA3.
+    # page-size-1 reference attention in place of FA3, whatever the host GPU.
+    monkeypatch.setattr(packed_dit, "cosyvoice3_packed_fa_version", lambda: 3)
     monkeypatch.setattr(packed_dit, "native_mish", torch.nn.functional.mish)
     monkeypatch.setattr(
         packed_dit,
