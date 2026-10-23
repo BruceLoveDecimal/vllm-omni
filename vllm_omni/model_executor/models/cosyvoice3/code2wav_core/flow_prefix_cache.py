@@ -37,6 +37,7 @@ from .packed_dit import (
     flow_graph_total,
     layer_norm_preserving_eager,
     packed_conv_mish,
+    project_qkv,
     rotate_in_place,
     to_device_async,
 )
@@ -262,7 +263,7 @@ def attend_prefix(
     page_table: torch.Tensor,
 ) -> torch.Tensor:
     x = x.to(attn.to_q.weight.dtype)
-    query, key, value = attn.to_q(x), attn.to_k(x), attn.to_v(x)
+    query, key, value = project_qkv(attn, x)
     rotate_in_place(query, *rope)
     rotate_in_place(key, *rope)
     head_dim = attn.inner_dim // attn.heads

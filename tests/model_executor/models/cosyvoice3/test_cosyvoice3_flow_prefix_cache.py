@@ -88,3 +88,46 @@ def test_prefix_cache_matches_full_recompute(monkeypatch, hop_tokens, pages):
         torch.testing.assert_close(output, reference, rtol=1e-4, atol=1e-4)
     assert model._flow_prefix_cache.num_pages == pages
     assert model._flow_prefix_cache.used_pages == 0
+
+
+@torch.inference_mode()
+def test_prefix_cache_rows_per_solve_do_not_change_outputs(monkeypatch):
+    """Solving hops in fewer, larger groups only packs more rows per GEMM."""
+    import vllm_omni.model_executor.models.cosyvoice3.code2wav_core.flow_prefix_cache as prefix_cache
+
+    torch.manual_seed(1)
+    hop_tokens = [25, 25]
+    requests = [
+        dict(
+            token=torch.randint(0, 64, (1, sum(hop_tokens) + LOOKAHEAD + 5)),
+            prompt_token=torch.randint(0, 64, (1, PROMPT)),
+            prompt_feat=torch.randn(1, 2 * PROMPT, 80),
+            embedding=torch.randn(1, 192),
+        )
+        for _ in range(12)
+    ]
+    monkeypatch.setenv("COSYVOICE3_FLOW_PREFIX_CACHE_GIB", "0.05")
+
+    def stream_batch(slots):
+        monkeypatch.setattr(prefix_cache, "_FLOW_GRAPH_SLOTS", slots)
+        model = _tiny_streaming_flow(monkeypatch)
+        outputs, states = [], [None] * len(requests)
+        for prefix, offset, finalize in _hops(hop_tokens):
+            if finalize:
+                break
+            items = [
+                dict(request, token=request["token"][:, :prefix], token_offset_tokens=offset, finalize=False)
+                for request in requests
+            ]
+            served = model.forward_streaming_batch(
+                [dict(item, cache_state=state) for item, state in zip(items, states)], n_timesteps=STEPS
+            )
+            outputs.append([mel for mel, _ in served])
+            states = [state for _, state in served]
+        return outputs
+
+    eight = stream_batch((1, 2, 4, 8))  # 12 hops: a group of 8, then one of 4
+    sixteen = stream_batch((1, 2, 4, 8, 16))  # 12 hops: one group
+    for hop_eight, hop_sixteen in zip(eight, sixteen):
+        for mel_eight, mel_sixteen in zip(hop_eight, hop_sixteen):
+            assert torch.equal(mel_eight, mel_sixteen)

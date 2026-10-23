@@ -10,6 +10,7 @@ Full-context and chunk-causal attention use vLLM's FA3 binding.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -89,6 +90,8 @@ class PackedDiT:
             and conv_pos.conv1[0].weight.dtype in (torch.float16, torch.bfloat16)
             else None
         )
+        for block in dit.transformer_blocks:
+            fuse_qkv(block.attn)
         self._modulations: dict = {}
 
     @torch.inference_mode()
@@ -435,6 +438,33 @@ def ragged_attention_tensor_geometry(
     return output.reshape(1, -1, attention.heads * attention.head_dim)
 
 
+def fuse_qkv(attn: torch.nn.Module) -> None:
+    """Concatenate to_q, to_k and to_v into one projection.
+
+    Each output column is the same dot product over the same input, so one
+    N=3 * inner GEMM replaces three small ones. The three modules keep views
+    of the fused weight, so it adds no memory.
+    """
+    projections = (attn.to_q, attn.to_k, attn.to_v)
+    if hasattr(attn, "qkv_weight") or any(projection.bias is None for projection in projections):
+        return
+    weight = torch.cat([projection.weight.detach() for projection in projections])
+    bias = torch.cat([projection.bias.detach() for projection in projections])
+    for projection, part, part_bias in zip(projections, weight.split(attn.inner_dim), bias.split(attn.inner_dim)):
+        projection.weight.data = part
+        projection.bias.data = part_bias
+    attn.register_buffer("qkv_weight", weight, persistent=False)
+    attn.register_buffer("qkv_bias", bias, persistent=False)
+
+
+def project_qkv(attn: torch.nn.Module, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Query, key and value of ``x``: views of one fused projection when available."""
+    if not hasattr(attn, "qkv_weight"):
+        return attn.to_q(x), attn.to_k(x), attn.to_v(x)
+    query, key, value = F.linear(x, attn.qkv_weight, attn.qkv_bias).split(attn.inner_dim, dim=-1)
+    return query, key, value
+
+
 def attend_tensor_geometry(
     attn: torch.nn.Module,
     x: torch.Tensor,
@@ -445,9 +475,7 @@ def attend_tensor_geometry(
     # note (ratish): under autocast to_q, to_k and to_v would each cast the
     # float32 norm output again.
     x = x.to(attn.to_q.weight.dtype)
-    query = attn.to_q(x)
-    key = attn.to_k(x)
-    value = attn.to_v(x)
+    query, key, value = project_qkv(attn, x)
     rotate_in_place(query, *rope)
     rotate_in_place(key, *rope)
     output = ragged_attention_tensor_geometry(query, key, value, attention, max_seqlen_q).to(query.dtype)
@@ -651,7 +679,20 @@ def pad_to_graph_bucket(rows, noise, mu, spks, cond):
     )
 
 
-_FLOW_GRAPH_SLOTS = (1, 2, 4, 8)
+def flow_graph_slots(max_rows: int) -> tuple[int, ...]:
+    """Row-slot buckets of a Flow solve: powers of two up to ``max_rows``.
+
+    Streaming hops beyond the largest bucket split into further solves. More
+    rows per solve give each GEMM more rows to fill the GPU with, at the cost
+    of more recorded layouts.
+    """
+    if max_rows < 1:
+        raise ValueError("COSYVOICE3_FLOW_GRAPH_MAX_ROWS must be at least 1")
+    slots = tuple(1 << shift for shift in range(max_rows.bit_length()))
+    return slots if slots[-1] == max_rows else (*slots, max_rows)
+
+
+_FLOW_GRAPH_SLOTS = flow_graph_slots(int(os.environ.get("COSYVOICE3_FLOW_GRAPH_MAX_ROWS", "8")))
 _FLOW_GRAPH_MAX_TOTAL = int(__import__("os").environ.get("COSYVOICE3_FLOW_GRAPH_MAX_TOTAL", "16384"))
 _FLOW_GRAPH_SEGMENT_STEP = 16
 
