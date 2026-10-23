@@ -416,15 +416,20 @@ def rope_tensor_geometry(
 
 
 def ragged_attention_tensor_geometry(
+    attn: torch.nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     attention: RaggedRowAttention,
     max_seqlen_q: int,
 ) -> torch.Tensor:
-    page_shape = (-1, FA3_PAGE_SIZE, attention.heads, attention.head_dim)
+    # Read the head layout from the module: Dynamo specializes its ints, but
+    # under dynamic=True it makes RaggedRowAttention's ints symbolic, and the
+    # RoPE write-back into q/k then indexes with runtime divisions (~5x slower).
+    heads, head_dim = attn.heads, attn.inner_dim // attn.heads
+    page_shape = (-1, FA3_PAGE_SIZE, heads, head_dim)
     output = packed_fa3(
-        query[0].reshape(-1, attention.heads, attention.head_dim),
+        query[0].reshape(-1, heads, head_dim),
         key[0].reshape(page_shape),
         value[0].reshape(page_shape),
         attention.cache_seqlens,
@@ -432,7 +437,7 @@ def ragged_attention_tensor_geometry(
         attention.cu_seqlens_q,
         max_seqlen_q,
     )
-    return output.reshape(1, -1, attention.heads * attention.head_dim)
+    return output.reshape(1, -1, heads * head_dim)
 
 
 def attend_tensor_geometry(
@@ -450,7 +455,7 @@ def attend_tensor_geometry(
     value = attn.to_v(x)
     rotate_in_place(query, *rope)
     rotate_in_place(key, *rope)
-    output = ragged_attention_tensor_geometry(query, key, value, attention, max_seqlen_q).to(query.dtype)
+    output = ragged_attention_tensor_geometry(attn, query, key, value, attention, max_seqlen_q).to(query.dtype)
     return attn.to_out[1](attn.to_out[0](output))
 
 
