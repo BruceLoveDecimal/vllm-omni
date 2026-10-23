@@ -566,15 +566,20 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 payload = self._materialize_full_payload_entry(accumulated)[0] if accumulated is not None else None
             if self._async_chunk and isinstance(payload, dict):
                 payload = unflatten_payload(payload)
-            token_update = bool(
-                self._async_chunk
-                and accepted_tokens
-                and getattr(getattr(self, "_custom_process_func", None), "requires_token_updates", False)
+            # Token-only processors dispatch without a payload: full-history
+            # producers on every step, token-update producers on new tokens.
+            processor = getattr(self, "_custom_process_func", None)
+            full_token_history = getattr(processor, "_requires_full_token_history", False) is True
+            token_update = full_token_history or bool(
+                self._async_chunk and accepted_tokens and getattr(processor, "requires_token_updates", False) is True
             )
             if payload is None and not state.finished and not token_update:
                 continue
             include_token_history = bool(
-                not self._async_chunk or state.resumable or self._put_req_chunk.get(state.external_req_id, 0) == 0
+                full_token_history
+                or not self._async_chunk
+                or state.resumable
+                or self._put_req_chunk.get(state.external_req_id, 0) == 0
             )
             entries.append(
                 (

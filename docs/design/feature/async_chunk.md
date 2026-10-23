@@ -60,17 +60,17 @@ for its output-streaming support and duplex/input-streaming limits.
 4. **Non-blocking Scheduler**: Requests waiting for chunks don't block the entire scheduler
 5. **Code2Wav Batch Inference**: Supports batched processing in code2wav stage
 
-| Input     | Output           | Async_chunk enabled | Code2Wav batch size | Max_Concurrency | Prompts | Mean E2E   | Mean TTFT  | Mean TPOT | Mean TTFP   | Mean RTF | Mean ITL |
-|-----------|------------------|---------------------|---------------------|----------------|---------|------------|------------|-----------|-------------|----------|----------|
-| text 100  | text 100+audio   | False               | 1                   | 1              | 50      | 6581.80    | 43.22      | 8.31      | 6459.34     | 0.24     | 8.22     |
-| text 100  | text 100+audio   | False               | 1                   | 4              | 50      | 7398.63    | 67.57      | 9.14      | 7285.35     | 0.27     | 9.05     |
-| text 100  | text 100+audio   | False               | 1                   | 10             | 50      | 13522.99   | 131.82     | 12.72     | 13410.44    | 0.49     | 12.60    |
-| text 100  | text 100+audio   | False               | 64                  | 1              | 50      | 6505.13    | 43.14      | 8.52      | 6395.40     | 0.24     | 8.44     |
-| text 100  | text 100+audio   | False               | 64                  | 4              | 50      | 7668.15    | 51.15      | 9.36      | 7562.37     | 0.28     | 9.27     |
-| text 100  | text 100+audio   | False               | 64                  | 10             | 50      | 9516.18    | 138.06     | 14.75     | 9409.26     | 0.34     | 14.60    |
-| text 100  | text 100+audio   | True                | 1                   | 1              | 50      | 6179.79    | 44.58      | 8.69      | 522.99      | 0.22     | 8.60     |
-| text 100  | text 100+audio   | True                | 1                   | 4              | 50      | 7692.69    | 103.96     | 10.22     | 785.85      | 0.29     | 10.12    |
-| text 100  | text 100+audio   | True                | 1                   | 10             | 50      | 11152.71   | 685.60     | 17.64     | 1628.88     | 0.41     | 17.62    |
+| Input       | Output             | Async_chunk enabled   | Code2Wav batch size   | Max_Concurrency  | Prompts   | Mean E2E     | Mean TTFT    | Mean TPOT   | Mean TTFP     | Mean RTF   | Mean ITL   |
+| ----------- | ------------------ | --------------------- | --------------------- | ---------------- | --------- | ------------ | ------------ | ----------- | ------------- | ---------- | ---------- |
+| text 100    | text 100+audio     | False                 | 1                     | 1                | 50        | 6581.80      | 43.22        | 8.31        | 6459.34       | 0.24       | 8.22       |
+| text 100    | text 100+audio     | False                 | 1                     | 4                | 50        | 7398.63      | 67.57        | 9.14        | 7285.35       | 0.27       | 9.05       |
+| text 100    | text 100+audio     | False                 | 1                     | 10               | 50        | 13522.99     | 131.82       | 12.72       | 13410.44      | 0.49       | 12.60      |
+| text 100    | text 100+audio     | False                 | 64                    | 1                | 50        | 6505.13      | 43.14        | 8.52        | 6395.40       | 0.24       | 8.44       |
+| text 100    | text 100+audio     | False                 | 64                    | 4                | 50        | 7668.15      | 51.15        | 9.36        | 7562.37       | 0.28       | 9.27       |
+| text 100    | text 100+audio     | False                 | 64                    | 10               | 50        | 9516.18      | 138.06       | 14.75       | 9409.26       | 0.34       | 14.60      |
+| text 100    | text 100+audio     | True                  | 1                     | 1                | 50        | 6179.79      | 44.58        | 8.69        | 522.99        | 0.22       | 8.60       |
+| text 100    | text 100+audio     | True                  | 1                     | 4                | 50        | 7692.69      | 103.96       | 10.22       | 785.85        | 0.29       | 10.12      |
+| text 100    | text 100+audio     | True                  | 1                     | 10               | 50        | 11152.71     | 685.60       | 17.64       | 1628.88       | 0.41       | 17.62      |
 
 Performance data collected on H800 GPUs through comprehensive benchmarking with cudagraph enabled. text input uses random dataset.
 
@@ -112,12 +112,12 @@ The following diagram illustrates the **Async Chunk Architecture** for multi-sta
 
 **Diagram Legend:**
 
-| Step | Stage Type | Description |
-|------|-----------|------------|
+| Step      | Stage Type     | Description                                 |
+| --------- | -------------- | ------------------------------------------- |
 | `prefill` | Initialization | Context processing, KV cache initialization |
-| `decode` | Autoregressive | Token-by-token generation in AR stages |
-| `codes` | Audio Encoding | RVQ codec codes from Talker stage |
-| `output` | Final Output | Text chunks or audio waveforms |
+| `decode`  | Autoregressive | Token-by-token generation in AR stages      |
+| `codes`   | Audio Encoding | RVQ codec codes from Talker stage           |
+| `output`  | Final Output   | Text chunks or audio waveforms              |
 
 ### Data Flow
 
@@ -215,7 +215,7 @@ In sequential mode, each stage must wait for the previous stage to complete enti
    - `OmniGenerationScheduler`: For generation stages
    - Both schedulers use **OmniChunkTransferAdapter** and **before/after** hooks around `super().schedule()`:
      - **Before** `super().schedule()`: `process_pending_chunks(waiting, running)` moves requests waiting for chunks to `WAITING_FOR_CHUNK`, enqueues load tasks for background polling
-     - **After** `super().schedule()`: `restore_queues(waiting, running)` restores requests with ready chunks back to waiting/running, `postprocess_scheduler_output(scheduler_output)` attaches cached additional_information, clears chunk-ready flags
+     - **After** `super().schedule()`: `restore_queues(waiting, running)` restores requests with ready chunks back to waiting/running, `postprocess_scheduler_output(scheduler_output)` attaches cached additional_information and clears chunk-ready flags. Generation stages declaring `supports_pending_generation` retain the ready input until their runner stops reporting it as pending. This capability also serializes executions of that input on the legacy path; ordinary stateless legacy stages retain their existing overlap.
    - **put_chunk** `save_async(pooler_output, request)`; **get_chunk** / **get_chunk_for_generation** `load_async(request)`
    - **OmniGenerationScheduler atomic scheduling contract**: Connector-delivered async chunks are indivisible scheduling units. The generation scheduler must either admit a ready chunk in its entirety or defer it intact with its codes and metadata unchanged. It must never slice a chunk to fit the remaining step token budget, because consumers such as the Qwen3-TTS ICL first chunk validate received chunks against their declared metadata.
    - A ready chunk larger than the full step budget (`max_num_scheduled_tokens`) can never be admitted in any step. Such a request is terminated through the standard cleanup path with `FINISHED_ERROR` and an ERROR engine output carrying the rejection reason.
