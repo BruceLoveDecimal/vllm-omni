@@ -72,6 +72,7 @@ from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
     HUNYUAN_IMAGE3_PIPELINE,
 )
 from vllm_omni.model_executor.models.hunyuan_video.pipeline import HUNYUAN_VIDEO_15_PIPELINE
+from vllm_omni.model_executor.models.hy_nomas.pipeline import HY_NOMAS_PIPELINE
 from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS2_PIPELINE,
     INDEXTTS25_PIPELINE,
@@ -184,6 +185,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "hunyuan_image3_dit": HUNYUAN_IMAGE3_DIT_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,
     "hunyuan_video_15": HUNYUAN_VIDEO_15_PIPELINE,
+    "hy_nomas": HY_NOMAS_PIPELINE,
     "indextts2": INDEXTTS2_PIPELINE,
     "indextts2_5": INDEXTTS25_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,

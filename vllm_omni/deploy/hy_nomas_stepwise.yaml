@@ -1,0 +1,32 @@
+# Experimental precision-first realtime baseline. Released-weight GPU parity
+# and live playback are not yet qualified. Requires the Diffusers checkpoint.
+# Full model-owned KV history is bounded by hy_nomas_max_segments; no eviction.
+pipeline: hy_nomas
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: HyNomasPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    default_sampling_params:
+      num_inference_steps: 8
+      guidance_scale: 1.0
+      num_frames: 240
+      fps: 24
+      output_type: pil
+    model_config:
+      ar_diffusion_height: 704
+      ar_diffusion_width: 1280
+      hy_nomas_segment_latent_frames: 30
+      hy_nomas_max_segments: 2
+      ar_diffusion_kv_config:
+        # Model-owned mixed KV uses its explicit reservation. Do not expand
+        # the currently unused paged pool into all available memory.
+        gpu_memory_fraction: 0.01
+        warmup_cudagraph: false

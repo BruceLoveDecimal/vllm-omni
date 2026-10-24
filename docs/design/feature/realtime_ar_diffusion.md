@@ -241,3 +241,13 @@ CPU contract tests cover:
 GPU validation must additionally exercise real model loading, action input,
 prompt switching, rolling-window replacement, reset, close, finite output
 latents, and exact metadata/request identity.
+
+## Hy-Nomas precision baseline
+
+The experimental [Hy-Nomas integration](../model_specific/hy_nomas.md) uses
+stepwise rollouts and the existing realtime WebSocket route. It retains mixed
+video/text KV in model-owned state, bounded at admission and accounted for by
+`model_owned_state_bytes_per_session`. It does not use paged attention or the
+tick continuation protocol. Prompt masks change atomically at segment boundaries;
+PixelUMM emits only stable prefixes followed by a final tail flush. Released
+weights and live playback have not yet been qualified.
