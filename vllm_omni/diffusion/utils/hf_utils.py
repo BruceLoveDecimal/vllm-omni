@@ -8,6 +8,8 @@ from functools import lru_cache
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
+from vllm_omni.model_extras.hy_nomas import HY_NOMAS_DECODER_FILE, HY_NOMAS_DIT_FILE, HY_NOMAS_MODEL_ID
+
 logger = init_logger(__name__)
 
 DIFFUSION_MODEL_INDEX_FILES = (
@@ -74,6 +76,15 @@ def _looks_like_magi2(model_name: str) -> bool:
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
 
+    normalized = str(model_name).rstrip("/")
+    if normalized.lower() == HY_NOMAS_MODEL_ID.lower() or (
+        os.path.isdir(normalized)
+        and all(
+            os.path.isfile(os.path.join(normalized, relative))
+            for relative in (HY_NOMAS_DIT_FILE, HY_NOMAS_DECODER_FILE)
+        )
+    ):
+        return "HyNomasPipeline"
     return "Magi2Pipeline" if _looks_like_magi2(model_name) else None
 
 
