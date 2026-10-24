@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar
 
 import torch
@@ -45,6 +45,7 @@ class HyNomasSession:
     kv_cache: list[dict[str, torch.Tensor]]
     decoder: PixelUMMStreamingDecodeSession | None = None
     frame_offset: int = 0
+    segment_token_lengths: list[int] = field(default_factory=list)
 
 
 def segment_lengths(num_frames: int, segment_frames: int, max_segments: int) -> list[int]:
@@ -96,6 +97,11 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
         self.width = int(config.get("ar_diffusion_width", 1280))
         self.segment_frames = int(config.get("hy_nomas_segment_latent_frames", 30))
         self.max_segments = int(config.get("hy_nomas_max_segments", 4))
+        self.max_cache_segments = config.get("hy_nomas_max_cache_segments")
+        if self.max_cache_segments is not None and (
+            type(self.max_cache_segments) is not int or self.max_cache_segments <= 0
+        ):
+            raise ValueError("hy_nomas_max_cache_segments must be a positive integer or None.")
         if min(self.height, self.width) < 32 or self.height % 32 or self.width % 32:
             raise ValueError("Hy-Nomas height and width must be positive multiples of 32.")
         segment_lengths(1, self.segment_frames, self.max_segments)
@@ -138,9 +144,12 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
         cfg = self.transformer.config
         frame_tokens = (self.height // 32) * (self.width // 32)
-        tokens = self.max_segments * (self.segment_frames * frame_tokens + self.max_text_length)
+        cache_segments = self.max_segments
+        if self.max_cache_segments is not None:
+            cache_segments = min(cache_segments, self.max_cache_segments)
+        tokens = cache_segments * (self.segment_frames * frame_tokens + self.max_text_length)
         element_size = next(self.transformer.parameters()).element_size()
-        # Preserve full mixed video/text history. Two copies cover concatenation
+        # Two copies of retained mixed video/text history cover concatenation
         # during cache commit; a boolean visibility mask is retained per layer.
         cache_bytes = (
             2 * cfg.num_layers * tokens * (2 * cfg.num_attention_heads * cfg.attention_head_dim * element_size + 1)
@@ -360,7 +369,20 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
             latents.shape, generator=state.sampling.generator, device=latents.device, dtype=latents.dtype
         )
         cache_latents = ((1 - sigma) * latents.float() + sigma * noise.float()).to(latents.dtype)
+        # Match native causal_ar.py cache_write: denoising reads all retained
+        # segments; evict whole segments only before committing this segment.
+        # This optional bounded history is not equivalent to full-history output.
+        if self.max_cache_segments is not None:
+            while len(session.segment_token_lengths) >= self.max_cache_segments:
+                tokens = session.segment_token_lengths.pop(0)
+                for layer in session.kv_cache:
+                    for name in ("key", "value", "mask"):
+                        # clone releases the evicted storage, unlike a view.
+                        layer[name] = layer[name][:, tokens:].clone()
         self._predict(state, cache_latents, torch.tensor(sigma * 1000, device=latents.device), commit=True)
+        encoded: EncodedPrompt = state.extra["encoded"]
+        video_tokens = latents.shape[2] * (latents.shape[3] * latents.shape[4])
+        session.segment_token_lengths.append(video_tokens + encoded.embeds.shape[1])
         completed = state.chunk_index
         session.frame_offset += latents.shape[2]
         state.chunk_index += 1

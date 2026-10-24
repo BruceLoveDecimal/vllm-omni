@@ -62,6 +62,12 @@ python streaming_video_client.py \
 The example client sends one `session.start` message, prints each received binary video chunk with its byte size and elapsed time, and saves the received bytes to `--output` after `session.done`.
 The client remuxes the gathered stream to a regular progressive MP4 file so that local playback knows the video duration.
 
+For a slow model that may take over 60 seconds between chunks, add
+`--ping-interval 10` to send `session.ping` every ten seconds after `video.start`.
+The default is `0` (disabled). Pings keep the server stall clock alive; they do
+not accelerate generation. Use an external total-runtime limit when running
+unattended tests.
+
 Schedule midway prompt updates with `--prompt-updates`. None are sent unless you ask for them, and only pipelines that implement midway prompt updates accept them. Each entry uses `"at"` as seconds on the client clock after the server sends `video.start`:
 
 ```bash

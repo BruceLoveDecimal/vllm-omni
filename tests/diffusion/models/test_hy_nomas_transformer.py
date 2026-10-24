@@ -14,9 +14,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 class _SDPA(nn.Module):
-    def forward(self, query, key, value):
+    def forward(self, query, key, value, attn_metadata=None):
         return F.scaled_dot_product_attention(
-            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attn_mask=None if attn_metadata is None else attn_metadata.attn_mask,
         ).transpose(1, 2)
 
 
@@ -134,3 +137,35 @@ def test_strict_checkpoint_loading(tiny_model):
         tiny_model.load_weights([("not_a_parameter", torch.zeros(1))])
     with pytest.raises(ValueError, match="Duplicate"):
         tiny_model.load_weights([weights[0], weights[0]])
+
+
+@pytest.mark.parametrize("mask_ndim", [None, 2, 4])
+def test_attention_preserves_reference_key_layout(mask_ndim):
+    # Equivalent visibility is insufficient for BF16 parity: keep the exact
+    # sequence lengths and broadcast mask rather than compacting visible keys.
+    query = torch.randn(2, 3, 2, 6)
+    key = torch.randn(2, 5, 2, 6)
+    value = torch.randn_like(key)
+    mask = torch.tensor([[True, False, True, False, True], [False, True, True, True, False]])
+    expected_mask = None if mask_ndim is None else mask[:, None, None, :]
+    supplied_mask = None if mask_ndim is None else mask if mask_ndim == 2 else expected_mask
+    calls = []
+
+    def observe(q, k, v, attn_metadata=None):
+        assert q is query and k is key and v is value
+        actual_mask = None if attn_metadata is None else attn_metadata.attn_mask
+        if expected_mask is None:
+            assert actual_mask is None
+        else:
+            assert actual_mask is not None
+            assert actual_mask.shape == (2, 1, 1, 5)
+            torch.testing.assert_close(actual_mask, expected_mask)
+        calls.append((q.shape, k.shape, v.shape))
+        return _SDPA()(q, k, v, attn_metadata=attn_metadata)
+
+    actual = model_module._attend(observe, query, key, value, supplied_mask)
+    expected = F.scaled_dot_product_attention(
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), attn_mask=expected_mask
+    ).transpose(1, 2)
+    assert len(calls) == 1
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
