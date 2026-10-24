@@ -13,9 +13,12 @@ from __future__ import annotations
 from vllm_omni.diffusion.interaction.modality_handlers.base import InteractionHandler
 from vllm_omni.diffusion.interaction.modality_handlers.camera import SE3DeltaCameraHandler
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import PromptInteractionHandler
+from vllm_omni.diffusion.models.hy_nomas.interaction import HyNomasPromptHandler
 
 STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
     # Pipeline class name -> modality -> handler class.
+    "HyNomasPipeline": {"camera": SE3DeltaCameraHandler, "prompt": HyNomasPromptHandler},
+    "HyNomasModularPipeline": {"camera": SE3DeltaCameraHandler, "prompt": HyNomasPromptHandler},
     "HeliosPipeline": {
         "prompt": PromptInteractionHandler,
     },
