@@ -34,6 +34,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import RMSNorm
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -57,24 +58,13 @@ def _attend(
     value: torch.Tensor,
     mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # Every query in a group sees the same keys. Remove invisible keys rather
-    # than passing a dense mask to a backend that may not support masks.
+    # Preserve the reference SDPA sequence layout: removing masked keys changes
+    # kernel selection and BF16 reduction order, even with equivalent visibility.
     if mask is None:
         return attention(query, key, value)
-    outputs = []
-    for sample in range(query.shape[0]):
-        indices = torch.nonzero(mask[sample].reshape(-1), as_tuple=True)[0]
-        if indices.numel() == 0:
-            outputs.append(torch.zeros_like(query[sample : sample + 1]))
-            continue
-        outputs.append(
-            attention(
-                query[sample : sample + 1],
-                key[sample : sample + 1, indices],
-                value[sample : sample + 1, indices],
-            )
-        )
-    return torch.cat(outputs, dim=0)
+    if mask.ndim == 2:
+        mask = mask[:, None, None, :]
+    return attention(query, key, value, attn_metadata=AttentionMetadata(attn_mask=mask))
 
 
 @dataclass(frozen=True)

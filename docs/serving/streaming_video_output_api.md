@@ -168,6 +168,8 @@ This feature is pipeline-dependent. An enabled endpoint does not imply that
 the loaded model supports midway prompt or camera updates.
 
 The default start timeout is 10 seconds and the server reports a stall after
-about 60 seconds without generation progress or a `session.ping`. See the
+about 60 seconds without generation progress or a `session.ping`. For models
+that take longer between chunks, the shared client accepts `--ping-interval 10`
+to keep the session alive. The default client ping interval is zero (disabled). See the
 [streaming video generation example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/streaming_video_generation)
 for prompt/camera-update scheduling and browser playback.

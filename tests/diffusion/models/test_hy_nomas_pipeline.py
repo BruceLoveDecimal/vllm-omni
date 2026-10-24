@@ -39,6 +39,7 @@ def pipeline(monkeypatch):
     result.height = result.width = 32
     result.segment_frames = 1
     result.max_segments = 4
+    result.max_cache_segments = None
     result.max_text_length = 1280
     result._sessions = {}
     result._bound_session = None
@@ -229,3 +230,80 @@ def test_generator_list_is_rejected_without_replacing_caller_rng(pipeline):
         pipeline.prepare_encode(state)
     assert sampling.generator is generators
     assert "rng" not in pipeline._sessions
+
+
+@pytest.mark.parametrize("limit", [None, 1, 2])
+def test_segment_history_eviction_matches_native_commit_order(pipeline, monkeypatch, limit):
+    pipeline.max_cache_segments = limit
+    sampling = _sampling()
+    sampling.num_frames = 16
+    state = StepRequestState(request_id="history", prompt="A landscape", sampling=sampling)
+    pipeline.prepare_encode(state)
+    session = pipeline._sessions["history"]
+    session.kv_cache = [{}, {}]
+    observations = []
+
+    def predict(state, latents, timestep, *, commit=False):
+        counts = [layer.get("mask", torch.empty(1, 0)).shape[1] for layer in session.kv_cache]
+        observations.append((session.frame_offset, commit, counts))
+        if commit:
+            for index, layer in enumerate(session.kv_cache):
+                for name in ("key", "value", "mask"):
+                    value = session.frame_offset + 10 * index
+                    new = torch.full((1, 3), value, dtype=torch.float32)
+                    old = layer.get(name, torch.empty(1, 0))
+                    layer[name] = torch.cat((old, new), dim=1)
+        return torch.zeros_like(latents)
+
+    monkeypatch.setattr(pipeline, "_predict", predict)
+    for segment in range(4):
+        pipeline.prepare_next_chunk(state)
+        pipeline.denoise_step(None, states=[state])
+        pipeline.post_decode(state)
+        retained = segment + 1 if limit is None else min(segment + 1, limit)
+        assert session.frame_offset == segment + 1
+        assert session.segment_token_lengths == [3] * retained
+        for index, layer in enumerate(session.kv_cache):
+            expected = torch.arange(segment + 1 - retained, segment + 1).repeat_interleave(3) + 10 * index
+            for name in ("key", "value", "mask"):
+                torch.testing.assert_close(layer[name][0], expected.float())
+                assert layer[name].untyped_storage().nbytes() == retained * 3 * 4
+    for segment in range(4):
+        before = segment if limit is None else min(segment, limit)
+        commit = segment if limit is None else min(segment, limit - 1)
+        assert observations[2 * segment] == (segment, False, [3 * before] * 2)
+        assert observations[2 * segment + 1] == (segment, True, [3 * commit] * 2)
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "2"])
+def test_invalid_history_limit_rejected_before_loading(value, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(),
+        quantization_config=None,
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        model_config={"hy_nomas_max_cache_segments": value},
+    )
+    with pytest.raises(ValueError, match="hy_nomas_max_cache_segments"):
+        pipeline_module.HyNomasPipeline(od_config=config)
+
+
+def test_history_budget_only_bounds_kv(pipeline):
+    pipeline.transformer.weight = nn.Parameter(torch.zeros(1))
+    pipeline.transformer.config = SimpleNamespace(
+        num_layers=2,
+        num_attention_heads=1,
+        attention_head_dim=2,
+        in_channels=1,
+        text_embed_dim=1,
+    )
+    pipeline.decoder = SimpleNamespace(temporal_window_latents=10)
+    full = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+    pipeline.max_cache_segments = 2
+    bounded = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+    per_segment_kv = 2 * 2 * (1 + 1280) * (2 * 1 * 2 * 4 + 1)
+    assert full - bounded == 2 * per_segment_kv
+    pipeline.max_cache_segments = 5
+    assert pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session == full

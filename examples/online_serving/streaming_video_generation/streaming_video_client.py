@@ -18,6 +18,7 @@ import base64
 import contextlib
 import io
 import json
+import math
 import mimetypes
 import os
 import time
@@ -223,6 +224,25 @@ def build_session_start(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def _nonnegative_finite_interval(value: str) -> float:
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("ping interval must be a nonnegative finite number") from exc
+    if not math.isfinite(interval) or interval < 0:
+        raise argparse.ArgumentTypeError("ping interval must be a nonnegative finite number")
+    return interval
+
+
+async def _run_session_pings(websocket: Any, interval: float, send_lock: asyncio.Lock) -> None:
+    if interval == 0:
+        return
+    while True:
+        await asyncio.sleep(interval)
+        async with send_lock:
+            await websocket.send(json.dumps({"type": "session.ping"}))
+
+
 async def _run_prompt_update_scheduler(
     websocket: Any,
     updates: list[ScheduledPromptUpdate],
@@ -331,6 +351,7 @@ async def stream_video(args: argparse.Namespace) -> None:
     send_lock = asyncio.Lock()
     prompt_update_task: asyncio.Task[None] | None = None
     camera_update_task: asyncio.Task[None] | None = None
+    ping_task: asyncio.Task[None] | None = None
     pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
@@ -386,6 +407,8 @@ async def stream_video(args: argparse.Namespace) -> None:
                     stream_format = msg.get("format") or stream_format
                     print(f"Video session started: request_id={msg.get('request_id')} format={msg.get('format')}")
                     video_started_at = time.perf_counter()
+                    if args.ping_interval > 0 and ping_task is None:
+                        ping_task = asyncio.create_task(_run_session_pings(websocket, args.ping_interval, send_lock))
                     if args.prompt_updates and prompt_update_task is None:
                         prompt_update_task = asyncio.create_task(
                             _run_prompt_update_scheduler(
@@ -432,6 +455,9 @@ async def stream_video(args: argparse.Namespace) -> None:
                 pass
         raise
     finally:
+        if ping_task is not None:
+            ping_task.cancel()
+            await asyncio.gather(ping_task, return_exceptions=True)
         if prompt_update_task is not None:
             prompt_update_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -457,6 +483,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Streaming video generation WebSocket client")
     parser.add_argument("--host", default="127.0.0.1", help="API server host")
     parser.add_argument("--port", type=int, default=8000, help="API server port")
+    parser.add_argument(
+        "--ping-interval",
+        type=_nonnegative_finite_interval,
+        default=0.0,
+        help="Send session.ping every N seconds after video.start; 0 disables pings (default).",
+    )
     parser.add_argument(
         "--model",
         default="BestWishYsh/Helios-Distilled",

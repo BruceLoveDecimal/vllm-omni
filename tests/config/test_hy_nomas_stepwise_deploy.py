@@ -23,6 +23,7 @@ def test_deploy_resolves_a_registered_realtime_video_topology():
     assert topology.stages[0].model_arch == deploy.stages[0].model_class_name
     stage = deploy.stages[0]
     assert stage.max_num_seqs == 1 and stage.step_execution
+    assert stage.diffusion_attention_config == {"default": {"backend": "TORCH_SDPA"}}
     assert stage.engine_extras["streaming_output"]
     assert stage.engine_extras["engine_backend"].endswith("ar_diffusion.engine.ARDiffusionEngine")
     # No implicit retargeting of ordinary offline generation onto AR serving.

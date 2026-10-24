@@ -10,6 +10,9 @@ stages:
     devices: "0"
     max_num_seqs: 1
     enforce_eager: true
+    diffusion_attention_config:
+      default:
+        backend: TORCH_SDPA
     model_class_name: HyNomasPipeline
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
     step_execution: true
