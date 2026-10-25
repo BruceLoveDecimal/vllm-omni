@@ -20,7 +20,6 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
-from vllm_omni.diffusion.utils.hf_utils import should_defer_native_model_download
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
@@ -86,10 +85,6 @@ def omni_snapshot_download(model_id: str) -> str:
     # as a Hugging Face repo here either fails validation or downloads through
     # the wrong backend before the stage processes are created.
     if is_runai_obj_uri(model_id):
-        return model_id
-
-    # 原生模型由各自的组件 loader 解析目录、版本和所需权重。
-    if should_defer_native_model_download(model_id):
         return model_id
 
     # TODO: this is just a workaround for quickly use modelscope, we should support
