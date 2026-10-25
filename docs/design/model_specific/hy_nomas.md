@@ -630,6 +630,12 @@ at a time; stage 1 uses request execution and retains a PixelUMM streaming
 session across those invocations. Both stage processes run on GPU 0. The
 full-request deployment remains available separately.
 
+Playback feedback/pacing (`streaming_pacing` or `streaming_buffer_seconds`)
+continues to require a single-stage diffusion topology after rebasing onto main
+`36027f8f9` (which includes #8721). It is rejected for both two-stage deployments.
+The decoder acknowledgment bounds segment handoff only; it does not pace
+production against the client's playback position.
+
 The internal `diffusion_segment` envelope implements stop-and-wait flow control:
 
 1. The step scheduler suspends a nonterminal producer request as soon as its
@@ -641,7 +647,12 @@ The internal `diffusion_segment` envelope implements stop-and-wait flow control:
    engine invocation is terminal, while the orchestrator keeps the parent
    rollout active until the final segment. Only that acknowledgment restores
    the producer's credit. Duplicate or out-of-order segments/acks fail the request.
-4. The last segment flushes PixelUMM once and releases the decoder session.
+4. The producer retains the upstream runner's `pending_chunk_boundary` flag
+   while waiting for the acknowledgment. Its next scheduled wave applies queued
+   interactions and prepares the next chunk, in that order. Controls received
+   while segment N is decoded therefore affect segment N+1. An interaction
+   alone cannot restore segment credit.
+5. The last segment flushes PixelUMM once and releases the decoder session.
    No acknowledgment is needed to resume an already completed producer.
 
 There is at most one unacknowledged latent segment per request. This bounds
@@ -652,8 +663,10 @@ stage 0, so the existing interaction routing remains applicable. Interaction
 metadata accompanies the latent payload and returns with the decoded video.
 The producer yields between denoising steps instead of grouping an entire
 segment into one worker call, so control RPCs and aborts can run before the
-next chunk boundary. The frontend accepts a diffusion stage 0 with downstream
-stages; it no longer requires the whole pipeline to contain a single stage.
+next chunk boundary. For multiple stages, the frontend requires exactly two
+diffusion stages, a step-execution streaming producer, and a decoder configured
+with `streaming_stage_input` consuming stage 0. Encoder-first and full-request
+multi-stage topologies reject interactions at ingress.
 Controls received before worker admission are kept on the queued request
 (up to 32 events), then enqueued into its interaction coordinator on admission.
 Cancellation drops those controls with the request. Event metadata on media
@@ -706,3 +719,43 @@ checks passed. The mypy hook still reports 59 diagnostics also reproduced on
 the branch base for the same files; normalized comparison found no new
 mypy diagnostics. Concurrent multi-client serving, multiple decoder replicas,
 separate-GPU performance and three-stage routing remain unqualified.
+
+#### Rebase and interaction-boundary regression validation
+
+The branch was rebased onto main `36027f8f9`, including playback backpressure
+from #8721. Validation on 2026-10-26 uses the same RTX PRO 6000 Blackwell with
+PyTorch 2.13.0+cu130 and the repository CI's vLLM 0.32.0 wheel pinned to
+`5df63a7203cdb9328d824a27b682e77c7b9928be`, in a separate environment. The old
+vLLM 0.31.0 environment lacks APIs imported by current main and cannot collect
+the affected entrypoint/runner tests.
+
+The focused model, scheduler, interaction-wait, step-runner, RPC, cancellation,
+orchestration, configuration and video-serving CPU suite passes 772 tests
+(18 non-CPU cases deselected). Six CUDA component tests also pass, including
+BF16 execution with the shared attention/linear dispatch. Replacing the runner
+and entrypoint with their
+pre-fix versions makes four regressions fail: prompt and camera delivery in
+an acknowledgment wait, and interaction rejection for two/three-stage
+full-request or encoder-first topologies. They pass with the fixes.
+
+The real two-process WebSocket deployment passes three sequential cases:
+
+1. Reject a paced request at ingress with the single-stage requirement.
+2. Cancel after the decoder starts segment 0, then submit a recovery request.
+3. During recovery segment 0's decode, submit a changed prompt and camera target;
+   finish all 240 frames and verify both events start in segment 1.
+
+External validation-only import wrappers record decoder entry/exit and the
+producer's prepared prompt key without editing production sources. The recovery
+controls were sent 0.024 seconds into a 12.702-second decoder window. The next
+chunk was prepared after decoder exit and used the replacement prompt. Segment
+0 has no interaction IDs; segment 1 carries both started/completed event IDs.
+The resulting 1280 x 704 / 24 fps video contains 84 + 156 frames with strictly
+increasing PTS. These observations validate timing and lifecycle semantics;
+they do not establish a speedup or memory improvement.
+
+Artifacts are `hy-nomas-review-runtime.json`, `hy-nomas-review-trace.jsonl`,
+`hy-nomas-review-server.log`, `hy-nomas-review-all-tests.log` and
+`hy-nomas-review-red-tests.log`. The external probe lives outside the checkout.
+Diff-scoped hooks have no new mypy diagnostics: the runner property override
+and two existing step-pipeline test diagnostics are also present on main.

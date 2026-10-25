@@ -1686,3 +1686,72 @@ def test_execute_stepwise_with_cfg_parallel():
         args=(world_size, "cfg", "29542"),
         nprocs=world_size,
     )
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("modality", ["prompt", "camera"])
+def test_interaction_during_segment_ack_wait_applies_to_immediate_next_chunk(monkeypatch, mocker, modality):
+    from vllm_omni.diffusion.interaction.types import ChunkMediaSpec, InteractionPayload
+    from vllm_omni.diffusion.segment import SEGMENT_KEY
+    from vllm_omni.inputs.data import OmniInteractionEvent
+
+    pending: list[list[tuple[str, InteractionPayload]]] = []
+    applied: list[tuple[int, list[tuple[str, InteractionPayload]]]] = []
+    prepared: list[int] = []
+
+    class SegmentPipeline(_ChunkedStepPipeline):
+        def peek_chunk_media(self, state):
+            return ChunkMediaSpec(num_media_frames=12, fps=12.0, num_latent_frames=3)
+
+        def apply_interaction_at_chunk_boundary(self, state):
+            applied.extend((state.chunk_index, parts) for parts in pending)
+            pending.clear()
+
+        def prepare_next_chunk(self, state):
+            prepared.append(state.chunk_index)
+            # Materialize conditioning in the batch, just as the real producer
+            # fixes prompt/camera input during prepare_next_chunk.
+            state.latents = torch.tensor([float(len(applied))])
+
+        def post_decode(self, state, **kwargs):
+            index = state.chunk_index
+            super().post_decode(state, **kwargs)
+            return DiffusionOutput(
+                custom_output={SEGMENT_KEY: {"index": index, "finished": state.request_denoise_completed}}
+            )
+
+    runner = _make_runner()
+    runner.od_config.streaming_output = True
+    runner.pipeline = SegmentPipeline()
+    runner._interaction_coordinator = mocker.Mock()
+    runner._interaction_coordinator.maybe_prepare_initial_session.return_value = None
+    runner._interaction_coordinator.enqueue_parts.side_effect = lambda state, **kwargs: pending.append(kwargs["parts"])
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    scheduler = StepScheduler()
+    scheduler.add_request(_make_step_request(4))
+    for _ in range(2):
+        wave = scheduler.schedule()
+        scheduler.update_from_output(wave, runner.execute_stepwise(wave))
+
+    assert runner.state_cache["req-1"].pending_chunk_boundary
+    assert prepared == [0]
+    assert not applied
+    assert scheduler.get_execution_wait_timeout(0.0) is None
+    assert not scheduler.schedule().scheduled_request_ids
+
+    event: OmniInteractionEvent = (
+        {"prompt": "next prompt"} if modality == "prompt" else {"multi_modal_data": {"camera": {"yaw": 1.0}}}
+    )
+    runner.submit_interaction("req-1", {"event_id": "during-decode", "event": event})
+    scheduler.notify_interaction("req-1")
+    assert not scheduler.schedule().scheduled_request_ids
+    assert scheduler.get_execution_wait_timeout(0.0) is None
+    assert not applied and prepared == [0]
+
+    scheduler.acknowledge_segment("req-1", 0)
+    runner.execute_stepwise(scheduler.schedule())
+    expected_payload: InteractionPayload = {"prompt": "next prompt"} if modality == "prompt" else {"yaw": 1.0}
+    assert applied == [(1, [(modality, expected_payload)])]
+    assert prepared == [0, 1]
+    assert not runner.state_cache["req-1"].pending_chunk_boundary
+    assert runner.input_batch.latents.item() == 1.0

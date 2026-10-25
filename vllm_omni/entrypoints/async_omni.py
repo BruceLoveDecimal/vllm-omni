@@ -29,6 +29,7 @@ from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import SupportedTask
 
+from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ErrorMessage
@@ -661,11 +662,24 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     def _resolve_interaction_request(self, request_id: str) -> str:
         """Validate and map an external streaming id to its internal id."""
-        # Interaction ownership remains at stage 0. Downstream diffusion
-        # stages consume its generated segments and do not receive controls.
         stage_meta = self.engine.get_stage_metadata(0)
         if stage_meta.stage_type != "diffusion":
             raise ValueError("interaction requires a diffusion stage")
+        if self.num_stages != 1:
+            # The ordered segment protocol keeps the interactive producer at
+            # stage 0; encoder-first and full-request topologies do not.
+            if self.num_stages != 2 or self.engine.get_stage_metadata(1).stage_type != "diffusion":
+                raise ValueError("interaction requires single-stage diffusion or an ordered diffusion segment handoff")
+            stages = self.engine.stage_configs
+            producer = cast(VllmOmniDiffusionStageConfig, stages[0]).diffusion_config
+            decoder = cast(VllmOmniDiffusionStageConfig, stages[1]).diffusion_config
+            if not (
+                producer.step_execution
+                and producer.streaming_output
+                and decoder.model_config.get("streaming_stage_input", False)
+                and list(stages[1].input_sources) == [0]
+            ):
+                raise ValueError("interaction requires single-stage diffusion or an ordered diffusion segment handoff")
 
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id == request_id]
         if not internal_ids:

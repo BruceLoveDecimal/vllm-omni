@@ -16,7 +16,7 @@ from vllm_omni.inputs.data import OmniInteractionPrompt
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_async_omni(*, num_stages: int = 1, stage_type: str = "diffusion") -> AsyncOmni:
+def _make_async_omni(*, num_stages: int = 1, stage_type: str = "diffusion", segment_handoff: bool = False) -> AsyncOmni:
     omni = object.__new__(AsyncOmni)
     omni.log_stats = False
     omni.request_states = {
@@ -38,6 +38,15 @@ def _make_async_omni(*, num_stages: int = 1, stage_type: str = "diffusion") -> A
     }
     omni.engine = SimpleNamespace(  # pyright: ignore[reportAttributeAccessIssue]
         num_stages=num_stages,
+        stage_configs=[
+            SimpleNamespace(
+                diffusion_config=SimpleNamespace(step_execution=segment_handoff, streaming_output=segment_handoff)
+            ),
+            SimpleNamespace(
+                diffusion_config=SimpleNamespace(model_config={"streaming_stage_input": segment_handoff}),
+                input_sources=[0],
+            ),
+        ],
         get_stage_metadata=lambda stage_id: SimpleNamespace(stage_type=stage_type),
         submit_interaction_async=AsyncMock(),
     )
@@ -207,7 +216,7 @@ async def test_submit_interaction_async_forwards_unsupported_dict_shape_to_engin
 
 @pytest.mark.asyncio
 async def test_multistage_interaction_targets_diffusion_entry_stage():
-    omni = _make_async_omni(num_stages=2)
+    omni = _make_async_omni(num_stages=2, segment_handoff=True)
     omni.request_states.pop("external-abc-uuid-2")
     await omni.submit_interaction_async("external-abc", interaction=_prompt_interaction())
     omni.engine.submit_interaction_async.assert_awaited_once_with(
@@ -221,3 +230,32 @@ async def test_multistage_interaction_rejects_non_diffusion_entry_stage():
     omni = _make_async_omni(num_stages=2, stage_type="llm")
     with pytest.raises(ValueError, match="requires a diffusion stage"):
         await omni.submit_interaction_async("external-abc", interaction=_prompt_interaction())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("num_stages", [2, 3])
+async def test_multistage_interaction_rejects_full_request_and_encoder_first_topologies(num_stages):
+    omni = _make_async_omni(num_stages=num_stages)
+    omni.request_states.pop("external-abc-uuid-2")
+    with pytest.raises(ValueError, match="ordered diffusion segment handoff"):
+        await omni.submit_interaction_async("external-abc", interaction=_prompt_interaction())
+    omni.engine.submit_interaction_async.assert_not_called()
+
+
+@pytest.mark.parametrize("missing", ["step_execution", "streaming_output", "streaming_stage_input", "input_sources"])
+def test_multistage_interaction_requires_complete_segment_capability(missing):
+    omni = _make_async_omni(num_stages=2, segment_handoff=True)
+    if missing == "streaming_stage_input":
+        omni.engine.stage_configs[1].diffusion_config.model_config.clear()
+    elif missing == "input_sources":
+        omni.engine.stage_configs[1].input_sources = []
+    else:
+        setattr(omni.engine.stage_configs[0].diffusion_config, missing, False)
+    with pytest.raises(ValueError, match="ordered diffusion segment handoff"):
+        omni._resolve_interaction_request("other-req")
+
+
+def test_two_stage_segment_handoff_still_rejects_playback_pacing():
+    omni = _make_async_omni(num_stages=2, segment_handoff=True)
+    with pytest.raises(ValueError, match="playback feedback requires single-stage diffusion"):
+        omni.validate_streaming_playback_request()

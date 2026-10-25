@@ -55,3 +55,31 @@ def test_two_stage_realtime_uses_streamed_producer_and_stateful_decoder():
     assert producer.engine_extras["engine_backend"].endswith("ARDiffusionEngine")
     assert not decoder.step_execution
     assert decoder.engine_extras["model_config"]["streaming_stage_input"]
+
+
+@pytest.mark.parametrize(
+    "deploy_name,allows_interaction",
+    [("hy_nomas_two_stage_realtime.yaml", True), ("hy_nomas_two_stage.yaml", False), ("wan2_2_egd.yaml", False)],
+)
+def test_resolved_stage_configs_enforce_segment_interaction_capability(deploy_name, allows_interaction):
+    from types import SimpleNamespace
+
+    from vllm_omni.config.omni_config import VllmOmniConfig
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+    path = Path(__file__).resolve().parents[2] / "vllm_omni/deploy" / deploy_name
+    deploy = load_deploy_config(path)
+    topology = resolve_pipeline_config(deploy.pipeline, None)
+    config = VllmOmniConfig.from_pipeline_config(topology, user_deploy_config=deploy)
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        num_stages=len(config.stage_configs),
+        stage_configs=config.stage_configs,
+        get_stage_metadata=lambda i: SimpleNamespace(stage_type=config.stage_configs[i].stage_type),
+    )
+    omni.request_states = {"r": SimpleNamespace(request_id="r", external_request_id="external")}
+    if allows_interaction:
+        assert omni._resolve_interaction_request("external") == "r"
+    else:
+        with pytest.raises(ValueError, match="ordered diffusion segment handoff"):
+            omni._resolve_interaction_request("external")

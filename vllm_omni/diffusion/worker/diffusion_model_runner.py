@@ -1529,10 +1529,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                         result,
                                     )
                                     if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
-                                        if getattr(req.sampling, "streaming_buffer_seconds", None) is not None:
+                                        paced = getattr(req.sampling, "streaming_buffer_seconds", None) is not None
+                                        marker = segment_envelope(result)
+                                        if paced or (marker is not None and not marker.get("ack")):
+                                            # A segment producer resumes only after the decoder ack.
+                                            # Apply controls received during decode in that next wave.
                                             req.pending_chunk_boundary = True
-                                            pipe = cast(SupportsInteractionApply, pipeline)
-                                            streaming_next_media_duration = pipe.peek_chunk_media(req).duration_s
+                                            if paced:
+                                                pipe = cast(SupportsInteractionApply, pipeline)
+                                                streaming_next_media_duration = pipe.peek_chunk_media(req).duration_s
                                         else:
                                             pipe = cast(SupportsInteractionApply, pipeline)
                                             pipe.apply_interaction_at_chunk_boundary(req)

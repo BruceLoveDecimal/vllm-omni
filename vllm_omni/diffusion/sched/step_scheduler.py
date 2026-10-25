@@ -53,37 +53,32 @@ class StepScheduler(BaseScheduler):
             raise ValueError(f"Unexpected segment acknowledgment for {request_id}: {index}, expected {expected}")
         del self._segment_waiters[request_id]
 
-    def has_requests(self) -> bool:
-        if not self._segment_waiters:
-            return super().has_requests()
-        return bool(
-            any(rid not in self._segment_waiters for rid in self._running)
-            or (self._waiting and len(self._running) < self.max_num_running_reqs)
-            or self._finished_req_ids
-            or self._kv_transfer_request_ids
-            or self._kv_finished_request_ids
-            or self._kv_draining_requests
+    def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
+        return (
+            state.request_id not in self._segment_waiters
+            and self._request_progress[state.request_id].wait_deadline is None
         )
 
-    def schedule(self) -> DiffusionSchedulerOutput:
-        output = super().schedule()
-        output.scheduled_cached_reqs.request_ids = [
-            rid for rid in output.scheduled_cached_reqs.request_ids if rid not in self._segment_waiters
-        ]
-        return output
-
-    def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
-        return self._request_progress[state.request_id].wait_deadline is None
-
     def get_execution_wait_timeout(self, now: float) -> float | None:
-        deadlines = [p.wait_deadline for p in self._request_progress.values() if p.wait_deadline is not None]
-        if not deadlines or any(self._request_progress[rid].wait_deadline is None for rid in self._running):
+        deadlines = [
+            p.wait_deadline
+            for rid, p in self._request_progress.items()
+            if rid not in self._segment_waiters and p.wait_deadline is not None
+        ]
+        if self._segment_waiters:
+            deadlines.append(inf)
+        if not deadlines or any(self._can_schedule_running(self._request_states[rid]) for rid in self._running):
             return 0.0
         if len(self._running) < self.max_num_running_reqs and any(
             self._can_schedule_waiting(self._request_states[request_id]) for request_id in self._waiting
         ):
             return 0.0
-        if self._finished_req_ids or self._kv_transfer_request_ids or self._kv_draining_requests:
+        if (
+            self._finished_req_ids
+            or self._kv_transfer_request_ids
+            or self._kv_finished_request_ids
+            or self._kv_draining_requests
+        ):
             return 0.0
         deadline = min(deadlines)
         return None if deadline == inf else max(deadline - now, 0.0)

@@ -2360,12 +2360,18 @@ def test_segment_credit_blocks_next_wave_until_matching_ack():
     output = _make_step_output("stream", 1)
     output.result = DiffusionOutput(finished=False, custom_output={SEGMENT_KEY: {"index": 0, "finished": False}})
     scheduler.update_from_output(wave, BatchRunnerOutput.from_list([output]))
-    assert not scheduler.has_requests()
+    assert scheduler.has_requests()
+    assert scheduler.get_execution_wait_timeout(0.0) is None
     assert not scheduler.schedule().scheduled_request_ids
     with pytest.raises(ValueError, match="Unexpected segment acknowledgment"):
         scheduler.acknowledge_segment("stream", 1)
-    assert not scheduler.has_requests()
+    assert scheduler.has_requests()
+    assert scheduler.get_execution_wait_timeout(0.0) is None
+    scheduler.notify_interaction("stream")
+    assert not scheduler.schedule().scheduled_request_ids
+    assert scheduler.get_execution_wait_timeout(0.0) is None
     scheduler.acknowledge_segment("stream", 0)
+    assert scheduler.get_execution_wait_timeout(0.0) == 0.0
     assert scheduler.has_requests()
     assert scheduler.schedule().scheduled_request_ids == ["stream"]
     with pytest.raises(ValueError):
@@ -2384,3 +2390,26 @@ def test_abort_retires_blocked_segment_without_ack():
     scheduler.finish_requests("stream", DiffusionRequestStatus.FINISHED_ABORTED)
     scheduler.pop_request_state("stream")
     assert not scheduler._segment_waiters
+
+
+def test_segment_wait_keeps_other_requests_and_terminal_kv_work_runnable():
+    from vllm_omni.diffusion.segment import SEGMENT_KEY
+
+    scheduler = StepScheduler()
+    scheduler.max_num_running_reqs = 2
+    scheduler.add_request(_make_step_request("stream"))
+    wave = scheduler.schedule()
+    output = _make_step_output("stream", 1)
+    output.result = DiffusionOutput(finished=False, custom_output={SEGMENT_KEY: {"index": 0, "finished": False}})
+    scheduler.update_from_output(wave, BatchRunnerOutput.from_list([output]))
+    assert scheduler.get_execution_wait_timeout(0.0) is None
+    scheduler._kv_finished_request_ids.add("kv-done")
+    assert scheduler.get_execution_wait_timeout(0.0) == 0.0
+    scheduler._kv_finished_request_ids.clear()
+    request = _make_step_request("other")
+    request.sampling_params.step_index = 1
+    scheduler.add_request(request)
+    assert scheduler.get_execution_wait_timeout(0.0) == 0.0
+    assert scheduler.schedule().scheduled_request_ids == ["other"]
+    assert scheduler._running == ["stream", "other"]
+    assert scheduler.get_execution_wait_timeout(0.0) == 0.0

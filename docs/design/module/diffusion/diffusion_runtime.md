@@ -538,3 +538,17 @@ at idle through the engine, executor, worker, and runner using two CPU regressio
 - [Async diffusion output](../../feature/async_diffusion_output.md)
 - [Engine orchestration](../engine_orchestration.md)
 - [Stage runtime](../stage_runtime.md)
+
+### Segment acknowledgments and deferred interaction boundaries
+
+A nonterminal `diffusion_segment` output suspends the producer through
+`StepScheduler._can_schedule_running`. The base `has_requests` still reports
+owned work; `get_execution_wait_timeout` waits for an event while all admitted
+requests await decoder acknowledgments, using the same control-loop mechanism
+as interaction waits. New interactions cannot release segment credit.
+
+The runner sets `StepRequestState.pending_chunk_boundary` on segment emission.
+After the decoder acknowledgment, the next scheduled call applies interactions
+and then prepares the next chunk. Inputs for chunk N+1 remain open to controls
+received during decode of chunk N. Cancellation retires both the scheduler's
+segment waiter and the runner's pending request state.
