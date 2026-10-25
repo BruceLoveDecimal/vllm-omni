@@ -759,3 +759,6 @@ Artifacts are `hy-nomas-review-runtime.json`, `hy-nomas-review-trace.jsonl`,
 `hy-nomas-review-red-tests.log`. The external probe lives outside the checkout.
 Diff-scoped hooks have no new mypy diagnostics: the runner property override
 and two existing step-pipeline test diagnostics are also present on main.
+
+The subsequent fixed-workload latency, memory, CUDA timeline and approximate MFU
+measurements are recorded in [two-stage profiling](hy_nomas_profiling.md).
