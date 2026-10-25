@@ -33,11 +33,14 @@ import torch.nn.functional as F
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import RMSNorm
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.norm import LayerNorm
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
+from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15PatchEmbed
 from vllm_omni.diffusion.models.hy_nomas.cache import HyNomasKVCache
 
 
@@ -91,18 +94,6 @@ def _apply_rotary_emb(hidden_states, rotary_emb):
     real, imaginary = hidden_states.float().unflatten(-1, (-1, 2)).unbind(-1)
     rotated = torch.stack((-imaginary, real), dim=-1).flatten(-2)
     return (hidden_states.float() * cosine[None, :, None] + rotated * sine[None, :, None]).to(hidden_states.dtype)
-
-
-class HyNomasLayerNorm(nn.LayerNorm):
-    def forward(self, hidden_states) -> torch.Tensor:
-        # The released model keeps normalization and subsequent modulation in float32.
-        return F.layer_norm(
-            hidden_states.float(),
-            self.normalized_shape,
-            None if self.weight is None else self.weight.float(),
-            None if self.bias is None else self.bias.float(),
-            self.eps,
-        )
 
 
 class HyNomasRotaryPosEmbed(nn.Module):
@@ -198,9 +189,9 @@ class HyNomasTextAttention(nn.Module):
 class HyNomasTokenRefinerBlock(nn.Module):
     def __init__(self, hidden_size, heads):
         super().__init__()
-        self.norm1 = HyNomasLayerNorm(hidden_size, eps=1e-6)
+        self.norm1 = LayerNorm(hidden_size, eps=1e-6)
         self.attn = HyNomasTextAttention(hidden_size, heads)
-        self.norm2 = HyNomasLayerNorm(hidden_size, eps=1e-6)
+        self.norm2 = LayerNorm(hidden_size, eps=1e-6)
         self.mlp = HyNomasTokenRefinerMLP(hidden_size)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
 
@@ -431,12 +422,12 @@ class HyNomasTransformerBlock(nn.Module):
     def __init__(self, hidden_size, heads, mlp_ratio):
         super().__init__()
         self.img_mod = HyNomasModulation(hidden_size)
-        self.img_norm1 = HyNomasLayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
-        self.img_norm2 = HyNomasLayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
+        self.img_norm1 = LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False, keep_fp32_output=True)
+        self.img_norm2 = LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False, keep_fp32_output=True)
         self.img_mlp = FeedForward(hidden_size, inner_dim=int(hidden_size * mlp_ratio))
         self.txt_mod = HyNomasModulation(hidden_size)
-        self.txt_norm1 = HyNomasLayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
-        self.txt_norm2 = HyNomasLayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
+        self.txt_norm1 = LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False, keep_fp32_output=True)
+        self.txt_norm2 = LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False, keep_fp32_output=True)
         self.txt_mlp = FeedForward(hidden_size, inner_dim=int(hidden_size * mlp_ratio))
         self.attn = HyNomasAttention(hidden_size, heads)
 
@@ -527,19 +518,10 @@ class HyNomasCameraAttention(nn.Module):
         return self.processor(self, hidden_states, camera_hidden_states, rotary_emb, camera_attention_mask)
 
 
-class HyNomasPatchEmbed(nn.Module):
-    def __init__(self, in_channels, hidden_size):
-        super().__init__()
-        self.proj = nn.Conv3d(in_channels, hidden_size, kernel_size=1, stride=1)
-
-    def forward(self, hidden_states) -> torch.Tensor:
-        return self.proj(hidden_states).flatten(2).transpose(1, 2).contiguous()
-
-
 class HyNomasFinalLayer(nn.Module):
     def __init__(self, hidden_size, out_channels):
         super().__init__()
-        self.norm_final = HyNomasLayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
+        self.norm_final = LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False, keep_fp32_output=True)
         self.linear = nn.Linear(hidden_size, out_channels)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
 
@@ -568,6 +550,13 @@ class HyNomasTransformer3DModel(nn.Module):
         camera_num_attention_heads (`int`, defaults to `16`): Number of camera attention heads.
         camera_rope_axes_dim (`tuple[int]`, defaults to `(8, 28, 28)`): Camera RoPE dimensions.
     """
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "_mlp.fc1.": "_mlp.net.0.proj.",
+            "_mlp.fc2.": "_mlp.net.2.",
+        }
+    )
 
     _no_split_modules = [
         "HyNomasTransformerBlock",
@@ -622,7 +611,7 @@ class HyNomasTransformer3DModel(nn.Module):
         if camera_attention_dim != camera_num_attention_heads * sum(camera_rope_axes_dim):
             raise ValueError("camera_attention_dim must match camera_num_attention_heads * sum(camera_rope_axes_dim).")
         hidden_size = num_attention_heads * attention_head_dim
-        self.img_in = HyNomasPatchEmbed(in_channels, hidden_size)
+        self.img_in = HunyuanVideo15PatchEmbed((1, 1, 1), in_channels, hidden_size)
         self.txt_in = HyNomasTokenRefiner(text_embed_dim, hidden_size, num_attention_heads)
         self.time_in = HyNomasTimestepEmbedder(hidden_size)
         self.rotary_embed = HyNomasRotaryPosEmbed(rope_axes_dim, rope_theta)
@@ -652,13 +641,10 @@ class HyNomasTransformer3DModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the converted checkpoint without silently dropping or inventing parameters."""
         parameters = dict(self.named_parameters())
-        checkpoint_names: dict[str, str] = {}
-        for name in parameters:
-            if name.startswith("double_blocks.") and "_mlp.net." in name:
-                checkpoint_name = name.replace("_mlp.net.0.proj.", "_mlp.fc1.").replace("_mlp.net.2.", "_mlp.fc2.")
-                checkpoint_names[checkpoint_name] = name
-            else:
-                checkpoint_names[name] = name
+        checkpoint_mapper = WeightsMapper(
+            orig_to_new_substr={new: old for old, new in self.hf_to_vllm_mapper.orig_to_new_substr.items()}
+        )
+        checkpoint_names = set(checkpoint_mapper.apply_list(list(parameters)))
         loaded: set[str] = set()
         seen: set[str] = set()
         for name, tensor in weights:
@@ -666,11 +652,11 @@ class HyNomasTransformer3DModel(nn.Module):
                 raise ValueError(f"Unexpected Hy-Nomas transformer weight: {name}")
             if name in seen:
                 raise ValueError(f"Duplicate Hy-Nomas transformer weight: {name}")
-            destination = checkpoint_names[name]
+            destination = self.hf_to_vllm_mapper.apply_list([name])[0]
             default_weight_loader(parameters[destination], tensor)
             seen.add(name)
             loaded.add(destination)
-        missing = checkpoint_names.keys() - seen
+        missing = checkpoint_names - seen
         if missing:
             raise ValueError(f"Missing Hy-Nomas transformer weights: {sorted(missing)}")
         return loaded
@@ -766,7 +752,7 @@ class HyNomasTransformer3DModel(nn.Module):
                 raise ValueError("All kv_cache layers must contain the same number of tokens.")
         if rotary_emb is None:
             rotary_emb = self.rotary_embed(num_frames, height, width, hidden_states.device, frame_offset)
-        hidden_states = self.img_in(hidden_states)
+        hidden_states = self.img_in(hidden_states).contiguous()
         temb = self.time_in(timestep, hidden_states.dtype)
         encoder_hidden_states = self.txt_in(encoder_hidden_states, timestep, encoder_attention_mask)
         camera_hidden_states = None

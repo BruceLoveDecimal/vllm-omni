@@ -513,6 +513,54 @@ parallel linear layers. Diff-scoped pre-commit checks passed. The CPU loader
 regression checks both image/text MLP outputs against the original checkpoint
 names and rejects missing or duplicate mapped weights.
 
+### Pure deduplication of HY1.5 components
+
+The first reuse tier preserves the reference arithmetic and checkpoint contract:
+
+- `img_in` uses `HunyuanVideo15PatchEmbed((1, 1, 1), ...)`; the Nomas caller
+  retains `.contiguous()` so downstream GEMMs see the original memory layout.
+- Shared `LayerNorm` replaces the local class. Token-refiner norms retain
+  input dtype; double-stream and final-layer norms set `keep_fp32_output=True`
+  for subsequent modulation. The option defaults to false and is keyword-only;
+  enabling it bypasses MindIE-SD on NPU in favor of native FP32 normalization.
+- `hunyuan_video/qwen_prompt.py` owns chat tokenization, user-marker discovery
+  and hidden-state extraction. Tokenization stays separate from encoding so
+  Nomas action boundaries reuse the same token IDs. HY1.5 retains its fixed
+  crop of 108, empty-prompt space substitution, encoder fields, default cache
+  behavior and final dtype cast. Nomas retains dynamic cropping and
+  `use_cache=False`; its action timing logic remains model-specific.
+- `WeightsMapper` declares the MLP name mapping. Loading still rejects missing,
+  duplicate and unexpected checkpoint keys, including unmapped internal names.
+
+No AdaLN replacement, timestep/RoPE rewrite, prompt-interaction redesign,
+packed QKV or fused normalization is included in this tier. This is code reuse,
+not a claim of lower latency or memory use. HY1.5 I2V retains the existing
+`format_text_input` import location.
+
+Validation on the same RTX PRO 6000 Blackwell / PyTorch 2.13 setup, BF16,
+TORCH_SDPA, seed 42 and eight denoising steps:
+
+- Two 240-frame, 704 x 1280 rollouts (30 + 30 latent frames) match the retained
+  shared-MLP baseline: all 32 flow predictions, four latents and four raw RGB
+  chunks have identical SHA-256 hashes.
+- The 10 + 10 + 1 latent-frame workload, with one cached history segment,
+  action grouping, moving camera and a final prompt replacement, matches the
+  recorded control baseline: all 24 predictions, three latents and three RGB
+  chunks are byte-identical.
+- Focused Nomas/HY1.5, shared normalization and neighboring CPU suites pass
+  1184 tests (eight skipped, 50 non-CPU tests deselected). Six Nomas CUDA
+  component tests also pass. Tests cover all 2268 transformer checkpoint keys,
+  strict loading failures, FP32-output NPU fallback, system-prompt equality,
+  the real local Qwen tokenizer's crop of 108, and HY1.5 encoding arguments.
+- Diff-scoped pre-commit hooks pass except three existing mypy diagnostics
+  about `LayerNorm`'s multiple-inheritance constructor, reproduced on the
+  unmodified baseline. No new mypy diagnostics remain.
+
+Artifacts: `reuse-main.json`, `reuse-contract.json`, `reuse-summary.json`,
+`reuse-tests.log`, `reuse-gpu-tests.log`, and `reuse-source-manifest.json`.
+These tests do not qualify full HY1.5 video generation or NPU hardware execution;
+NPU fallback is tested with a mocked fused-kernel entry point.
+
 ### M4: two-stage model boundary and realtime transport
 
 A first split would keep conditioning and the autoregressive DiT in stage 0,

@@ -14,6 +14,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm_omni.diffusion.models.hunyuan_video.qwen_prompt import (
+    encode_qwen_chat_prompt,
+    qwen_chat_crop_start,
+    tokenize_qwen_chat_prompt,
+)
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase, Qwen2_5_VLTextModel
 
@@ -28,15 +34,7 @@ SYSTEM_PROMPT = (
 
 
 def _tokenize(tokenizer, prompt, max_length=None):
-    kwargs = {} if max_length is None else {"truncation": True, "max_length": max_length, "padding": "max_length"}
-    return tokenizer.apply_chat_template(
-        [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-        **kwargs,
-    )
+    return tokenize_qwen_chat_prompt(tokenizer, prompt, SYSTEM_PROMPT, max_length)
 
 
 def _action_variants(prompt):
@@ -132,16 +130,10 @@ def encode_segment_prompt(
         raise ValueError("Hy-Nomas requires a nonempty segment prompt.")
     if max_sequence_length < 1:
         raise ValueError("max_sequence_length must be positive.")
-    marker = tokenizer("<|im_start|>user\n", add_special_tokens=False)["input_ids"]
-    ids = _tokenize(tokenizer, "")["input_ids"][0].tolist()
-    crop = next(
-        (i + len(marker) for i in range(len(ids) - len(marker) + 1) if ids[i : i + len(marker)] == marker), None
-    )
-    if crop is None:
-        raise ValueError("The tokenizer chat template must contain the Qwen user marker.")
+    crop = qwen_chat_crop_start(tokenizer, SYSTEM_PROMPT)
     length = max_sequence_length
     tokens = _tokenize(tokenizer, prompt, length + crop).to(device)
-    encoded = text_encoder(**tokens, output_hidden_states=True, use_cache=False)
+    embeds, mask = encode_qwen_chat_prompt(text_encoder, tokens, crop, use_cache=False)
     full_ids = tokens["input_ids"][0].tolist()
     boundaries = []
     for variant in _action_variants(prompt):
@@ -152,8 +144,8 @@ def encode_segment_prompt(
         )
         boundaries.append(max(boundaries[-1] if boundaries else 0, min(length - 1, common - crop)))
     return EncodedPrompt(
-        embeds=encoded.hidden_states[-3][:, crop:],
-        mask=tokens["attention_mask"][:, crop:],
+        embeds=embeds,
+        mask=mask,
         action_offsets=boundaries + [min(length, int(tokens["attention_mask"].sum()))] if boundaries else None,
         cache_action_start=boundaries[0] if boundaries else None,
     )

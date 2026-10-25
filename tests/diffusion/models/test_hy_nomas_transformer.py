@@ -263,3 +263,34 @@ def test_preallocated_capacity_rejects_overflow_without_advancing_history():
         cache.stage((key,), (key,), mask)
     assert cache.length == 2
     assert torch.equal(cache.key, before)
+
+
+def test_shared_patch_embed_preserves_reference_layout(tiny_model):
+    from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15PatchEmbed
+
+    assert isinstance(tiny_model.img_in, HunyuanVideo15PatchEmbed)
+    x = torch.randn(1, 4, 2, 3, 4)
+    expected = (
+        F.conv3d(x, tiny_model.img_in.proj.weight, tiny_model.img_in.proj.bias).flatten(2).transpose(1, 2).contiguous()
+    )
+    actual = tiny_model.img_in(x).contiguous()
+    assert actual.stride() == expected.stride()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_full_checkpoint_mapping_coverage(monkeypatch):
+    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(model_module, "_attention", lambda *args: _SDPA())
+    monkeypatch.setattr("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", lambda: 1)
+    with torch.device("meta"):
+        model = model_module.HyNomasTransformer3DModel()
+    parameters = dict(model.named_parameters())
+    checkpoint = [
+        name.replace("_mlp.net.0.proj.", "_mlp.fc1.").replace("_mlp.net.2.", "_mlp.fc2.") for name in parameters
+    ]
+    mapped = model.hf_to_vllm_mapper.apply_list(checkpoint)
+    assert len(mapped) == len(set(mapped)) == len(parameters) == 2268
+    assert set(mapped) == set(parameters)
+    assert model.load_weights((name, parameters[target]) for name, target in zip(checkpoint, mapped)) == set(parameters)

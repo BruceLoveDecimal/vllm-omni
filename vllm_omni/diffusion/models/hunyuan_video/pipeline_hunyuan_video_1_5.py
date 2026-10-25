@@ -27,6 +27,11 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
+from vllm_omni.diffusion.models.hunyuan_video.qwen_prompt import (
+    encode_qwen_chat_prompt,
+    format_text_input,  # noqa: F401 - retain the existing import location
+    tokenize_qwen_chat_prompt,
+)
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
@@ -52,12 +57,6 @@ def retrieve_latents(
         return encoder_output.latents
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
-
-
-def format_text_input(prompt: list[str], system_message: str) -> list[list[dict[str, str]]]:
-    return [
-        [{"role": "system", "content": system_message}, {"role": "user", "content": p if p else " "}] for p in prompt
-    ]
 
 
 def extract_glyph_texts(prompt: str) -> str | None:
@@ -226,32 +225,19 @@ class HunyuanVideo15Pipeline(
         dtype: torch.dtype,
         num_hidden_layers_to_skip: int = 2,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        prompt_formatted = format_text_input(prompt, self.system_message)
-
-        text_inputs = self.tokenizer.apply_chat_template(
-            prompt_formatted,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            padding="max_length",
-            max_length=self.tokenizer_max_length + self.prompt_template_encode_start_idx,
-            truncation=True,
-            return_tensors="pt",
+        text_inputs = tokenize_qwen_chat_prompt(
+            self.tokenizer,
+            prompt,
+            self.system_message,
+            self.tokenizer_max_length + self.prompt_template_encode_start_idx,
         )
-
-        text_input_ids = text_inputs.input_ids.to(device=device)
-        prompt_attention_mask = text_inputs.attention_mask.to(device=device)
-
-        prompt_embeds = self.text_encoder(
-            input_ids=text_input_ids,
-            attention_mask=prompt_attention_mask,
-            output_hidden_states=True,
-        ).hidden_states[-(num_hidden_layers_to_skip + 1)]
-
-        crop_start = self.prompt_template_encode_start_idx
-        if crop_start is not None and crop_start > 0:
-            prompt_embeds = prompt_embeds[:, crop_start:]
-            prompt_attention_mask = prompt_attention_mask[:, crop_start:]
+        tokens = {
+            "input_ids": text_inputs.input_ids.to(device=device),
+            "attention_mask": text_inputs.attention_mask.to(device=device),
+        }
+        prompt_embeds, prompt_attention_mask = encode_qwen_chat_prompt(
+            self.text_encoder, tokens, max(0, self.prompt_template_encode_start_idx), num_hidden_layers_to_skip
+        )
 
         return prompt_embeds.to(dtype=dtype), prompt_attention_mask
 
