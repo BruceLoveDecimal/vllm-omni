@@ -24,7 +24,7 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos`` accepts the ``timeline_guides`` manifest plus
     # ``guide_files`` uploads, forwarded as ``multi_modal_data["timeline_guides"]``.
     supports_timeline_guides: bool = False
-    # 使用进程级运行状态的外部模型需要隔离调用进程。
+    # Isolate external runtimes that modify process-global state.
     requires_process_isolation: bool = False
 
 
