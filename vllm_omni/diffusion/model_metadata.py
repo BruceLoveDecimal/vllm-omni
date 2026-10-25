@@ -24,8 +24,6 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos`` accepts the ``timeline_guides`` manifest plus
     # ``guide_files`` uploads, forwarded as ``multi_modal_data["timeline_guides"]``.
     supports_timeline_guides: bool = False
-    # Isolate external runtimes that modify process-global state.
-    requires_process_isolation: bool = False
 
 
 # FLUX.2 Klein supports up to four reference images.
@@ -41,10 +39,7 @@ BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
-    "HyNomasPipeline": DiffusionModelMetadata(
-        final_output_type="video",
-        requires_process_isolation=True,
-    ),
+    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
     "Flux2KleinPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
