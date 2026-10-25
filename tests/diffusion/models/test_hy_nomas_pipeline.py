@@ -25,6 +25,9 @@ class _TinyTransformer(nn.Module):
         self.calls = []
         self.conditions = []
 
+    def rotary_embed(self, frames, height, width, device, offset):
+        return (torch.full((frames * height * width, 1), offset, device=device),) * 2
+
     def forward(self, hidden_states, timestep, update_cache=False, frame_offset=0, **kwargs):
         self.calls.append((hidden_states.clone(), timestep.clone(), update_cache, frame_offset))
         self.conditions.append(kwargs)
@@ -240,19 +243,19 @@ def test_segment_history_eviction_matches_native_commit_order(pipeline, monkeypa
     state = StepRequestState(request_id="history", prompt="A landscape", sampling=sampling)
     pipeline.prepare_encode(state)
     session = pipeline._sessions["history"]
-    session.kv_cache = [{}, {}]
+    session.kv_cache = [pipeline_module.HyNomasKVCache(12) for _ in range(2)]
     observations = []
 
     def predict(state, latents, timestep, *, commit=False):
-        counts = [layer.get("mask", torch.empty(1, 0)).shape[1] for layer in session.kv_cache]
+        counts = [layer.length for layer in session.kv_cache]
         observations.append((session.frame_offset, commit, counts))
-        if commit:
-            for index, layer in enumerate(session.kv_cache):
-                for name in ("key", "value", "mask"):
-                    value = session.frame_offset + 10 * index
-                    new = torch.full((1, 3), value, dtype=torch.float32)
-                    old = layer.get(name, torch.empty(1, 0))
-                    layer[name] = torch.cat((old, new), dim=1)
+        for index, layer in enumerate(session.kv_cache):
+            value = session.frame_offset + 10 * index
+            new = torch.full((1, 3, 1, 1), value, dtype=torch.float32)
+            mask = torch.ones(1, 3, dtype=torch.bool)
+            layer.stage((new,), (new,), mask)
+            if commit:
+                layer.commit(mask)
         return torch.zeros_like(latents)
 
     monkeypatch.setattr(pipeline, "_predict", predict)
@@ -265,9 +268,11 @@ def test_segment_history_eviction_matches_native_commit_order(pipeline, monkeypa
         assert session.segment_token_lengths == [3] * retained
         for index, layer in enumerate(session.kv_cache):
             expected = torch.arange(segment + 1 - retained, segment + 1).repeat_interleave(3) + 10 * index
-            for name in ("key", "value", "mask"):
-                torch.testing.assert_close(layer[name][0], expected.float())
-                assert layer[name].untyped_storage().nbytes() == retained * 3 * 4
+            for tensor in (layer.key, layer.value):
+                torch.testing.assert_close(tensor[0, : layer.length, 0, 0], expected.float())
+                allocated_segments = segment + 1 if limit is None else min(segment + 1, limit + 1)
+                assert tensor.untyped_storage().nbytes() == allocated_segments * 3 * 4
+            assert layer.mask[:, : layer.length].all()
     for segment in range(4):
         before = segment if limit is None else min(segment, limit)
         commit = segment if limit is None else min(segment, limit - 1)
@@ -303,7 +308,69 @@ def test_history_budget_only_bounds_kv(pipeline):
     full = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
     pipeline.max_cache_segments = 2
     bounded = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
-    per_segment_kv = 2 * 2 * (1 + 1280) * (2 * 1 * 2 * 4 + 1)
-    assert full - bounded == 2 * per_segment_kv
+    per_segment_kv = 2 * (1 + 1280) * (2 * 1 * 2 * 4 + 1)
+    per_segment_scratch = (1 + 1280) * 1 * 2 * 4
+    assert full - bounded == per_segment_kv + per_segment_scratch
     pipeline.max_cache_segments = 5
     assert pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session == full
+
+
+def test_condition_cache_reuses_prompt_but_refreshes_segment_geometry(pipeline, monkeypatch):
+    calls = []
+
+    def encode(prompt, *args):
+        calls.append(prompt)
+        return pipeline_module.EncodedPrompt(torch.zeros(1, 2, 1), torch.ones(1, 2, dtype=torch.bool), None, None)
+
+    monkeypatch.setattr(pipeline_module, "encode_segment_prompt", encode)
+    sampling = _sampling()
+    sampling.num_frames = 12
+    sampling.extra_args = {"segment_prompts": ["same", "same", "changed"]}
+    state = StepRequestState(request_id="cached", prompt="same", sampling=sampling)
+    pipeline.prepare_encode(state)
+    tables = []
+    for _ in range(3):
+        pipeline.prepare_next_chunk(state)
+        session = pipeline._sessions[state.request_id]
+        tables.append(session.rotary_emb)
+        while not state.chunk_denoise_completed:
+            pipeline.step_scheduler(state, pipeline.denoise_step(None, states=[state]))
+        pipeline.post_decode(state)
+    assert calls == ["same", "changed"]
+    assert [table[0].item() for table in tables] == [0, 1, 2]
+    for index, condition in enumerate(pipeline.transformer.conditions):
+        assert condition["rotary_emb"] is tables[index // 3]
+    pipeline.reset_ar_diffusion_session(state.request_id)
+    assert state.request_id not in pipeline._sessions
+
+
+@pytest.mark.parametrize(
+    "offload, accepted",
+    [
+        ({"mode": "module", "components": ["text_encoder"]}, True),
+        ({"mode": "module", "components": ["dit"]}, False),
+        ({"mode": "module", "components": ["dit", "text_encoder"]}, False),
+        ({"mode": "layer", "components": ["text_encoder"]}, False),
+    ],
+)
+def test_offload_policy_keeps_dit_and_decoder_resident(offload, accepted, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
+
+    def reached_loader(*args, **kwargs):
+        raise RuntimeError("policy accepted before loading")
+
+    monkeypatch.setattr(pipeline_module, "get_hf_file_to_dict", reached_loader)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(),
+        quantization_config=None,
+        diffusion_offload_config=offload,
+        model_config={},
+        revision=None,
+        model="unused",
+    )
+    if accepted:
+        with pytest.raises(RuntimeError, match="policy accepted"):
+            pipeline_module.HyNomasPipeline(od_config=config)
+    else:
+        with pytest.raises(ValueError, match="only module-mode text_encoder"):
+            pipeline_module.HyNomasPipeline(od_config=config)

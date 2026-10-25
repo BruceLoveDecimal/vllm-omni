@@ -91,7 +91,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def mrope_tables(arch: PixelUMMArchitecture, grid: tuple[int, int, int], device) -> tuple[torch.Tensor, torch.Tensor]:
-    """cos/sin [1, T*H*W, 1, head_dim] for a THW-ordered grid, laid out [T | H | W]."""
+    """cos/sin [1, T*H*W, 1, head_dim] for a T/H/W-ordered grid, laid out [T | H | W]."""
     positions = torch.meshgrid(*(torch.arange(n, device=device) for n in grid), indexing="ij")
     thetas = (arch.rope_theta_t, arch.rope_theta_hw, arch.rope_theta_hw)
     cos_parts, sin_parts = [], []
@@ -173,7 +173,7 @@ class PixelUMMAttention(nn.Module):
         self.k_norm_hw = PixelUMMRMSNorm(dim // 2, arch.rms_norm_eps)
         self.attention = Attention(
             num_heads=heads,
-            num_kv_heads=heads,
+            num_kv_heads=kv,
             head_size=dim,
             softmax_scale=dim**-0.5,
             causal=False,
@@ -194,10 +194,8 @@ class PixelUMMAttention(nn.Module):
         key = torch.cat((self.k_norm_t(key_time), self.k_norm_hw(key_spatial)), dim=-1)
         query = apply_mrope(query, cos, sin, arch.rope_sections).to(value.dtype)
         key = apply_mrope(key, cos, sin, arch.rope_sections).to(value.dtype)
-        # Match the reference SDPA path before qualifying fused GQA kernels.
-        repeat = arch.num_heads // arch.num_kv_heads
-        key = key.repeat_interleave(repeat, dim=2)
-        value = value.repeat_interleave(repeat, dim=2)
+        # Keep K/V compressed through neighborhood gathering. The shared backend
+        # selects fused GQA where supported and owns the equal-head fallback.
         if neighborhoods is None:
             output = self.attention(query, key, value)
         else:

@@ -27,12 +27,14 @@ from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.hy_nomas.cache import HyNomasKVCache
 from vllm_omni.diffusion.models.hy_nomas.camera import normalize_camera
 from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder, PixelUMMStreamingDecodeSession
 from vllm_omni.diffusion.models.hy_nomas.interaction import HyNomasPromptSession
 from vllm_omni.diffusion.models.hy_nomas.prompt import EncodedPrompt, _action_windows, encode_segment_prompt
 from vllm_omni.diffusion.models.hy_nomas.transformer import HyNomasTransformer3DModel
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, SupportsStepExecution
+from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, OffloadStrategy, resolve_offload
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
@@ -42,10 +44,13 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVStat
 
 @dataclass
 class HyNomasSession:
-    kv_cache: list[dict[str, torch.Tensor]]
+    kv_cache: list[HyNomasKVCache]
     decoder: PixelUMMStreamingDecodeSession | None = None
     frame_offset: int = 0
     segment_token_lengths: list[int] = field(default_factory=list)
+    prompt_key: tuple[str, int] | None = None
+    encoded_prompt: EncodedPrompt | None = None
+    rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 def segment_lengths(num_frames: int, segment_frames: int, max_segments: int) -> list[int]:
@@ -84,14 +89,11 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
             raise ValueError("Hy-Nomas's precision baseline supports one worker; distributed layouts are unqualified.")
         if od_config.quantization_config is not None:
             raise ValueError("Hy-Nomas's precision baseline does not support quantized weights.")
-        if any(
-            (
-                od_config.enable_cpu_offload,
-                od_config.enable_layerwise_offload,
-                od_config.enable_distributed_layerwise_offload,
-            )
+        offload = resolve_offload(od_config)
+        if offload.strategy is not OffloadStrategy.NONE and not (
+            offload.strategy is OffloadStrategy.MODEL_LEVEL and offload.components == {TEXT_ENCODER_COMPONENT}
         ):
-            raise ValueError("Hy-Nomas streaming decoder offload is not yet qualified; use resident components.")
+            raise ValueError("Hy-Nomas supports only module-mode text_encoder offload; keep DiT and decoder resident.")
         config = od_config.model_config or {}
         self.height = int(config.get("ar_diffusion_height", 704))
         self.width = int(config.get("ar_diffusion_width", 1280))
@@ -146,13 +148,21 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
         frame_tokens = (self.height // 32) * (self.width // 32)
         cache_segments = self.max_segments
         if self.max_cache_segments is not None:
-            cache_segments = min(cache_segments, self.max_cache_segments)
+            # Denoising sees retained history plus the uncommitted current segment.
+            cache_segments = min(cache_segments, self.max_cache_segments + 1)
         tokens = cache_segments * (self.segment_frames * frame_tokens + self.max_text_length)
         element_size = next(self.transformer.parameters()).element_size()
-        # Two copies of retained mixed video/text history cover concatenation
-        # during cache commit; a boolean visibility mask is retained per layer.
         cache_bytes = (
-            2 * cfg.num_layers * tokens * (2 * cfg.num_attention_heads * cfg.attention_head_dim * element_size + 1)
+            cfg.num_layers * tokens * (2 * cfg.num_attention_heads * cfg.attention_head_dim * element_size + 1)
+        )
+        # Growth and eviction copy one layer's one tensor at a time. They do
+        # not overlap; the growth bound also covers eviction compaction.
+        cache_bytes += (
+            (cache_segments - 1)
+            * (self.segment_frames * frame_tokens + self.max_text_length)
+            * cfg.num_attention_heads
+            * cfg.attention_head_dim
+            * element_size
         )
         frames = self.max_segments * self.segment_frames
         # Initial noise, retained decoder latents, decoder pending pixels, and
@@ -161,6 +171,8 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
         latent_bytes = 3 * frames * frame_tokens * cfg.in_channels * element_size
         pixel_bytes = self.decoder.temporal_window_latents * 4 * self.height * self.width * 3 * 4
         text_bytes = self.max_text_length * cfg.text_embed_dim * element_size
+        # One segment's FP32 rotary tables, shared by all denoising/cache steps.
+        rotary_bytes = 2 * self.segment_frames * frame_tokens * cfg.attention_head_dim * 4
         return ARDiffusionKVCacheSpec(
             num_layers=cfg.num_layers,
             num_kv_heads=cfg.num_attention_heads,
@@ -170,7 +182,7 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
             window_frames=1,
             kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
             session_capacity=1,
-            model_owned_state_bytes_per_session=cache_bytes + latent_bytes + pixel_bytes + text_bytes,
+            model_owned_state_bytes_per_session=cache_bytes + latent_bytes + pixel_bytes + text_bytes + rotary_bytes,
         )
 
     @contextmanager
@@ -258,7 +270,11 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
             cameras = torch.cat([cameras[:, :1].expand(-1, pad, -1, -1), cameras], dim=1)
         pixels = [length * 4 for length in lengths]
         pixels[-1] -= sum(lengths) * 4 - frames
-        session = HyNomasSession(kv_cache=[{} for _ in self.transformer.double_blocks])
+        capacity_segments = len(lengths)
+        if self.max_cache_segments is not None:
+            capacity_segments = min(capacity_segments, self.max_cache_segments + 1)
+        capacity = sum(lengths[:capacity_segments]) * (height // 32) * (width // 32) + capacity_segments * max_length
+        session = HyNomasSession(kv_cache=[HyNomasKVCache(capacity) for _ in self.transformer.double_blocks])
         if sampling.output_type != "latent":
             session.decoder = self.decoder.create_streaming_decode_session(to_cpu=True, retain_history=False)
         self._sessions[state.request_id] = session
@@ -291,13 +307,21 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
         prompt_session = state.interaction_sessions.get("prompt")
         if isinstance(prompt_session, HyNomasPromptSession) and prompt_session.prompt is not None:
             prompt = prompt_session.prompt
-        encoded = encode_segment_prompt(
-            prompt, self.tokenizer, self.text_encoder, self.device, state.extra["max_length"]
-        )
+        prompt_key = (prompt, state.extra["max_length"])
+        if session.prompt_key != prompt_key:
+            encoded = encode_segment_prompt(
+                prompt, self.tokenizer, self.text_encoder, self.device, state.extra["max_length"]
+            )
+            session.prompt_key, session.encoded_prompt = prompt_key, encoded
+        encoded = session.encoded_prompt
+        assert encoded is not None
         state.prompt_embeds, state.prompt_embeds_mask = encoded.embeds, encoded.mask
         state.extra["encoded"] = encoded
         state.extra["action_windows"] = _action_windows(prompt, length, state.extra["fps"])
         state.latents = state.extra["initial_noise"][:, :, start : start + length].clone()
+        session.rotary_emb = self.transformer.rotary_embed(
+            length, state.latents.shape[3], state.latents.shape[4], state.latents.device, start
+        )
         state.scheduler = FlowMatchEulerDiscreteScheduler.from_config(self.scheduler.config)
         sigmas = torch.linspace(1, 0, state.chunk_num_steps + 1)[:-1].tolist()
         state.scheduler.set_timesteps(sigmas=sigmas, device=self.device)
@@ -336,6 +360,7 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
             action_text_offsets=[encoded.action_offsets] if windows is not None else None,
             action_frame_windows=windows,
             cache_action_start=encoded.cache_action_start,
+            rotary_emb=session.rotary_emb,
             return_dict=False,
         )[0]
 
@@ -376,10 +401,9 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
             while len(session.segment_token_lengths) >= self.max_cache_segments:
                 tokens = session.segment_token_lengths.pop(0)
                 for layer in session.kv_cache:
-                    for name in ("key", "value", "mask"):
-                        # clone releases the evicted storage, unlike a view.
-                        layer[name] = layer[name][:, tokens:].clone()
+                    layer.evict(tokens)
         self._predict(state, cache_latents, torch.tensor(sigma * 1000, device=latents.device), commit=True)
+        session.rotary_emb = None
         encoded: EncodedPrompt = state.extra["encoded"]
         video_tokens = latents.shape[2] * (latents.shape[3] * latents.shape[4])
         session.segment_token_lengths.append(video_tokens + encoded.embeds.shape[1])

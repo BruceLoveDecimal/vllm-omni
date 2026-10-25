@@ -37,6 +37,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
+from vllm_omni.diffusion.models.hy_nomas.cache import HyNomasKVCache
 
 
 def _attention(heads: int, head_dim: int, role: str) -> Attention:
@@ -156,12 +158,14 @@ class HyNomasTextProjection(nn.Module):
         return self.linear_2(hidden_states)
 
 
-class HyNomasMLP(nn.Module):
-    def __init__(self, hidden_size, mlp_ratio=4.0, act_fn="gelu"):
+class HyNomasTokenRefinerMLP(nn.Module):
+    """The text refiner uses SiLU, unlike the shared HY1.5 GELU feed-forward."""
+
+    def __init__(self, hidden_size):
         super().__init__()
-        self.fc1 = nn.Linear(hidden_size, int(hidden_size * mlp_ratio))
-        self.act = nn.SiLU() if act_fn == "silu" else nn.GELU(approximate="tanh")
-        self.fc2 = nn.Linear(int(hidden_size * mlp_ratio), hidden_size)
+        self.fc1 = nn.Linear(hidden_size, hidden_size * 4)
+        self.act = nn.SiLU()
+        self.fc2 = nn.Linear(hidden_size * 4, hidden_size)
 
     def forward(self, hidden_states) -> torch.Tensor:
         hidden_states = self.fc1(hidden_states)
@@ -197,7 +201,7 @@ class HyNomasTokenRefinerBlock(nn.Module):
         self.norm1 = HyNomasLayerNorm(hidden_size, eps=1e-6)
         self.attn = HyNomasTextAttention(hidden_size, heads)
         self.norm2 = HyNomasLayerNorm(hidden_size, eps=1e-6)
-        self.mlp = HyNomasMLP(hidden_size, act_fn="silu")
+        self.mlp = HyNomasTokenRefinerMLP(hidden_size)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
 
     def forward(self, hidden_states, temb, attention_mask) -> torch.Tensor:
@@ -272,8 +276,6 @@ class HyNomasAttnProcessor:
         encoder_query = attn.txt_attn_q_norm(encoder_query).to(encoder_value.dtype)
         encoder_key = attn.txt_attn_k_norm(encoder_key).to(encoder_value.dtype)
         query = torch.cat((query, encoder_query), dim=1)
-        current_key = torch.cat((key, encoder_key), dim=1)
-        current_value = torch.cat((value, encoder_value), dim=1)
         batch_size, video_length = hidden_states.shape[:2]
         text_length = encoder_hidden_states.shape[1]
         text_mask = encoder_attention_mask
@@ -283,12 +285,18 @@ class HyNomasAttnProcessor:
             (torch.ones(batch_size, video_length, dtype=torch.bool, device=query.device), text_mask.bool()), dim=1
         )
         history_length = 0
-        key, value, key_mask = current_key, current_value, current_mask
-        if kv_cache is not None and "key" in kv_cache:
-            history_length = kv_cache["key"].shape[1]
-            key = torch.cat((kv_cache["key"], current_key), dim=1)
-            value = torch.cat((kv_cache["value"], current_value), dim=1)
-            key_mask = torch.cat((kv_cache["mask"], current_mask), dim=1)
+        key_mask = current_mask
+        if isinstance(kv_cache, HyNomasKVCache):
+            history_length = kv_cache.length
+            key, value, key_mask = kv_cache.stage((key, encoder_key), (value, encoder_value), current_mask)
+        else:
+            key = torch.cat((key, encoder_key), dim=1)
+            value = torch.cat((value, encoder_value), dim=1)
+            if kv_cache is not None and "key" in kv_cache:
+                history_length = kv_cache["key"].shape[1]
+                key = torch.cat((kv_cache["key"], key), dim=1)
+                value = torch.cat((kv_cache["value"], value), dim=1)
+                key_mask = torch.cat((kv_cache["mask"], current_mask), dim=1)
 
         output = self._compute_attention(
             attn.attention,
@@ -314,9 +322,12 @@ class HyNomasAttnProcessor:
                 for batch_index, offsets in enumerate(action_text_offsets):
                     if offsets is not None:
                         cache_mask[batch_index, video_length + offsets[0] :] = False
-            if history_length:
-                cache_mask = torch.cat((kv_cache["mask"], cache_mask), dim=1)
-            kv_cache.update(key=key.detach(), value=value.detach(), mask=cache_mask)
+            if isinstance(kv_cache, HyNomasKVCache):
+                kv_cache.commit(cache_mask)
+            else:
+                if history_length:
+                    cache_mask = torch.cat((kv_cache["mask"], cache_mask), dim=1)
+                kv_cache.update(key=key.detach(), value=value.detach(), mask=cache_mask)
 
         output = output.flatten(-2)
         hidden_states, encoder_hidden_states = output.split((video_length, text_length), dim=1)
@@ -422,11 +433,11 @@ class HyNomasTransformerBlock(nn.Module):
         self.img_mod = HyNomasModulation(hidden_size)
         self.img_norm1 = HyNomasLayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
         self.img_norm2 = HyNomasLayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
-        self.img_mlp = HyNomasMLP(hidden_size, mlp_ratio)
+        self.img_mlp = FeedForward(hidden_size, inner_dim=int(hidden_size * mlp_ratio))
         self.txt_mod = HyNomasModulation(hidden_size)
         self.txt_norm1 = HyNomasLayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
         self.txt_norm2 = HyNomasLayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
-        self.txt_mlp = HyNomasMLP(hidden_size, mlp_ratio)
+        self.txt_mlp = FeedForward(hidden_size, inner_dim=int(hidden_size * mlp_ratio))
         self.attn = HyNomasAttention(hidden_size, heads)
 
     def forward(
@@ -641,15 +652,25 @@ class HyNomasTransformer3DModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the converted checkpoint without silently dropping or inventing parameters."""
         parameters = dict(self.named_parameters())
+        checkpoint_names: dict[str, str] = {}
+        for name in parameters:
+            if name.startswith("double_blocks.") and "_mlp.net." in name:
+                checkpoint_name = name.replace("_mlp.net.0.proj.", "_mlp.fc1.").replace("_mlp.net.2.", "_mlp.fc2.")
+                checkpoint_names[checkpoint_name] = name
+            else:
+                checkpoint_names[name] = name
         loaded: set[str] = set()
+        seen: set[str] = set()
         for name, tensor in weights:
-            if name not in parameters:
+            if name not in checkpoint_names:
                 raise ValueError(f"Unexpected Hy-Nomas transformer weight: {name}")
-            if name in loaded:
+            if name in seen:
                 raise ValueError(f"Duplicate Hy-Nomas transformer weight: {name}")
-            default_weight_loader(parameters[name], tensor)
-            loaded.add(name)
-        missing = parameters.keys() - loaded
+            destination = checkpoint_names[name]
+            default_weight_loader(parameters[destination], tensor)
+            seen.add(name)
+            loaded.add(destination)
+        missing = checkpoint_names.keys() - seen
         if missing:
             raise ValueError(f"Missing Hy-Nomas transformer weights: {sorted(missing)}")
         return loaded
@@ -660,7 +681,7 @@ class HyNomasTransformer3DModel(nn.Module):
         encoder_hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_attention_mask: torch.Tensor | None = None,
-        kv_cache: list[dict[str, torch.Tensor]] | None = None,
+        kv_cache: list[dict[str, torch.Tensor]] | list[HyNomasKVCache] | None = None,
         update_cache: bool = False,
         frame_offset: int = 0,
         camera_extrinsics: torch.Tensor | None = None,
@@ -669,6 +690,7 @@ class HyNomasTransformer3DModel(nn.Module):
         action_frame_windows: list[tuple[int, int, int]] | None = None,
         cache_action_start: int | None = None,
         return_dict: bool = True,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> Transformer2DModelOutput | tuple[torch.Tensor]:
         r"""Predict flow velocity for one segment.
 
@@ -681,7 +703,7 @@ class HyNomasTransformer3DModel(nn.Module):
                 Diffusion timesteps of shape `(batch,)` in the reference model's 0–1000 scale.
             encoder_attention_mask (`torch.Tensor`, *optional*):
                 Boolean text validity mask of shape `(batch, text_tokens)`.
-            kv_cache (`list[dict[str, torch.Tensor]]`, *optional*):
+            kv_cache (`list[dict[str, torch.Tensor]]` or `list[HyNomasKVCache]`, *optional*):
                 Caller-owned history, with one dictionary per transformer block. Empty dictionaries start a new
                 session. Populated entries contain `key`, `value`, and `mask` tensors. The model stores no session
                 state.
@@ -702,6 +724,9 @@ class HyNomasTransformer3DModel(nn.Module):
                 Text boundary after which tokens become invisible to later segments, independently of action windows.
             return_dict (`bool`, defaults to `True`):
                 Whether to return a [`~models.modeling_outputs.Transformer2DModelOutput`] or a tuple.
+            rotary_emb (`tuple[torch.Tensor, torch.Tensor]`, *optional*):
+                Precomputed FP32 rotary tables for this segment's geometry, absolute
+                frame offset and device. The caller owns their lifetime.
 
         Returns:
             [`~models.modeling_outputs.Transformer2DModelOutput`] or `tuple[torch.Tensor]`:
@@ -719,6 +744,9 @@ class HyNomasTransformer3DModel(nn.Module):
         if kv_cache is not None:
             cache_lengths = []
             for layer_cache in kv_cache:
+                if isinstance(layer_cache, HyNomasKVCache):
+                    cache_lengths.append(layer_cache.length)
+                    continue
                 if not layer_cache:
                     cache_lengths.append(0)
                     continue
@@ -736,7 +764,8 @@ class HyNomasTransformer3DModel(nn.Module):
                 cache_lengths.append(key.shape[1])
             if len(set(cache_lengths)) != 1:
                 raise ValueError("All kv_cache layers must contain the same number of tokens.")
-        rotary_emb = self.rotary_embed(num_frames, height, width, hidden_states.device, frame_offset)
+        if rotary_emb is None:
+            rotary_emb = self.rotary_embed(num_frames, height, width, hidden_states.device, frame_offset)
         hidden_states = self.img_in(hidden_states)
         temb = self.time_in(timestep, hidden_states.dtype)
         encoder_hidden_states = self.txt_in(encoder_hidden_states, timestep, encoder_attention_mask)
