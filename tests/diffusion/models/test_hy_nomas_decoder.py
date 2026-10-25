@@ -23,7 +23,7 @@ class _SDPA(torch.nn.Module):
 
     def forward(self, query, key, value):
         return F.scaled_dot_product_attention(
-            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), enable_gqa=True
         ).transpose(1, 2)
 
 

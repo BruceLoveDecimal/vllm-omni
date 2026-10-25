@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.model_executor.layers.linear import LinearBase
 
 from vllm_omni.diffusion.models.hy_nomas import transformer as model_module
 
@@ -27,8 +28,12 @@ class _SDPA(nn.Module):
 def tiny_model(monkeypatch):
     # Select a real CPU math kernel without constructing platform/distributed state.
     monkeypatch.setattr(model_module, "_attention", lambda *args: _SDPA())
+    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", lambda: 1)
     torch.manual_seed(13)
-    return model_module.HyNomasTransformer3DModel(
+    model = model_module.HyNomasTransformer3DModel(
         in_channels=4,
         out_channels=4,
         num_layers=2,
@@ -42,6 +47,11 @@ def tiny_model(monkeypatch):
         camera_num_attention_heads=2,
         camera_rope_axes_dim=(2, 2, 2),
     ).eval()
+    for module in model.modules():
+        if isinstance(module, LinearBase):
+            nn.init.normal_(module.weight, std=0.02)
+            nn.init.zeros_(module.bias)
+    return model
 
 
 def test_action_groups_match_dense_visibility_oracle():
@@ -129,8 +139,30 @@ def test_camera_gate_and_front_padding(tiny_model):
 
 
 def test_strict_checkpoint_loading(tiny_model):
-    weights = list(tiny_model.state_dict().items())
+    weights = []
+    for name, tensor in tiny_model.state_dict().items():
+        name = name.replace("_mlp.net.0.proj.", "_mlp.fc1.").replace("_mlp.net.2.", "_mlp.fc2.")
+        weights.append((name, tensor.clone()))
+    weights.reverse()
     assert tiny_model.load_weights(weights) == set(tiny_model.state_dict())
+    for prefix in ("img", "txt"):
+        checkpoint = dict(weights)
+        inputs = torch.randn(1, 5, 12)
+        mlp_base = f"double_blocks.0.{prefix}_mlp."
+        expected_mlp = F.linear(
+            F.gelu(
+                F.linear(inputs, checkpoint[mlp_base + "fc1.weight"], checkpoint[mlp_base + "fc1.bias"]),
+                approximate="tanh",
+            ),
+            checkpoint[mlp_base + "fc2.weight"],
+            checkpoint[mlp_base + "fc2.bias"],
+        )
+        torch.testing.assert_close(getattr(tiny_model.double_blocks[0], f"{prefix}_mlp")(inputs), expected_mlp)
+    mapped_name = "double_blocks.0.img_mlp.fc1.weight"
+    with pytest.raises(ValueError, match="Missing"):
+        tiny_model.load_weights([(name, tensor) for name, tensor in weights if name != mapped_name])
+    with pytest.raises(ValueError, match="Duplicate"):
+        tiny_model.load_weights(weights + [(mapped_name, dict(weights)[mapped_name])])
     with pytest.raises(ValueError, match="Missing"):
         tiny_model.load_weights(weights[:-1])
     with pytest.raises(ValueError, match="Unexpected"):
@@ -169,3 +201,65 @@ def test_attention_preserves_reference_key_layout(mask_ndim):
     ).transpose(1, 2)
     assert len(calls) == 1
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("bounded", [False, True])
+def test_preallocated_history_matches_concat_with_actions_camera_and_short_tail(tiny_model, bounded):
+    from vllm_omni.diffusion.models.hy_nomas.cache import HyNomasKVCache
+
+    dynamic: list[dict[str, torch.Tensor]] = [{}, {}]
+    reserved = [HyNomasKVCache(39), HyNomasKVCache(39)]
+    offset = 0
+    for frames in (2, 2, 1):
+        pointers = None
+        latents = torch.randn(1, 4, frames, 2, 2)
+        text = torch.randn(1, 5, 8)
+        args = dict(
+            hidden_states=latents,
+            encoder_hidden_states=text,
+            timestep=torch.tensor([500.0]),
+            encoder_attention_mask=torch.tensor([[True, True, True, True, False]]),
+            frame_offset=offset,
+            camera_extrinsics=torch.eye(4).repeat(1, frames * 4, 1, 1),
+            action_text_offsets=[[2, 3, 4]],
+            action_frame_windows=[(0, frames, 0)],
+            cache_action_start=2,
+        )
+        for commit in (False, False, True):
+            if bounded and commit and offset:
+                count = reserved[0].length
+                for layer in reserved:
+                    layer.evict(count)
+                for layer in dynamic:
+                    for name in ("key", "value", "mask"):
+                        layer[name] = layer[name][:, count:].clone()
+            expected = tiny_model(**args, kv_cache=dynamic, update_cache=commit).sample
+            rotary = tiny_model.rotary_embed(frames, 2, 2, latents.device, offset)
+            actual = tiny_model(**args, kv_cache=reserved, update_cache=commit, rotary_emb=rotary).sample
+            assert torch.equal(actual, expected)
+            current = [layer.key.data_ptr() for layer in reserved]
+            if pointers is None:
+                pointers = current
+            assert current == pointers
+            if commit:
+                for baseline, cached in zip(dynamic, reserved):
+                    for name in ("key", "value", "mask"):
+                        assert torch.equal(baseline[name], getattr(cached, name)[:, : cached.length])
+        offset += frames
+
+
+def test_preallocated_capacity_rejects_overflow_without_advancing_history():
+    from vllm_omni.diffusion.models.hy_nomas.cache import HyNomasKVCache
+
+    cache = HyNomasKVCache(3)
+    key = torch.randn(1, 2, 2, 4)
+    mask = torch.tensor([[True, False]])
+    cache.stage((key,), (key,), mask)
+    assert cache.length == 0
+    cache.commit(mask)
+    before = cache.key.clone()
+    with pytest.raises(ValueError, match="capacity"):
+        cache.stage((key,), (key,), mask)
+    assert cache.length == 2
+    assert torch.equal(cache.key, before)
