@@ -1185,3 +1185,33 @@ async def test_requests_without_pause_never_trigger_the_barrier():
 
     assert (first.error, second.error) == ("result_for_r1", "result_for_r2")
     assert _methods(engine) == ["execute_model", "ping", "execute_model"]
+
+
+def test_interaction_before_admission_is_bounded_and_request_owned():
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.sched import DiffusionRequestStatus, StepScheduler
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    engine = _make_engine_with_loop(None, start_loop=False)
+    engine.scheduler = StepScheduler()
+    engine.od_config.streaming_output = True
+    request = OmniDiffusionRequest(
+        prompt="scene", sampling_params=OmniDiffusionSamplingParams(num_inference_steps=8), request_id="waiting"
+    )
+    engine.scheduler.add_request(request)
+    for index in range(33):
+        interaction = {"event_id": str(index), "event": {"prompt": "updated"}}
+        task = _RpcTask("submit_interaction", ("waiting", interaction), None, None, None)
+        engine._run_rpc_task(task)
+        if index < 32:
+            assert task.future.result() is None
+        else:
+            with pytest.raises(ValueError, match="Too many interactions"):
+                task.future.result()
+    assert len(request.pending_interactions) == 32
+    assert not engine.executor.calls  # No worker state exists yet.
+    wave = engine.scheduler.schedule()
+    assert wave.scheduled_new_reqs[0].req.pending_interactions == request.pending_interactions
+    engine.scheduler.finish_requests("waiting", DiffusionRequestStatus.FINISHED_ABORTED)
+    engine.scheduler.pop_request_state("waiting")
+    assert engine.scheduler.get_request_state("waiting") is None

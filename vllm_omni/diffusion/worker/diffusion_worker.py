@@ -891,6 +891,15 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def release_stream_requests(self, request_ids: list[str]) -> None:
+        """Release request-owned decoder history, including between invocations."""
+        assert self.model_runner is not None
+        release = getattr(self.model_runner.pipeline, "release_stream_request", None)
+        if not callable(release):
+            raise ValueError("Streaming stage does not implement release_stream_request")
+        for request_id in request_ids:
+            release(request_id)
+
     def release_step_requests(self, request_ids: list[str]) -> None:
         """Retire cancelled step state at the serialized worker-call boundary."""
         assert self.model_runner is not None, "Model runner not initialized"

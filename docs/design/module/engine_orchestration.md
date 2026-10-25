@@ -154,3 +154,19 @@ keeps its existing semantics.
   in the cited validation paths.
 - Obtain approval from a technical owner and an independent validation
   reviewer.
+
+## Experimental diffusion segment routing
+
+For the Hy-Nomas two-stage streaming deployment, the orchestrator routes each
+producer `diffusion_segment` envelope through the existing diffusion input
+bridge. It tracks one pending segment and its expected index on the parent
+request. Decoder acknowledgments normalize the per-invocation terminal flag
+to the parent rollout's terminal flag before frontend delivery. A successful
+nonterminal decode restores the producer's scheduling credit; a failed or
+out-of-order handoff uses request-scoped error cleanup and all-stage abort.
+This path currently requires two stages and one decoder replica.
+
+The path uses inline CPU payloads and `async_chunk: false`; it does not change
+the connector-based asynchronous chunk protocol. The model-specific payload,
+state ownership and validation evidence are documented in
+[Hy-Nomas realtime transport](../model_specific/hy_nomas.md#incremental-realtime-deployment).

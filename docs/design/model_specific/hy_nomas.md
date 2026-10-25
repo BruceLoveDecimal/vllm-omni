@@ -513,7 +513,7 @@ parallel linear layers. Diff-scoped pre-commit checks passed. The CPU loader
 regression checks both image/text MLP outputs against the original checkpoint
 names and rejects missing or duplicate mapped weights.
 
-### M4: realtime stage boundary under investigation
+### M4: two-stage model boundary and realtime transport
 
 A first split would keep conditioning and the autoregressive DiT in stage 0,
 and move the stateful streaming PixelUMM decoder into stage 1. Transfer latent
@@ -522,6 +522,45 @@ count and final-segment status. A bounded queue must apply backpressure before
 the producer creates more segments; the decoder must retain overlap state
 and flush exactly once. Cancellation must release both stages and queued
 latents, including during a partially emitted chunk.
+
+The initial implementation provides `HyNomasDenoisePipeline` (text encoder
+and DiT only) and `HyNomasDecodePipeline` (PixelUMM only). Select the explicit
+`hy_nomas_two_stage.yaml` deployment for the experimental full-request topology.
+The existing single-stage topology and realtime deployment remain unchanged.
+The two-stage deployment uses the standard diffusion engine on both stages,
+`async_chunk: false`, and the generic `diffusion_stage_handoff` processor.
+It does **not** implement realtime chunk transport or interactive updates.
+
+Stage 0 commits KV in the original order, copies completed latents to CPU,
+and emits the complete segment list at request completion. Each entry carries
+version 1, index, total segment count, absolute latent offset, valid pixel-frame
+count, a final flag and the latent tensor. Stage 1 validates the whole list
+before decoding, rejecting gaps, reordering, inconsistent geometry/dtype and
+invalid frame counts. It transfers segments to its GPU one at a time, uses a
+single request-local streaming decode session, and flushes once. Decoder state
+is not stored on the pipeline across requests. Stage 0's existing `finally`
+cleanup still releases its request KV state after success or failure.
+
+This first topology buffers the full latent request on the host and the final
+video on the decoder host; it is bounded by the configured producer segment
+limit, not a cross-stage backpressure protocol. The deployment places both
+workers on GPU 0 as an experimental single-card configuration. Independent
+worker/allocator overhead and real service execution require qualification;
+model-level parity alone does not establish that deployment's memory minimum.
+
+Initial validation on the same RTX PRO 6000 Blackwell used two independently
+loaded pipeline objects, the production Diffusers loader and generic handoff,
+in one process with single-rank NCCL/vLLM state. BF16 / TORCH_SDPA, 704 x 1280,
+seed 42, two 30-latent segments, eight steps and identity camera conditioning
+produced 240 RGB frames. All 16 denoising predictions, two final latent tensors
+and RGB slices corresponding to the previous 84 + 156 frame output matched
+the single-stage baseline's byte hashes. The denoise object had no decoder;
+the decode object had neither transformer nor text encoder. The test does not
+cover multiprocessing/IPC, HTTP/WebSocket serving, concurrent requests or
+mid-generation interactions, and makes no latency/memory improvement claim.
+Forty existing/new pipeline, payload and configuration cases passed, followed
+by two added tests for producer failure cleanup and real tiny-decoder overlap
+with partial visible frames. Diff-scoped pre-commit checks passed.
 
 The current orchestrator sends interactions explicitly to stage 0. Keeping the
 DiT there is compatible with that routing, but arbitrary stage placement needs
@@ -533,5 +572,89 @@ On one GPU, separate stages still contend for the same compute and may retain
 more activations concurrently. Stage separation alone is not evidence of
 lower latency or memory. Qualification must compare first media-chunk latency,
 steady-state chunk interval, interaction-to-visible-output delay and peak
-allocated/reserved memory against the single-stage baseline. This stage split
-is planned, not enabled by the current changes.
+allocated/reserved memory against the single-stage baseline.
+
+#### Incremental realtime deployment
+
+Select `vllm_omni/deploy/hy_nomas_two_stage_realtime.yaml` for the incremental
+path. Stage 0 uses AR-Diffusion step execution and emits one CPU latent segment
+at a time; stage 1 uses request execution and retains a PixelUMM streaming
+session across those invocations. Both stage processes run on GPU 0. The
+full-request deployment remains available separately.
+
+The internal `diffusion_segment` envelope implements stop-and-wait flow control:
+
+1. The step scheduler suspends a nonterminal producer request as soon as its
+   segment is emitted, before scheduling another denoising wave.
+2. The orchestrator forwards that segment through the generic diffusion bridge.
+   The decoder validates the sequence, offsets, frame count, dtype and geometry
+   against its retained session before pushing the latent.
+3. A completed decoder invocation acknowledges the same segment index. Its
+   engine invocation is terminal, while the orchestrator keeps the parent
+   rollout active until the final segment. Only that acknowledgment restores
+   the producer's credit. Duplicate or out-of-order segments/acks fail the request.
+4. The last segment flushes PixelUMM once and releases the decoder session.
+   No acknowledgment is needed to resume an already completed producer.
+
+There is at most one unacknowledged latent segment per request. This bounds
+stage handoff, not the downstream WebSocket playback buffer. The initial
+implementation supports exactly two stages and one decoder replica; it does
+not add general multi-stage or session-affine replica scheduling. DiT stays in
+stage 0, so the existing interaction routing remains applicable. Interaction
+metadata accompanies the latent payload and returns with the decoded video.
+The producer yields between denoising steps instead of grouping an entire
+segment into one worker call, so control RPCs and aborts can run before the
+next chunk boundary. The frontend accepts a diffusion stage 0 with downstream
+stages; it no longer requires the whole pipeline to contain a single stage.
+Controls received before worker admission are kept on the queued request
+(up to 32 events), then enqueued into its interaction coordinator on admission.
+Cancellation drops those controls with the request. Event metadata on media
+chunks remains the indication of when an accepted control actually took effect.
+
+Cancellation and stage errors use the existing all-stage abort path. The
+producer retires step/KV state even while waiting for acknowledgment. The
+decoder's abort hook drops retained history even between individual decode
+invocations. Cleanup runs at serialized worker boundaries; cancellation does
+not preempt an already running CUDA kernel. Late outputs are discarded after
+the orchestrator removes the parent request.
+
+The deployment enables `release_cache_between_segments` in both workers.
+Separate processes cannot reuse one another's unused CUDA allocator blocks,
+so each worker releases unused cache at a segment handoff. Live model weights,
+DiT KV and PixelUMM overlap history remain allocated. This is a memory/latency
+tradeoff for a shared GPU, not a general recommendation for separate GPUs.
+
+The first multi-process WebSocket run on the RTX PRO 6000 Blackwell returned
+84 + 156 media frames and a trailer, producing 240 frames at 1280 x 704 / 24 fps.
+With eight denoising steps, BF16 / TORCH_SDPA and seed 42, first media arrived at
+67.74 seconds and the trailer at 159.55 seconds. This run preceded allocator
+cache release and reached approximately 96,924 MiB across the two CUDA worker
+processes. These are serving observations, not a speedup comparison against
+the earlier single-process benchmark.
+
+The subsequent service run enabled segment cache release and per-step control
+RPC boundaries. It passed three sequential WebSocket cases in the same server:
+
+- Cancel during denoising, before any media output.
+- Cancel immediately after the first 84-frame media payload.
+- Immediately submit a recovery request and a same-text prompt event while
+  admission is pending; receive its queued acknowledgment and its
+  started/active/completed event IDs on segment 1, then finish all 240 frames.
+
+The recovery video decoded at 1280 x 704 with strictly increasing PTS. Its
+first binary media payload arrived at 63.401 seconds and the trailer/done at
+155.053 seconds, including the preceding cancellation/admission overlap.
+Sampling `nvidia-smi` every 0.5 seconds across the test sequence observed a
+maximum sum of 88,932 MiB (86.85 GiB) for the two CUDA worker processes. This
+includes process/context and allocator occupancy; it is not a PyTorch peak
+allocated-memory measurement or a controlled single-stage comparison.
+
+Validation artifacts are `hy-nomas-stream-runtime.json`,
+`hy-nomas-stream-admission-runtime.log` and
+`hy-nomas-stream-admission-server.log` in the remote validation directory.
+The focused model, scheduler, RPC, cancellation, orchestration and entrypoint
+suite passed **399 tests**. Diff-scoped formatting, lint, SPDX and test-marker
+checks passed. The mypy hook still reports 59 diagnostics also reproduced on
+the branch base for the same files; normalized comparison found no new
+mypy diagnostics. Concurrent multi-client serving, multiple decoder replicas,
+separate-GPU performance and three-stage routing remain unqualified.

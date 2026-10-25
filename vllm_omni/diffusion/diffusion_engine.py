@@ -624,7 +624,12 @@ class DiffusionEngine:
         if output.media is None and output.output is None:
             # Encode-only stages carry forward prompt embeddings in custom_output
             # even though they do not emit media.
-            custom_output = output.custom_output or {}
+            custom_output = dict(output.custom_output or {})
+            if "diffusion_segment" in custom_output:
+                custom_output["diffusion_segment_events"] = {
+                    key: getattr(output, key)
+                    for key in ("started_event_ids", "active_event_ids", "completed_event_ids")
+                }
             if not custom_output:
                 logger.warning("Output is None, returning empty OmniRequestOutput")
             return format_empty_diffusion_outputs(
@@ -1024,6 +1029,29 @@ class DiffusionEngine:
         try:
             if task.method == "pause_scheduler":
                 result = self._run_pause_barrier(remaining)
+            elif task.method == "submit_interaction" and isinstance(self.scheduler, StepScheduler):
+                request_id, interaction = task.args
+                state = self.scheduler.get_request_state(request_id)
+                if state is not None and state.status == DiffusionRequestStatus.WAITING:
+                    if not self.od_config.streaming_output:
+                        raise ValueError("submit_interaction requires streaming_output=True")
+                    if len(state.req.pending_interactions) >= 32:
+                        raise ValueError("Too many interactions before diffusion request admission")
+                    state.req.pending_interactions.append(interaction)
+                    result = None
+                else:
+                    result = self.executor.collective_rpc(
+                        method=task.method,
+                        timeout=remaining,
+                        args=task.args,
+                        kwargs=task.kwargs,
+                        unique_reply_rank=task.unique_reply_rank,
+                    )
+            elif task.method == "acknowledge_segment":
+                if not isinstance(self.scheduler, StepScheduler):
+                    raise ValueError("Segment acknowledgments require step execution")
+                self.scheduler.acknowledge_segment(*task.args)
+                result = None
             elif task.method == "resume_scheduler":
                 result = self._open_scheduling_gate()
             else:
@@ -2102,6 +2130,10 @@ class DiffusionEngine:
             # Abort processing is serialized with execution. There may never be
             # another scheduler wave to deliver finished_req_ids to the runner.
             self.executor.collective_rpc("release_step_requests", args=(request_ids,))
+        if request_ids and (getattr(getattr(self, "od_config", None), "model_config", None) or {}).get(
+            "streaming_stage_input", False
+        ):
+            self.executor.collective_rpc("release_stream_requests", args=(request_ids,))
         self._remove_diffusion_kv_requests(request_ids)
 
     def _finalize_finished_request(

@@ -42,6 +42,7 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS, FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
+from vllm_omni.diffusion.segment import segment_envelope
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata, scope_stage_replica_mm_uuids
@@ -250,6 +251,8 @@ class OrchestratorRequestState:
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
     finished_stage_ids: set[int] = field(default_factory=set)
     pending_final_output: OutputMessage | None = None
+    diffusion_segment_index: int = 0
+    diffusion_segment_pending: bool = False
 
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
@@ -2088,6 +2091,52 @@ class OrchestratorBase:
         self._running_counter.increment()
         req_state.running_counter_registered = True
 
+    async def _route_diffusion_segment(self, stage_id, replica_id, output, req_state) -> bool:
+        """Forward one segment, or accept its decoder acknowledgment."""
+        req_id = output.request_id
+        marker = segment_envelope(output)
+        if marker is not None:
+            if len(self.stage_pools) != 2 or req_state.final_stage_id != 1:
+                raise ValueError("Streamed diffusion handoff currently requires exactly two stages")
+            if marker["index"] != req_state.diffusion_segment_index:
+                raise ValueError("Out-of-order diffusion segment")
+            if marker.get("ack"):
+                if stage_id != 1 or not req_state.diffusion_segment_pending:
+                    raise ValueError("Unexpected diffusion segment acknowledgment")
+                req_state.diffusion_segment_pending = False
+                req_state.diffusion_segment_index += 1
+                output.finished = marker["finished"]
+                if not marker["finished"]:
+                    producer = self.stage_pools[0]
+                    producer_replica = producer.get_bound_replica_id(req_id)
+                    if producer_replica is None:
+                        raise RuntimeError("Segment producer lost its request binding")
+                    result = await producer.collective_rpc(
+                        producer_replica,
+                        "acknowledge_segment",
+                        timeout=60,
+                        args=(req_id, marker["index"]),
+                    )
+                    if isinstance(result, dict) and result.get("supported") is False:
+                        raise RuntimeError(f"Segment acknowledgment failed: {result}")
+            else:
+                if stage_id != 0 or req_state.diffusion_segment_pending:
+                    raise ValueError("Producer exceeded its one-segment credit")
+                if self.stage_pools[1].num_replicas != 1:
+                    raise ValueError("Streamed diffusion requires a single decoder replica")
+                req_state.diffusion_segment_pending = True
+                if output.finished:
+                    req_state.finished_stage_ids.add(stage_id)
+                await self._forward_to_next_stage(
+                    req_id,
+                    stage_id,
+                    output,
+                    req_state,
+                    src_replica_id=replica_id,
+                )
+                return True
+        return False
+
     async def _route_output(
         self,
         stage_id: int,
@@ -2098,6 +2147,22 @@ class OrchestratorBase:
     ) -> None:
         """Route a processed output: send to frontend and/or forward."""
         req_id = output.request_id
+        try:
+            if await self._route_diffusion_segment(stage_id, replica_id, output, req_state):
+                if stage_metrics is not None:
+                    await self.output_async_queue.put(
+                        StageMetricsMessage(
+                            request_id=req_id,
+                            stage_id=stage_id,
+                            replica_id=replica_id,
+                            metrics=stage_metrics,
+                            stage_submit_ts=req_state.stage_submit_ts.get(stage_id),
+                        )
+                    )
+                return
+        except Exception as exc:
+            await self._handle_stage_error(stage_id, output, error=str(exc))
+            return
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished

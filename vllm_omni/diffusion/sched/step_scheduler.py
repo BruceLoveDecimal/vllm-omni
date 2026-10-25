@@ -17,6 +17,7 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     SchedulerRequestState,
 )
+from vllm_omni.diffusion.segment import segment_envelope
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
@@ -39,10 +40,37 @@ class StepScheduler(BaseScheduler):
 
     def __init__(self) -> None:
         super().__init__()
+        self._segment_waiters: dict[str, int] = {}
         self._request_progress: dict[str, _StepProgress] = {}
 
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
+        self._segment_waiters.clear()
+
+    def acknowledge_segment(self, request_id: str, index: int) -> None:
+        expected = self._segment_waiters.get(request_id)
+        if expected != index:
+            raise ValueError(f"Unexpected segment acknowledgment for {request_id}: {index}, expected {expected}")
+        del self._segment_waiters[request_id]
+
+    def has_requests(self) -> bool:
+        if not self._segment_waiters:
+            return super().has_requests()
+        return bool(
+            any(rid not in self._segment_waiters for rid in self._running)
+            or (self._waiting and len(self._running) < self.max_num_running_reqs)
+            or self._finished_req_ids
+            or self._kv_transfer_request_ids
+            or self._kv_finished_request_ids
+            or self._kv_draining_requests
+        )
+
+    def schedule(self) -> DiffusionSchedulerOutput:
+        output = super().schedule()
+        output.scheduled_cached_reqs.request_ids = [
+            rid for rid in output.scheduled_cached_reqs.request_ids if rid not in self._segment_waiters
+        ]
+        return output
 
     def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
         return self._request_progress[state.request_id].wait_deadline is None
@@ -172,6 +200,11 @@ class StepScheduler(BaseScheduler):
                 terminal_statuses[request_id] = DiffusionRequestStatus.FINISHED_COMPLETED
                 terminal_errors[request_id] = None
             else:
+                marker = segment_envelope(req_result) if req_result is not None else None
+                if marker is not None:
+                    if marker.get("ack") or marker["finished"]:
+                        raise ValueError("Only nonterminal producer segments may wait for acknowledgment")
+                    self._segment_waiters[request_id] = marker["index"]
                 state.error = None
                 wait = req_output.wait_for_interaction
                 if wait is not None:
@@ -188,6 +221,7 @@ class StepScheduler(BaseScheduler):
 
     def _pop_extra_request_state(self, request_id: str) -> None:
         self._request_progress.pop(request_id, None)
+        self._segment_waiters.pop(request_id, None)
 
     def _finish_requests(
         self,

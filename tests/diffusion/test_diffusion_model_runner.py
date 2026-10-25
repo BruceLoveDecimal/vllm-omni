@@ -1570,3 +1570,18 @@ def test_request_runner_preserves_client_error_before_rpc(monkeypatch, batch_siz
 
     runner.pipeline = _DummyPipeline(output=DiffusionOutput(output="next request"))
     assert runner.execute_model(_make_request()).output == "next request"
+
+
+@pytest.mark.parametrize("enabled,segment,expected", [(True, True, 1), (True, False, 0), (False, True, 0)])
+def test_allocator_release_is_opt_in_and_only_at_segment_boundaries(monkeypatch, enabled, segment, expected):
+    from vllm_omni.diffusion.segment import SEGMENT_KEY
+
+    runner = SimpleNamespace(od_config=SimpleNamespace(model_config={"release_cache_between_segments": enabled}))
+    calls = []
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "empty_cache", lambda: calls.append(True))
+    output = DiffusionOutput(
+        custom_output={SEGMENT_KEY: {"index": 0, "finished": False}} if segment else None,
+    )
+    result = DiffusionModelRunner._prepare_output_for_transport(runner, output, OmniDiffusionSamplingParams())
+    assert result is output
+    assert len(calls) == expected

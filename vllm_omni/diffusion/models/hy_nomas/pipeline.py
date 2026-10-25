@@ -64,6 +64,7 @@ def segment_lengths(num_frames: int, segment_frames: int, max_segments: int) -> 
 
 
 class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecution, InteractionMixin):
+    _decode_in_process: ClassVar[bool] = True
     supports_step_execution: ClassVar[bool] = True
     supports_chunk_step_grouping: ClassVar[bool] = True
     dummy_run_num_frames: ClassVar[int] = 0
@@ -113,13 +114,16 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
         revision = od_config.revision
         model = od_config.model
         tf_config = get_hf_file_to_dict("transformer/config.json", model, revision=revision)
-        decoder_config = get_hf_file_to_dict("decoder/config.json", model, revision=revision)
-        if tf_config is None or decoder_config is None:
+        if tf_config is None:
             raise ValueError("Use the converted Hy-Nomas-Diffusers checkpoint with transformer and decoder configs.")
         self.transformer = HyNomasTransformer3DModel(
             od_config=od_config, **{k: v for k, v in tf_config.items() if not k.startswith("_")}
         )
-        self.decoder = PixelUMMDecoder(**{k: v for k, v in decoder_config.items() if not k.startswith("_")})
+        if self._decode_in_process:
+            decoder_config = get_hf_file_to_dict("decoder/config.json", model, revision=revision)
+            if decoder_config is None:
+                raise ValueError("Hy-Nomas requires decoder/config.json.")
+            self.decoder = PixelUMMDecoder(**{k: v for k, v in decoder_config.items() if not k.startswith("_")})
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", revision=revision)
         self.text_encoder = (
             Qwen2_5_VLTextModel.from_pretrained(
@@ -138,10 +142,13 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=model, subfolder="transformer", prefix="transformer.", revision=revision
             ),
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=model, subfolder="decoder", prefix="decoder.", revision=revision
-            ),
         ]
+        if self._decode_in_process:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=model, subfolder="decoder", prefix="decoder.", revision=revision
+                )
+            )
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
         cfg = self.transformer.config
@@ -169,7 +176,11 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
         # Qwen embeddings. This is a persistent-state bound, not a measured peak;
         # decoder/attention workspace still requires separate GPU qualification.
         latent_bytes = 3 * frames * frame_tokens * cfg.in_channels * element_size
-        pixel_bytes = self.decoder.temporal_window_latents * 4 * self.height * self.width * 3 * 4
+        pixel_bytes = (
+            self.decoder.temporal_window_latents * 4 * self.height * self.width * 3 * 4
+            if self._decode_in_process
+            else 0
+        )
         text_bytes = self.max_text_length * cfg.text_embed_dim * element_size
         # One segment's FP32 rotary tables, shared by all denoising/cache steps.
         rotary_bytes = 2 * self.segment_frames * frame_tokens * cfg.attention_head_dim * 4
@@ -226,7 +237,8 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
         frames = 120 if sampling.num_frames is None else sampling.num_frames
         lengths = segment_lengths(frames, self.segment_frames, self.max_segments)
         if (
-            sampling.output_type != "latent"
+            self._decode_in_process
+            and sampling.output_type != "latent"
             and len(lengths) > 1
             and self.segment_frames < self.decoder.temporal_window_latents
         ):
@@ -275,7 +287,7 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
             capacity_segments = min(capacity_segments, self.max_cache_segments + 1)
         capacity = sum(lengths[:capacity_segments]) * (height // 32) * (width // 32) + capacity_segments * max_length
         session = HyNomasSession(kv_cache=[HyNomasKVCache(capacity) for _ in self.transformer.double_blocks])
-        if sampling.output_type != "latent":
+        if self._decode_in_process and sampling.output_type != "latent":
             session.decoder = self.decoder.create_streaming_decode_session(to_cpu=True, retain_history=False)
         self._sessions[state.request_id] = session
         state.total_chunks = len(lengths)
@@ -410,7 +422,7 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
         completed = state.chunk_index
         session.frame_offset += latents.shape[2]
         state.chunk_index += 1
-        if state.sampling.output_type == "latent":
+        if not self._decode_in_process or state.sampling.output_type == "latent":
             output = latents
         else:
             if session.decoder is None:
@@ -452,10 +464,13 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
                 while not state.chunk_denoise_completed:
                     prediction = self.denoise_step(None, states=[state])
                     self.step_scheduler(state, prediction)
-                chunks.append(self.post_decode(state).output)
-            return DiffusionOutput(output=torch.cat(chunks, dim=2))
+                chunks.append(self.post_decode(state))
+            return self._combine_chunk_outputs(chunks)
         finally:
             self.close_ar_diffusion_session(state.request_id)
+
+    def _combine_chunk_outputs(self, chunks: list[DiffusionOutput]) -> DiffusionOutput:
+        return DiffusionOutput(output=torch.cat([chunk.output for chunk in chunks], dim=2))
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)

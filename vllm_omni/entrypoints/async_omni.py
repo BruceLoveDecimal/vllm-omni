@@ -661,8 +661,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     def _resolve_interaction_request(self, request_id: str) -> str:
         """Validate and map an external streaming id to its internal id."""
-        if self.num_stages != 1:
-            raise ValueError("interaction requires single-stage diffusion")
+        # Interaction ownership remains at stage 0. Downstream diffusion
+        # stages consume its generated segments and do not receive controls.
         stage_meta = self.engine.get_stage_metadata(0)
         if stage_meta.stage_type != "diffusion":
             raise ValueError("interaction requires a diffusion stage")

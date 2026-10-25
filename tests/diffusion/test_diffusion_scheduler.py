@@ -2349,3 +2349,38 @@ class TestPendingFinishedRequestIds:
         assert sched.pending_finished_request_ids() == set()
         # The next wave still ships the id to the worker for its own cleanup.
         assert sched.schedule().finished_req_ids == {"a"}
+
+
+def test_segment_credit_blocks_next_wave_until_matching_ack():
+    from vllm_omni.diffusion.segment import SEGMENT_KEY
+
+    scheduler = StepScheduler()
+    scheduler.add_request(_make_step_request("stream"))
+    wave = scheduler.schedule()
+    output = _make_step_output("stream", 1)
+    output.result = DiffusionOutput(finished=False, custom_output={SEGMENT_KEY: {"index": 0, "finished": False}})
+    scheduler.update_from_output(wave, BatchRunnerOutput.from_list([output]))
+    assert not scheduler.has_requests()
+    assert not scheduler.schedule().scheduled_request_ids
+    with pytest.raises(ValueError, match="Unexpected segment acknowledgment"):
+        scheduler.acknowledge_segment("stream", 1)
+    assert not scheduler.has_requests()
+    scheduler.acknowledge_segment("stream", 0)
+    assert scheduler.has_requests()
+    assert scheduler.schedule().scheduled_request_ids == ["stream"]
+    with pytest.raises(ValueError):
+        scheduler.acknowledge_segment("stream", 0)
+
+
+def test_abort_retires_blocked_segment_without_ack():
+    from vllm_omni.diffusion.segment import SEGMENT_KEY
+
+    scheduler = StepScheduler()
+    scheduler.add_request(_make_step_request("stream"))
+    wave = scheduler.schedule()
+    output = _make_step_output("stream", 1)
+    output.result = DiffusionOutput(finished=False, custom_output={SEGMENT_KEY: {"index": 0, "finished": False}})
+    scheduler.update_from_output(wave, BatchRunnerOutput.from_list([output]))
+    scheduler.finish_requests("stream", DiffusionRequestStatus.FINISHED_ABORTED)
+    scheduler.pop_request_state("stream")
+    assert not scheduler._segment_waiters

@@ -415,6 +415,7 @@ class StageDiffusionProc:
                         kv_transfer_params=kv_transfer_params,
                         payload_sender_info=payload_sender_info,
                     )
+                    tasks.pop(request_id, None)
                     await response_socket.send(encoder.encode({"type": "result", "output": result}))
                 else:
                     async for result in self._process_streaming_request(
@@ -466,7 +467,8 @@ class StageDiffusionProc:
                 if self._is_executor_dead():
                     self._signal_fatal_engine_failure(f"add_request {request_id}: {e!s}")
             finally:
-                tasks.pop(request_id, None)
+                if tasks.get(request_id) is asyncio.current_task():
+                    tasks.pop(request_id, None)
 
         async def _dispatch_rpc(msg: dict[str, Any]) -> None:
             rpc_id = msg["rpc_id"]

@@ -294,6 +294,26 @@ mode-specific sampling-parameter key and stops at the first incompatible
 waiting request. This is intentionally conservative and can cause
 head-of-line blocking.
 
+### Incremental diffusion stage handoffs
+
+The experimental Hy-Nomas two-stage deployment uses `diffusion_segment`
+metadata for stop-and-wait handoffs. A nonterminal producer segment consumes
+its request's credit in `StepScheduler`; `acknowledge_segment` restores that
+credit only for the expected index. Other requests, aborts and control RPCs
+remain eligible while that producer waits. The decoder completes one engine
+invocation per segment while retaining model-owned overlap state for the parent
+rollout. `streaming_stage_input` enables serialized decoder-state cleanup on
+abort, including when no decoder invocation is active.
+
+Stepwise controls received before first admission are stored on the request
+with a 32-event limit and transferred to the interaction coordinator on worker
+admission. Cancelling the queued request also discards its pending controls.
+The optional `release_cache_between_segments` setting returns unused device
+allocator blocks at output boundaries when stage processes share a GPU.
+
+See [Hy-Nomas realtime transport](../../model_specific/hy_nomas.md#incremental-realtime-deployment)
+for the supported topology, payload validation and service qualification.
+
 ## Executor and IPC
 
 `DiffusionExecutor` is the backend interface. Built-in backends are selected by

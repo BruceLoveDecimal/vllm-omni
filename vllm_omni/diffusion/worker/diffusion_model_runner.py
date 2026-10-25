@@ -72,6 +72,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
     validate_new_request_data_identity,
 )
+from vllm_omni.diffusion.segment import segment_envelope
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.stage_payload import DiffusionStagePayloadMixin
@@ -751,6 +752,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 od_config=self.od_config,
                 sampling_params=sampling_params,
             )
+        if (getattr(self.od_config, "model_config", None) or {}).get(
+            "release_cache_between_segments", False
+        ) and segment_envelope(output) is not None:
+            # Separate stage processes cannot reuse each other's allocator
+            # cache. Return unused blocks before yielding the single-GPU credit.
+            current_omni_platform.empty_cache()
         return output
 
     def _runner_output_from_outputs(
@@ -1150,6 +1157,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
                     external_req_id=getattr(sched_new_req.req, "external_req_id", None),
                 )
+                new_state.extra["pending_interactions"] = list(getattr(sched_new_req.req, "pending_interactions", ()))
                 if (
                     sched_new_req.diffusion_kv_metadata is not None
                     and getattr(self.od_config, "kv_transfer_config", None) is not None
@@ -1248,6 +1256,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # If the pipeline supports interaction, the interaction session initialization also needs to call
                 # synchronized_monotonic_time(). Wrap in another try-block to not block on prepare_encode failures.
                 try:
+                    pending_interactions = state.extra.pop("pending_interactions", [])
+                    if pending_interactions and not supports_interaction_apply(pipeline):
+                        raise ValueError("Queued interactions require an interactive diffusion pipeline")
                     if supports_interaction_apply(pipeline):
                         pipe = cast(SupportsInteractionApply, pipeline)
                         if state.pending_chunk_boundary:
@@ -1259,6 +1270,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             assert self._interaction_coordinator is not None, (
                                 "Model not loaded. Call load_model() first."
                             )
+                            for interaction in pending_interactions:
+                                self.submit_interaction(state.request_id, interaction)
                             state.interaction_chunk_metadata = (
                                 self._interaction_coordinator.maybe_prepare_initial_session(state, pipe)
                             )

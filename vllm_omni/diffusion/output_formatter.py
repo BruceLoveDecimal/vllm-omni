@@ -352,6 +352,7 @@ def _format_single_prompt_output(
         OmniRequestOutput.from_diffusion(
             request_id=request_id,
             images=outputs,
+            custom_output=diffusion_output.custom_output,
             prompt=prompt,
             metrics=metrics,
             latents=trajectory_latents,

@@ -266,6 +266,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
     },
+    "HyNomasDenoisePipeline": {
+        "extra_body_params": frozenset({"segment_prompts", "camera_extrinsics"}),
+        "video_generation_defaults_builder": get_hy_nomas_video_generation_defaults,
+    },
     "HyNomasPipeline": {
         "extra_body_params": frozenset({"segment_prompts", "camera_extrinsics"}),
         "video_generation_defaults_builder": get_hy_nomas_video_generation_defaults,

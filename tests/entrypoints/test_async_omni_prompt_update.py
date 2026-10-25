@@ -203,3 +203,21 @@ async def test_submit_interaction_async_forwards_unsupported_dict_shape_to_engin
         "external-abc-uuid-1",
         interaction=payload,
     )
+
+
+@pytest.mark.asyncio
+async def test_multistage_interaction_targets_diffusion_entry_stage():
+    omni = _make_async_omni(num_stages=2)
+    omni.request_states.pop("external-abc-uuid-2")
+    await omni.submit_interaction_async("external-abc", interaction=_prompt_interaction())
+    omni.engine.submit_interaction_async.assert_awaited_once_with(
+        "external-abc-uuid-1",
+        interaction=_prompt_interaction(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_multistage_interaction_rejects_non_diffusion_entry_stage():
+    omni = _make_async_omni(num_stages=2, stage_type="llm")
+    with pytest.raises(ValueError, match="requires a diffusion stage"):
+        await omni.submit_interaction_async("external-abc", interaction=_prompt_interaction())

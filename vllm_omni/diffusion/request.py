@@ -8,7 +8,7 @@ import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt, OmniPromptType
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
@@ -86,6 +86,9 @@ class OmniDiffusionRequest:
     # Engine-owned shared-memory signal for cooperative full-forward workers.
     # Only the engine creates/unlinks it; workers attach readers until return.
     cancellation_signal: str | None = field(default=None, repr=False)
+
+    # Controls accepted while waiting for first worker admission. Bounded by the engine.
+    pending_interactions: list[OmniInteractionPrompt] = field(default_factory=list)
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
