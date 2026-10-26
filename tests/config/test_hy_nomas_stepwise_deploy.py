@@ -58,6 +58,9 @@ def test_two_stage_realtime_uses_streamed_producer_and_stateful_decoder():
         "per_role": {"hy_nomas.joint": {"backend": "CUDNN_ATTN"}},
     }
     assert decoder.diffusion_attention_config == {"default": {"backend": "TORCH_SDPA"}}
+    # Only the DiT producer is compiled; the decoder stays eager.
+    assert producer.enforce_eager is False
+    assert decoder.enforce_eager is True
     assert not decoder.step_execution
     assert decoder.engine_extras["model_config"]["streaming_stage_input"]
     # Realtime clones the first diffusion stage's request parameters to all

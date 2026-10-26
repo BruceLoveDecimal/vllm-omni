@@ -8,7 +8,8 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
-    enforce_eager: true
+    # Regional torch.compile of the DiT blocks fuses their norm/RoPE/modulation chains.
+    enforce_eager: false
     model_class_name: HyNomasDenoisePipeline
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
     step_execution: true
