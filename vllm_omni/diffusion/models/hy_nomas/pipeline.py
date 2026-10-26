@@ -416,10 +416,10 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
                     tokens = session.segment_token_lengths.pop(0)
                     for layer in session.kv_cache:
                         layer.evict(tokens)
+            history = session.kv_cache[0].length
             self._predict(state, cache_latents, torch.tensor(sigma * 1000, device=latents.device), commit=True)
-            encoded: EncodedPrompt = state.extra["encoded"]
-            video_tokens = latents.shape[2] * (latents.shape[3] * latents.shape[4])
-            session.segment_token_lengths.append(video_tokens + encoded.embeds.shape[1])
+            # Commits keep only visible tokens, so record what was actually retained.
+            session.segment_token_lengths.append(session.kv_cache[0].length - history)
         session.rotary_emb = None
         completed = state.chunk_index
         session.frame_offset += latents.shape[2]

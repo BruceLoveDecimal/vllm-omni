@@ -128,10 +128,14 @@ def test_dit_cache_camera_and_action_cuda(gpu_context):
     cached_commit = model(**args, camera_extrinsics=poses, update_cache=True).sample
     assert torch.equal(cached_commit, committed)
     cached_continued = model(**args, camera_extrinsics=poses, frame_offset=2).sample
-    assert torch.equal(cached_continued, continued)
+    # Compacted history drops invisible keys: equal math, different reduction order.
+    torch.testing.assert_close(cached_continued, continued)
     for reserved_cache, snapshot in zip(reserved, snapshots):
-        for name in snapshot:
-            assert torch.equal(getattr(reserved_cache, name)[:, : reserved_cache.length], snapshot[name])
+        visible = snapshot["mask"][0]
+        assert reserved_cache.length == 10
+        assert reserved_cache.mask[:, : reserved_cache.length].all()
+        for name in ("key", "value"):
+            assert torch.equal(getattr(reserved_cache, name)[:, : reserved_cache.length], snapshot[name][:, visible])
 
 
 @pytest.mark.parametrize("tile_pixels", [0, 16])

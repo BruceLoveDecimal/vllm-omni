@@ -228,25 +228,69 @@ def test_preallocated_history_matches_concat_with_actions_camera_and_short_tail(
         )
         for commit in (False, False, True):
             if bounded and commit and offset:
-                count = reserved[0].length
                 for layer in reserved:
-                    layer.evict(count)
+                    layer.evict(layer.length)
                 for layer in dynamic:
+                    count = layer["key"].shape[1]
                     for name in ("key", "value", "mask"):
                         layer[name] = layer[name][:, count:].clone()
             expected = tiny_model(**args, kv_cache=dynamic, update_cache=commit).sample
             rotary = tiny_model.rotary_embed(frames, 2, 2, latents.device, offset)
             actual = tiny_model(**args, kv_cache=reserved, update_cache=commit, rotary_emb=rotary).sample
-            assert torch.equal(actual, expected)
+            # Compaction drops invisible keys: equal math, different reduction order.
+            torch.testing.assert_close(actual, expected)
             current = [layer.key.data_ptr() for layer in reserved]
             if pointers is None:
                 pointers = current
             assert current == pointers
             if commit:
                 for baseline, cached in zip(dynamic, reserved):
-                    for name in ("key", "value", "mask"):
-                        assert torch.equal(baseline[name], getattr(cached, name)[:, : cached.length])
+                    visible = baseline["mask"][0]
+                    assert cached.mask[:, : cached.length].all()
+                    for name in ("key", "value"):
+                        torch.testing.assert_close(
+                            baseline[name][:, visible], getattr(cached, name)[:, : cached.length]
+                        )
         offset += frames
+
+
+@torch.no_grad()
+def test_trimmed_text_and_compact_history_match_padded_mask(tiny_model, monkeypatch):
+    from vllm_omni.diffusion.models.hy_nomas.cache import HyNomasKVCache
+
+    masks = []
+    attend = model_module._attend
+
+    def observe(attention, query, key, value, mask=None):
+        masks.append(mask)
+        return attend(attention, query, key, value, mask)
+
+    monkeypatch.setattr(model_module, "_attend", observe)
+    text = torch.randn(1, 5, 8)
+    text_mask = torch.tensor([[True] * 3 + [False] * 2])
+    padded = [HyNomasKVCache(30), HyNomasKVCache(30)]
+    trimmed = [HyNomasKVCache(30), HyNomasKVCache(30)]
+    for offset in (0, 2):
+        args = dict(hidden_states=torch.randn(1, 4, 2, 2, 2), timestep=torch.tensor([500.0]), frame_offset=offset)
+        for commit in (False, True):
+            expected = tiny_model(
+                **args,
+                encoder_hidden_states=text,
+                encoder_attention_mask=text_mask,
+                kv_cache=padded,
+                update_cache=commit,
+            ).sample
+            masks.clear()
+            actual = tiny_model(**args, encoder_hidden_states=text[:, :3], kv_cache=trimmed, update_cache=commit).sample
+            torch.testing.assert_close(actual, expected)
+            # Neither text refinement nor joint attention over history needs a mask.
+            assert masks and all(mask is None for mask in masks)
+    for masked, compact in zip(padded, trimmed):
+        assert masked.length == compact.length == 2 * (8 + 3)
+        for name in ("key", "value"):
+            torch.testing.assert_close(
+                getattr(masked, name)[:, : masked.length], getattr(compact, name)[:, : compact.length]
+            )
 
 
 def test_preallocated_capacity_rejects_overflow_without_advancing_history():
@@ -254,7 +298,7 @@ def test_preallocated_capacity_rejects_overflow_without_advancing_history():
 
     cache = HyNomasKVCache(3)
     key = torch.randn(1, 2, 2, 4)
-    mask = torch.tensor([[True, False]])
+    mask = torch.tensor([[True, True]])
     cache.stage((key,), (key,), mask)
     assert cache.length == 0
     cache.commit(mask)
@@ -263,6 +307,24 @@ def test_preallocated_capacity_rejects_overflow_without_advancing_history():
         cache.stage((key,), (key,), mask)
     assert cache.length == 2
     assert torch.equal(cache.key, before)
+
+
+def test_commit_keeps_only_visible_tokens():
+    from vllm_omni.diffusion.models.hy_nomas.cache import HyNomasKVCache
+
+    key = torch.arange(4.0).reshape(1, 4, 1, 1)
+    gathered = HyNomasKVCache(8)
+    gathered.stage((key,), (key + 10,), torch.ones(1, 4, dtype=torch.bool))
+    gathered.commit(torch.tensor([[True, False, True, False]]))
+    assert gathered.length == 2
+    assert gathered.key[0, :2, 0, 0].tolist() == [0.0, 2.0]
+    assert gathered.value[0, :2, 0, 0].tolist() == [10.0, 12.0]
+    prefix = HyNomasKVCache(8)
+    prefix.stage((key,), (key,), torch.ones(1, 4, dtype=torch.bool))
+    prefix.commit(torch.tensor([[True, True, True, False]]), visible_prefix=3)
+    assert prefix.length == 3 and prefix.mask[:, :3].all()
+    with pytest.raises(ValueError, match="visible_prefix"):
+        prefix.commit(torch.ones(1, 1, dtype=torch.bool), visible_prefix=2)
 
 
 def test_shared_patch_embed_preserves_reference_layout(tiny_model):

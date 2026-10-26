@@ -277,7 +277,8 @@ class HyNomasAttnProcessor:
         )
         history_length = 0
         key_mask = current_mask
-        if isinstance(kv_cache, HyNomasKVCache):
+        compact_history = isinstance(kv_cache, HyNomasKVCache)
+        if compact_history:
             history_length = kv_cache.length
             key, value, key_mask = kv_cache.stage((key, encoder_key), (value, encoder_value), current_mask)
         else:
@@ -302,19 +303,26 @@ class HyNomasAttnProcessor:
             encoder_attention_mask,
             action_text_offsets,
             action_token_windows,
+            mask_history=not compact_history,
         )
-        output = output * current_mask[:, :, None, None].to(output.dtype)
+        if encoder_attention_mask is not None:
+            output = output * current_mask[:, :, None, None].to(output.dtype)
 
         if update_cache:
             cache_mask = current_mask.clone()
+            # Without a text mask the visible tokens are a prefix known on the host.
+            visible_text = text_length
             if cache_action_start is not None:
                 cache_mask[:, video_length + cache_action_start :] = False
+                visible_text = cache_action_start
             elif action_text_offsets is not None:
                 for batch_index, offsets in enumerate(action_text_offsets):
                     if offsets is not None:
                         cache_mask[batch_index, video_length + offsets[0] :] = False
-            if isinstance(kv_cache, HyNomasKVCache):
-                kv_cache.commit(cache_mask)
+                        visible_text = min(offsets[0], text_length)
+            if compact_history:
+                visible_prefix = None if encoder_attention_mask is not None else video_length + visible_text
+                kv_cache.commit(cache_mask, visible_prefix)
             else:
                 if history_length:
                     cache_mask = torch.cat((kv_cache["mask"], cache_mask), dim=1)
@@ -338,11 +346,12 @@ class HyNomasAttnProcessor:
         encoder_attention_mask,
         action_text_offsets,
         action_token_windows,
+        mask_history=True,
     ):
         if action_text_offsets is None:
-            attention_mask = (
-                key_mask[:, None, None, :] if encoder_attention_mask is not None or history_length else None
-            )
+            # Compacted history is all visible, so only padded text needs a mask.
+            needs_mask = encoder_attention_mask is not None or (history_length and mask_history)
+            attention_mask = key_mask[:, None, None, :] if needs_mask else None
             output = _attend(attention, query, key, value, attention_mask)
         else:
             # Each query group shares a visible key set; no quadratic dense mask is needed.

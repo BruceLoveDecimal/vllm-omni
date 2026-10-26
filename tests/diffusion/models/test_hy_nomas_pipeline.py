@@ -377,3 +377,30 @@ def test_offload_policy_keeps_dit_and_decoder_resident(offload, accepted, monkey
     else:
         with pytest.raises(ValueError, match="only module-mode text_encoder"):
             pipeline_module.HyNomasPipeline(od_config=config)
+
+
+@pytest.mark.parametrize("right_padded", [True, False])
+def test_prompt_encoding_trims_only_right_padding(monkeypatch, right_padded):
+    from transformers import BatchEncoding
+
+    from vllm_omni.diffusion.models.hy_nomas import prompt as prompt_module
+
+    valid = [1, 1, 0, 0] if right_padded else [0, 0, 1, 1]
+    tokens = BatchEncoding(
+        {"input_ids": torch.tensor([[9, 1, 2, 0, 0]]), "attention_mask": torch.tensor([[1] + valid])}
+    )
+    embeds = torch.randn(1, 4, 3)
+    monkeypatch.setattr(prompt_module, "qwen_chat_crop_start", lambda *args: 1)
+    monkeypatch.setattr(prompt_module, "_tokenize", lambda *args: tokens)
+    monkeypatch.setattr(
+        prompt_module,
+        "encode_qwen_chat_prompt",
+        lambda encoder, tokens, crop, **kwargs: (embeds, tokens["attention_mask"][:, crop:]),
+    )
+    encoded = prompt_module.encode_segment_prompt("fox", None, None, torch.device("cpu"), 4)
+    if right_padded:
+        assert encoded.mask is None
+        assert torch.equal(encoded.embeds, embeds[:, :2])
+    else:
+        assert encoded.embeds is embeds
+        assert encoded.mask.tolist() == [valid]

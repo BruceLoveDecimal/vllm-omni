@@ -113,7 +113,8 @@ def _action_windows(prompt, frames, fps):
 @dataclass
 class EncodedPrompt:
     embeds: torch.Tensor
-    mask: torch.Tensor
+    # None when every token is valid.
+    mask: torch.Tensor | None
     action_offsets: list[int] | None
     cache_action_start: int | None
 
@@ -143,6 +144,11 @@ def encode_segment_prompt(
             min(len(full_ids), len(variant_ids)),
         )
         boundaries.append(max(boundaries[-1] if boundaries else 0, min(length - 1, common - crop)))
+    # Right padding leaves the valid text as a prefix. Dropping the padded tail
+    # is equivalent under the key mask and lets attention run without a mask.
+    valid = int(mask.sum())
+    if bool(mask[0, :valid].all()):
+        embeds, mask = embeds[:, :valid], None
     return EncodedPrompt(
         embeds=embeds,
         mask=mask,

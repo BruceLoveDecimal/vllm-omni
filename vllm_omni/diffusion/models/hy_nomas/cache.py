@@ -9,8 +9,8 @@ class HyNomasKVCache:
     """Reserve a contiguous history plus scratch tail for one world, per segment.
 
     Denoising overwrites the uncommitted tail. Only the separate cache-write
-    forward advances length. Masked tokens retain their original positions so
-    attention sees the same sequence shapes and contiguous per-world storage.
+    forward advances length. Commits keep only visible tokens, so committed
+    history never needs a key mask.
     """
 
     def __init__(self, capacity: int):
@@ -59,12 +59,27 @@ class HyNomasKVCache:
         self.mask[:, self.length : end].copy_(mask)
         return self.key[:, :end], self.value[:, :end], self.mask[:, :end]
 
-    def commit(self, mask: torch.Tensor) -> None:
+    def commit(self, mask: torch.Tensor, visible_prefix: int | None = None) -> None:
+        """Append the staged tokens that ``mask`` keeps visible.
+
+        ``visible_prefix`` states that exactly the first tokens are visible,
+        avoiding a device sync and gather.
+        """
         end = self.length + mask.shape[1]
-        if self.mask is None or end > self.capacity:
+        if self.mask is None or self.key is None or self.value is None or end > self.capacity:
             raise ValueError("Stage KV before committing within its capacity.")
-        self.mask[:, self.length : end].copy_(mask)
-        self.length = end
+        if visible_prefix is None:
+            index = mask[0].nonzero().squeeze(1)
+            visible_prefix = index.numel()
+            if visible_prefix != mask.shape[1]:
+                for tensor in (self.key, self.value):
+                    tensor[:, self.length : self.length + visible_prefix] = tensor[:, self.length : end].index_select(
+                        1, index
+                    )
+        elif not 0 <= visible_prefix <= mask.shape[1]:
+            raise ValueError("visible_prefix must lie within the staged tokens.")
+        self.mask[:, self.length : self.length + visible_prefix] = True
+        self.length += visible_prefix
 
     def evict(self, tokens: int) -> None:
         if not 0 <= tokens <= self.length:
