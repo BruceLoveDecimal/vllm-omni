@@ -138,34 +138,13 @@ def test_camera_gate_and_front_padding(tiny_model):
         tiny_model(**args, camera_extrinsics=poses[:, :4])
 
 
-def _checkpoint_names(name):
-    """Map a parameter to its converted-checkpoint names, splitting fused q/k/v."""
-    name = name.replace("_mlp.net.0.proj.", "_mlp.fc1.").replace("_mlp.net.2.", "_mlp.fc2.")
-    fused = model_module._FUSED_QKV.fullmatch(name)
-    return [name] if fused is None else [f"{fused[1]}{projection}.{fused[2]}" for projection in "qkv"]
-
-
-def _checkpoint(state):
-    weights = []
-    for name, tensor in state.items():
-        names = _checkpoint_names(name)
-        weights.extend(zip(names, (part.clone() for part in tensor.chunk(len(names)))))
-    return weights
-
-
 def test_strict_checkpoint_loading(tiny_model):
-    weights = _checkpoint(tiny_model.state_dict())
+    weights = []
+    for name, tensor in tiny_model.state_dict().items():
+        name = name.replace("_mlp.net.0.proj.", "_mlp.fc1.").replace("_mlp.net.2.", "_mlp.fc2.")
+        weights.append((name, tensor.clone()))
     weights.reverse()
-    checkpoint = dict(weights)
-    for parameter in tiny_model.parameters():
-        nn.init.zeros_(parameter)
     assert tiny_model.load_weights(weights) == set(tiny_model.state_dict())
-    for prefix in ("img", "txt"):
-        base = f"double_blocks.1.attn.{prefix}_attn_"
-        for field in ("weight", "bias"):
-            fused = getattr(getattr(tiny_model.double_blocks[1].attn, f"{prefix}_attn_qkv"), field)
-            expected = torch.cat([checkpoint[f"{base}{projection}.{field}"] for projection in "qkv"])
-            assert torch.equal(fused, expected)
     for prefix in ("img", "txt"):
         checkpoint = dict(weights)
         inputs = torch.randn(1, 5, 12)
@@ -370,14 +349,10 @@ def test_full_checkpoint_mapping_coverage(monkeypatch):
     with torch.device("meta"):
         model = model_module.HyNomasTransformer3DModel()
     parameters = dict(model.named_parameters())
-    # Each fused q/k/v projection replaces three checkpoint projections.
-    assert len(parameters) == 2268 - 2 * 2 * 2 * 54
-    checkpoint = [(name, target) for target in parameters for name in _checkpoint_names(target)]
-    assert len(checkpoint) == len({name for name, _ in checkpoint}) == 2268
-    weights = []
-    for name, target in checkpoint:
-        tensor = parameters[target]
-        if model_module._FUSED_QKV.fullmatch(target):
-            tensor = tensor[: tensor.shape[0] // 3]
-        weights.append((name, tensor))
-    assert model.load_weights(weights) == set(parameters)
+    checkpoint = [
+        name.replace("_mlp.net.0.proj.", "_mlp.fc1.").replace("_mlp.net.2.", "_mlp.fc2.") for name in parameters
+    ]
+    mapped = model.hf_to_vllm_mapper.apply_list(checkpoint)
+    assert len(mapped) == len(set(mapped)) == len(parameters) == 2268
+    assert set(mapped) == set(parameters)
+    assert model.load_weights((name, parameters[target]) for name, target in zip(checkpoint, mapped)) == set(parameters)

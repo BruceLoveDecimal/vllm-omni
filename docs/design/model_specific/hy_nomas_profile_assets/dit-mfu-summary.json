@@ -380,5 +380,67 @@
     0.39248260855674744
    ]
   }
+ },
+ "p12f": {
+  "runs": [
+   {
+    "elapsed_ms": 61482.737058,
+    "first_media_ms": 26619.455676,
+    "dit_ms": 29816.936504095793,
+    "peak_memory_gib": 66.12353515625
+   },
+   {
+    "elapsed_ms": 61403.891366,
+    "first_media_ms": 26778.10146,
+    "dit_ms": 29929.610518738627,
+    "peak_memory_gib": 65.51806640625
+   },
+   {
+    "elapsed_ms": 61379.907428,
+    "first_media_ms": 26993.809665,
+    "dit_ms": 29964.6611250937,
+    "peak_memory_gib": 66.12353515625
+   }
+  ],
+  "warmup_ms": 92649.271187,
+  "median_elapsed_ms": 61403.891366,
+  "stdev_elapsed_ms": 53.798706977775254,
+  "median_first_media_ms": 26778.10146,
+  "median_dit_ms": 29929.610518738627,
+  "max_peak_memory_gib": 66.12353515625,
+  "repeat_exact": true,
+  "rgb_sha256": "2ba4dc3b6f91646d30d4ca3e7c0fe27899db08ea8a792cc23beb5647b798331c",
+  "executed_pflop": 10.1824223987712,
+  "useful_pflop": 10.1824223987712,
+  "dit_mfu_executed_pct": 72.72602086282349,
+  "dit_mfu_useful_pct": 72.72602086282349,
+  "e2e_mfu_useful_note": "DiT-only; decoder FLOPs (6.654 PF) unchanged",
+  "e2e_mfu_useful_pct": 58.612966298205386,
+  "vs_cudnn": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.5048038568188334,
+   "ssim_mean": 0.605120517561833,
+   "ssim_min": 0.2879735827445984,
+   "ssim_seg0": 0.7364268991209212,
+   "ssim_seg1": 0.5344170813377087,
+   "psnr_db": 17.06375244163349,
+   "latent_relative_l2": [
+    0.3119826316833496,
+    0.5465735793113708
+   ]
+  },
+  "vs_sdpa": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.43877346089876873,
+   "ssim_mean": 0.6594532211621602,
+   "ssim_min": 0.3998081386089325,
+   "ssim_seg0": 0.7356929402975809,
+   "ssim_seg1": 0.6184010647046261,
+   "psnr_db": 18.283654907637555,
+   "latent_relative_l2": [
+    0.31399938464164734,
+    0.43763235211372375
+   ]
+  }
  }
 }

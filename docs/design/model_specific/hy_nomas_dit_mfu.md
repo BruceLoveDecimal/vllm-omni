@@ -1,19 +1,19 @@
 # Hy-Nomas realtime DiT MFU optimization, 2026-10-26
 
 Four changes on top of cuDNN joint attention cut the realtime smoke from
-**79,479 ms to 61,560 ms** end to end (1.29x; 2.16x versus TORCH_SDPA) and
-raise DiT MFU on valid-token FLOPs from **45.0% to 72.8%**. Peak device
-memory falls from 88.25 to 65.53 GiB. Only the final-commit skip is bitwise
+**79,479 ms to 61,404 ms** end to end (1.29x; 2.17x versus TORCH_SDPA) and
+raise DiT MFU on valid-token FLOPs from **45.0% to 72.7%**. Peak device
+memory falls from 88.25 to 66.12 GiB. Only the final-commit skip is bitwise
 exact; the others change BF16 rounding and therefore the sampled trajectory.
 
 ## Changes
 
-| Step | Commit subject | Effect |
+| Step | Change | Effect |
 | --- | --- | --- |
 | P0-1 | Skip the Hy-Nomas final-segment KV commit | The last segment's cache-write forward had no reader |
 | P1-1 | Run Hy-Nomas joint attention mask-free | Trim right-padded text (25 of 1,280 tokens valid), commit only visible KV, pass no mask |
 | P0-2 | Compile the Hy-Nomas realtime DiT stage | `enforce_eager: false` on the DiT stage; regional compile of the 54 blocks |
-| P1-2 | Fuse Hy-Nomas Q/K/V projections and QK norm/RoPE | One q/k/v GEMM per stream; shared `fused_joint_qkv_norm_rope` op |
+| P1-2 | Fuse Hy-Nomas QK norm/RoPE (q/k/v merge dropped) | Shared `fused_joint_qkv_norm_rope` op for both streams' Q/K norm, video RoPE and the join |
 
 P1-1 also removes the dense `[heads, Q, K]` Boolean mask that the masked
 attention path materialized: 16 x 27,680 x 55,360 bytes is 22.8 GiB, matching
@@ -52,13 +52,13 @@ hash exactly across warmup and measured runs.
 | + P0-1 final-commit skip | 76,981 | 31 | 34,119 | 45,366 | 52.1% | 48.0% | 46.8% | 88.25 |
 | + P1-1 mask-free attention | 69,739 | 141 | 31,313 | 38,723 | 56.2% | 56.2% | 51.6% | 65.58 |
 | + P0-2 regional compile | 61,723 | 182 | 26,816 | 30,544 | 71.3% | 71.3% | 58.3% | 68.17 |
-| + P1-2 q/k/v merge only | 61,826 | 89 | 26,937 | 30,571 | 71.2% | 71.2% | 58.2% | 68.89 |
-| **+ P1-2 complete** | **61,560** | 242 | **26,824** | **29,918** | **72.8%** | **72.8%** | **58.5%** | **65.53** |
+| **+ P1-2 fused norm/RoPE** | **61,404** | 54 | **26,778** | **29,930** | **72.7%** | **72.7%** | **58.6%** | **66.12** |
 
-The compiled configurations' first request takes about 101-107 s instead of
+The compiled configurations' first request takes about 93-107 s instead of
 85 s because it includes compilation. P1-2's end-to-end change is within
-run-to-run spread; its DiT gain comes from the fused norm/RoPE, while the q/k/v
-merge alone shows none.
+run-to-run spread; its DiT gain is about 0.6 s. A variant that also merged each
+stream's q/k/v projections into one GEMM measured 61,560 ms with the fused
+norm/RoPE and 61,826 ms without it, so the merge was dropped.
 
 ## Output comparison
 
@@ -73,7 +73,7 @@ prediction by 0.69% ([attention diagnosis](hy_nomas_attention_diagnosis.md)).
 | + P0-1 | yes | 0.712 (0.860 / 0.633) | 19.26 | 1.000 |
 | + P1-1 | no | 0.689 (0.854 / 0.600) | 18.49 | 0.607 |
 | + P0-2 | no | 0.589 (0.677 / 0.542) | 17.15 | 0.549 |
-| + P1-2 complete | no | 0.687 (0.751 / 0.652) | 18.84 | 0.661 |
+| + P1-2 | no | 0.659 (0.736 / 0.618) | 18.28 | 0.605 |
 
 ![Selected frames from SDPA, cuDNN and each optimization step](hy_nomas_profile_assets/dit-mfu-contact.jpg)
 
@@ -95,16 +95,17 @@ The final state passes all 103 Hy-Nomas CPU/CUDA component, pipeline, stage,
 decoder, deploy and Qwen prompt tests (one skip); the P0-1 and P1-1 commit
 states pass their suites (97 and 101 tests). New cases cover
 final-commit skipping, visible-token KV compaction, prompt trimming for right-
-versus left-padded text, trimmed-versus-padded transformer equivalence,
-fused-versus-separate q/k/v checkpoint loading and fused-versus-eager norm/RoPE.
+versus left-padded text, trimmed-versus-padded transformer equivalence and
+fused-versus-eager norm/RoPE.
 
 External harness scripts remain outside the repository, under
 `/root/autodl-tmp/nomas-cudnn-opt/tools` on the GPU host:
 
 ```bash
 # NAME, code root, deploy config; one warmup plus three measured requests
-bash tools/run-variant.sh p12 /root/autodl-tmp/nomas-cudnn-p12 compile.yaml
-/root/autodl-tmp/venv-nomas-review/bin/python tools/analyze.py p01 p11 p02 p12q p12
+bash tools/run-variant.sh p12f /root/autodl-tmp/nomas-cudnn-p12f \
+  /root/autodl-tmp/nomas-cudnn-p12f/vllm_omni/deploy/hy_nomas_two_stage_realtime.yaml
+/root/autodl-tmp/venv-nomas-review/bin/python tools/analyze.py p01 p11 p02 p12f
 ```
 
 `run-variant.sh` reuses the backend smoke's `start-server.sh`, `benchmark.py`

@@ -24,7 +24,6 @@ numerical equivalence to the optional Magi/Flash kernels.
 """
 
 import math
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -48,8 +47,6 @@ from vllm_omni.diffusion.layers.norm import LayerNorm
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15PatchEmbed
 from vllm_omni.diffusion.models.hy_nomas.cache import HyNomasKVCache
-
-_FUSED_QKV = re.compile(r"(double_blocks\.\d+\.attn\.(?:img|txt)_attn_)qkv\.(weight|bias)")
 
 
 def _attention(heads: int, head_dim: int, role: str) -> Attention:
@@ -265,10 +262,12 @@ class HyNomasAttnProcessor:
         cache_action_start=None,
         qk_norm_rope_table=None,
     ):
-        query, key, value = attn.img_attn_qkv(hidden_states).unflatten(-1, (3, attn.heads, -1)).unbind(-3)
-        encoder_query, encoder_key, encoder_value = (
-            attn.txt_attn_qkv(encoder_hidden_states).unflatten(-1, (3, attn.heads, -1)).unbind(-3)
-        )
+        query = attn.img_attn_q(hidden_states).unflatten(-1, (attn.heads, -1))
+        key = attn.img_attn_k(hidden_states).unflatten(-1, (attn.heads, -1))
+        value = attn.img_attn_v(hidden_states).unflatten(-1, (attn.heads, -1))
+        encoder_query = attn.txt_attn_q(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
+        encoder_key = attn.txt_attn_k(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
+        encoder_value = attn.txt_attn_v(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
         if qk_norm_rope_table is not None and _fused_cuda_supported(
             query, key, query.shape[-1], qk_norm_rope_table.shape[-1], interleaved=True
         ):
@@ -439,9 +438,8 @@ class HyNomasAttention(nn.Module):
         self.heads = heads
         self.attention = _attention(heads, hidden_size // heads, "hy_nomas.joint")
         for prefix in ("img", "txt"):
-            # The checkpoint's separate q/k/v projections load into one GEMM.
-            setattr(self, f"{prefix}_attn_qkv", nn.Linear(hidden_size, 3 * hidden_size))
-            setattr(self, f"{prefix}_attn_proj", nn.Linear(hidden_size, hidden_size))
+            for projection in ("q", "k", "v", "proj"):
+                setattr(self, f"{prefix}_attn_{projection}", nn.Linear(hidden_size, hidden_size))
             setattr(self, f"{prefix}_attn_q_norm", RMSNorm(hidden_size // heads, eps=1e-6))
             setattr(self, f"{prefix}_attn_k_norm", RMSNorm(hidden_size // heads, eps=1e-6))
         self.processor = self._default_processor_cls()
@@ -685,32 +683,19 @@ class HyNomasTransformer3DModel(nn.Module):
         checkpoint_mapper = WeightsMapper(
             orig_to_new_substr={new: old for old, new in self.hf_to_vllm_mapper.orig_to_new_substr.items()}
         )
-        # Checkpoint name -> (parameter name, q/k/v shard of a fused projection or None).
-        destinations: dict[str, tuple[str, int | None]] = {}
-        for parameter_name in parameters:
-            checkpoint_name = checkpoint_mapper.apply_list([parameter_name])[0]
-            fused = _FUSED_QKV.fullmatch(checkpoint_name)
-            if fused is None:
-                destinations[checkpoint_name] = (parameter_name, None)
-                continue
-            for shard, projection in enumerate("qkv"):
-                destinations[f"{fused[1]}{projection}.{fused[2]}"] = (parameter_name, shard)
+        checkpoint_names = set(checkpoint_mapper.apply_list(list(parameters)))
         loaded: set[str] = set()
         seen: set[str] = set()
         for name, tensor in weights:
-            if name not in destinations:
+            if name not in checkpoint_names:
                 raise ValueError(f"Unexpected Hy-Nomas transformer weight: {name}")
             if name in seen:
                 raise ValueError(f"Duplicate Hy-Nomas transformer weight: {name}")
-            destination, shard = destinations[name]
-            parameter = parameters[destination]
-            if shard is not None:
-                size = parameter.shape[0] // 3
-                parameter = parameter.data[shard * size : (shard + 1) * size]
-            default_weight_loader(parameter, tensor)
+            destination = self.hf_to_vllm_mapper.apply_list([name])[0]
+            default_weight_loader(parameters[destination], tensor)
             seen.add(name)
             loaded.add(destination)
-        missing = set(destinations) - seen
+        missing = checkpoint_names - seen
         if missing:
             raise ValueError(f"Missing Hy-Nomas transformer weights: {sorted(missing)}")
         return loaded
