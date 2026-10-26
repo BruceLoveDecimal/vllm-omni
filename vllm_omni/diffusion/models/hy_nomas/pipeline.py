@@ -401,24 +401,26 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery, SupportsStepExecuti
         latents = state.latents
         if latents is None:
             raise RuntimeError("Cannot commit an empty Hy-Nomas segment.")
-        sigma = 0.206897
-        noise = randn_tensor(
-            latents.shape, generator=state.sampling.generator, device=latents.device, dtype=latents.dtype
-        )
-        cache_latents = ((1 - sigma) * latents.float() + sigma * noise.float()).to(latents.dtype)
-        # Match native causal_ar.py cache_write: denoising reads all retained
-        # segments; evict whole segments only before committing this segment.
-        # This optional bounded history is not equivalent to full-history output.
-        if self.max_cache_segments is not None:
-            while len(session.segment_token_lengths) >= self.max_cache_segments:
-                tokens = session.segment_token_lengths.pop(0)
-                for layer in session.kv_cache:
-                    layer.evict(tokens)
-        self._predict(state, cache_latents, torch.tensor(sigma * 1000, device=latents.device), commit=True)
+        # No later segment reads the final segment's KV, so skip its cache-write forward.
+        if state.chunk_index + 1 < state.total_chunks:
+            sigma = 0.206897
+            noise = randn_tensor(
+                latents.shape, generator=state.sampling.generator, device=latents.device, dtype=latents.dtype
+            )
+            cache_latents = ((1 - sigma) * latents.float() + sigma * noise.float()).to(latents.dtype)
+            # Match native causal_ar.py cache_write: denoising reads all retained
+            # segments; evict whole segments only before committing this segment.
+            # This optional bounded history is not equivalent to full-history output.
+            if self.max_cache_segments is not None:
+                while len(session.segment_token_lengths) >= self.max_cache_segments:
+                    tokens = session.segment_token_lengths.pop(0)
+                    for layer in session.kv_cache:
+                        layer.evict(tokens)
+            self._predict(state, cache_latents, torch.tensor(sigma * 1000, device=latents.device), commit=True)
+            encoded: EncodedPrompt = state.extra["encoded"]
+            video_tokens = latents.shape[2] * (latents.shape[3] * latents.shape[4])
+            session.segment_token_lengths.append(video_tokens + encoded.embeds.shape[1])
         session.rotary_emb = None
-        encoded: EncodedPrompt = state.extra["encoded"]
-        video_tokens = latents.shape[2] * (latents.shape[3] * latents.shape[4])
-        session.segment_token_lengths.append(video_tokens + encoded.embeds.shape[1])
         completed = state.chunk_index
         session.frame_offset += latents.shape[2]
         state.chunk_index += 1

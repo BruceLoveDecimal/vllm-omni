@@ -64,7 +64,8 @@ def test_producer_emits_all_segments_and_cleans_session(pipeline):
     assert [s["pixel_frames"] for s in segments] == [4, 4]
     assert all(s["latents"].device.type == "cpu" for s in segments)
     assert not pipeline._sessions
-    assert sum(call[2] for call in pipeline.transformer.calls) == 2
+    # Only the first segment commits; the final segment's KV has no reader.
+    assert sum(call[2] for call in pipeline.transformer.calls) == 1
     handed = diffusion_stage_handoff([result], {"prompt": "landscape"})[0]
     assert handed[PAYLOAD_KEY] is segments
 

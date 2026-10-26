@@ -86,16 +86,16 @@ def test_segment_scheduler_commits_once_after_denoising(pipeline):
         assert state.chunk_index == index + 1
         assert pipeline._sessions["world"].frame_offset == index + 1
     assert state.request_denoise_completed
-    assert [call[2] for call in pipeline.transformer.calls] == [False, False, True] * 2
-    assert [call[3] for call in pipeline.transformer.calls] == [0] * 3 + [1] * 3
+    # The final segment's KV has no reader, so only the first segment commits.
+    assert [call[2] for call in pipeline.transformer.calls] == [False, False, True, False, False]
+    assert [call[3] for call in pipeline.transformer.calls] == [0] * 3 + [1] * 2
     expected_generator = torch.Generator("cpu").manual_seed(42)
     torch.randn(initial.shape, generator=expected_generator)
-    for index in range(2):
-        noise = torch.randn((1, 1, 1, 1, 1), generator=expected_generator)
-        expected = (1 - 0.206897) * (initial[:, :, index : index + 1] - 1) + 0.206897 * noise
-        actual, time, _, _ = pipeline.transformer.calls[index * 3 + 2]
-        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
-        torch.testing.assert_close(time, torch.tensor([206.897]))
+    noise = torch.randn((1, 1, 1, 1, 1), generator=expected_generator)
+    expected = (1 - 0.206897) * (initial[:, :, :1] - 1) + 0.206897 * noise
+    actual, time, _, _ = pipeline.transformer.calls[2]
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(time, torch.tensor([206.897]))
 
 
 def test_forward_failure_releases_session(pipeline, monkeypatch):
@@ -263,21 +263,24 @@ def test_segment_history_eviction_matches_native_commit_order(pipeline, monkeypa
         pipeline.prepare_next_chunk(state)
         pipeline.denoise_step(None, states=[state])
         pipeline.post_decode(state)
-        retained = segment + 1 if limit is None else min(segment + 1, limit)
+        committed = min(segment + 1, 3)  # The final segment skips its commit.
+        retained = committed if limit is None else min(committed, limit)
         assert session.frame_offset == segment + 1
         assert session.segment_token_lengths == [3] * retained
         for index, layer in enumerate(session.kv_cache):
-            expected = torch.arange(segment + 1 - retained, segment + 1).repeat_interleave(3) + 10 * index
+            expected = torch.arange(committed - retained, committed).repeat_interleave(3) + 10 * index
             for tensor in (layer.key, layer.value):
                 torch.testing.assert_close(tensor[0, : layer.length, 0, 0], expected.float())
                 allocated_segments = segment + 1 if limit is None else min(segment + 1, limit + 1)
                 assert tensor.untyped_storage().nbytes() == allocated_segments * 3 * 4
             assert layer.mask[:, : layer.length].all()
+    assert len(observations) == 7
     for segment in range(4):
         before = segment if limit is None else min(segment, limit)
-        commit = segment if limit is None else min(segment, limit - 1)
         assert observations[2 * segment] == (segment, False, [3 * before] * 2)
-        assert observations[2 * segment + 1] == (segment, True, [3 * commit] * 2)
+        if segment < 3:
+            commit = segment if limit is None else min(segment, limit - 1)
+            assert observations[2 * segment + 1] == (segment, True, [3 * commit] * 2)
 
 
 @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "2"])
