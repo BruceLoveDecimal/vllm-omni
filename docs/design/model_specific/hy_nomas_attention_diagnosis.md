@@ -202,3 +202,6 @@ local copy: `/tmp/hy-nomas-attn-diagnosis/nomas-attn-diagnosis-evidence.tar.gz`.
 SHA-256: `b9fcc8e5416c1708e1061ea7f46a2c0fae542eb2a90b8e8a03df8d3b86435fc5`.
 It contains scripts, logs, metrics and manifests; large tensor files remain
 separate on the instance.
+
+The subsequent [matched video smoke comparison](hy_nomas_backend_smoke.md)
+measures warmed end-to-end speed and all-frame raw/encoded video differences.
