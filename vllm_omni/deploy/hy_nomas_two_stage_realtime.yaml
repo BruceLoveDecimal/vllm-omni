@@ -13,9 +13,13 @@ stages:
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
     step_execution: true
     streaming_output: true
+    # cuDNN for DiT joint attention only; output is not bitwise equal to TORCH_SDPA.
     diffusion_attention_config:
       default:
         backend: TORCH_SDPA
+      per_role:
+        hy_nomas.joint:
+          backend: CUDNN_ATTN
     diffusion_offload_config:
       mode: module
       components: [text_encoder]

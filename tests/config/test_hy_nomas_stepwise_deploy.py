@@ -53,6 +53,11 @@ def test_two_stage_realtime_uses_streamed_producer_and_stateful_decoder():
     assert producer.step_execution
     assert producer.engine_extras["streaming_output"]
     assert producer.engine_extras["engine_backend"].endswith("ARDiffusionEngine")
+    assert producer.diffusion_attention_config == {
+        "default": {"backend": "TORCH_SDPA"},
+        "per_role": {"hy_nomas.joint": {"backend": "CUDNN_ATTN"}},
+    }
+    assert decoder.diffusion_attention_config == {"default": {"backend": "TORCH_SDPA"}}
     assert not decoder.step_execution
     assert decoder.engine_extras["model_config"]["streaming_stage_input"]
     # Realtime clones the first diffusion stage's request parameters to all
