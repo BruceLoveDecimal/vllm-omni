@@ -24,6 +24,7 @@ numerical equivalence to the optional Magi/Flash kernels.
 """
 
 import math
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -38,10 +39,17 @@ from vllm.model_executor.models.utils import WeightsMapper
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_joint_qkv_norm_rope,
+    pack_qk_norm_rope_table,
+)
 from vllm_omni.diffusion.layers.norm import LayerNorm
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15PatchEmbed
 from vllm_omni.diffusion.models.hy_nomas.cache import HyNomasKVCache
+
+_FUSED_QKV = re.compile(r"(double_blocks\.\d+\.attn\.(?:img|txt)_attn_)qkv\.(weight|bias)")
 
 
 def _attention(heads: int, head_dim: int, role: str) -> Attention:
@@ -255,18 +263,41 @@ class HyNomasAttnProcessor:
         action_text_offsets=None,
         action_token_windows=None,
         cache_action_start=None,
+        qk_norm_rope_table=None,
     ):
-        query = attn.img_attn_q(hidden_states).unflatten(-1, (attn.heads, -1))
-        key = attn.img_attn_k(hidden_states).unflatten(-1, (attn.heads, -1))
-        value = attn.img_attn_v(hidden_states).unflatten(-1, (attn.heads, -1))
-        query = _apply_rotary_emb(attn.img_attn_q_norm(query).to(value.dtype), rotary_emb)
-        key = _apply_rotary_emb(attn.img_attn_k_norm(key).to(value.dtype), rotary_emb)
-        encoder_query = attn.txt_attn_q(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
-        encoder_key = attn.txt_attn_k(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
-        encoder_value = attn.txt_attn_v(encoder_hidden_states).unflatten(-1, (attn.heads, -1))
-        encoder_query = attn.txt_attn_q_norm(encoder_query).to(encoder_value.dtype)
-        encoder_key = attn.txt_attn_k_norm(encoder_key).to(encoder_value.dtype)
-        query = torch.cat((query, encoder_query), dim=1)
+        query, key, value = attn.img_attn_qkv(hidden_states).unflatten(-1, (3, attn.heads, -1)).unbind(-3)
+        encoder_query, encoder_key, encoder_value = (
+            attn.txt_attn_qkv(encoder_hidden_states).unflatten(-1, (3, attn.heads, -1)).unbind(-3)
+        )
+        if qk_norm_rope_table is not None and _fused_cuda_supported(
+            query, key, query.shape[-1], qk_norm_rope_table.shape[-1], interleaved=True
+        ):
+            # One launch for both streams' Q/K RMSNorm, video RoPE and the
+            # [video | text] cat. The CUDA RMSNorm rounding matches the eager
+            # norm's BF16 steps; the FP32 table keeps RoPE in FP32.
+            query, key, value = fused_joint_qkv_norm_rope(
+                query,
+                key,
+                value,
+                encoder_query,
+                encoder_key,
+                encoder_value,
+                attn.img_attn_q_norm.weight,
+                attn.img_attn_k_norm.weight,
+                attn.txt_attn_q_norm.weight,
+                attn.txt_attn_k_norm.weight,
+                qk_norm_rope_table,
+                attn.img_attn_q_norm.eps,
+                cuda_rms_norm=True,
+            )
+            keys, values = (key,), (value,)
+        else:
+            query = _apply_rotary_emb(attn.img_attn_q_norm(query).to(value.dtype), rotary_emb)
+            key = _apply_rotary_emb(attn.img_attn_k_norm(key).to(value.dtype), rotary_emb)
+            encoder_query = attn.txt_attn_q_norm(encoder_query).to(encoder_value.dtype)
+            encoder_key = attn.txt_attn_k_norm(encoder_key).to(encoder_value.dtype)
+            query = torch.cat((query, encoder_query), dim=1)
+            keys, values = (key, encoder_key), (value, encoder_value)
         batch_size, video_length = hidden_states.shape[:2]
         text_length = encoder_hidden_states.shape[1]
         text_mask = encoder_attention_mask
@@ -280,10 +311,10 @@ class HyNomasAttnProcessor:
         compact_history = isinstance(kv_cache, HyNomasKVCache)
         if compact_history:
             history_length = kv_cache.length
-            key, value, key_mask = kv_cache.stage((key, encoder_key), (value, encoder_value), current_mask)
+            key, value, key_mask = kv_cache.stage(keys, values, current_mask)
         else:
-            key = torch.cat((key, encoder_key), dim=1)
-            value = torch.cat((value, encoder_value), dim=1)
+            key = torch.cat(keys, dim=1)
+            value = torch.cat(values, dim=1)
             if kv_cache is not None and "key" in kv_cache:
                 history_length = kv_cache["key"].shape[1]
                 key = torch.cat((kv_cache["key"], key), dim=1)
@@ -408,8 +439,9 @@ class HyNomasAttention(nn.Module):
         self.heads = heads
         self.attention = _attention(heads, hidden_size // heads, "hy_nomas.joint")
         for prefix in ("img", "txt"):
-            for projection in ("q", "k", "v", "proj"):
-                setattr(self, f"{prefix}_attn_{projection}", nn.Linear(hidden_size, hidden_size))
+            # The checkpoint's separate q/k/v projections load into one GEMM.
+            setattr(self, f"{prefix}_attn_qkv", nn.Linear(hidden_size, 3 * hidden_size))
+            setattr(self, f"{prefix}_attn_proj", nn.Linear(hidden_size, hidden_size))
             setattr(self, f"{prefix}_attn_q_norm", RMSNorm(hidden_size // heads, eps=1e-6))
             setattr(self, f"{prefix}_attn_k_norm", RMSNorm(hidden_size // heads, eps=1e-6))
         self.processor = self._default_processor_cls()
@@ -653,19 +685,32 @@ class HyNomasTransformer3DModel(nn.Module):
         checkpoint_mapper = WeightsMapper(
             orig_to_new_substr={new: old for old, new in self.hf_to_vllm_mapper.orig_to_new_substr.items()}
         )
-        checkpoint_names = set(checkpoint_mapper.apply_list(list(parameters)))
+        # Checkpoint name -> (parameter name, q/k/v shard of a fused projection or None).
+        destinations: dict[str, tuple[str, int | None]] = {}
+        for parameter_name in parameters:
+            checkpoint_name = checkpoint_mapper.apply_list([parameter_name])[0]
+            fused = _FUSED_QKV.fullmatch(checkpoint_name)
+            if fused is None:
+                destinations[checkpoint_name] = (parameter_name, None)
+                continue
+            for shard, projection in enumerate("qkv"):
+                destinations[f"{fused[1]}{projection}.{fused[2]}"] = (parameter_name, shard)
         loaded: set[str] = set()
         seen: set[str] = set()
         for name, tensor in weights:
-            if name not in checkpoint_names:
+            if name not in destinations:
                 raise ValueError(f"Unexpected Hy-Nomas transformer weight: {name}")
             if name in seen:
                 raise ValueError(f"Duplicate Hy-Nomas transformer weight: {name}")
-            destination = self.hf_to_vllm_mapper.apply_list([name])[0]
-            default_weight_loader(parameters[destination], tensor)
+            destination, shard = destinations[name]
+            parameter = parameters[destination]
+            if shard is not None:
+                size = parameter.shape[0] // 3
+                parameter = parameter.data[shard * size : (shard + 1) * size]
+            default_weight_loader(parameter, tensor)
             seen.add(name)
             loaded.add(destination)
-        missing = checkpoint_names - seen
+        missing = set(destinations) - seen
         if missing:
             raise ValueError(f"Missing Hy-Nomas transformer weights: {sorted(missing)}")
         return loaded
@@ -781,6 +826,17 @@ class HyNomasTransformer3DModel(nn.Module):
                 F.silu(self.c2ws_hidden_states_layer1(camera_hidden_states))
             ).to(camera_hidden_states.device)
             camera_rotary_emb = self.camera_rotary_embed(num_frames, 1, 1, hidden_states.device)
+        # One packed table per forward: video rows rotate, trailing text rows get the identity.
+        cosine, sine = rotary_emb
+        qk_norm_rope_table = pack_qk_norm_rope_table(
+            cosine[:, ::2],
+            sine[:, ::2],
+            batch_size,
+            dtype=torch.float32,
+            activation_dtype=hidden_states.dtype,
+            identity_rows=encoder_hidden_states.shape[1],
+            cuda_rms_norm=True,
+        )
         action_token_windows = None
         if action_frame_windows is not None:
             action_token_windows = [
@@ -794,6 +850,7 @@ class HyNomasTransformer3DModel(nn.Module):
                 "action_text_offsets": action_text_offsets,
                 "action_token_windows": action_token_windows,
                 "cache_action_start": cache_action_start,
+                "qk_norm_rope_table": qk_norm_rope_table,
             }
             hidden_states, encoder_hidden_states = block(
                 hidden_states, encoder_hidden_states, temb, rotary_emb, attention_kwargs=attention_kwargs

@@ -138,6 +138,60 @@ def test_dit_cache_camera_and_action_cuda(gpu_context):
             assert torch.equal(getattr(reserved_cache, name)[:, : reserved_cache.length], snapshot[name][:, visible])
 
 
+def test_fused_qk_norm_rope_matches_eager_cuda(gpu_context, monkeypatch):
+    from vllm_omni.diffusion.models.hy_nomas import transformer as model_module
+
+    dtype = gpu_context
+    model = (
+        HyNomasTransformer3DModel(
+            in_channels=4,
+            out_channels=4,
+            num_layers=2,
+            num_attention_heads=2,
+            attention_head_dim=128,
+            text_embed_dim=8,
+            mlp_ratio=2,
+            rope_axes_dim=(16, 56, 56),
+            camera_embed_dim=8,
+            camera_attention_dim=256,
+            camera_num_attention_heads=2,
+            camera_rope_axes_dim=(16, 56, 56),
+        )
+        .to(device="cuda", dtype=dtype)
+        .eval()
+    )
+    for module in model.modules():
+        if isinstance(module, LinearBase):
+            torch.nn.init.normal_(module.weight, std=0.02)
+            torch.nn.init.zeros_(module.bias)
+    for name, parameter in model.named_parameters():
+        if "_norm." in name:
+            torch.nn.init.normal_(parameter, mean=1.0, std=0.1)
+    args = dict(
+        hidden_states=torch.randn(1, 4, 2, 2, 2, device="cuda", dtype=dtype),
+        encoder_hidden_states=torch.randn(1, 5, 8, device="cuda", dtype=dtype),
+        timestep=torch.tensor([500.0], device="cuda"),
+    )
+    calls = []
+    fused = model_module.fused_joint_qkv_norm_rope
+
+    def observe(*inputs, **kwargs):
+        calls.append(inputs[0].shape)
+        return fused(*inputs, **kwargs)
+
+    monkeypatch.setattr(model_module, "fused_joint_qkv_norm_rope", observe)
+    actual = model(**args).sample
+    # The fused kernel serves only BF16 CUDA activations; FP32 keeps the eager chain.
+    assert len(calls) == (2 if dtype == torch.bfloat16 else 0)
+    monkeypatch.setattr(model_module, "pack_qk_norm_rope_table", lambda *args, **kwargs: None)
+    expected = model(**args).sample
+    if dtype == torch.float32:
+        assert torch.equal(actual, expected)
+    else:
+        # The CUDA RMSNorm reduction order flips about one BF16 ulp in some Q/K values.
+        torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-2)
+
+
 @pytest.mark.parametrize("tile_pixels", [0, 16])
 def test_pixelumm_single_window_and_stream_cuda(gpu_context, monkeypatch, tile_pixels):
     dtype = gpu_context
