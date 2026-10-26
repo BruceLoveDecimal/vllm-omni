@@ -184,3 +184,8 @@ local copy: `/tmp/hy-nomas-opt-results/nomas-opt-evidence.tar.gz`.
 SHA-256: `847f229c48079497add63930c8bb58cd890a75c20d0e2b0e3f1d861660c8bfb2`.
 Raw tensors, videos and SQLite files remain under `/root/autodl-tmp/nomas-opt`;
 the small metrics and activity figure above are committed with this report.
+
+The subsequent [attention numerical diagnosis](hy_nomas_attention_diagnosis.md)
+locates the first divergence and compares captured inputs to FP64. It finds
+comparable local error for both backends and strong downstream sensitivity;
+the historical parity failure does not by itself prove cuDNN is less accurate.

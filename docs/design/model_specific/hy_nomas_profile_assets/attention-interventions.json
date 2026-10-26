@@ -1,0 +1,31 @@
+[
+  {
+    "target_layer": 0,
+    "initial_latent_sha256": "95b99eccea2e8952108c996e1cca3506fe67d0c2e775e4bd36682b55831006ac",
+    "prediction": {
+      "exact": false,
+      "max_abs": 0.078125,
+      "rmse": 0.009265496395528316,
+      "relative_l2": 0.006923964712768793
+    }
+  },
+  {
+    "target_layer": 53,
+    "initial_latent_sha256": "95b99eccea2e8952108c996e1cca3506fe67d0c2e775e4bd36682b55831006ac",
+    "prediction": {
+      "exact": false,
+      "max_abs": 0.03125,
+      "rmse": 0.0016467032255604863,
+      "relative_l2": 0.00123056850861758
+    }
+  },
+  {
+    "kind": "all_cudnn_prediction_cpu_metric",
+    "prediction": {
+      "exact": false,
+      "max_abs": 0.0859375,
+      "rmse": 0.010220829397439957,
+      "relative_l2": 0.007637879811227322
+    }
+  }
+]
