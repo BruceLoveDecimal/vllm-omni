@@ -189,3 +189,7 @@ The subsequent [attention numerical diagnosis](hy_nomas_attention_diagnosis.md)
 locates the first divergence and compares captured inputs to FP64. It finds
 comparable local error for both backends and strong downstream sensitivity;
 the historical parity failure does not by itself prove cuDNN is less accurate.
+
+The later [DiT MFU optimization](hy_nomas_dit_mfu.md) adopts cuDNN joint
+attention for the realtime deployment and adds mask-free attention, regional
+compile and fused Q/K/V norm/RoPE, with measured latency, MFU and output drift.

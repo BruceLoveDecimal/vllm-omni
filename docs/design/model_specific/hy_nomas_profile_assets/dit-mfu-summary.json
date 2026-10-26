@@ -1,0 +1,384 @@
+{
+ "sdpa": {
+  "runs": [
+   {
+    "elapsed_ms": 133297.840332,
+    "first_media_ms": 51756.186304,
+    "dit_ms": 102203.57832498848,
+    "peak_memory_gib": 86.23095703125
+   },
+   {
+    "elapsed_ms": 133164.837198,
+    "first_media_ms": 51631.60906,
+    "dit_ms": 102186.1159466207,
+    "peak_memory_gib": 88.25048828125
+   },
+   {
+    "elapsed_ms": 133152.681078,
+    "first_media_ms": 51585.590303,
+    "dit_ms": 102194.80973854661,
+    "peak_memory_gib": 86.23095703125
+   }
+  ],
+  "warmup_ms": 148544.25415,
+  "median_elapsed_ms": 133164.837198,
+  "stdev_elapsed_ms": 80.5282703248907,
+  "median_first_media_ms": 51631.60906,
+  "median_dit_ms": 102194.80973854661,
+  "max_peak_memory_gib": 88.25048828125,
+  "repeat_exact": true,
+  "rgb_sha256": "659b79d4dce02a332667bd8fc04c3f078f3e53aad916c0a2dc1dfc56ad1e2e65",
+  "executed_pflop": 11.8830354794496,
+  "useful_pflop": 10.1824223987712,
+  "dit_mfu_executed_pct": 24.856406165810267,
+  "dit_mfu_useful_pct": 21.299139208446093,
+  "e2e_mfu_useful_note": "DiT-only; decoder FLOPs (6.654 PF) unchanged",
+  "e2e_mfu_useful_pct": 27.02713637431667
+ },
+ "cudnn": {
+  "runs": [
+   {
+    "elapsed_ms": 79576.93146,
+    "first_media_ms": 33930.641454,
+    "dit_ms": 48408.251786604524,
+    "peak_memory_gib": 86.23095703125
+   },
+   {
+    "elapsed_ms": 79424.684186,
+    "first_media_ms": 33787.587647,
+    "dit_ms": 48409.58100371063,
+    "peak_memory_gib": 88.25048828125
+   },
+   {
+    "elapsed_ms": 79478.998459,
+    "first_media_ms": 33834.84804,
+    "dit_ms": 48405.74577823281,
+    "peak_memory_gib": 86.23095703125
+   }
+  ],
+  "warmup_ms": 97689.599404,
+  "median_elapsed_ms": 79478.998459,
+  "stdev_elapsed_ms": 77.1580038803711,
+  "median_first_media_ms": 33834.84804,
+  "median_dit_ms": 48408.251786604524,
+  "max_peak_memory_gib": 88.25048828125,
+  "repeat_exact": true,
+  "rgb_sha256": "280ae7e1c46a0628c6a56fe18d5b6c0845661ac1cd82c24e4642b2bf9d0f6092",
+  "executed_pflop": 11.8830354794496,
+  "useful_pflop": 10.1824223987712,
+  "dit_mfu_executed_pct": 52.47443576555551,
+  "dit_mfu_useful_pct": 44.964678513845655,
+  "e2e_mfu_useful_note": "DiT-only; decoder FLOPs (6.654 PF) unchanged",
+  "e2e_mfu_useful_pct": 45.283210470633136
+ },
+ "p01": {
+  "runs": [
+   {
+    "elapsed_ms": 77026.982053,
+    "first_media_ms": 34102.198654,
+    "dit_ms": 45340.28638526797,
+    "peak_memory_gib": 86.23101806640625
+   },
+   {
+    "elapsed_ms": 76980.832209,
+    "first_media_ms": 34119.251577,
+    "dit_ms": 45373.36272932589,
+    "peak_memory_gib": 88.25054931640625
+   },
+   {
+    "elapsed_ms": 76967.266878,
+    "first_media_ms": 34184.464656,
+    "dit_ms": 45365.769827738404,
+    "peak_memory_gib": 86.23101806640625
+   }
+  ],
+  "warmup_ms": 93556.750639,
+  "median_elapsed_ms": 76980.832209,
+  "stdev_elapsed_ms": 31.30422876557628,
+  "median_first_media_ms": 34119.251577,
+  "median_dit_ms": 45365.769827738404,
+  "max_peak_memory_gib": 88.25054931640625,
+  "repeat_exact": true,
+  "rgb_sha256": "280ae7e1c46a0628c6a56fe18d5b6c0845661ac1cd82c24e4642b2bf9d0f6092",
+  "executed_pflop": 11.0543995537408,
+  "useful_pflop": 10.1824223987712,
+  "dit_mfu_executed_pct": 52.089076209128294,
+  "dit_mfu_useful_pct": 47.98026104852013,
+  "e2e_mfu_useful_note": "DiT-only; decoder FLOPs (6.654 PF) unchanged",
+  "e2e_mfu_useful_pct": 46.752731971547185,
+  "vs_cudnn": {
+   "bitwise_equal": true,
+   "raw_relative_l2": 0.0,
+   "ssim_mean": 1.0,
+   "ssim_min": 1.0,
+   "ssim_seg0": 1.0,
+   "ssim_seg1": 1.0,
+   "psnr_db": Infinity,
+   "latent_relative_l2": [
+    0.0,
+    0.0
+   ]
+  },
+  "vs_sdpa": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.39197838229102766,
+   "ssim_mean": 0.7121358753492435,
+   "ssim_min": 0.3110447824001312,
+   "ssim_seg0": 0.8596944212913513,
+   "ssim_seg1": 0.6326812736881084,
+   "psnr_db": 19.263207034888087,
+   "latent_relative_l2": [
+    0.1963663548231125,
+    0.4516139626502991
+   ]
+  }
+ },
+ "p11": {
+  "runs": [
+   {
+    "elapsed_ms": 69739.475757,
+    "first_media_ms": 31279.109148,
+    "dit_ms": 38708.24063755572,
+    "peak_memory_gib": 65.57666015625
+   },
+   {
+    "elapsed_ms": 69967.466736,
+    "first_media_ms": 31409.263349,
+    "dit_ms": 38754.0627270937,
+    "peak_memory_gib": 65.38916015625
+   },
+   {
+    "elapsed_ms": 69708.627336,
+    "first_media_ms": 31312.588817,
+    "dit_ms": 38722.97981567681,
+    "peak_memory_gib": 65.38916015625
+   }
+  ],
+  "warmup_ms": 84699.251045,
+  "median_elapsed_ms": 69739.475757,
+  "stdev_elapsed_ms": 141.3797171779682,
+  "median_first_media_ms": 31312.588817,
+  "median_dit_ms": 38722.97981567681,
+  "max_peak_memory_gib": 65.57666015625,
+  "repeat_exact": true,
+  "rgb_sha256": "3dfcb9a493dcfceff55924f832258022f363c7e27b6fd86eae556036beaf0d29",
+  "executed_pflop": 10.1824223987712,
+  "useful_pflop": 10.1824223987712,
+  "dit_mfu_executed_pct": 56.21110486235762,
+  "dit_mfu_useful_pct": 56.21110486235762,
+  "e2e_mfu_useful_note": "DiT-only; decoder FLOPs (6.654 PF) unchanged",
+  "e2e_mfu_useful_pct": 51.607273730513704,
+  "vs_cudnn": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.5202348184468908,
+   "ssim_mean": 0.6070884636292855,
+   "ssim_min": 0.250081330537796,
+   "ssim_seg0": 0.8515723532154447,
+   "ssim_seg1": 0.47544329231366134,
+   "psnr_db": 16.800416333305442,
+   "latent_relative_l2": [
+    0.2178473174571991,
+    0.6231682896614075
+   ]
+  },
+  "vs_sdpa": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.4285737428180265,
+   "ssim_mean": 0.6887638757626215,
+   "ssim_min": 0.3127516508102417,
+   "ssim_seg0": 0.8542834697734742,
+   "ssim_seg1": 0.5996379405260086,
+   "psnr_db": 18.485585023675565,
+   "latent_relative_l2": [
+    0.21585068106651306,
+    0.476401150226593
+   ]
+  }
+ },
+ "p02": {
+  "runs": [
+   {
+    "elapsed_ms": 61429.661014,
+    "first_media_ms": 26733.559892,
+    "dit_ms": 30373.984672129154,
+    "peak_memory_gib": 68.17236328125
+   },
+   {
+    "elapsed_ms": 61723.169502,
+    "first_media_ms": 26816.429939,
+    "dit_ms": 30543.627470731735,
+    "peak_memory_gib": 68.17236328125
+   },
+   {
+    "elapsed_ms": 61762.475196,
+    "first_media_ms": 26876.570349,
+    "dit_ms": 30629.45816665888,
+    "peak_memory_gib": 68.17236328125
+   }
+  ],
+  "warmup_ms": 106724.898375,
+  "median_elapsed_ms": 61723.169502,
+  "stdev_elapsed_ms": 181.86874839161624,
+  "median_first_media_ms": 26816.429939,
+  "median_dit_ms": 30543.627470731735,
+  "max_peak_memory_gib": 68.17236328125,
+  "repeat_exact": true,
+  "rgb_sha256": "3c8c53f393500ff5ec49b83d09b72ac54628be8c030b69c416150d66afb4b9f2",
+  "executed_pflop": 10.1824223987712,
+  "useful_pflop": 10.1824223987712,
+  "dit_mfu_executed_pct": 71.26401345379624,
+  "dit_mfu_useful_pct": 71.26401345379624,
+  "e2e_mfu_useful_note": "DiT-only; decoder FLOPs (6.654 PF) unchanged",
+  "e2e_mfu_useful_pct": 58.3097764462242,
+  "vs_cudnn": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.5558224864990087,
+   "ssim_mean": 0.5491188400735457,
+   "ssim_min": 0.24434208869934082,
+   "ssim_seg0": 0.7055384559290749,
+   "ssim_seg1": 0.46489289307441467,
+   "psnr_db": 16.22601963541174,
+   "latent_relative_l2": [
+    0.3443739414215088,
+    0.6133050918579102
+   ]
+  },
+  "vs_sdpa": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.49997438107704045,
+   "ssim_mean": 0.5894237661113342,
+   "ssim_min": 0.33793818950653076,
+   "ssim_seg0": 0.6770761985154379,
+   "ssim_seg1": 0.5422263025091245,
+   "psnr_db": 17.148695276627663,
+   "latent_relative_l2": [
+    0.36381712555885315,
+    0.4957326352596283
+   ]
+  }
+ },
+ "p12q": {
+  "runs": [
+   {
+    "elapsed_ms": 61687.422303,
+    "first_media_ms": 26863.785004,
+    "dit_ms": 30399.8905364424,
+    "peak_memory_gib": 68.68798828125
+   },
+   {
+    "elapsed_ms": 61852.724912,
+    "first_media_ms": 26941.565691,
+    "dit_ms": 30571.22533209622,
+    "peak_memory_gib": 68.88916015625
+   },
+   {
+    "elapsed_ms": 61825.928617,
+    "first_media_ms": 26937.138511,
+    "dit_ms": 30580.58082126081,
+    "peak_memory_gib": 68.58642578125
+   }
+  ],
+  "warmup_ms": 105001.803669,
+  "median_elapsed_ms": 61825.928617,
+  "stdev_elapsed_ms": 88.71958914260853,
+  "median_first_media_ms": 26937.138511,
+  "median_dit_ms": 30571.22533209622,
+  "max_peak_memory_gib": 68.88916015625,
+  "repeat_exact": true,
+  "rgb_sha256": "400ad826844938f9ff18659524f45ba525fab9d462409757d3dac972ce36631a",
+  "executed_pflop": 10.1824223987712,
+  "useful_pflop": 10.1824223987712,
+  "dit_mfu_executed_pct": 71.199680593657,
+  "dit_mfu_useful_pct": 71.199680593657,
+  "e2e_mfu_useful_note": "DiT-only; decoder FLOPs (6.654 PF) unchanged",
+  "e2e_mfu_useful_pct": 58.2128614275986,
+  "vs_cudnn": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.5292453996264638,
+   "ssim_mean": 0.5802405092865228,
+   "ssim_min": 0.25836190581321716,
+   "ssim_seg0": 0.7525049795707067,
+   "ssim_seg1": 0.48748271759503925,
+   "psnr_db": 16.652191532455554,
+   "latent_relative_l2": [
+    0.29717496037483215,
+    0.6032292246818542
+   ]
+  },
+  "vs_sdpa": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.4526926751525865,
+   "ssim_mean": 0.6496150402973095,
+   "ssim_min": 0.4083203375339508,
+   "ssim_seg0": 0.7673511001325789,
+   "ssim_seg1": 0.5862187003860106,
+   "psnr_db": 18.012768237946577,
+   "latent_relative_l2": [
+    0.2846389412879944,
+    0.48042094707489014
+   ]
+  }
+ },
+ "p12": {
+  "runs": [
+   {
+    "elapsed_ms": 61236.835124,
+    "first_media_ms": 26713.181184,
+    "dit_ms": 29800.156705081463,
+    "peak_memory_gib": 65.52587890625
+   },
+   {
+    "elapsed_ms": 61559.599712,
+    "first_media_ms": 26823.603451,
+    "dit_ms": 29917.777739465237,
+    "peak_memory_gib": 65.02001953125
+   },
+   {
+    "elapsed_ms": 61711.382341,
+    "first_media_ms": 26859.374793,
+    "dit_ms": 30002.942360937595,
+    "peak_memory_gib": 65.02001953125
+   }
+  ],
+  "warmup_ms": 101464.071941,
+  "median_elapsed_ms": 61559.599712,
+  "stdev_elapsed_ms": 242.35305062910717,
+  "median_first_media_ms": 26823.603451,
+  "median_dit_ms": 29917.777739465237,
+  "max_peak_memory_gib": 65.52587890625,
+  "repeat_exact": true,
+  "rgb_sha256": "ca9a985032e5aaa1efccd290906bfb0859f16893644c618b2331a2eecc4a80ff",
+  "executed_pflop": 10.1824223987712,
+  "useful_pflop": 10.1824223987712,
+  "dit_mfu_executed_pct": 72.75478472890325,
+  "dit_mfu_useful_pct": 72.75478472890325,
+  "e2e_mfu_useful_note": "DiT-only; decoder FLOPs (6.654 PF) unchanged",
+  "e2e_mfu_useful_pct": 58.46471114256525,
+  "vs_cudnn": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.45780106826304817,
+   "ssim_mean": 0.6611014644304911,
+   "ssim_min": 0.3373696804046631,
+   "ssim_seg0": 0.7899978274390811,
+   "ssim_seg1": 0.5916957305027888,
+   "psnr_db": 17.912802215870315,
+   "latent_relative_l2": [
+    0.2702646851539612,
+    0.4813445210456848
+   ]
+  },
+  "vs_sdpa": {
+   "bitwise_equal": false,
+   "raw_relative_l2": 0.4115907181809747,
+   "ssim_mean": 0.6868221727510293,
+   "ssim_min": 0.3330247700214386,
+   "ssim_seg0": 0.7514908633061818,
+   "ssim_seg1": 0.6520005701444088,
+   "psnr_db": 18.837738877672084,
+   "latent_relative_l2": [
+    0.3065890371799469,
+    0.39248260855674744
+   ]
+  }
+ }
+}
