@@ -38,6 +38,7 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
     HyNomasARConfig,
 )
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
+    build_native_transformer,
     build_transformer,
     commit_cache,
     initialize_reference_parallelism,
@@ -172,7 +173,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
         raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
-    allowed = {"text_encoder", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
+    allowed = {"text_encoder", "dit_backend", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
     if custom.keys() - allowed:
         raise ValueError(f"Unsupported Hy-Nomas custom_pipeline_args: {sorted(custom.keys() - allowed)}")
     HyNomasARConfig.from_args(custom)
@@ -183,6 +184,8 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
     ):
         raise ValueError("Hy-Nomas step execution requires the ARDiffusionEngine backend.")
+    if custom.get("dit_backend", "reference") not in ("reference", "native"):
+        raise ValueError("Hy-Nomas dit_backend must be reference or native.")
     text_encoder = custom.get("text_encoder")
     if "text_encoder" in custom and (not isinstance(text_encoder, str) or not text_encoder.strip()):
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
@@ -283,7 +286,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         from configs.constants import PROMPT_TEMPLATE
         from hymm.models.text_encoder import TextEncoder
 
-        self.transformer = build_transformer(self.args, self.device, transformer_config)
+        if (od_config.custom_pipeline_args or {}).get("dit_backend", "reference") == "native":
+            self.transformer = build_native_transformer(self.args, self.device, transformer_config, self.sp_size)
+        else:
+            self.transformer = build_transformer(self.args, self.device, transformer_config)
         text_config = self.args.text_encoder
         self.text_encoder = (
             TextEncoder(
