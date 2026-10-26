@@ -115,6 +115,48 @@ pass `--custom-pipeline-args '{"text_encoder":"/path/to/Qwen2.5-VL-7B-Instruct"}
 to the server, or `custom_pipeline_args={"text_encoder": "/path/to/Qwen2.5-VL-7B-Instruct"}`
 to the Python API.
 
+## Native DiT (experimental)
+
+Select the native DiT with
+`--custom-pipeline-args '{"dit_backend":"native"}'`, or set
+`custom_pipeline_args={"dit_backend": "native"}` in the Python API. Merge this
+key into existing custom arguments when specifying a text encoder or AR capacity.
+Omitting the key, or selecting `reference`, keeps the reference DiT.
+
+The native DiT reuses Omni's HY1.5 patch embedding, its shared feed-forward
+implementation, the shared LayerNorm and attention dispatcher. Hy-Nomas retains
+its own token refiner, timestep/RoPE arithmetic, action visibility and camera
+conditioning. Checkpoint loading validates all parameter names and shapes.
+The upstream package is still required for the text encoder, decoder and
+scheduler. Decoder KV storage is unchanged.
+
+Both DiTs use the same serving protocol, persistent-session state, runner-owned
+segmented KV, model CPU offload and Ulysses configuration. The native attention
+path explicitly exchanges image tokens and shards KV heads across Ulysses ranks.
+This is a single-stage pipeline. Native action attention groups queries by
+visibility instead of allocating a quadratic action mask. Image RoPE tables are
+computed once per chunk, reused by denoising and the clean-cache forward, and
+released before decoding; their FP32 storage is included in AR admission sizing.
+
+CPU coverage includes strict weight mapping, cache commits, action/camera math,
+chunk-local RoPE reuse, and a two-process Gloo SP-versus-single-rank comparison.
+These checks do not establish BF16 CUDA accuracy, NCCL performance or GPU offload
+correctness. The deployment results for the reference DiT do not qualify the
+native DiT. It remains opt-in until real-weight GPU validation is complete.
+
+With the reference dependencies and checkpoints described above, run the existing
+GPU accuracy suite against the native candidate using:
+
+```bash
+HY_NOMAS_DIT_BACKEND=native python -m pytest \
+  tests/e2e/accuracy/test_hy_nomas.py --run-level local_model -v
+```
+
+The suite keeps its existing comparison thresholds and covers ordinary generation,
+segments, camera conditions and persistent turns, with and without CPU offload.
+Two-GPU NCCL execution needs a separate serving/SP validation. Explicit attention
+backend selection must support dense masks, such as `TORCH_SDPA` or `CUDNN_ATTN`.
+
 ## Offline generation
 
 Run commands from the vLLM-Omni repository:

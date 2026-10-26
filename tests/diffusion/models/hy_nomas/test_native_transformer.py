@@ -248,6 +248,17 @@ def test_invalid_cache_rejected_before_any_write(tiny_model):
     assert torch.equal(before, args["kv_cache_list"][0]["k"])
 
 
+@torch.no_grad()
+@pytest.mark.parametrize("offset", [0, 3])
+def test_precomputed_rotary_preserves_output(tiny_model, offset):
+    args = _inputs(tiny_model)
+    args["global_frame_counter"] = offset
+    expected = tiny_model.forward_with_cache(**args)[0]
+    rotary = tiny_model.rotary_embed(2, 2, 2, torch.device("cpu"), offset)
+    actual = tiny_model.forward_with_cache(**args, rotary_emb=rotary)[0]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def _sp_worker(rank, rendezvous):
     from datetime import timedelta
     from types import SimpleNamespace
