@@ -22,18 +22,21 @@ def _is_npu_tensor(x: torch.Tensor) -> bool:
 class LayerNorm(nn.LayerNorm, CustomOp):
     """
     LayerNorm implementation that inherits from both ``nn.LayerNorm`` and ``CustomOp``.
+    ``keep_fp32_output`` retains the FP32 result for subsequent modulation.
+    It also bypasses the NPU fused kernel; the default preserves input dtype.
     NPU:
         Uses ``mindiesd.fast_layernorm(self, x)`` when MindIE-SD is installed.
     CUDA / HIP / XPU / native:
         Falls back to FP32 nn.LayerNorm implementation.
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True):
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True, *, keep_fp32_output: bool = False):
         super().__init__(  # type: ignore[call-arg]
             normalized_shape=dim,
             eps=eps,
             elementwise_affine=elementwise_affine,
         )
+        self.keep_fp32_output = keep_fp32_output
         # CustomOp.__init__ cannot be called here because it would re-run
         # nn.Module initialization and clear LayerNorm parameters.
         self._forward_method = CustomOp.dispatch_forward(self)
@@ -48,7 +51,7 @@ class LayerNorm(nn.LayerNorm, CustomOp):
         return self.forward_native(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        if _HAS_MINDIESD:
+        if _HAS_MINDIESD and not self.keep_fp32_output:
             try:
                 from mindiesd import fast_layernorm
 
@@ -63,13 +66,14 @@ class LayerNorm(nn.LayerNorm, CustomOp):
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         origin_dtype = x.dtype
-        return F.layer_norm(
+        output = F.layer_norm(
             x.float(),
             self.normalized_shape,
             self.weight.float() if self.weight is not None else None,
             self.bias.float() if self.bias is not None else None,
             self.eps,
-        ).to(origin_dtype)
+        )
+        return output if self.keep_fp32_output else output.to(origin_dtype)
 
 
 class RMSNorm(CustomOp):
