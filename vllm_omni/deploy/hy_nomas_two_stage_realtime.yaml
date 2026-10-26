@@ -20,6 +20,7 @@ stages:
       mode: module
       components: [text_encoder]
     default_sampling_params:
+      output_type: np
       num_inference_steps: 8
       guidance_scale: 1.0
       num_frames: 240
@@ -45,5 +46,8 @@ stages:
       default:
         backend: TORCH_SDPA
     default_sampling_params:
-      output_type: pil
+      output_type: np
       fps: 24
+    video_output_transport:
+      enable_device_postprocess: true
+      enable_registered_shm: true

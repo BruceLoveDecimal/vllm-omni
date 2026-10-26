@@ -630,6 +630,18 @@ at a time; stage 1 uses request execution and retains a PixelUMM streaming
 session across those invocations. Both stage processes run on GPU 0. The
 full-request deployment remains available separately.
 
+Both realtime stages select `output_type: np`: realtime request sampling is
+copied from the first diffusion stage. The decoder supplies normalized BCTHW
+video through the existing typed-media contract. With
+`video_output_transport.enable_device_postprocess` and
+`enable_registered_shm` enabled on stage 1, the shared runner reduces eligible
+video to uint8 on the GPU and uses registered shared memory for delivery.
+Conversion and transport remain owned by the common media helpers. Explicit
+`pt`/`pil` output retains the CPU path; frame interpolation or disabled device
+postprocessing retains float media. Empty buffered segments still acknowledge
+without media. See [optimization validation](hy_nomas_optimization.md) for
+pixel parity, latency and memory limits.
+
 Playback feedback/pacing (`streaming_pacing` or `streaming_buffer_seconds`)
 continues to require a single-stage diffusion topology after rebasing onto main
 `36027f8f9` (which includes #8721). It is rejected for both two-stage deployments.

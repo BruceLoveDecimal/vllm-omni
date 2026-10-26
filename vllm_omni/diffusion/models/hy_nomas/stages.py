@@ -13,6 +13,14 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder, PixelUMMStreamingDecodeSession
 from vllm_omni.diffusion.models.hy_nomas.pipeline import HyNomasPipeline
@@ -145,26 +153,50 @@ class HyNomasDecodePipeline(nn.Module, SupportsComponentDiscovery):
         prompt = request.prompt
         if not isinstance(prompt, dict):
             raise ValueError("Hy-Nomas decode requires a stage payload.")
+        sampling = request.sampling_params
+        typed_video = (sampling.output_type or "np") == "np"
+        # Retain legacy CPU output for other presentations. The shared runner
+        # bounds conversion temporaries and owns uint8 reduction/SHM policy.
+        to_cpu = not (
+            typed_video
+            and self.od_config.video_output_transport.enable_device_postprocess
+            and not sampling.enable_frame_interpolation
+        )
         if SEGMENT_KEY in prompt:
-            return self._decode_segment(request.request_id, prompt)
-        segments = validate_latent_segments(prompt.get(PAYLOAD_KEY))
-        # A local session cannot leak into a later request or survive an error.
-        session = self.decoder.create_streaming_decode_session(to_cpu=True, retain_history=False)
-        chunks = []
-        for segment in segments:
-            latent = segment["latents"].to(device=self.device, dtype=self.decoder.dtype)
-            chunk = session.push(latent, pixel_frames=segment["pixel_frames"])
-            if chunk.numel():
-                chunks.append(chunk)
-        tail = session.finish()
-        if tail.numel():
-            chunks.append(tail)
-        return DiffusionOutput(output=torch.cat(chunks, dim=2))
+            output = self._decode_segment(request.request_id, prompt, to_cpu=to_cpu)
+        else:
+            segments = validate_latent_segments(prompt.get(PAYLOAD_KEY))
+            # A local session cannot leak into a later request or survive an error.
+            session = self.decoder.create_streaming_decode_session(to_cpu=to_cpu, retain_history=False)
+            chunks = []
+            for segment in segments:
+                latent = segment["latents"].to(device=self.device, dtype=self.decoder.dtype)
+                chunk = session.push(latent, pixel_frames=segment["pixel_frames"])
+                if chunk.numel():
+                    chunks.append(chunk)
+            tail = session.finish()
+            if tail.numel():
+                chunks.append(tail)
+            output = DiffusionOutput(output=torch.cat(chunks, dim=2))
+        if typed_video and output.output is not None:
+            output.media = DiffusionMediaOutput(
+                video=VideoMediaOutput(
+                    tensor=output.output,
+                    spec=VideoTensorSpec(
+                        layout=VideoTensorLayout.BCTHW,
+                        encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                        value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+                        preserve_input_dtype=True,
+                    ),
+                )
+            )
+            output.output = None
+        return output
 
     def release_stream_request(self, request_id: str) -> None:
         self._decode_sessions.pop(request_id, None)
 
-    def _decode_segment(self, request_id: str, prompt: dict) -> DiffusionOutput:
+    def _decode_segment(self, request_id: str, prompt: dict, *, to_cpu: bool = True) -> DiffusionOutput:
         state = self._decode_sessions.get(request_id)
         try:
             segments = prompt.get(PAYLOAD_KEY)
@@ -191,7 +223,7 @@ class HyNomasDecodePipeline(nn.Module, SupportsComponentDiscovery):
                 if self._decode_sessions:
                     raise ValueError("Hy-Nomas streaming decode supports one active session.")
                 state = _DecodeState(
-                    self.decoder.create_streaming_decode_session(to_cpu=True, retain_history=False),
+                    self.decoder.create_streaming_decode_session(to_cpu=to_cpu, retain_history=False),
                     total,
                     segment["latents"].shape[3:],
                     segment["latents"].dtype,

@@ -55,6 +55,13 @@ def test_two_stage_realtime_uses_streamed_producer_and_stateful_decoder():
     assert producer.engine_extras["engine_backend"].endswith("ARDiffusionEngine")
     assert not decoder.step_execution
     assert decoder.engine_extras["model_config"]["streaming_stage_input"]
+    # Realtime clones the first diffusion stage's request parameters to all
+    # diffusion stages, so selecting np only on the decoder is insufficient.
+    assert producer.default_sampling_params["output_type"] == decoder.default_sampling_params["output_type"] == "np"
+    assert decoder.video_output_transport == {
+        "enable_device_postprocess": True,
+        "enable_registered_shm": True,
+    }
 
 
 @pytest.mark.parametrize(

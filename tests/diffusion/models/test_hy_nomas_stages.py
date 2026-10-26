@@ -100,9 +100,11 @@ class FakeDecoder(nn.Module):
         super().__init__()
         self.created = 0
         self.finished = 0
+        self.to_cpu: list[bool] = []
 
     def create_streaming_decode_session(self, **kwargs):
-        assert kwargs == {"to_cpu": True, "retain_history": False}
+        assert not kwargs["retain_history"]
+        self.to_cpu.append(kwargs["to_cpu"])
         self.created += 1
         owner = self
 
@@ -111,7 +113,7 @@ class FakeDecoder(nn.Module):
 
             def push(self, latent, *, pixel_frames):
                 # Stateful output exposes accidental reinitialization per segment.
-                result = torch.full((1, 3, pixel_frames, 1, 1), self.offset)
+                result = torch.full((1, 3, pixel_frames, 1, 1), self.offset, dtype=owner.dtype)
                 self.offset += latent.shape[2]
                 return result
 
@@ -251,3 +253,46 @@ def test_buffered_decoder_segment_still_acknowledges_without_media(monkeypatch):
     assert result.output is None
     assert result.custom_output[SEGMENT_KEY] == {"index": 0, "finished": False, "ack": True}
     assert "world" in model._decode_sessions
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("incremental", [False, True])
+@pytest.mark.parametrize("output_type", [None, "np"])
+def test_numpy_media_reuses_shared_transport_and_preserves_pixel_bytes(monkeypatch, enabled, incremental, output_type):
+    import numpy as np
+    from diffusers.video_processor import VideoProcessor
+
+    from vllm_omni.diffusion import ipc
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, VideoOutputTransportConfig
+    from vllm_omni.diffusion.media import VideoTensorEncoding
+    from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
+    from vllm_omni.diffusion.postprocess.media import finalize_diffusion_media
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    model = streaming_model()
+    model.od_config = OmniDiffusionConfig(
+        video_output_transport=VideoOutputTransportConfig(enable_device_postprocess=enabled)
+    )
+    params = OmniDiffusionSamplingParams(output_type=output_type)
+    segments = payload()
+    batches = [stream_batch(segment) for segment in segments] if incremental else [batch({PAYLOAD_KEY: segments})]
+    actual = []
+    monkeypatch.setattr(ipc, "_SHM_TENSOR_THRESHOLD", 1)
+    for request_batch in batches:
+        request_batch.requests[0].sampling_params = params
+        output = model(request_batch)
+        assert output.output is None and output.media is not None
+        output.media = prepare_diffusion_media_for_transport(
+            output.media, od_config=model.od_config, sampling_params=params
+        )
+        assert (output.media.video.spec.encoding is VideoTensorEncoding.UINT8_FRAMES) == enabled
+        ipc.pack_diffusion_output_shm(output)
+        ipc.unpack_diffusion_output_shm(output)
+        frames = finalize_diffusion_media(output.media, sampling_params=params)["payload"]["video"]
+        actual.append(frames if enabled else np.round(frames * 255).astype(np.uint8))
+    raw = torch.cat([torch.zeros(1, 3, 8, 1, 1), torch.full((1, 3, 3, 1, 1), 2.0)], dim=2)
+    expected = VideoProcessor().postprocess_video(raw, output_type="np")
+    np.testing.assert_array_equal(np.concatenate(actual, axis=1), np.round(expected * 255).astype(np.uint8))
+    assert model.decoder.to_cpu == [not enabled]
+    assert model.decoder.finished == 1
+    assert not model._decode_sessions
