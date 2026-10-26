@@ -158,7 +158,8 @@ def test_public_defaults(architecture):
 
 
 @pytest.mark.parametrize("text_encoder_override", [None, "local-text-encoder"])
-def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encoder_override):
+@pytest.mark.parametrize("dit_backend", [None, "reference", "native"])
+def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encoder_override, dit_backend):
     download = Mock(return_value=str(checkpoint))
     transformer = nn.Linear(2, 2, bias=False)
     transformer.patch_size = (1, 1, 1)
@@ -177,6 +178,7 @@ def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encod
     monkeypatch.setitem(sys.modules, loader.__name__, loader)
     monkeypatch.setitem(sys.modules, constants.__name__, constants)
     monkeypatch.setattr(pipeline_hy_nomas, "build_transformer", Mock(return_value=transformer))
+    monkeypatch.setattr(pipeline_hy_nomas, "build_native_transformer", Mock(return_value=transformer))
     monkeypatch.setattr(pipeline_hy_nomas, "build_decoder", Mock(return_value=vae))
     monkeypatch.setattr(pipeline_hy_nomas, "get_local_device", lambda: torch.device("cuda:0"))
     monkeypatch.setattr(pipeline_hy_nomas, "initialize_reference_parallelism", Mock(return_value=None))
@@ -202,14 +204,19 @@ def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encod
         ),
     )
     monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", False)
+    custom = {} if text_encoder_override is None else {"text_encoder": text_encoder_override}
+    if dit_backend is not None:
+        custom["dit_backend"] = dit_backend
     config = OmniDiffusionConfig(
         model=MODEL_ID,
         revision="test-revision",
         dtype=torch.bfloat16,
         distributed_executor_backend="mp",
-        custom_pipeline_args={} if text_encoder_override is None else {"text_encoder": text_encoder_override},
+        custom_pipeline_args=custom,
     )
     pipeline = HyNomasPipeline(od_config=config)
+    assert pipeline_hy_nomas.build_native_transformer.call_count == int(dit_backend == "native")
+    assert pipeline_hy_nomas.build_transformer.call_count == int(dit_backend != "native")
     assert pipeline.transformer is transformer and pipeline.text_encoder is text_encoder and pipeline.vae is vae
     assert [(source.subfolder, source.prefix) for source in pipeline.weights_sources] == [
         ("transformer", "transformer."),
@@ -454,6 +461,7 @@ def test_module_offload_selects_components_and_removes_hooks(monkeypatch, compon
         ({"quantization_config": "int8"}, "unquantized"),
         ({"lora_path": "adapter"}, "LoRA"),
         ({"custom_pipeline_args": {"arbitrary": True}}, "custom_pipeline_args"),
+        ({"custom_pipeline_args": {"dit_backend": "unknown"}}, "dit_backend"),
         ({"enable_layerwise_offload": True}, "layer offload"),
         ({"flow_shift": 3.0}, "flow_shift=5"),
         ({"enforce_eager": False, "diffusion_compile_granularity": "full"}, "full transformer compilation"),

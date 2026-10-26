@@ -12,6 +12,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import WeightsMapper
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSegmentedKVState
@@ -77,7 +78,23 @@ def build_transformer(config: DictConfig, device: torch.device, model_config: di
     return transformer.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
 
 
+def build_native_transformer(config: DictConfig, device: torch.device, model_config: dict, sp_size: int) -> nn.Module:
+    from vllm_omni.diffusion.models.hy_nomas.transformer import HyNomasTransformer3DModel
+
+    with set_default_torch_dtype(torch.bfloat16), torch.device(device):
+        transformer = HyNomasTransformer3DModel(
+            **{key: value for key, value in model_config.items() if not key.startswith("_")},
+            sp_size=sp_size,
+            camera_chunk_size=int(config.camera.camera_chunk_size) if config.camera.per_chunk_camera_attn else 0,
+        )
+    return transformer.to(dtype=torch.bfloat16).eval().requires_grad_(False)
+
+
 def load_transformer_weights(transformer: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    from vllm_omni.diffusion.models.hy_nomas.transformer import HyNomasTransformer3DModel
+
+    if isinstance(transformer, HyNomasTransformer3DModel):
+        return transformer.load_weights(weights)
     return load_component_weights(transformer, _DIT_NAMES.apply(weights))
 
 
