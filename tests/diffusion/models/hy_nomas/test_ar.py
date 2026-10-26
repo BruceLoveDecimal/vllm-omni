@@ -358,6 +358,35 @@ def test_unchanged_prompt_is_cached_once_and_camera_is_sliced(runner):
         assert state.extra["hy_nomas_camera"].flatten().tolist() == [3, 4, 5]
 
 
+def test_native_rotary_is_reused_within_chunk_and_released(pipeline, monkeypatch):
+    from unittest.mock import Mock
+
+    from tests.diffusion.models.hy_nomas.test_native_transformer import _make_model
+
+    pipeline.transformer = _make_model(monkeypatch)
+    pipeline.in_channels = 4
+    pipeline.hidden_size = 12
+    monkeypatch.setattr(
+        pipeline,
+        "_encode_prompt",
+        lambda text: {"text_states": torch.ones(1, 4, 8), "text_mask": torch.ones(1, 4, dtype=torch.bool)},
+    )
+    rotary = Mock(wraps=pipeline.transformer.rotary_embed.forward)
+    monkeypatch.setattr(pipeline.transformer.rotary_embed, "forward", rotary)
+    state = StepRequestState(
+        request_id="rotary",
+        sampling=sampling(frames=21, extra={"segment_frame_boundaries": [0, 12, 21]}),
+        prompt="forest|||river",
+    )
+    pipeline.prepare_encode(state)
+    assert state.total_chunks == 2
+    for index in range(2):
+        step_chunk(pipeline, state)
+        assert rotary.call_count == index + 1
+        assert rotary.call_args.args[-1] == index * 3
+        assert "hy_nomas_rotary" not in state.extra
+
+
 def test_camera_tick_and_live_updates(runner):
     control = ARDiffusionControlInput("camera", "hy_nomas.camera.v1", {"camera_trajectory": "pan_left"})
     execute(runner, batch(controls=(control,)))

@@ -53,6 +53,7 @@ from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import (
     plan_chunks,
     prepare_camera,
 )
+from vllm_omni.diffusion.models.hy_nomas.transformer import HyNomasTransformer3DModel
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
@@ -446,6 +447,9 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         # Fixed noise, the decoder's latent timeline, pending pixels and text.
         model_bytes = latent_elements * (self.in_channels + self.transformer.config.out_channels) * 2
         model_bytes += config.height * config.width * 3 * 4 * 40 + config.max_segments * text_tokens * 3584 * 2
+        if isinstance(self.transformer, HyNomasTransformer3DModel):
+            # One chunk of FP32 cosine/sine tables, shared by all denoising steps.
+            model_bytes += config.chunk_latent_frames * frame_tokens * (self.hidden_size // self.heads_num) * 2 * 4
         return ARDiffusionKVCacheSpec(
             num_layers=self.num_double_blocks,
             num_kv_heads=self.heads_num // self.sp_size,
@@ -636,6 +640,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         start = state.extra["hy_nomas_request_latent_start"] + chunk.start
         end = start + chunk.end - chunk.start
         state.latents = session.noise[:, : self.transformer.config.out_channels, start:end].clone()
+        if isinstance(self.transformer, HyNomasTransformer3DModel):
+            state.extra["hy_nomas_rotary"] = self.transformer.rotary_embed(
+                *state.latents.shape[2:], state.latents.device, session.latent_frames
+            )
         state.scheduler = self._new_scheduler(request.steps)
         state.timesteps = state.scheduler.timesteps
         state.step_index = state.step_in_chunk = 0
@@ -737,6 +745,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                     intra_seg_txt_offsets=state.extra["hy_nomas_intra_offsets"],
                     intra_seg_vid_windows=state.extra["hy_nomas_intra_windows"],
                     camera_rope_time_offset=0,
+                    **({"rotary_emb": state.extra["hy_nomas_rotary"]} if "hy_nomas_rotary" in state.extra else {}),
                 )
             if commit:
                 if written != current_tokens:
@@ -840,6 +849,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             commit=True,
         )
         session.latent_frames += chunk.end - chunk.start
+        state.extra.pop("hy_nomas_rotary", None)
         frame_start = session.emitted_frames
         completed = state.chunk_index
         state.chunk_index += 1
