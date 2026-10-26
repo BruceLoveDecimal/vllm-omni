@@ -1,0 +1,30 @@
+[
+  {
+    "case": "main",
+    "batch_size": 1,
+    "segment_ms": [
+      12936.260597780347,
+      16244.685251265764
+    ],
+    "total_ms": 29180.94584904611,
+    "exact": true,
+    "max_abs": 0.0,
+    "first_layer_attention_calls": 660,
+    "peak_allocated_gib": 18.734283924102783,
+    "peak_reserved_gib": 22.7265625
+  },
+  {
+    "case": "main",
+    "batch_size": 2,
+    "segment_ms": [
+      13256.844958290458,
+      16538.639333099127
+    ],
+    "total_ms": 29795.484291389585,
+    "exact": false,
+    "max_abs": 0.609375,
+    "first_layer_attention_calls": 330,
+    "peak_allocated_gib": 18.734283924102783,
+    "peak_reserved_gib": 22.7265625
+  }
+]

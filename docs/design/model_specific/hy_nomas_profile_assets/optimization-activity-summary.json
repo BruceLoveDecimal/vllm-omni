@@ -1,0 +1,422 @@
+{
+  "client_elapsed_ms": 133236.621796,
+  "clock_alignment": "client UTC nanoseconds minus Nsight session utcEpochNs",
+  "kernel_count": 218240,
+  "kernel_only": {
+    "busy_ms": 127602.326651,
+    "busy_pct": 95.77121134636187,
+    "idle_ms": 5634.295144999996,
+    "largest_gaps": [
+      {
+        "start_ms": 130140.408456,
+        "end_ms": 133236.621796,
+        "elapsed_ms": 3096.21334
+      },
+      {
+        "start_ms": 49900.454727,
+        "end_ms": 50850.87433,
+        "elapsed_ms": 950.419603
+      },
+      {
+        "start_ms": 373.162397,
+        "end_ms": 776.680976,
+        "elapsed_ms": 403.518579
+      },
+      {
+        "start_ms": 0.0,
+        "end_ms": 296.273877,
+        "elapsed_ms": 296.273877
+      },
+      {
+        "start_ms": 115441.560068,
+        "end_ms": 115489.768294,
+        "elapsed_ms": 48.208226
+      },
+      {
+        "start_ms": 37681.888959,
+        "end_ms": 37707.568858,
+        "elapsed_ms": 25.679899
+      },
+      {
+        "start_ms": 4877.476905,
+        "end_ms": 4896.210611,
+        "elapsed_ms": 18.733706
+      },
+      {
+        "start_ms": 58070.210956,
+        "end_ms": 58084.298187,
+        "elapsed_ms": 14.087231
+      },
+      {
+        "start_ms": 50862.368225,
+        "end_ms": 50876.110531,
+        "elapsed_ms": 13.742306
+      },
+      {
+        "start_ms": 108262.427403,
+        "end_ms": 108275.488002,
+        "elapsed_ms": 13.060599
+      },
+      {
+        "start_ms": 33573.291816,
+        "end_ms": 33586.285125,
+        "elapsed_ms": 12.993309
+      },
+      {
+        "start_ms": 50850.879162,
+        "end_ms": 50862.021089,
+        "elapsed_ms": 11.141927
+      }
+    ]
+  },
+  "kernel_copy_memset": {
+    "busy_ms": 128434.95434,
+    "busy_pct": 96.39613539335163,
+    "idle_ms": 4801.667455999996,
+    "largest_gaps": [
+      {
+        "start_ms": 130302.147879,
+        "end_ms": 133236.621796,
+        "elapsed_ms": 2934.473917
+      },
+      {
+        "start_ms": 50005.045832,
+        "end_ms": 50850.87433,
+        "elapsed_ms": 845.828498
+      },
+      {
+        "start_ms": 130140.408456,
+        "end_ms": 130294.768541,
+        "elapsed_ms": 154.360085
+      },
+      {
+        "start_ms": 623.712765,
+        "end_ms": 776.680976,
+        "elapsed_ms": 152.968211
+      },
+      {
+        "start_ms": 49900.454727,
+        "end_ms": 50001.067088,
+        "elapsed_ms": 100.612361
+      },
+      {
+        "start_ms": 115464.829944,
+        "end_ms": 115489.384648,
+        "elapsed_ms": 24.554704
+      },
+      {
+        "start_ms": 115441.59306,
+        "end_ms": 115464.735,
+        "elapsed_ms": 23.14194
+      },
+      {
+        "start_ms": 0.0,
+        "end_ms": 23.122612,
+        "elapsed_ms": 23.122612
+      },
+      {
+        "start_ms": 37687.351632,
+        "end_ms": 37707.209115,
+        "elapsed_ms": 19.857483
+      },
+      {
+        "start_ms": 4877.804776,
+        "end_ms": 4896.210611,
+        "elapsed_ms": 18.405835
+      },
+      {
+        "start_ms": 58070.537419,
+        "end_ms": 58084.298187,
+        "elapsed_ms": 13.760768
+      },
+      {
+        "start_ms": 50862.622592,
+        "end_ms": 50876.110531,
+        "elapsed_ms": 13.487939
+      }
+    ]
+  },
+  "by_pid": {
+    "9784": {
+      "busy_ms": 100934.535359,
+      "busy_pct": 75.75585000461955,
+      "idle_ms": 32302.08643699999,
+      "largest_gaps": [
+        {
+          "start_ms": 115441.560068,
+          "end_ms": 133236.621796,
+          "elapsed_ms": 17795.061728
+        },
+        {
+          "start_ms": 37681.888959,
+          "end_ms": 50850.87433,
+          "elapsed_ms": 13168.985371
+        },
+        {
+          "start_ms": 373.162397,
+          "end_ms": 776.680976,
+          "elapsed_ms": 403.518579
+        },
+        {
+          "start_ms": 0.0,
+          "end_ms": 296.273877,
+          "elapsed_ms": 296.273877
+        },
+        {
+          "start_ms": 4877.476905,
+          "end_ms": 4896.210611,
+          "elapsed_ms": 18.733706
+        },
+        {
+          "start_ms": 58070.210956,
+          "end_ms": 58084.298187,
+          "elapsed_ms": 14.087231
+        },
+        {
+          "start_ms": 50862.368225,
+          "end_ms": 50876.110531,
+          "elapsed_ms": 13.742306
+        },
+        {
+          "start_ms": 108262.427403,
+          "end_ms": 108275.488002,
+          "elapsed_ms": 13.060599
+        },
+        {
+          "start_ms": 33573.291816,
+          "end_ms": 33586.285125,
+          "elapsed_ms": 12.993309
+        },
+        {
+          "start_ms": 50850.879162,
+          "end_ms": 50862.021089,
+          "elapsed_ms": 11.141927
+        },
+        {
+          "start_ms": 58064.48073,
+          "end_ms": 58070.210188,
+          "elapsed_ms": 5.729458
+        },
+        {
+          "start_ms": 4873.878388,
+          "end_ms": 4877.476105,
+          "elapsed_ms": 3.597717
+        }
+      ]
+    },
+    "10490": {
+      "busy_ms": 26667.791292,
+      "busy_pct": 20.01536134174232,
+      "idle_ms": 106568.83050399998,
+      "largest_gaps": [
+        {
+          "start_ms": 49900.454727,
+          "end_ms": 115489.768294,
+          "elapsed_ms": 65589.313567
+        },
+        {
+          "start_ms": 0.0,
+          "end_ms": 37707.568858,
+          "elapsed_ms": 37707.568858
+        },
+        {
+          "start_ms": 130140.408456,
+          "end_ms": 133236.621796,
+          "elapsed_ms": 3096.21334
+        },
+        {
+          "start_ms": 49896.013489,
+          "end_ms": 49896.617487,
+          "elapsed_ms": 0.603998
+        },
+        {
+          "start_ms": 49896.917263,
+          "end_ms": 49897.516558,
+          "elapsed_ms": 0.599295
+        },
+        {
+          "start_ms": 37707.824538,
+          "end_ms": 37708.095193,
+          "elapsed_ms": 0.270655
+        },
+        {
+          "start_ms": 130133.715675,
+          "end_ms": 130133.962075,
+          "elapsed_ms": 0.2464
+        },
+        {
+          "start_ms": 115489.776902,
+          "end_ms": 115489.896582,
+          "elapsed_ms": 0.11968
+        },
+        {
+          "start_ms": 115490.770467,
+          "end_ms": 115490.866339,
+          "elapsed_ms": 0.095872
+        },
+        {
+          "start_ms": 115489.91271,
+          "end_ms": 115489.926054,
+          "elapsed_ms": 0.013344
+        },
+        {
+          "start_ms": 40149.404275,
+          "end_ms": 40149.409235,
+          "elapsed_ms": 0.00496
+        },
+        {
+          "start_ms": 40149.492339,
+          "end_ms": 40149.497299,
+          "elapsed_ms": 0.00496
+        }
+      ]
+    }
+  },
+  "stage_kernel_overlap_ms": 1.4551915228366852e-11,
+  "top_kernels": [
+    {
+      "pid": 9784,
+      "name": "fmha_cutlassF_bf16_aligned_64x128_rf_sm80(PyTorchMemEffAttention::AttentionKernel<cutlass::bfloat16_t, cutlass::arch::Sm80, (bool)1, (int)64, (int)128, (int)128, (bool)1, (bool)1>::Params)",
+      "count": 1036,
+      "sum_ms": 81701.64201399994
+    },
+    {
+      "pid": 10490,
+      "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(T1::Params)",
+      "count": 2794,
+      "sum_ms": 12700.607101999978
+    },
+    {
+      "pid": 9784,
+      "name": "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8>(T1::Params)",
+      "count": 7034,
+      "sum_ms": 6502.88648999998
+    },
+    {
+      "pid": 10490,
+      "name": "void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits<(int)128, (int)128, (int)64, (int)4, (bool)0, (bool)0, cutlass::bfloat16_t, Flash_kernel_traits<(int)128, (int)128, (int)64, (int)4, cutlass::bfloat16_t>>, (bool)0, (bool)0, (bool)0, (bool)0, (bool)1, (bool)1, (bool)0, (bool)0>(pytorch_flash::Flash_fwd_params)",
+      "count": 19800,
+      "sum_ms": 3940.170782999996
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+      "count": 11994,
+      "sum_ms": 1823.7721039999863
+    },
+    {
+      "pid": 10490,
+      "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+      "count": 4004,
+      "sum_ms": 1728.8594659999978
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)]>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+      "count": 3897,
+      "sum_ms": 1706.2578640000013
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+      "count": 9941,
+      "sum_ms": 1301.987799999994
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+      "count": 4000,
+      "sum_ms": 1156.4051000000013
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+      "count": 7794,
+      "sum_ms": 1032.5958490000066
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+      "count": 1946,
+      "sum_ms": 856.2177369999999
+    },
+    {
+      "pid": 10490,
+      "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>, (int)4, TrivialOffsetCalculator<(int)1, unsigned int>, TrivialOffsetCalculator<(int)1, unsigned int>, at::native::memory::LoadWithCast<(int)1>, at::native::memory::StoreWithCast<(int)1>>(int, T1, T2, T4, T5, T6, T7)",
+      "count": 1688,
+      "sum_ms": 783.0679050000002
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float>>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+      "count": 9007,
+      "sum_ms": 782.4506809999979
+    },
+    {
+      "pid": 10490,
+      "name": "void at::native::<unnamed>::CatArrayBatchedCopy_vectorized<at::native::<unnamed>::OpaqueType<(unsigned int)4>, unsigned int, (int)4, (int)128, (int)1, (int)16, (int)4>(char *, at::native::<unnamed>::CatArrInputTensorMetadata<T1, T2, T4, T5>, at::native::<unnamed>::TensorSizeStride<T2, (unsigned int)4>, int, T2)",
+      "count": 1584,
+      "sum_ms": 758.2611160000004
+    },
+    {
+      "pid": 10490,
+      "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+      "count": 1616,
+      "sum_ms": 748.7579670000006
+    },
+    {
+      "pid": 10490,
+      "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float>>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+      "count": 396,
+      "sum_ms": 684.6890889999996
+    },
+    {
+      "pid": 10490,
+      "name": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::<unnamed>::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase &, T2)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+      "count": 803,
+      "sum_ms": 617.528384
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl<at::native::CUDAFunctor_add<float>>(at::TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3)",
+      "count": 3906,
+      "sum_ms": 590.9923749999995
+    },
+    {
+      "pid": 10490,
+      "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::MeanOps<float, float, float, float>, unsigned int, float, (int)4, (int)4>>(T3)",
+      "count": 2387,
+      "sum_ms": 581.958222999998
+    },
+    {
+      "pid": 10490,
+      "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned long)3>>(int, T2, T3)",
+      "count": 792,
+      "sum_ms": 574.0502439999999
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::<unnamed>::vectorized_layer_norm_kernel<float, float, (bool)0>(int, T2, const T1 *, const T1 *, const T1 *, T2 *, T2 *, T1 *)",
+      "count": 3978,
+      "sum_ms": 561.6014079999992
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::GeluCUDAKernelImpl(at::TensorIteratorBase &, at::native::GeluType)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 4)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+      "count": 1944,
+      "sum_ms": 560.2256179999986
+    },
+    {
+      "pid": 9784,
+      "name": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::<unnamed>::pow_tensor_scalar_kernel_impl<float, float>(at::TensorIteratorBase &, T2)::[lambda(float) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+      "count": 3945,
+      "sum_ms": 547.2386230000019
+    },
+    {
+      "pid": 10490,
+      "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::silu_kernel(at::TensorIteratorBase &)::[lambda() (instance 1)]::operator ()() const::[lambda() (instance 6)]::operator ()() const::[lambda(c10::BFloat16) (instance 1)], std::array<char *, (unsigned long)2>>(int, T2, T3)",
+      "count": 396,
+      "sum_ms": 456.0206780000001
+    }
+  ]
+}

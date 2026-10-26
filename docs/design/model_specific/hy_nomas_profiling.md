@@ -151,8 +151,10 @@ diagnostic, not a baseline or an optimization A/B result.
 
 SHM array writes/reads are nested in packing/unpacking and must not be added
 again. The legacy path transports a large floating-point RGB tensor to the
-engine, creates PIL frames, then serializes their uncompressed pixel bytes to
-the frontend. The measurements identify substantial copying and serialization
+engine, postprocesses it into NumPy frames, then serializes the uncompressed
+frame array to the frontend. The retained host trace records `_encode_ndarray`,
+rather than `_encode_pil_image`; the decoder YAML presentation default is
+overridden by the realtime request sampling parameters. The measurements identify substantial copying and serialization
 cost beyond H.264 encoding. They do not assign every remaining socket, queue,
 allocation, WebSocket-send or scheduling interval to a specific function.
 
@@ -201,7 +203,7 @@ used instead.
 
 | Priority / milestone | Candidate and evidence | Benefit to test | Implementation / validation | Quality risk |
 | --- | --- | --- | --- | --- |
-| P0 / M1: host/media | Reduce repeated float-RGB, PIL and MsgPack copies; two long empty intervals and measured IPC costs | Recover part of the approximately 20,607 ms in the two largest idle intervals; this is a ceiling, not a promised saving | Reuse typed media/SHM transport and supported planar conversion; benchmark without profiler, retain exact frame/hash/PTS checks and decode-time interaction/cancel regressions | Low if conversion and lifetime contracts remain identical |
+| P0 / M1: host/media | Reduce repeated float-RGB, frame-conversion and MsgPack copies; two long empty intervals and measured IPC costs | Recover part of the approximately 20,607 ms in the two largest idle intervals; this is a ceiling, not a promised saving | Reuse typed media/SHM transport and supported planar conversion; benchmark without profiler, retain exact frame/hash/PTS checks and decode-time interaction/cancel regressions | Low if conversion and lifetime contracts remain identical |
 | P1 / M2: attention | Qualify a faster masked-attention path through the existing shared dispatcher; DiT attention is 81% of its kernel time | A hypothetical 2× improvement of this family saves approximately 40,846 ms before other effects; no such speedup is demonstrated | Reuse shared HY1.5/backend infrastructure; preserve full history, action masks and padding semantics; compare full-weight predictions, latents, RGB and temporal quality | Medium/high: previous token removal changed BF16 results; merely selecting FlashAttention is not qualified |
 | P1 / M3: decoder | Batch compatible local neighborhoods and reduce repeated gather/cat/RoPE/norm layouts; 23,760 attention calls and 3,211 ms of layout kernels | Reduce launches and memory traffic while retaining GQA and overlap windows | Reuse existing attention/norm helpers; fixed-seed raw RGB checks including window edges, three-run latency/memory A/B | Medium: batching/fusion can change reduction order |
 | P1 / M4: stage protocol | Separate decode-complete credit from expensive media delivery, with bounded output ownership | Reduce producer waiting in the internal idle interval; single-GPU compute overlap is not an assumed benefit | Preserve next-segment interaction timing, one-credit/bounded buffering, output order, abort/recovery; remeasure peak memory | Medium: lifecycle and interaction semantics |
@@ -282,3 +284,6 @@ as `nomas-profile/measured-1.mp4`, `torch-1.mp4` and `nsys-1.mp4`.
 Compact results are checked in as [metrics.json](hy_nomas_profile_assets/metrics.json).
 All model-serving processes started for this profiling were stopped, and the
 GPU process list was empty after collection. The instance itself remains on.
+
+Follow-up experiments and the validated media-transport change are recorded in
+[optimization validation](hy_nomas_optimization.md).

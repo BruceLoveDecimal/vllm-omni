@@ -1,0 +1,70 @@
+[
+  {
+    "q": 27680,
+    "k": 27680,
+    "backend": "SDPBackend.EFFICIENT_ATTENTION",
+    "median_ms": 55.820367431640626,
+    "repeat_ms": [
+      55.871453857421876,
+      55.820367431640626,
+      55.789727783203126
+    ],
+    "max_abs": 0.0,
+    "relative_l2": 0.0,
+    "exact": true
+  },
+  {
+    "q": 27680,
+    "k": 27680,
+    "backend": "SDPBackend.CUDNN_ATTENTION",
+    "median_ms": 19.17061767578125,
+    "repeat_ms": [
+      18.895065307617188,
+      19.17061767578125,
+      19.431890869140624
+    ],
+    "max_abs": 0.000244140625,
+    "relative_l2": 0.0007964179967530072,
+    "exact": false
+  },
+  {
+    "q": 27680,
+    "k": 27680,
+    "backend": "SDPBackend.FLASH_ATTENTION",
+    "unsupported": "No available kernel. Aborting execution."
+  },
+  {
+    "q": 27680,
+    "k": 55360,
+    "backend": "SDPBackend.EFFICIENT_ATTENTION",
+    "median_ms": 112.65159912109375,
+    "repeat_ms": [
+      112.65159912109375,
+      112.71068115234375,
+      112.63726806640625
+    ],
+    "max_abs": 0.0,
+    "relative_l2": 0.0,
+    "exact": true
+  },
+  {
+    "q": 27680,
+    "k": 55360,
+    "backend": "SDPBackend.CUDNN_ATTENTION",
+    "median_ms": 38.799276733398436,
+    "repeat_ms": [
+      38.2398193359375,
+      38.799276733398436,
+      38.91825866699219
+    ],
+    "max_abs": 0.000244140625,
+    "relative_l2": 0.0007487225229851902,
+    "exact": false
+  },
+  {
+    "q": 27680,
+    "k": 55360,
+    "backend": "SDPBackend.FLASH_ATTENTION",
+    "unsupported": "No available kernel. Aborting execution."
+  }
+]

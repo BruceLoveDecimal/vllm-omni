@@ -1,0 +1,40 @@
+{
+  "runs": [
+    {
+      "label": "measured-1",
+      "elapsed_ms": 133153.441829,
+      "first_media_ms": 51681.487136,
+      "frames": 240,
+      "rgb_sha256": "659b79d4dce02a332667bd8fc04c3f078f3e53aad916c0a2dc1dfc56ad1e2e65",
+      "peak_memory_gib": 86.23101806640625,
+      "mean_gpu_activity_pct": 96.84178652535958,
+      "sm_clock_mhz": 2422
+    },
+    {
+      "label": "measured-2",
+      "elapsed_ms": 133545.165421,
+      "first_media_ms": 51665.295555,
+      "frames": 240,
+      "rgb_sha256": "659b79d4dce02a332667bd8fc04c3f078f3e53aad916c0a2dc1dfc56ad1e2e65",
+      "peak_memory_gib": 88.25054931640625,
+      "mean_gpu_activity_pct": 96.51017332328561,
+      "sm_clock_mhz": 2422
+    },
+    {
+      "label": "measured-3",
+      "elapsed_ms": 133213.767271,
+      "first_media_ms": 51790.631998,
+      "frames": 240,
+      "rgb_sha256": "659b79d4dce02a332667bd8fc04c3f078f3e53aad916c0a2dc1dfc56ad1e2e65",
+      "peak_memory_gib": 86.23101806640625,
+      "mean_gpu_activity_pct": 96.7286470143613,
+      "sm_clock_mhz": 2422
+    }
+  ],
+  "median_elapsed_ms": 133213.767271,
+  "median_first_media_ms": 51681.487136,
+  "std_elapsed_ms": 210.9151746181919,
+  "median_peak_memory_gib": 86.23101806640625,
+  "max_peak_memory_gib": 88.25054931640625,
+  "median_nvml_activity_pct": 96.7286470143613
+}
