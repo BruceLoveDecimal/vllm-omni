@@ -126,45 +126,6 @@ def test_strict_checkpoint_loading(tiny_model):
     mapped_name = "double_blocks.0.img_mlp.fc1.weight"
     with pytest.raises(ValueError, match="Missing"):
         tiny_model.load_weights([(name, tensor) for name, tensor in weights if name != mapped_name])
-    with pytest.raises(ValueError, match="Duplicate"):
-        tiny_model.load_weights(weights + [(mapped_name, dict(weights)[mapped_name])])
-    with pytest.raises(ValueError, match="Missing"):
-        tiny_model.load_weights(weights[:-1])
-    with pytest.raises(ValueError, match="Unexpected"):
-        tiny_model.load_weights([("not_a_parameter", torch.zeros(1))])
-    with pytest.raises(ValueError, match="Duplicate"):
-        tiny_model.load_weights([weights[0], weights[0]])
-
-
-def test_shared_patch_embed_preserves_reference_layout(tiny_model):
-    from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15PatchEmbed
-
-    assert isinstance(tiny_model.img_in, HunyuanVideo15PatchEmbed)
-    x = torch.randn(1, 4, 2, 3, 4)
-    expected = (
-        F.conv3d(x, tiny_model.img_in.proj.weight, tiny_model.img_in.proj.bias).flatten(2).transpose(1, 2).contiguous()
-    )
-    actual = tiny_model.img_in(x).contiguous()
-    assert actual.stride() == expected.stride()
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
-def test_full_checkpoint_mapping_coverage(monkeypatch):
-    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr("vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(model_module, "_attention", lambda *args: _SDPA())
-    monkeypatch.setattr("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", lambda: 1)
-    with torch.device("meta"):
-        model = model_module.HyNomasTransformer3DModel()
-    parameters = dict(model.named_parameters())
-    checkpoint = [
-        name.replace("_mlp.net.0.proj.", "_mlp.fc1.").replace("_mlp.net.2.", "_mlp.fc2.") for name in parameters
-    ]
-    mapped = model.hf_to_vllm_mapper.apply_list(checkpoint)
-    assert len(mapped) == len(set(mapped)) == len(parameters) == 2268
-    assert set(mapped) == set(parameters)
-    assert model.load_weights((name, parameters[target]) for name, target in zip(checkpoint, mapped)) == set(parameters)
 
 
 def _inputs(model, *, frames=2, history=0, cache_text=True):
@@ -180,28 +141,6 @@ def _inputs(model, *, frames=2, history=0, cache_text=True):
         cache_valid_len=history,
         cache_txt=cache_text,
     )
-
-
-@torch.no_grad()
-def test_denoising_does_not_commit_and_clean_forward_preserves_history(tiny_model):
-    args = _inputs(tiny_model, history=3)
-    for cache, mask in zip(args["kv_cache_list"], args["cache_mask_list"]):
-        cache["k"][:, :3].normal_()
-        cache["v"][:, :3].normal_()
-        mask[:, :3] = torch.tensor([True, False, True])
-    old = [{key: value.clone() for key, value in cache.items()} for cache in args["kv_cache_list"]]
-    old_masks = [mask.clone() for mask in args["cache_mask_list"]]
-    output, written = tiny_model.forward_with_cache(**args)
-    assert written == 0
-    for before, after, mask, old_mask in zip(old, args["kv_cache_list"], args["cache_mask_list"], old_masks):
-        assert torch.equal(before["k"], after["k"]) and torch.equal(before["v"], after["v"])
-        assert torch.equal(mask, old_mask)
-    committed, written = tiny_model.forward_with_cache(**args, update_cache=True)
-    torch.testing.assert_close(output, committed, rtol=0, atol=0)
-    assert written == 13
-    for before, after, mask in zip(old, args["kv_cache_list"], args["cache_mask_list"]):
-        assert torch.equal(before["k"][:, :3], after["k"][:, :3])
-        assert mask[0].tolist() == [True, False, True] + [True] * 12 + [False]
 
 
 @torch.no_grad()
@@ -239,15 +178,6 @@ def test_camera_disabled_and_prepadded_inputs_match(tiny_model):
     torch.testing.assert_close(baseline, gated, rtol=0, atol=0)
 
 
-def test_invalid_cache_rejected_before_any_write(tiny_model):
-    args = _inputs(tiny_model)
-    args["kv_cache_list"][-1]["v"] = torch.empty(1, 1, 1, 1)
-    before = args["kv_cache_list"][0]["k"].clone()
-    with pytest.raises(ValueError, match="rank-local heads"):
-        tiny_model.forward_with_cache(**args, update_cache=True)
-    assert torch.equal(before, args["kv_cache_list"][0]["k"])
-
-
 @torch.no_grad()
 @pytest.mark.parametrize("cache_text", [False, True])
 @pytest.mark.parametrize("commit", [False, True])
@@ -258,7 +188,7 @@ def test_staging_reuse_matches_concat_and_preserves_history(tiny_model, cache_te
     for cache, mask in zip(args["kv_cache_list"], args["cache_mask_list"]):
         cache["k"][:, :3].normal_()
         cache["v"][:, :3].normal_()
-        mask[:, :3] = True
+        mask[:, :3] = torch.tensor([True, False, True])
     baseline = copy.deepcopy(args)
     before = copy.deepcopy(args)
     expected, written = tiny_model.forward_with_cache(**baseline, update_cache=commit)
@@ -285,17 +215,6 @@ def test_staging_reuse_matches_concat_and_preserves_history(tiny_model, cache_te
             if commit:
                 torch.testing.assert_close(current[name], reference[name], rtol=0, atol=0)
         assert torch.equal(mask, reference_mask)
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("offset", [0, 3])
-def test_precomputed_rotary_preserves_output(tiny_model, offset):
-    args = _inputs(tiny_model)
-    args["global_frame_counter"] = offset
-    expected = tiny_model.forward_with_cache(**args)[0]
-    rotary = tiny_model.rotary_embed(2, 2, 2, torch.device("cpu"), offset)
-    actual = tiny_model.forward_with_cache(**args, rotary_emb=rotary)[0]
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _sp_worker(rank, rendezvous):

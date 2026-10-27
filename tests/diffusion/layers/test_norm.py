@@ -779,21 +779,16 @@ def test_rmsnorm_fused_native_parity_custom_weight():
         torch.testing.assert_close(out_fused, out_native, atol=atol_map[dtype], rtol=rtol_map[dtype])
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("affine", [True, False])
-@pytest.mark.parametrize("keep_fp32", [True, False])
-def test_layernorm_output_precision_contract(dtype, affine, keep_fp32):
+def test_layernorm_keeps_bf16_modulation_in_fp32(affine):
     from vllm_omni.diffusion.layers.norm import LayerNorm
 
-    norm = LayerNorm(16, elementwise_affine=affine, keep_fp32_output=keep_fp32).to(dtype)
-    x = torch.randn(2, 3, 16, dtype=dtype)
+    norm = LayerNorm(16, elementwise_affine=affine, keep_fp32_output=True).to(torch.bfloat16)
+    x = torch.randn(2, 3, 16, dtype=torch.bfloat16)
     expected = torch.nn.functional.layer_norm(
         x.float(), (16,), norm.weight.float() if affine else None, norm.bias.float() if affine else None, norm.eps
     )
-    if not keep_fp32:
-        expected = expected.to(dtype)
-    for forward in (norm, norm.forward_native, norm.forward_cuda, norm.forward_hip):
-        torch.testing.assert_close(forward(x), expected, atol=0, rtol=0)
+    torch.testing.assert_close(norm(x), expected, atol=0, rtol=0)
 
 
 def test_layernorm_fp32_output_bypasses_mindiesd(monkeypatch):

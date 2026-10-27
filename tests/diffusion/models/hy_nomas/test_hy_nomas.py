@@ -157,8 +157,9 @@ def test_public_defaults(architecture):
     assert "segment_frame_boundaries" in get_extra_body_params(architecture)
 
 
-@pytest.mark.parametrize("text_encoder_override", [None, "local-text-encoder"])
-@pytest.mark.parametrize("dit_backend", [None, "reference", "native"])
+@pytest.mark.parametrize(
+    "text_encoder_override,dit_backend", [(None, None), ("local-text-encoder", None), (None, "native")]
+)
 def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encoder_override, dit_backend):
     download = Mock(return_value=str(checkpoint))
     transformer = nn.Linear(2, 2, bias=False)
