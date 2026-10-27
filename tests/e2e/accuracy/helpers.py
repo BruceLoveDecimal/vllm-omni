@@ -1155,6 +1155,7 @@ def send_video_request_with_timeout(
     request_config: dict[str, Any],
     *,
     timeout_seconds: int,
+    poll_interval_seconds: float = 2,
 ) -> bytes:
     form_data = request_config.get("form_data")
     if not isinstance(form_data, dict):
@@ -1196,7 +1197,9 @@ def send_video_request_with_timeout(
         raise requests.HTTPError(f"{exc}; response body: {response.text}", response=response) from exc
     job_data = response.json()
     video_id = job_data["id"]
-    online_client._wait_until_video_completed(video_id, timeout_seconds=timeout_seconds)
+    online_client._wait_until_video_completed(
+        video_id, timeout_seconds=timeout_seconds, poll_interval_seconds=poll_interval_seconds
+    )
     video_content = online_client._download_video_content(video_id)
     print(f"online_video_e2e_latency_s={time.perf_counter() - start_time:.3f}")
     return video_content

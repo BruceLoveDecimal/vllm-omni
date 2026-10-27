@@ -1998,7 +1998,7 @@ class OnlineOmniClient:
         return result
 
     def _wait_until_video_completed(
-        self, video_id: str, poll_interval_seconds: int = 2, timeout_seconds: int = 300
+        self, video_id: str, poll_interval_seconds: float = 2, timeout_seconds: int = 300
     ) -> None:
         status_url = self._build_url(f"/v1/videos/{video_id}")
         deadline = time.monotonic() + timeout_seconds
