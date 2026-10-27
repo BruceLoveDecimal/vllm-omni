@@ -115,7 +115,7 @@ pass `--custom-pipeline-args '{"text_encoder":"/path/to/Qwen2.5-VL-7B-Instruct"}
 to the server, or `custom_pipeline_args={"text_encoder": "/path/to/Qwen2.5-VL-7B-Instruct"}`
 to the Python API.
 
-## Native DiT (experimental)
+## Native DiT and decoder (experimental)
 
 Select the native DiT with
 `--custom-pipeline-args '{"dit_backend":"native"}'`, or set
@@ -127,8 +127,8 @@ The native DiT reuses Omni's HY1.5 patch embedding, its shared feed-forward
 implementation, the shared LayerNorm and attention dispatcher. Hy-Nomas retains
 its own token refiner, timestep/RoPE arithmetic, action visibility and camera
 conditioning. Checkpoint loading validates all parameter names and shapes.
-The upstream package is still required for the text encoder, decoder and
-scheduler.
+The upstream package is still required for text/camera processing, the scheduler,
+and whichever model components are configured to use their reference implementation.
 
 Both DiTs use the same serving protocol, persistent-session state, runner-owned
 segmented KV, model CPU offload and Ulysses configuration. The native attention
@@ -155,20 +155,39 @@ GQA availability depends on hardware and backend. The reference local
 FlexAttention path already uses compact GQA and is unchanged. These are attention
 temporaries, not quantized or cross-request decoder KV caches.
 
+For the complete native decoder, including its network, temporal/spatial blending
+and streaming session, select
+`--custom-pipeline-args '{"dit_backend":"native","decoder_backend":"native"}'`.
+This path does not import the upstream decoder. It always uses shared GQA for
+full attention and spatial-neighborhood attention, collecting neighbors at the
+original KV head count instead of materializing a full dense spatial mask.
+FP32 QK normalization and RoPE intermediates are processed in bounded token chunks;
+temporal windows are blended incrementally into a preallocated output buffer.
+It preserves checkpoint parameter names, absolute-frame noise, stable-prefix
+streaming, per-push frame trimming and final tail flush.
+
+The default `decoder_backend=reference` retains the reference decoder; its optional
+`decoder_attention_backend=shared_gqa` adapter remains available for comparisons.
+Do not explicitly set `decoder_attention_backend=reference` with a native decoder.
+Both implementations remain registered as the `vae` component for model CPU
+offload. Layerwise offload and decoder parallelism remain unsupported.
+
 CPU coverage includes strict weight mapping, cache commits, action/camera math,
 chunk-local RoPE reuse, and a two-process Gloo SP-versus-single-rank comparison.
 Decoder CPU comparisons use the pinned reference with small random weights and
 cover full attention, parameter identity, local-path dispatch, streaming chunks
-and final flush. They do not exercise CUDA FlexAttention or real model weights.
+and final flush. Native decoder tests additionally compare one/two-step decode,
+overlapping spatial tiles, local-attention visibility and every streaming push
+against the pinned reference. They do not exercise CUDA FlexAttention or real model weights.
 These checks do not establish BF16 CUDA accuracy, NCCL performance or GPU offload
 correctness. The deployment results for the reference DiT do not qualify the
-native DiT. It remains opt-in until real-weight GPU validation is complete.
+native DiT or decoder. Both remain opt-in until real-weight GPU validation is complete.
 
 With the reference dependencies and checkpoints described above, run the existing
 GPU accuracy suite against the native candidate using:
 
 ```bash
-HY_NOMAS_DIT_BACKEND=native HY_NOMAS_DECODER_ATTENTION_BACKEND=shared_gqa python -m pytest \
+HY_NOMAS_DIT_BACKEND=native HY_NOMAS_DECODER_BACKEND=native python -m pytest \
   tests/e2e/accuracy/test_hy_nomas.py --run-level local_model -v
 ```
 

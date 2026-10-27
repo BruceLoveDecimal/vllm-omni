@@ -115,7 +115,15 @@ def read_component_config(root: Path, component: str, filename: str, class_name:
     return config
 
 
-def build_decoder(config: dict[str, Any], device: torch.device, *, compact_gqa: bool = False) -> nn.Module:
+def build_decoder(
+    config: dict[str, Any], device: torch.device, *, compact_gqa: bool = False, backend: str = "reference"
+) -> nn.Module:
+    if backend == "native":
+        from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder
+
+        with set_default_torch_dtype(torch.bfloat16), torch.device(device):
+            vae = PixelUMMDecoder(**{name: value for name, value in config.items() if not name.startswith("_")})
+        return vae.eval().requires_grad_(False)
     from hymm.models.vae.pixelumm_decoder.autoencoder import PixelUMMDCAELatentDecoder
     from hymm.models.vae.pixelumm_decoder.model import DCAEVPixelUMMDecoder, GenExpertArch
 
@@ -182,6 +190,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         "text_encoder",
         "dit_backend",
         "decoder_attention_backend",
+        "decoder_backend",
         *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__),
     }
     if custom.keys() - allowed:
@@ -198,6 +207,12 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         raise ValueError("Hy-Nomas dit_backend must be reference or native.")
     if custom.get("decoder_attention_backend", "reference") not in ("reference", "shared_gqa"):
         raise ValueError("Hy-Nomas decoder_attention_backend must be reference or shared_gqa.")
+    if custom.get("decoder_backend", "reference") not in ("reference", "native"):
+        raise ValueError("Hy-Nomas decoder_backend must be reference or native.")
+    if custom.get("decoder_backend") == "native" and custom.get("decoder_attention_backend") == "reference":
+        raise ValueError(
+            "The native Hy-Nomas decoder uses shared GQA; omit decoder_attention_backend or use shared_gqa."
+        )
     text_encoder = custom.get("text_encoder")
     if "text_encoder" in custom and (not isinstance(text_encoder, str) or not text_encoder.strip()):
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
@@ -328,6 +343,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             decoder_config,
             self.device,
             compact_gqa=(od_config.custom_pipeline_args or {}).get("decoder_attention_backend") == "shared_gqa",
+            backend=(od_config.custom_pipeline_args or {}).get("decoder_backend", "reference"),
         )
         self.s_ratio = self.vae.spatial_compression_ratio
         self.patch_size = self.transformer.patch_size

@@ -463,6 +463,11 @@ def test_module_offload_selects_components_and_removes_hooks(monkeypatch, compon
         ({"custom_pipeline_args": {"arbitrary": True}}, "custom_pipeline_args"),
         ({"custom_pipeline_args": {"dit_backend": "unknown"}}, "dit_backend"),
         ({"custom_pipeline_args": {"decoder_attention_backend": "unknown"}}, "decoder_attention_backend"),
+        ({"custom_pipeline_args": {"decoder_backend": "unknown"}}, "decoder_backend"),
+        (
+            {"custom_pipeline_args": {"decoder_backend": "native", "decoder_attention_backend": "reference"}},
+            "uses shared GQA",
+        ),
         ({"enable_layerwise_offload": True}, "layer offload"),
         ({"flow_shift": 3.0}, "flow_shift=5"),
         ({"enforce_eager": False, "diffusion_compile_granularity": "full"}, "full transformer compilation"),
