@@ -249,6 +249,45 @@ def test_invalid_cache_rejected_before_any_write(tiny_model):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("cache_text", [False, True])
+@pytest.mark.parametrize("commit", [False, True])
+def test_staging_reuse_matches_concat_and_preserves_history(tiny_model, cache_text, commit):
+    import copy
+
+    args = _inputs(tiny_model, history=3, cache_text=cache_text)
+    for cache, mask in zip(args["kv_cache_list"], args["cache_mask_list"]):
+        cache["k"][:, :3].normal_()
+        cache["v"][:, :3].normal_()
+        mask[:, :3] = True
+    baseline = copy.deepcopy(args)
+    before = copy.deepcopy(args)
+    expected, written = tiny_model.forward_with_cache(**baseline, update_cache=commit)
+    pointers = []
+    attention = tiny_model.double_blocks[0].attn.attention
+    handle = attention.register_forward_pre_hook(lambda _, values: pointers.append(values[1].data_ptr()))
+    try:
+        actual, reused_written = tiny_model.forward_with_cache(**args, update_cache=commit, reuse_kv_staging=True)
+    finally:
+        handle.remove()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert reused_written == written
+    if cache_text or not commit:
+        assert pointers == [args["kv_cache_list"][0]["k"].data_ptr()]
+    for old, current, reference, mask, reference_mask in zip(
+        before["kv_cache_list"],
+        args["kv_cache_list"],
+        baseline["kv_cache_list"],
+        args["cache_mask_list"],
+        baseline["cache_mask_list"],
+    ):
+        for name in ("k", "v"):
+            torch.testing.assert_close(current[name][:, :3], old[name][:, :3], rtol=0, atol=0)
+            if commit:
+                torch.testing.assert_close(current[name], reference[name], rtol=0, atol=0)
+        assert torch.equal(mask, reference_mask)
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("offset", [0, 3])
 def test_precomputed_rotary_preserves_output(tiny_model, offset):
     args = _inputs(tiny_model)
@@ -309,6 +348,7 @@ def _sp_worker(rank, rendezvous):
                         **{**args, "kv_cache_list": local, "cache_mask_list": local_masks},
                         **extras,
                         update_cache=commit,
+                        reuse_kv_staging=True,
                     )
                     assert written == local_written
                     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
