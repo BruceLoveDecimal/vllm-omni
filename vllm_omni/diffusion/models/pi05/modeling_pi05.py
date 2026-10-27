@@ -60,6 +60,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.siglip import SiglipVisionModel
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
@@ -88,6 +90,13 @@ _PACKED_PARAMS = (
 )
 _PACKED_SHARDS = {"qkv_proj": {"q", "k", "v"}, "gate_up_proj": {0, 1}}
 _UNUSED_EXPERT_LM_HEAD = "paligemma_with_expert.gemma_expert.lm_head.weight"
+
+# The vLLM-Omni attention backends that take π0.5's arbitrary attention mask
+# (``attention: diffusion``), by ``get_name()`` → the name a
+# ``diffusion_attention_config`` selects them by. FLASH_ATTN reads a mask as
+# key padding only, and FlashInfer takes a boolean one.
+_MASKED_ATTENTION_BACKENDS = {"SDPA": "TORCH_SDPA", "CUDNN_ATTN": "CUDNN_ATTN", "FLASHINFER_ATTN": "FLASHINFER_ATTN"}
+_BOOLEAN_MASK_ATTENTION_BACKENDS = ("FLASHINFER_ATTN",)
 
 # Large negative value to fill masked-out positions in a float attention mask.
 # Matches OpenPI's constant exactly so that numerics line up during parity.
@@ -461,7 +470,7 @@ class Pi05GemmaAttention(nn.Module):
     is ``None`` except in the PaliGemma prefix with quantization enabled.
     """
 
-    def __init__(self, config, quant_config: QuantizationConfig | None, prefix: str):
+    def __init__(self, config, quant_config: QuantizationConfig | None, prefix: str, attention: str = "pi05"):
         super().__init__()
         self.config = config
         self.head_dim = config.head_dim
@@ -489,6 +498,29 @@ class Pi05GemmaAttention(nn.Module):
         self.scaling = 1.0 / math.sqrt(self.head_dim)
         # Gemma rotates the two halves of each head (NeoX style).
         self.rotary = RotaryEmbedding(is_neox_style=True)
+        # ``attention: diffusion``: vLLM-Omni's attention layer; ``None`` is R0's.
+        self.attn: Attention | None = None
+        self.boolean_mask = False
+        if attention == "diffusion":
+            self.attn = Attention(
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                causal=False,
+                softmax_scale=self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                prefix=f"{prefix}.attn",
+                role="pi05",
+                skip_sequence_parallel=True,
+            )
+            backend = self.attn.attn_backend.get_name()
+            takes_mask = self.attn.attn_backend.supports_attention_mask(self.attn.attn_spec)
+            if backend not in _MASKED_ATTENTION_BACKENDS or not takes_mask:
+                raise ValueError(
+                    f"π0.5 attends under an arbitrary mask, which the {backend} attention backend does not take. "
+                    f"Select one of {sorted(_MASKED_ATTENTION_BACKENDS.values())} for role 'pi05' in "
+                    "diffusion_attention_config."
+                )
+            self.boolean_mask = backend in _BOOLEAN_MASK_ATTENTION_BACKENDS
 
     def project(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
@@ -516,6 +548,45 @@ class Pi05GemmaAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         return q, k, v
+
+    def attend(
+        self, q: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """``q`` ``(B, S, heads, head_dim)`` over ``key``/``value`` ``(B, kv_heads, K,
+        head_dim)`` under eager's float mask ``(B, 1, S, ≥ K)``; returns ``(B, S,
+        heads · head_dim)``.
+
+        The K/V stay in the workspace's ``(B, kv_heads, K, head_dim)`` layout; the
+        vLLM-Omni layer reads them as ``(B, K, kv_heads, head_dim)``, a view of it.
+        """
+        batch_size, seq_len = q.shape[:2]
+        mask = attention_mask[:, :, :, : key.shape[2]]
+        if self.attn is None:
+            att = _attend(q.transpose(1, 2), key, value, mask, self.num_key_value_groups, self.scaling)
+            return att.transpose(1, 2).reshape(batch_size, seq_len, self.q_size)
+        if self.boolean_mask:
+            mask = _boolean_attention_mask(mask)
+        else:
+            mask = mask.to(q.dtype)
+        out = self.attn(q, key.transpose(1, 2), value.transpose(1, 2), AttentionMetadata(attn_mask=mask))
+        return out.reshape(batch_size, seq_len, self.q_size)
+
+
+def _boolean_attention_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Eager's float mask as the boolean keep-mask a FlashInfer-style backend takes.
+
+    A padded prefix token's query row masks every key. Eager's finite mask
+    value spreads such a row evenly over all keys; a boolean mask would leave
+    it empty, and the backend's empty softmax can return NaN, which reaches
+    every later layer through that token's K/V (masked keys still multiply
+    their values by zero). The row attends to its own token instead: no valid
+    query reads a padded token, so neither choice reaches the actions.
+    """
+    keep = attention_mask == 0
+    empty = ~keep.any(dim=-1, keepdim=True)
+    query_len, key_len = keep.shape[-2:]
+    own_token = torch.eye(query_len, key_len, dtype=torch.bool, device=keep.device)
+    return keep | (empty & own_token)
 
 
 class Pi05GemmaMLP(nn.Module):
@@ -554,9 +625,16 @@ class Pi05GemmaDecoderLayer(nn.Module):
     there is no timestep in the prefix).
     """
 
-    def __init__(self, config, quant_config: QuantizationConfig | None, prefix: str, cond_dim: int | None = None):
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        cond_dim: int | None = None,
+        attention: str = "pi05",
+    ):
         super().__init__()
-        self.self_attn = Pi05GemmaAttention(config, quant_config, prefix=f"{prefix}.self_attn")
+        self.self_attn = Pi05GemmaAttention(config, quant_config, prefix=f"{prefix}.self_attn", attention=attention)
         self.mlp = Pi05GemmaMLP(config, quant_config, prefix=f"{prefix}.mlp")
         if cond_dim is None:
             self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -582,8 +660,7 @@ class Pi05GemmaDecoderLayer(nn.Module):
 
         q, k, v = attn.project(x, cos, sin)
         k, v = k.transpose(1, 2), v.transpose(1, 2)
-        att = _attend(q.transpose(1, 2), k, v, attention_mask, attn.num_key_value_groups, attn.scaling)
-        att = att.transpose(1, 2).reshape(q.shape[0], q.shape[1], attn.q_size)
+        att = attn.attend(q, k, v, attention_mask)
 
         out, _ = attn.o_proj(_match(att, attn.o_proj))
         out = out + residual
@@ -601,8 +678,8 @@ class Pi05ExpertDecoderLayer(Pi05GemmaDecoderLayer):
     contribution to the residual stream.
     """
 
-    def __init__(self, config, prefix: str, cond_dim: int):
-        super().__init__(config, quant_config=None, prefix=prefix, cond_dim=cond_dim)
+    def __init__(self, config, prefix: str, cond_dim: int, attention: str = "pi05"):
+        super().__init__(config, quant_config=None, prefix=prefix, cond_dim=cond_dim, attention=attention)
 
     def forward(
         self,
@@ -630,10 +707,7 @@ class Pi05ExpertDecoderLayer(Pi05GemmaDecoderLayer):
         key_slots[:, :, prefix_len:].copy_(k_suf.transpose(1, 2))
         value_slots[:, :, prefix_len:].copy_(v_suf.transpose(1, 2))
 
-        att = _attend(
-            q.transpose(1, 2), key_slots, value_slots, attention_mask, attn.num_key_value_groups, attn.scaling
-        )
-        att = att.transpose(1, 2).reshape(q.shape[0], q.shape[1], attn.q_size)
+        att = attn.attend(q, key_slots, value_slots, attention_mask)
 
         out, _ = attn.o_proj(_match(att, attn.o_proj))
         hidden_states = _gated_residual(residual, out, gate)
@@ -659,6 +733,7 @@ class Pi05GemmaModel(nn.Module):
         prefix: str = "",
         cond_dim: int | None = None,
         embed_tokens: bool = True,
+        attention: str = "pi05",
     ):
         super().__init__()
         self.config = config
@@ -670,12 +745,14 @@ class Pi05GemmaModel(nn.Module):
             self.embed_tokens = None
         if cond_dim is None:
             layers = [
-                Pi05GemmaDecoderLayer(config, quant_config, prefix=f"{prefix}.layers.{index}")
+                Pi05GemmaDecoderLayer(config, quant_config, prefix=f"{prefix}.layers.{index}", attention=attention)
                 for index in range(config.num_hidden_layers)
             ]
         else:
             layers = [
-                Pi05ExpertDecoderLayer(config, prefix=f"{prefix}.layers.{index}", cond_dim=cond_dim)
+                Pi05ExpertDecoderLayer(
+                    config, prefix=f"{prefix}.layers.{index}", cond_dim=cond_dim, attention=attention
+                )
                 for index in range(config.num_hidden_layers)
             ]
         self.layers = nn.ModuleList(layers)
@@ -1475,9 +1552,10 @@ def _fused_denoise_forward(
     """The suffix pass and output head of ``denoise_step``, batch 1, with fused kernels.
 
     Per layer: AdaRMS norm, QKV projection + RoPE writing the suffix K/V
-    behind the cached prefix, attention over the whole workspace row, and the
-    ``o_proj`` and MLP GEMMs with their gated residuals and GELU; then the final
-    AdaRMS norm fused with ``action_out_proj``. In bfloat16 the GEMMs run in
+    behind the cached prefix, attention over the whole workspace row (R0's
+    fused kernels, or with ``attention: diffusion`` the vLLM-Omni layer), and
+    the ``o_proj`` and MLP GEMMs with their gated residuals and GELU; then the
+    final AdaRMS norm fused with ``action_out_proj``. In bfloat16 the GEMMs run in
     Triton with what follows them fused in, reading the packed vLLM weights in
     place; in float32 they stay on cuBLAS and only what follows them is fused.
     Returns ``v_t``.
@@ -1496,7 +1574,10 @@ def _fused_denoise_forward(
     hidden_states = torch.empty(seq_len, width, dtype=torch.promote_types(x_in.dtype, proj_dtype), device=device)
     x_normed = torch.empty(seq_len, width, dtype=proj_dtype, device=device)
     q = torch.empty(num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
-    scores = torch.empty(num_heads * seq_len, n_keys, dtype=proj_dtype, device=device)
+    # The score matrix R0's fused attention keeps; the vLLM-Omni layer needs none.
+    scores = None
+    if first_attn.attn is None:
+        scores = torch.empty(num_heads * seq_len, n_keys, dtype=proj_dtype, device=device)
     att = torch.empty(seq_len, num_heads * head_dim, dtype=proj_dtype, device=device)
     mlp_hidden = torch.empty(seq_len, expert.config.intermediate_size, dtype=proj_dtype, device=device)
     cos, sin = expert.rotary_emb(position_ids)
@@ -1511,7 +1592,10 @@ def _fused_denoise_forward(
         modulation = _adarms_modulation(layer.input_layernorm, adarms_cond)
         _fused_rms_norm(residual, layer.input_layernorm, x_normed, modulation=modulation)
         _fused_qkv_rope(x_normed, attn, cos, sin, q, key[prefix_len:], value[prefix_len:])
-        _fused_attention(q, key, value, mask, attn.scaling, scores, att)
+        if attn.attn is None:
+            _fused_attention(q, key, value, mask, attn.scaling, scores, att)
+        else:
+            att.copy_(attn.attend(q.transpose(0, 1)[None], key[None, None], value[None, None], attention_mask)[0])
         _fused_linear_residual(att, attn.o_proj, residual, hidden_states, gate=modulation[2 * width :])
         residual = hidden_states
 
@@ -1565,7 +1649,13 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
     projector and the action expert always run in the serving dtype.
     """
 
-    def __init__(self, vlm_config, action_expert_config, quant_config: QuantizationConfig | None = None):
+    def __init__(
+        self,
+        vlm_config,
+        action_expert_config,
+        quant_config: QuantizationConfig | None = None,
+        attention: str = "pi05",
+    ):
         super().__init__()
 
         # PaliGemma prefix: identical to π0. It sees no timestep, so no AdaRMS.
@@ -1610,14 +1700,18 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
             vision_config.hidden_size, vlm_config_hf.text_config.hidden_size
         )
         self.paligemma.model.language_model = Pi05GemmaModel(
-            vlm_config_hf.text_config, quant_config=quant_config, prefix="language_model"
+            vlm_config_hf.text_config, quant_config=quant_config, prefix="language_model", attention=attention
         )
 
         # The action expert doesn't embed tokens — it only consumes the
         # suffix action embeddings we feed in — and has no LM head.
         self.gemma_expert = _Container(action_expert_config_hf)
         self.gemma_expert.model = Pi05GemmaModel(
-            action_expert_config_hf, prefix="gemma_expert", cond_dim=self.adarms_cond_dim, embed_tokens=False
+            action_expert_config_hf,
+            prefix="gemma_expert",
+            cond_dim=self.adarms_cond_dim,
+            embed_tokens=False,
+            attention=attention,
         )
         # Set by ``Pi05ForActionPrediction.enable_fused_kernels`` on the
         # optimized path; ``False`` is the eager baseline.
@@ -1743,7 +1837,9 @@ class Pi05ForActionPrediction(nn.Module):
         self.expert_width = expert_config.width
 
         # Dual backbone
-        self.paligemma_with_expert = PaliGemmaWithActionExpertPi05(vlm_config, expert_config, quant_config)
+        self.paligemma_with_expert = PaliGemmaWithActionExpertPi05(
+            vlm_config, expert_config, quant_config, attention=getattr(config, "attention", "pi05")
+        )
 
         # Action chunk projections.
         self.action_in_proj = nn.Linear(self.action_dim, self.expert_width)

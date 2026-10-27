@@ -35,6 +35,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.compile import regionally_compile
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
 from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
@@ -292,8 +293,11 @@ class Pi05Pipeline(nn.Module):
         # can still narrow it, under the ``language_model`` prefix.
         quant_config = resolve_component_quant_config(self.od_config.quantization_config, "language_model")
         # Built on the device: an online-quantized weight starts on ``meta``
-        # and is materialized there as it loads, which ``.to(device)`` cannot move.
-        with torch.device(self._device):
+        # and is materialized there as it loads, which ``.to(device)`` cannot
+        # move. Under this stage's diffusion config, which a worker has set
+        # already, so ``attention: diffusion`` finds its attention backend
+        # in a standalone build too.
+        with set_current_diffusion_config(self.od_config), torch.device(self._device):
             model = Pi05ForActionPrediction(self.config, quant_config=quant_config)
         _set_inference_dtype(model, self._torch_dtype)
         self._load_checkpoint(model)

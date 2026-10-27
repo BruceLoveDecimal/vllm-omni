@@ -169,6 +169,13 @@ class Pi05Config:
     # by default: compiling moves the prefix pass's rounding, which every
     # denoising step reads.
     torch_compile: bool = False
+    # Serving only: the attention both Gemma towers run. ``pi05`` is R0's own:
+    # eager ``softmax(QKᵀ + mask) V``, and on the optimized path the fused
+    # Triton attention of the denoising step. ``diffusion`` routes it through
+    # vLLM-Omni's ``Attention`` layer instead, on the backend the stage's
+    # ``diffusion_attention_config`` selects for role ``pi05`` (a backend that
+    # takes an arbitrary mask: TORCH_SDPA, CUDNN_ATTN or FLASHINFER_ATTN).
+    attention: str = "pi05"
 
     # Derived from output_features[ACTION].shape; never accepted as a second
     # source of truth in config.json.
@@ -206,6 +213,8 @@ class Pi05Config:
         if self.num_inference_steps < 1:
             # ``dt = -1 / num_steps`` in the Euler loop.
             raise ValueError(f"num_inference_steps must be at least 1, got {self.num_inference_steps!r}.")
+        if self.attention not in ("pi05", "diffusion"):
+            raise ValueError(f"attention must be 'pi05' or 'diffusion', got {self.attention!r}.")
 
         self._derive_widths()
         self._validate_norm_stats()

@@ -24,6 +24,7 @@ behaviour still produces a well-shaped, finite action chunk:
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
@@ -880,9 +881,10 @@ def _init_tiny_weights(model, seed: int = 0) -> None:
                 param.data.normal_(std=0.02, generator=generator)
 
 
-def _tiny_pi05_model():
+def _tiny_pi05_model(attention: str = "pi05"):
     """A fresh model. Use for tests that load weights or otherwise mutate it."""
-    model = Pi05ForActionPrediction(Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4))
+    config = Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4, attention=attention)
+    model = Pi05ForActionPrediction(config)
     _init_tiny_weights(model)
     model.process_weights_after_loading()
     return model
@@ -1114,12 +1116,12 @@ def test_forward_requires_a_kv_workspace(tiny_model):
         backbone.forward(inputs_embeds=[None, torch.zeros(1, 4, tiny_model.expert_width)], past_key_values=[])
 
 
-def _gated_tiny_model():
+def _gated_tiny_model(attention: str = "pi05"):
     """A fresh model whose expert gates are open, so a chunk depends on the prefix K/V.
 
     AdaRMS ``dense`` is zero-initialized, which closes every expert gate.
     """
-    model = _tiny_pi05_model().eval()
+    model = _tiny_pi05_model(attention).eval()
     generator = torch.Generator().manual_seed(0)
     for module in model.modules():
         if isinstance(module, Pi05AdaRMSNorm) and module.dense is not None:
@@ -1198,6 +1200,94 @@ def test_step_workspace_rejects_prefixes_it_cannot_hold(tiny_model):
         workspace.load_prefixes([prefix])
     with pytest.raises(ValueError, match="tokens"):
         tiny_model.new_kv_workspace(batch_size=1, prefix_len=prefix.prefix_len - 1).load_prefixes([prefix])
+
+
+@contextmanager
+def _pi05_attention_backend(backend: str):
+    """``attention: diffusion`` builds its layers under this stage config's backend for role ``pi05``."""
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    od_config = OmniDiffusionConfig(diffusion_attention_config={"per_role": {"pi05": backend}})
+    with set_current_diffusion_config(od_config):
+        yield
+
+
+def _fake_attention_backend(name: str):
+    """SDPA under another backend's name, to drive the name-based checks on any host."""
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+
+    return type(f"Fake{name}", (SDPABackend,), {"get_name": staticmethod(lambda: name)})
+
+
+def _tiny_attention(attention: str = "diffusion"):
+    from transformers import GemmaConfig
+
+    config = GemmaConfig(
+        hidden_size=64, intermediate_size=128, num_attention_heads=2, num_key_value_heads=1, head_dim=32
+    )
+    return modeling_pi05.Pi05GemmaAttention(config, None, prefix="layers.0.self_attn", attention=attention)
+
+
+def test_config_rejects_an_unknown_attention():
+    with pytest.raises(ValueError, match="attention must be"):
+        Pi05Config(attention="flash")
+
+
+@pytest.mark.slow
+def test_diffusion_attention_matches_pi05_attention():
+    """``attention: diffusion`` on SDPA computes R0's attention: the same chunk
+    to float32 reduction-order rounding, on the prefix and every step."""
+    requests = [_prefix_inputs(prompt_token=3, live_views=1), _prefix_inputs(prompt_token=5, live_views=3)]
+    noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(7))
+    pi05 = _gated_tiny_model()
+    with _pi05_attention_backend("TORCH_SDPA"):
+        diffusion = _gated_tiny_model("diffusion")
+    assert diffusion.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.attn is not None
+    with torch.no_grad():
+        for inputs in requests:
+            expected = pi05.sample_actions(*inputs, noise=noise, num_steps=2)
+            actual = diffusion.sample_actions(*inputs, noise=noise, num_steps=2)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=1e-5)
+
+
+def test_diffusion_attention_rejects_a_padding_only_backend(monkeypatch):
+    """FLASH_ATTN reads a mask as key padding; π0.5's is arbitrary, so it must not run there."""
+    from vllm_omni.diffusion.attention import layer
+
+    monkeypatch.setattr(
+        layer, "get_attn_backend_for_role", lambda **kwargs: (_fake_attention_backend("FLASH_ATTN"), None)
+    )
+    with pytest.raises(ValueError, match="arbitrary mask"):
+        _tiny_attention()
+
+
+def test_boolean_mask_attends_a_fully_masked_row_to_its_own_token(monkeypatch):
+    """A boolean-mask backend sees eager's mask as keep-flags, a padded token's
+    empty row keeping its own token so the softmax stays finite; every other
+    row attends exactly as under the float mask."""
+    from vllm_omni.diffusion.attention import layer
+
+    monkeypatch.setattr(
+        layer, "get_attn_backend_for_role", lambda **kwargs: (_fake_attention_backend("FLASHINFER_ATTN"), None)
+    )
+    attention = _tiny_attention()
+    assert attention.boolean_mask
+    pad = torch.tensor([[True, True, False, True]])
+    float_mask = modeling_pi05.prepare_attention_masks_4d(make_att_2d_masks(pad, torch.zeros_like(pad)))
+
+    keep = modeling_pi05._boolean_attention_mask(float_mask)
+    assert torch.equal(keep[0, 0, 2], torch.tensor([False, False, True, False]))
+    assert torch.equal(keep[0, 0, [0, 1, 3]], float_mask[0, 0, [0, 1, 3]] == 0)
+
+    generator = torch.Generator().manual_seed(0)
+    q = torch.randn(1, 4, 2, 32, generator=generator)
+    key, value = (torch.randn(1, 1, 4, 32, generator=generator) for _ in range(2))
+    boolean = attention.attend(q, key, value, float_mask)
+    attention.boolean_mask = False
+    additive = attention.attend(q, key, value, float_mask)
+    assert torch.isfinite(boolean).all()
+    torch.testing.assert_close(boolean[:, [0, 1, 3]], additive[:, [0, 1, 3]])
 
 
 @pytest.mark.slow
