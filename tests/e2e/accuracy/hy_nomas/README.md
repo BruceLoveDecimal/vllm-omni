@@ -10,6 +10,14 @@ reference source and checkpoint, matching vLLM dependencies, FlashAttention,
 PyAV, torchmetrics, pynvml and pytest. The three-turn case reserves 48 latent
 frames and four prompt segments; this capacity stays identical across backends.
 
+For native DiT on CUDA, the default text refiner uses FlashAttention **2** and
+joint attention uses PyTorch FlexAttention, matching the reference's BF16
+rounding. The FA2 installation must support the GPU architecture. Shared HY1.5
+layers, Ulysses and KV staging remain native. Explicit per-role attention
+configuration still overrides these defaults; changing the attention kernel
+requires a new quality comparison. First-use Flex compilation is cold-start
+work, so retain warmups for performance measurements.
+
 ```bash
 export HY_NOMAS_MODEL=/path/to/Hy-Nomas-Diffusers
 export HY_NOMAS_RUN_COMPARISON=1

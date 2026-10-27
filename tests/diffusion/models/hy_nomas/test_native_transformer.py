@@ -292,3 +292,17 @@ def test_two_process_ulysses_matches_single_rank_with_continuation_and_camera(tm
     if not dist.is_gloo_available():
         pytest.skip("Gloo is required for CPU Ulysses validation")
     mp.spawn(_sp_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)
+
+
+@torch.no_grad()
+def test_text_attention_excludes_padding_queries(tiny_model):
+    attention = tiny_model.txt_in.individual_token_refiner.blocks[0].attn
+    hidden = torch.randn(1, 5, 12)
+    mask = torch.tensor([[True, False, True, True, False]])
+    output = attention(hidden, mask)
+    # Unpadding both Q and KV leaves zero attention on padded rows, before
+    # the output projection adds its bias. A key-only SDPA mask violates this.
+    torch.testing.assert_close(output[~mask], attention.self_attn_proj.bias.expand(2, -1), rtol=0, atol=0)
+    changed = hidden.clone()
+    changed[~mask] = 1000
+    torch.testing.assert_close(attention(changed, mask)[mask], output[mask], rtol=0, atol=0)

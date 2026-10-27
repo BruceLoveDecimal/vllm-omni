@@ -29,22 +29,38 @@ from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.distributed.comm import all_to_all_4D
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.layers.norm import LayerNorm
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15PatchEmbed
+from vllm_omni.platforms import current_omni_platform
 
 
 def _attention(heads: int, head_dim: int, role: str) -> Attention:
+    from vllm_omni.diffusion.models.hy_nomas.attention import HyNomasJointAttentionKernel, HyNomasTextAttentionKernel
+
+    config = get_current_diffusion_config_or_none()
+    category = "cross" if role == "hy_nomas.camera" else "self"
+    spec = None
+    if config is not None:
+        spec, _ = config.diffusion_attention_config.resolve_with_source(role=role, role_category=category)
+    kernel = None
+    if current_omni_platform.is_cuda() and spec is None:
+        if role == "hy_nomas.text":
+            kernel = HyNomasTextAttentionKernel()
+        elif role == "hy_nomas.joint":
+            kernel = HyNomasJointAttentionKernel()
     return Attention(
         num_heads=heads,
         head_size=head_dim,
         causal=False,
         softmax_scale=head_dim**-0.5,
         role=role,
-        role_category="cross" if role == "hy_nomas.camera" else "self",
+        role_category=category,
         skip_sequence_parallel=True,
+        custom_attention=kernel,
     )
 
 
@@ -159,7 +175,9 @@ class HyNomasTokenRefinerMLP(nn.Module):
 class HyNomasTextAttnProcessor:
     def __call__(self, attn, hidden_states, attention_mask=None):
         query, key, value = attn.self_attn_qkv(hidden_states).unflatten(-1, (3, attn.heads, -1)).unbind(-3)
-        hidden_states = _attend(attn.attention, query, key, value, attention_mask)
+        hidden_states = attn.attention(query, key, value, attn_metadata=AttentionMetadata(attn_mask=attention_mask))
+        if attention_mask is not None:
+            hidden_states = hidden_states * attention_mask[:, :, None, None].to(hidden_states.dtype)
         return attn.self_attn_proj(hidden_states.flatten(-2))
 
 
@@ -206,7 +224,6 @@ class HyNomasIndividualTokenRefiner(nn.Module):
         if attention_mask is not None:
             attention_mask = attention_mask.clone().bool()
             attention_mask[:, 0] = True
-            attention_mask = attention_mask[:, None, None, :]
         for block in self.blocks:
             hidden_states = block(hidden_states, temb, attention_mask)
         return hidden_states
@@ -250,6 +267,7 @@ class HyNomasAttnProcessor:
         cache_txt=True,
         cache_mask=None,
         reuse_kv_staging=False,
+        block_masks=None,
     ):
         query = attn.img_attn_q(hidden_states).unflatten(-1, (attn.heads, -1))
         key = attn.img_attn_k(hidden_states).unflatten(-1, (attn.heads, -1))
@@ -315,6 +333,7 @@ class HyNomasAttnProcessor:
             text_mask,
             action_text_offsets if cache_txt else None,
             action_token_windows,
+            block_masks,
         )
         output = output * query_mask[:, :, None, None].to(output.dtype)
         image_output, text_output = output.split((video_length, text_length), dim=1)
@@ -339,12 +358,25 @@ class HyNomasAttnProcessor:
         encoder_attention_mask,
         action_text_offsets,
         action_token_windows,
+        block_masks=None,
     ):
         if action_text_offsets is None:
             attention_mask = (
                 key_mask[:, None, None, :] if encoder_attention_mask is not None or history_length else None
             )
-            output = _attend(attention, query, key, value, attention_mask)
+            if isinstance(attention, Attention) and attention._has_custom_attention:
+                query_mask = torch.cat((torch.ones_like(key_mask[:, :video_length]), text_mask.bool()), dim=1)
+                output = attention(
+                    query,
+                    key,
+                    value,
+                    attn_metadata=AttentionMetadata(
+                        attn_mask=key_mask,
+                        extra={"query_mask": query_mask, "block_masks": block_masks, "mask_slot": "joint"},
+                    ),
+                )
+            else:
+                output = _attend(attention, query, key, value, attention_mask)
         else:
             # Each query group shares a visible key set; no quadratic dense mask is needed.
             outputs = []
@@ -376,13 +408,25 @@ class HyNomasAttnProcessor:
                     attention_mask = torch.cat((key_mask[batch_index, : history_length + video_length], visible_text))[
                         None, None, None, :
                     ]
-                    group_output = _attend(
-                        attention,
-                        query[batch_index : batch_index + 1, start:end],
-                        key[batch_index : batch_index + 1],
-                        value[batch_index : batch_index + 1],
-                        attention_mask,
-                    )
+                    group_query = query[batch_index : batch_index + 1, start:end]
+                    group_key = key[batch_index : batch_index + 1]
+                    group_value = value[batch_index : batch_index + 1]
+                    if isinstance(attention, Attention) and attention._has_custom_attention:
+                        group_output = attention(
+                            group_query,
+                            group_key,
+                            group_value,
+                            attn_metadata=AttentionMetadata(
+                                attn_mask=attention_mask,
+                                extra={
+                                    "query_mask": torch.ones_like(group_query[..., 0, 0], dtype=torch.bool),
+                                    "block_masks": block_masks,
+                                    "mask_slot": (batch_index, start, end),
+                                },
+                            ),
+                        )
+                    else:
+                        group_output = _attend(attention, group_query, group_key, group_value, attention_mask)
                     if offsets is not None:
                         query_mask = torch.arange(start, end, device=query.device) < video_length + valid_text
                         group_output = group_output * query_mask[None, :, None, None].to(group_output.dtype)
@@ -754,6 +798,9 @@ class HyNomasTransformer3DModel(nn.Module):
                 (start * height * width, end * height * width, action) for start, end, action in intra_seg_vid_windows
             ]
         )
+        # Every layer has the same token visibility. Keep masks local to this
+        # forward so continuation/commit changes cannot reuse stale visibility.
+        block_masks = {}
         for index, block in enumerate(self.double_blocks):
             image, text = block(
                 image,
@@ -770,6 +817,7 @@ class HyNomasTransformer3DModel(nn.Module):
                     cache_mask=cache_mask_list[index],
                     action_text_offsets=intra_seg_txt_offsets,
                     action_token_windows=windows,
+                    block_masks=block_masks,
                 ),
             )
             if camera_embedding is not None:
