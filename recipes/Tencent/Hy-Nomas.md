@@ -128,7 +128,7 @@ implementation, the shared LayerNorm and attention dispatcher. Hy-Nomas retains
 its own token refiner, timestep/RoPE arithmetic, action visibility and camera
 conditioning. Checkpoint loading validates all parameter names and shapes.
 The upstream package is still required for the text encoder, decoder and
-scheduler. Decoder KV storage is unchanged.
+scheduler.
 
 Both DiTs use the same serving protocol, persistent-session state, runner-owned
 segmented KV, model CPU offload and Ulysses configuration. The native attention
@@ -137,9 +137,29 @@ This is a single-stage pipeline. Native action attention groups queries by
 visibility instead of allocating a quadratic action mask. Image RoPE tables are
 computed once per chunk, reused by denoising and the clean-cache forward, and
 released before decoding; their FP32 storage is included in AR admission sizing.
+Native denoising writes current K/V into the uncommitted staging suffix and lets
+attention read that contiguous view, avoiding a full-history concatenation per
+layer and step. Committed history and masks remain unchanged. Continuation clean
+forwards still concatenate the extra current text once per chunk when it does not
+fit the write view. The runner's paged storage and contiguous staging both remain;
+this optimization does not halve the persistent KV allocation.
+
+To also enable compact full-attention decoder GQA, pass
+`--custom-pipeline-args '{"dit_backend":"native","decoder_attention_backend":"shared_gqa"}'`.
+The decoder option is independent of the DiT option and defaults to `reference`.
+The adapter retains the reference weights, FP32 QK normalization/RoPE, bounded
+intermediates, temporal windows and streaming session implementation. Full
+attention passes 8 KV heads alongside 32 query heads to shared attention without
+first repeating K/V. The backend owns any required equal-head fallback; fused
+GQA availability depends on hardware and backend. The reference local
+FlexAttention path already uses compact GQA and is unchanged. These are attention
+temporaries, not quantized or cross-request decoder KV caches.
 
 CPU coverage includes strict weight mapping, cache commits, action/camera math,
 chunk-local RoPE reuse, and a two-process Gloo SP-versus-single-rank comparison.
+Decoder CPU comparisons use the pinned reference with small random weights and
+cover full attention, parameter identity, local-path dispatch, streaming chunks
+and final flush. They do not exercise CUDA FlexAttention or real model weights.
 These checks do not establish BF16 CUDA accuracy, NCCL performance or GPU offload
 correctness. The deployment results for the reference DiT do not qualify the
 native DiT. It remains opt-in until real-weight GPU validation is complete.
@@ -148,7 +168,7 @@ With the reference dependencies and checkpoints described above, run the existin
 GPU accuracy suite against the native candidate using:
 
 ```bash
-HY_NOMAS_DIT_BACKEND=native python -m pytest \
+HY_NOMAS_DIT_BACKEND=native HY_NOMAS_DECODER_ATTENTION_BACKEND=shared_gqa python -m pytest \
   tests/e2e/accuracy/test_hy_nomas.py --run-level local_model -v
 ```
 

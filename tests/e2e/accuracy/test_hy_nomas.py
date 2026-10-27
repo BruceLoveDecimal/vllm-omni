@@ -83,6 +83,7 @@ def pipelines(model_cleanup):
         enforce_eager=True,
         custom_pipeline_args={
             "dit_backend": os.environ.get("HY_NOMAS_DIT_BACKEND", "reference"),
+            "decoder_attention_backend": os.environ.get("HY_NOMAS_DECODER_ATTENTION_BACKEND", "reference"),
             **({"text_encoder": os.environ["HY_NOMAS_TEXT_ENCODER"]} if "HY_NOMAS_TEXT_ENCODER" in os.environ else {}),
         },
     )

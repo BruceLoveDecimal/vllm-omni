@@ -115,7 +115,7 @@ def read_component_config(root: Path, component: str, filename: str, class_name:
     return config
 
 
-def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
+def build_decoder(config: dict[str, Any], device: torch.device, *, compact_gqa: bool = False) -> nn.Module:
     from hymm.models.vae.pixelumm_decoder.autoencoder import PixelUMMDCAELatentDecoder
     from hymm.models.vae.pixelumm_decoder.model import DCAEVPixelUMMDecoder, GenExpertArch
 
@@ -125,6 +125,10 @@ def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
         raise ValueError("Hy-Nomas local_attention_tile_pixels must be a nonnegative multiple of 16.")
     with set_default_torch_dtype(torch.bfloat16), torch.device(device):
         decoder = DCAEVPixelUMMDecoder(arch, local_attention_tile=local_pixels // 16)
+        if compact_gqa:
+            from vllm_omni.diffusion.models.hy_nomas.decoder_attention import enable_compact_gqa
+
+            enable_compact_gqa(decoder)
     vae = PixelUMMDCAELatentDecoder(
         decoder,
         **{
@@ -174,7 +178,12 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
         raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
-    allowed = {"text_encoder", "dit_backend", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
+    allowed = {
+        "text_encoder",
+        "dit_backend",
+        "decoder_attention_backend",
+        *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__),
+    }
     if custom.keys() - allowed:
         raise ValueError(f"Unsupported Hy-Nomas custom_pipeline_args: {sorted(custom.keys() - allowed)}")
     HyNomasARConfig.from_args(custom)
@@ -187,6 +196,8 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         raise ValueError("Hy-Nomas step execution requires the ARDiffusionEngine backend.")
     if custom.get("dit_backend", "reference") not in ("reference", "native"):
         raise ValueError("Hy-Nomas dit_backend must be reference or native.")
+    if custom.get("decoder_attention_backend", "reference") not in ("reference", "shared_gqa"):
+        raise ValueError("Hy-Nomas decoder_attention_backend must be reference or shared_gqa.")
     text_encoder = custom.get("text_encoder")
     if "text_encoder" in custom and (not isinstance(text_encoder, str) or not text_encoder.strip()):
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
@@ -313,7 +324,11 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             .eval()
             .requires_grad_(False)
         )
-        self.vae = build_decoder(decoder_config, self.device)
+        self.vae = build_decoder(
+            decoder_config,
+            self.device,
+            compact_gqa=(od_config.custom_pipeline_args or {}).get("decoder_attention_backend") == "shared_gqa",
+        )
         self.s_ratio = self.vae.spatial_compression_ratio
         self.patch_size = self.transformer.patch_size
         self.in_channels = self.transformer.config.in_channels
