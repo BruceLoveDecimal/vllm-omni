@@ -745,6 +745,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                     intra_seg_txt_offsets=state.extra["hy_nomas_intra_offsets"],
                     intra_seg_vid_windows=state.extra["hy_nomas_intra_windows"],
                     camera_rope_time_offset=0,
+                    **({"reuse_kv_staging": True} if isinstance(self.transformer, HyNomasTransformer3DModel) else {}),
                     **({"rotary_emb": state.extra["hy_nomas_rotary"]} if "hy_nomas_rotary" in state.extra else {}),
                 )
             if commit:

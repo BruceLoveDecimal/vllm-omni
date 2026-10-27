@@ -249,6 +249,7 @@ class HyNomasAttnProcessor:
         cache_valid_len=0,
         cache_txt=True,
         cache_mask=None,
+        reuse_kv_staging=False,
     ):
         query = attn.img_attn_q(hidden_states).unflatten(-1, (attn.heads, -1))
         key = attn.img_attn_k(hidden_states).unflatten(-1, (attn.heads, -1))
@@ -286,8 +287,19 @@ class HyNomasAttnProcessor:
             kv_cache["k"][:, history_length:stop].copy_(current_key[:, : write_mask.shape[1]])
             kv_cache["v"][:, history_length:stop].copy_(current_value[:, : write_mask.shape[1]])
             cache_mask[:, history_length:stop].copy_(write_mask)
-        key = torch.cat((kv_cache["k"][:, :history_length], current_key), dim=1)
-        value = torch.cat((kv_cache["v"][:, :history_length], current_value), dim=1)
+        attention_end = history_length + current_key.shape[1]
+        if reuse_kv_staging and attention_end <= kv_cache["k"].shape[1]:
+            # Only the uncommitted suffix is scratch. Committed history and its
+            # visibility mask remain unchanged until the clean forward commits.
+            for name, current in (("k", current_key), ("v", current_value)):
+                kv_cache[name][:, history_length:attention_end].copy_(current)
+            key = kv_cache["k"][:, :attention_end]
+            value = kv_cache["v"][:, :attention_end]
+        else:
+            # Continuation clean forwards attend extra text without committing
+            # it. Keep this once-per-chunk fallback when the write view is smaller.
+            key = torch.cat((kv_cache["k"][:, :history_length], current_key), dim=1)
+            value = torch.cat((kv_cache["v"][:, :history_length], current_value), dim=1)
         key_mask = torch.cat((cache_mask[:, :history_length], current_mask), dim=1)
         query = torch.cat((query, encoder_query), dim=1)
         output = self._compute_attention(
@@ -696,6 +708,7 @@ class HyNomasTransformer3DModel(nn.Module):
         intra_seg_vid_windows=None,
         camera_rope_time_offset=0,
         rotary_emb=None,
+        reuse_kv_staging=False,
     ):
         batch, _, frames, height, width = hidden_states.shape
         video_tokens = frames * height * width
@@ -750,6 +763,7 @@ class HyNomasTransformer3DModel(nn.Module):
                 attention_kwargs=dict(
                     encoder_attention_mask=text_mask,
                     kv_cache=kv_cache_list[index],
+                    reuse_kv_staging=reuse_kv_staging,
                     cache_valid_len=cache_valid_len,
                     update_cache=update_cache,
                     cache_txt=cache_txt,
