@@ -15,17 +15,22 @@ The kernels perform eager's operations in its order and round where it
 rounds, so what a test expects depends on whether a kernel reorders a
 reduction:
 
-* It does not: bit-exact. That is the GELU, the residual sums, and every
-  epilogue a GEMM feeds (RoPE and the K/V slot writes, the gated residual, the
-  GELU product) when the GEMM is cuBLAS's: float32 and the bfloat16 prefix
-  serve that way, and the bfloat16 action expert is run that way here too to
-  pin its rounding points.
-* It does (a Triton GEMM's accumulation, the RMS variance, softmax sums): the
-  result may differ where the reordering flips a rounding, and must be as
-  accurate as eager against a float64 evaluation of the same math: within
-  1.25x eager's relative L2 error and 1.5x its largest error. Eager's cuBLAS
+* It does not: bit-exact. That is the residual sums and every epilogue a
+  GEMM feeds (the V slot writes, the gated residual, the GELU product) when
+  the GEMM is cuBLAS's: float32 serves that way, and the bfloat16 action
+  expert is run that way here too to pin its rounding points.
+* It does (a Triton GEMM's accumulation, the RMS variance, softmax sums), or
+  it is RoPE, whose eager rotary kernel may contract its products into FMAs:
+  the result may differ where that flips a rounding, and must be as accurate
+  as eager against a float64 evaluation of the same math: within 1.25x
+  eager's relative L2 error and 1.5x its largest error. Eager's cuBLAS
   split-K GEMMs round twice in bfloat16, so the fused path is often the more
   accurate one.
+
+The eager ops are π0.5's own modules on vLLM's layers (``Pi05GemmaAttention``,
+``Pi05GemmaMLP``, ``RowParallelLinear``, ``GemmaRMSNorm``) and
+``Pi05AdaRMSNorm.forward_native``: on CUDA ``Pi05AdaRMSNorm`` itself dispatches
+a batch-1 call to the kernel under test.
 
 Needs a CUDA GPU; no checkpoint. ``-s`` prints each fused kernel's max absolute
 and relative L2 error against its eager op::
@@ -41,13 +46,8 @@ import pytest
 import torch
 import torch.nn as nn
 from transformers import GemmaConfig
-from transformers.models.gemma.modeling_gemma import (
-    GemmaAttention,
-    GemmaMLP,
-    GemmaRMSNorm,
-    GemmaRotaryEmbedding,
-    apply_rotary_pos_emb,
-)
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_omni.diffusion.models.pi05 import modeling_pi05 as M
 
@@ -163,24 +163,6 @@ def _prefix_pad_masks(seq_len: int) -> torch.Tensor:
     return pad
 
 
-# ── Elementwise: bit-exact ─────────────────────────────────────────────
-@pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
-def test_gelu_mul_is_bit_exact(dtype):
-    """The prefix MLP's ``act_fn(gate) · up`` between its cuBLAS GEMMs."""
-    tokens, width, mlp_width = SHAPES["prefix"]
-    mlp = GemmaMLP(_gemma_config(width, mlp_width))
-    gate = _randn(1, tokens, mlp_width, dtype=dtype, scale=3.0, seed=1)
-    up = _randn(1, tokens, mlp_width, dtype=dtype, seed=2)
-
-    expected = mlp.act_fn(gate) * up
-    actual = torch.empty_like(gate)
-    M._fused_gelu_mul(gate, up, actual)
-    _assert_bit_exact(actual, expected, "GELU-multiply", "GemmaMLP act_fn(gate) * up", dtype)
-
-    M._fused_gelu_mul(gate, up, gate)  # in place, as the prefix runs it
-    _assert_bit_exact(gate, expected, "in-place GELU-multiply", "GemmaMLP act_fn(gate) * up", dtype)
-
-
 # ── Norms: the RMS variance is a reordered reduction ──────────────────
 def _rms_norm_reference(x: torch.Tensor, eps: float, weight=None, scale=None, shift=None) -> torch.Tensor:
     x = x.double()
@@ -211,7 +193,12 @@ def test_rms_norm_matches_gemma_rms_norm(dtype, residual_add):
     if residual_add:
         _assert_bit_exact(summed_out, summed, kernel, "sublayer_out + residual", dtype)
     _assert_as_accurate_as_eager(
-        actual, expected, _rms_norm_reference(summed, norm.eps, weight=norm.weight), kernel, "GemmaRMSNorm", dtype
+        actual,
+        expected,
+        _rms_norm_reference(summed, norm.variance_epsilon, weight=norm.weight),
+        kernel,
+        "GemmaRMSNorm",
+        dtype,
     )
 
 
@@ -228,7 +215,7 @@ def test_final_rms_norm_keeps_the_residual_dtype(dtype):
     expected = norm(summed)
     actual = torch.empty_like(residual)
     M._fused_rms_norm(residual, norm, actual, add=mlp_out)
-    reference = _rms_norm_reference(summed, norm.eps, weight=norm.weight)
+    reference = _rms_norm_reference(summed, norm.variance_epsilon, weight=norm.weight)
     _assert_as_accurate_as_eager(
         actual, expected, reference, "residual-add final RMSNorm", "GemmaRMSNorm (model.norm)", dtype
     )
@@ -242,13 +229,34 @@ def test_adarms_norm_matches_pi05_adarms_norm(dtype):
     x = _randn(tokens, width, scale=4.0, seed=10)
     cond = _randn(1, width, seed=11)
 
-    expected = norm(x[None], cond)[0][0].to(dtype)
+    expected = norm.forward_native(x[None], cond)[0][0].to(dtype)
     modulation = M._adarms_modulation(norm, cond)
     actual = torch.empty(tokens, width, dtype=dtype, device=DEVICE)
     M._fused_rms_norm(x, norm, actual, modulation=modulation)
     scale, shift, _ = modulation.chunk(3)
     reference = _rms_norm_reference(x, norm.eps, scale=scale, shift=shift)
     _assert_as_accurate_as_eager(actual, expected, reference, "AdaRMSNorm", "Pi05AdaRMSNorm", dtype, _MODULATION_NOTE)
+
+
+def test_adarms_norm_custom_op_runs_the_kernel_for_batch_one():
+    """On CUDA ``Pi05AdaRMSNorm`` is the kernel for a batch-1 call and its
+    eager formula for any other; both return the same gate."""
+    tokens, width, _ = SHAPES["suffix"]
+    norm = _randomize(M.Pi05AdaRMSNorm(width, cond_dim=width), seed=9).to(DEVICE)
+    x = _randn(1, tokens, width, scale=4.0, seed=10)
+    cond = _randn(1, width, seed=11)
+
+    normed, gate = norm(x, cond)
+    kernel_out = torch.empty(tokens, width, device=DEVICE)
+    M._fused_rms_norm(x[0], norm, kernel_out, modulation=M._adarms_modulation(norm, cond))
+    assert torch.equal(normed[0], kernel_out)
+    eager_normed, eager_gate = norm.forward_native(x, cond)
+    assert torch.equal(gate.expand_as(eager_gate), eager_gate)
+    torch.testing.assert_close(normed, eager_normed)
+
+    batch_x, batch_cond = x.expand(2, -1, -1), cond.expand(2, -1)
+    batch_normed, _ = norm(batch_x, batch_cond)
+    assert torch.equal(batch_normed, norm.forward_native(batch_x, batch_cond)[0])
 
 
 # ── GEMMs with their epilogues ─────────────────────────────────────────
@@ -276,54 +284,49 @@ def _skip_unserved(gemm: str, dtype: torch.dtype) -> None:
         pytest.skip(f"{dtype} GEMMs stay on cuBLAS")
 
 
-@pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
-@pytest.mark.parametrize("part", SHAPES, ids=str)
-def test_qkv_rope_matches_eager(gemm, dtype, part):
-    """``q/k/v_proj`` then ``apply_rotary_pos_emb`` with the tower's RoPE table;
-    K and V land in their cache rows and nowhere else."""
-    _skip_unserved(gemm, dtype)
-    tokens, width, mlp_width = SHAPES[part]
-    config = _gemma_config(width, mlp_width)
-    attn = _proj_dtype_module(_randomize(GemmaAttention(config, layer_idx=0), seed=12), dtype)
-    rotary = GemmaRotaryEmbedding(config).to(DEVICE)
-    x = _randn(tokens, width, dtype=dtype, seed=13)
-    if part == "prefix":
-        position_ids = torch.cumsum(_prefix_pad_masks(tokens), dim=1) - 1
-    else:
-        position_ids = 376 + torch.arange(tokens, device=DEVICE)[None]
+def _rope64(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Gemma's half-split RoPE in float64; ``x`` ``(S, heads, D)``, ``cos``/``sin`` ``(S, D // 2)``."""
+    lo, hi = x.double().chunk(2, dim=-1)
+    cos, sin = cos.double()[:, None], sin.double()[:, None]
+    return torch.cat([lo * cos - hi * sin, hi * cos + lo * sin], dim=-1)
 
-    shape = (1, tokens, -1, HEAD_DIM)
-    q = attn.q_proj(x[None]).view(shape).transpose(1, 2)
-    k = attn.k_proj(x[None]).view(shape).transpose(1, 2)
-    v = attn.v_proj(x[None]).view(shape).transpose(1, 2)
-    # Eager's table, in its dtype: an input of the kernel, not part of its math.
-    cos, sin = rotary(v, position_ids)
-    q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
+def test_qkv_rope_matches_eager(gemm, dtype):
+    """The packed ``qkv_proj`` then RoPE, as ``Pi05GemmaAttention.project`` runs
+    them on a denoising step's chunk; K and V land in their workspace rows and
+    nowhere else."""
+    _skip_unserved(gemm, dtype)
+    tokens, width, mlp_width = SHAPES["suffix"]
+    attn = M.Pi05GemmaAttention(_gemma_config(width, mlp_width), None, prefix="self_attn")
+    attn = _proj_dtype_module(_randomize(attn, seed=12), dtype)
+    x = _randn(tokens, width, dtype=dtype, seed=13)
+    position_ids = 376 + torch.arange(tokens, device=DEVICE)[None]
+    cos, sin = M.Pi05GemmaRotaryEmbedding(HEAD_DIM).to(DEVICE)(position_ids)
+
+    q, k, v = attn.project(x[None], cos, sin)
+    # Eager's table, rounded to the projection dtype: an input of the kernel, not part of its math.
+    cos, sin = cos[0].to(dtype), sin[0].to(dtype)
+    w_q, w_k, w_v = attn.qkv_proj.weight.double().split([attn.q_size, attn.kv_size, attn.kv_size])
     x64 = x.double()
-    q64 = (x64 @ attn.q_proj.weight.double().t()).view(shape).transpose(1, 2)
-    k64 = (x64 @ attn.k_proj.weight.double().t()).view(shape).transpose(1, 2)
-    q64, k64 = apply_rotary_pos_emb(q64, k64, cos.double(), sin.double(), unsqueeze_dim=1)
-    v64 = x64 @ attn.v_proj.weight.double().t()
+    q64 = _rope64((x64 @ w_q.t()).view(tokens, HEADS, HEAD_DIM), cos, sin)
+    k64 = _rope64((x64 @ w_k.t()).view(tokens, 1, HEAD_DIM), cos, sin)
+    v64 = x64 @ w_v.t()
 
     offset = 7
     key_cache = torch.full((offset + tokens + 5, HEAD_DIM), float("nan"), dtype=dtype, device=DEVICE)
     value_cache = torch.full_like(key_cache, float("nan"))
     q_out = torch.empty(HEADS, tokens, HEAD_DIM, dtype=dtype, device=DEVICE)
     rows = slice(offset, offset + tokens)
-    M._fused_qkv_rope(x, attn, cos[0], sin[0], q_out, key_cache[rows], value_cache[rows])
+    M._fused_qkv_rope(x, attn, cos, sin, q_out, key_cache[rows], value_cache[rows])
 
     for cache in (key_cache, value_cache):
         assert torch.isnan(cache[:offset]).all() and torch.isnan(cache[offset + tokens :]).all()
-    note = (
-        "The q/k/v projection GEMMs run in torch (cuBLAS); the Triton kernel only applies RoPE and writes q, K and V."
-    )
-    _check_gemm_epilogue(
-        gemm, dtype, q_out, q[0].contiguous(), q64[0], "QKV+RoPE", f"q_proj + RoPE on the {part}", note
-    )
-    _check_gemm_epilogue(
-        gemm, dtype, key_cache[rows], k[0, 0], k64[0, 0], "QKV+RoPE", f"k_proj + RoPE on the {part}", note
-    )
-    _check_gemm_epilogue(gemm, dtype, value_cache[rows], v[0, 0], v64, "QKV+RoPE", f"v_proj on the {part}", note)
+    eager_q = q[0].transpose(0, 1).contiguous()
+    _assert_as_accurate_as_eager(q_out, eager_q, q64.transpose(0, 1), "QKV+RoPE", "qkv_proj + RoPE (q)", dtype)
+    _assert_as_accurate_as_eager(key_cache[rows], k[0, :, 0], k64[:, 0], "QKV+RoPE", "qkv_proj + RoPE (k)", dtype)
+    note = "The packed qkv_proj GEMM runs in torch (cuBLAS); the Triton kernel only writes V."
+    _check_gemm_epilogue(gemm, dtype, value_cache[rows], v[0, :, 0], v64, "QKV+RoPE", "qkv_proj (v)", note)
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
@@ -335,12 +338,12 @@ def test_linear_residual_matches_gated_residual(gemm, dtype, gated, n_in, tokens
     updated in place as the fused denoising step runs it."""
     _skip_unserved(gemm, dtype)
     _, width, _ = SHAPES["suffix"]
-    linear = _proj_dtype_module(_randomize(nn.Linear(n_in, width, bias=False), seed=17), dtype)
+    linear = _proj_dtype_module(_randomize(RowParallelLinear(n_in, width, bias=False), seed=17), dtype)
     x = _randn(tokens, n_in, dtype=dtype, seed=18)
     residual = _randn(tokens, width, scale=4.0, seed=19)
     gate = _randn(width, seed=20) if gated else None
 
-    expected = M._gated_residual(residual, linear(x[None])[0], gate)
+    expected = M._gated_residual(residual, linear(x[None])[0][0], gate)
     projection64 = x.double() @ linear.weight.double().t()
     reference = residual.double() + (gate.double() * projection64 if gated else projection64)
     actual = residual.clone()
@@ -354,21 +357,21 @@ def test_linear_residual_matches_gated_residual(gemm, dtype, gated, n_in, tokens
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("tokens", CHUNKS, ids=lambda tokens: f"chunk={tokens}")
 def test_linear_gelu_mul_matches_gemma_mlp_input(gemm, dtype, tokens):
-    """``act_fn(gate_proj(x)) · up_proj(x)``, the action expert's MLP up to ``down_proj``."""
+    """``GeluAndMul(gate_up_proj(x))``, the action expert's MLP up to ``down_proj``."""
     _skip_unserved(gemm, dtype)
     _, width, mlp_width = SHAPES["suffix"]
-    mlp = _proj_dtype_module(_randomize(GemmaMLP(_gemma_config(width, mlp_width)), seed=21), dtype)
+    mlp = M.Pi05GemmaMLP(_gemma_config(width, mlp_width), None, prefix="mlp")
+    mlp = _proj_dtype_module(_randomize(mlp, seed=21), dtype)
     x = _randn(tokens, width, dtype=dtype, seed=22)
 
-    expected = (mlp.act_fn(mlp.gate_proj(x[None])) * mlp.up_proj(x[None]))[0]
+    expected = mlp.act_fn(mlp.gate_up_proj(x[None])[0])[0]
     x64 = x.double()
-    reference = torch.nn.functional.gelu(x64 @ mlp.gate_proj.weight.double().t(), approximate="tanh") * (
-        x64 @ mlp.up_proj.weight.double().t()
-    )
+    w_gate, w_up = mlp.gate_up_proj.weight.double().chunk(2)
+    reference = torch.nn.functional.gelu(x64 @ w_gate.t(), approximate="tanh") * (x64 @ w_up.t())
     actual = torch.empty_like(expected)
     M._fused_linear_gelu_mul(x, mlp, actual)
-    eager = "GemmaMLP act_fn(gate_proj(x)) * up_proj(x)"
-    note = "The gate_proj and up_proj GEMMs run in torch (cuBLAS); the Triton kernel only applies the GELU and product."
+    eager = "Pi05GemmaMLP GeluAndMul(gate_up_proj(x))"
+    note = "The gate_up_proj GEMM runs in torch (cuBLAS); the activation is the eager GeluAndMul too."
     _check_gemm_epilogue(gemm, dtype, actual, expected, reference, "linear GELU-multiply", eager, note)
 
 
@@ -428,7 +431,7 @@ def test_final_head_matches_norm_and_action_out_proj(dtype):
     x = _randn(tokens, width, scale=4.0, seed=25)
     cond = _randn(1, width, seed=26)
 
-    normed, _ = norm(x[None], cond)
+    normed, _ = norm.forward_native(x[None], cond)
     expected = head(normed.to(head.weight.dtype))[0]
     modulation = M._adarms_modulation(norm, cond)
     scale, shift, _ = modulation.chunk(3)

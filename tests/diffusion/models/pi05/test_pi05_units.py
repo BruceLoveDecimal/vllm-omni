@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
 from vllm_omni.diffusion.models.pi05 import modeling_pi05
 from vllm_omni.diffusion.models.pi05.config import (
@@ -406,14 +407,29 @@ class _GraphTarget:
         self.events.append("enable_fused_kernels")
 
 
-def _graph_install_pipeline(device: str, events: list, monkeypatch, fused_kernels_error=None):
+def _graph_install_pipeline(
+    device: str, events: list, monkeypatch, fused_kernels_error=None, cuda_graph_decode=True, torch_compile=False
+):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05 import pipeline_pi05
     from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
 
     # Capture needs a GPU; test_pi05_cuda_graph_parity.py runs the real one.
     monkeypatch.setattr(Pi05CUDAGraphs, "capture", lambda graphs: events.append("capture"))
+    monkeypatch.setattr(pipeline_pi05.current_omni_platform, "supports_torch_inductor", lambda: True)
+
+    def fake_regionally_compile(model, **kwargs):
+        events.append(("compile", kwargs))
+        return model
+
+    monkeypatch.setattr(pipeline_pi05, "regionally_compile", fake_regionally_compile)
     pipeline = object.__new__(Pi05Pipeline)
     pipeline._device = torch.device(device)
     pipeline.model = _GraphTarget(events, fused_kernels_error)
+    pipeline.enable_cuda_graph_decode = cuda_graph_decode and device == "cuda"
+    pipeline.config = SimpleNamespace(torch_compile=torch_compile)
+    pipeline.od_config = SimpleNamespace(diffusion_compile_dynamic=True)
     return pipeline
 
 
@@ -440,6 +456,48 @@ def test_pipeline_installs_cuda_graphs_unless_enforce_eager(enforce_eager, devic
 
     assert isinstance(pipeline.model.cuda_graphs, Pi05CUDAGraphs) is installed
     assert events == (["enable_fused_kernels", "capture"] if installed else [])
+
+
+def test_pipeline_keeps_the_fused_kernels_without_cuda_graph_decode(monkeypatch):
+    """``enable_cuda_graph_decode: false`` drops the graphs, not the kernels."""
+    from types import SimpleNamespace
+
+    events: list = []
+    pipeline = _graph_install_pipeline("cuda", events, monkeypatch, cuda_graph_decode=False)
+
+    pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False))
+    pipeline.setup_compile()
+
+    assert events == ["enable_fused_kernels"]
+    assert pipeline.model.cuda_graphs is None
+
+
+def test_setup_compile_is_off_unless_the_deploy_config_asks(monkeypatch):
+    """The runner calls ``setup_compile`` whenever ``enforce_eager`` is unset;
+    the shipped config keeps the layers uncompiled."""
+    events: list = []
+    pipeline = _graph_install_pipeline("cuda", events, monkeypatch)
+
+    pipeline.setup_compile()
+
+    assert events == []
+
+
+def test_torch_compile_captures_the_graphs_after_compiling(monkeypatch):
+    """With ``torch_compile`` the capture moves from init to ``setup_compile``,
+    after the layers are compiled with inductor's own cudagraphs off."""
+    from types import SimpleNamespace
+
+    events: list = []
+    pipeline = _graph_install_pipeline("cuda", events, monkeypatch, torch_compile=True)
+
+    pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False))
+    assert events == ["enable_fused_kernels"]
+    pipeline.setup_compile()
+
+    options = {"triton.cudagraphs": False, "triton.cudagraph_trees": False}
+    assert events == ["enable_fused_kernels", ("compile", {"dynamic": True, "options": options}), "capture"]
+    assert isinstance(pipeline.model.cuda_graphs, Pi05CUDAGraphs)
 
 
 def test_pipeline_fails_when_the_fused_kernels_cannot_run(monkeypatch):
@@ -801,9 +859,33 @@ def _shrink_gemma_backbones():
     patch.undo()
 
 
+def _init_tiny_weights(model, seed: int = 0) -> None:
+    """Deterministic weights, as a checkpoint would provide.
+
+    vLLM's layers allocate their weights uninitialized (a checkpoint always
+    overwrites them), so the tiny model draws every weight itself: normal(0.02)
+    and zero biases, except the norms, which keep their identity init, and the
+    AdaRMS ``dense``, which keeps its zero init (closed gates).
+    """
+    generator = torch.Generator().manual_seed(seed)
+    identity_init = [module for module in model.modules() if isinstance(module, (GemmaRMSNorm, torch.nn.LayerNorm))]
+    identity_init += [module.dense for module in model.modules() if isinstance(module, Pi05AdaRMSNorm)]
+    for module in model.modules():
+        if any(module is kept for kept in identity_init):
+            continue
+        for name, param in module.named_parameters(recurse=False):
+            if name == "bias":
+                param.data.zero_()
+            else:
+                param.data.normal_(std=0.02, generator=generator)
+
+
 def _tiny_pi05_model():
     """A fresh model. Use for tests that load weights or otherwise mutate it."""
-    return Pi05ForActionPrediction(Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4))
+    model = Pi05ForActionPrediction(Pi05Config(max_action_dim=8, max_state_dim=8, chunk_size=4, n_action_steps=4))
+    _init_tiny_weights(model)
+    model.process_weights_after_loading()
+    return model
 
 
 @pytest.fixture(scope="module")
@@ -1193,6 +1275,7 @@ def test_bfloat16_layout_is_applied_before_checkpoint_load(monkeypatch, tmp_path
     time projections remain float32. The layout is established before loading
     so float32-retained weights never pass through bfloat16.
     """
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.pi05 import pipeline_pi05
 
     class _TinyPi05(torch.nn.Module):
@@ -1208,6 +1291,9 @@ def test_bfloat16_layout_is_applied_before_checkpoint_load(monkeypatch, tmp_path
             self.time_mlp_in = torch.nn.Linear(2, 2)
             self.time_mlp_out = torch.nn.Linear(2, 2)
 
+        def process_weights_after_loading(self):
+            pass
+
     # DiffusersLoader constructs custom pipelines under the requested default
     # dtype. Start fully in bfloat16 to verify that the helper restores every
     # float32-retained tensor rather than relying on the construction default.
@@ -1221,9 +1307,10 @@ def test_bfloat16_layout_is_applied_before_checkpoint_load(monkeypatch, tmp_path
     pipeline = object.__new__(pipeline_pi05.Pi05Pipeline)
     pipeline.model_dir = str(tmp_path)
     pipeline.config = object()
+    pipeline.od_config = OmniDiffusionConfig(model=str(tmp_path))
     pipeline._device = torch.device("cpu")
     pipeline._torch_dtype = torch.bfloat16
-    monkeypatch.setattr(pipeline_pi05, "Pi05ForActionPrediction", lambda _config: model)
+    monkeypatch.setattr(pipeline_pi05, "Pi05ForActionPrediction", lambda _config, quant_config: model)
     monkeypatch.setattr(pipeline_pi05.Pi05Pipeline, "_load_checkpoint", fake_load_checkpoint)
 
     initialized = pipeline._initialize_model()
@@ -1255,8 +1342,6 @@ def test_bfloat16_runs_and_tracks_float32(tiny_model):
     happen, activations overflowing to inf, or a dtype mismatch that would make
     the two outputs unrelated.
     """
-    import copy
-
     images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
     masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
     lang = torch.zeros(1, 200, dtype=torch.long)
@@ -1277,7 +1362,9 @@ def test_bfloat16_runs_and_tracks_float32(tiny_model):
     reference = run(tiny_model.eval(), torch.float32)
     from vllm_omni.diffusion.models.pi05.pipeline_pi05 import _set_inference_dtype
 
-    bf16_model = copy.deepcopy(tiny_model).eval()
+    # The same weights: the tiny model's init is seeded. (vLLM's parameters do
+    # not deep-copy.)
+    bf16_model = _tiny_pi05_model().eval()
     _set_inference_dtype(bf16_model, torch.bfloat16)
 
     # The cast actually happened — otherwise everything below passes trivially.

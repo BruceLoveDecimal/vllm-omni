@@ -34,6 +34,7 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
 from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
@@ -42,6 +43,8 @@ from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor, observ
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.component_config import resolve_component_quant_config
 
 logger = init_logger(__name__)
 
@@ -180,6 +183,14 @@ class Pi05Pipeline(nn.Module):
         # Sized for one observation, the deployed default (``max_num_seqs: 1``).
         # A larger batch gets a workspace of its own size in ``sample_actions``.
         self.model.kv_workspace = self.model.new_kv_workspace(batch_size=1)
+        # ``Pi05CUDAGraphs`` replays ``sample_actions``; read by the model
+        # runner (inductor cudagraphs off under compile) and the offloader.
+        self.enable_cuda_graph_decode = (
+            bool(getattr(od_config, "enable_cuda_graph_decode", True))
+            and not od_config.enforce_eager
+            and self._device.type == "cuda"
+        )
+        self.model.enable_cuda_graph_decode = self.enable_cuda_graph_decode
         self._install_cuda_graphs(od_config)
 
         self.processor = Pi05Processor(self.config, self.tokenizer, self._device)
@@ -277,10 +288,16 @@ class Pi05Pipeline(nn.Module):
         if not self.has_real_checkpoint():
             expected = os.path.join(self.model_dir or "<missing-model-dir>", "model.safetensors")
             raise FileNotFoundError(f"π0.5 serving requires checkpoint weights at {expected}.")
-        model = Pi05ForActionPrediction(self.config)
+        # Only the PaliGemma language model is quantized; a component config
+        # can still narrow it, under the ``language_model`` prefix.
+        quant_config = resolve_component_quant_config(self.od_config.quantization_config, "language_model")
+        # Built on the device: an online-quantized weight starts on ``meta``
+        # and is materialized there as it loads, which ``.to(device)`` cannot move.
+        with torch.device(self._device):
+            model = Pi05ForActionPrediction(self.config, quant_config=quant_config)
         _set_inference_dtype(model, self._torch_dtype)
-        model.to(device=self._device)
         self._load_checkpoint(model)
+        model.process_weights_after_loading()
         model.eval()
         return model
 
@@ -290,8 +307,10 @@ class Pi05Pipeline(nn.Module):
         The stage's ``enforce_eager`` (deploy yaml, or ``--enforce-eager`` on the
         CLI, which takes precedence) keeps the eager baseline. Otherwise the
         optimized path is set up here, at init: the fused Triton kernels are
-        enabled, and the CUDA graphs are captured over them and installed. A
-        failure of either raises rather than silently serving eagerly.
+        enabled, and unless ``enable_cuda_graph_decode`` is off the CUDA graphs
+        are captured over them and installed. With ``torch_compile`` the capture
+        waits for ``setup_compile``, so the graphs record the compiled layers.
+        A failure of either raises rather than silently serving eagerly.
         """
         if od_config.enforce_eager:
             logger.info("Pi05Pipeline: enforce_eager is set; sample_actions runs eagerly.")
@@ -309,6 +328,15 @@ class Pi05Pipeline(nn.Module):
                 "π0.5's optimized path needs its fused kernels. Set `enforce_eager: true` in the deploy "
                 "config, or pass --enforce-eager, to serve eagerly."
             ) from exc
+        if not self.enable_cuda_graph_decode:
+            logger.info("Pi05Pipeline: enable_cuda_graph_decode is off; sample_actions runs without CUDA graphs.")
+            return
+        if self.config.torch_compile and current_omni_platform.supports_torch_inductor():
+            logger.info("Pi05Pipeline: torch_compile is set; the CUDA graphs are captured in setup_compile.")
+            return
+        self._capture_cuda_graphs()
+
+    def _capture_cuda_graphs(self) -> None:
         graphs = Pi05CUDAGraphs(self.model)
         start = time.perf_counter()
         graphs.capture()
@@ -318,6 +346,28 @@ class Pi05Pipeline(nn.Module):
             "sample_actions runs its optimized path.",
             time.perf_counter() - start,
         )
+
+    def setup_compile(self) -> None:
+        """The model runner's compile hook, called unless the stage is ``enforce_eager``.
+
+        Compiles only with the deploy config's ``torch_compile``: the Gemma
+        decoder layers, one ``torch.compile`` each (``regionally_compile``;
+        ``diffusion_compile_granularity`` has no other granularity to offer
+        here), then captures the CUDA graphs over them. Inductor's own
+        cudagraphs stay off under the graphs this pipeline captures, so the
+        two never stack. Compilation is lazy and happens in the capture's
+        warm-up. The batch-1 denoising step runs the fused kernels, not the
+        expert layers, so on the served path compiling changes the prefix pass.
+        """
+        if not self.config.torch_compile:
+            logger.info("Pi05Pipeline: torch_compile is off in the deploy config; the layers run uncompiled.")
+            return
+        compile_kwargs: dict[str, Any] = {"dynamic": self.od_config.diffusion_compile_dynamic}
+        if self.enable_cuda_graph_decode:
+            compile_kwargs["options"] = {"triton.cudagraphs": False, "triton.cudagraph_trees": False}
+        regionally_compile(self.model, **compile_kwargs)
+        if self.enable_cuda_graph_decode:
+            self._capture_cuda_graphs()
 
     def _load_checkpoint(self, model: Pi05ForActionPrediction) -> None:
         import safetensors.torch

@@ -20,10 +20,16 @@ the suffix attention mask and leaves ``[1] + [0] * (horizon - 1)``.
 ~116M parameters against the ~8K that ``state_proj`` saves. (LeRobot's README
 says otherwise; the checkpoint disagrees.)
 
+The layers are vLLM-Omni's: both Gemma towers run on vLLM's packed parallel
+linear layers (``QKVParallelLinear``, ``MergedColumnParallelLinear``,
+``RowParallelLinear``), ``GemmaRMSNorm`` and ``GeluAndMul``, with the omni
+``RotaryEmbedding``; SigLIP is vLLM's ``SiglipVisionModel``. Only the
+PaliGemma language model takes a ``quant_config``, and only when one is set.
+The AdaRMS norm vLLM lacks is a ``CustomOp`` of its own.
+
 The optimized path's fused Triton kernels live here too, next to the eager
 layers they replace; ``Pi05ForActionPrediction.enable_fused_kernels`` switches
-the prefix forward and the denoising step onto them. The eager baseline never
-runs them.
+the denoising step onto them. The eager baseline never runs them.
 
 Reference implementations:
    - OpenPI: openpi/src/openpi/models_pytorch/pi0_pytorch.py, gemma_pytorch.py
@@ -42,15 +48,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.auto import CONFIG_MAPPING
-from transformers.models.gemma.modeling_gemma import (
-    GemmaForCausalLM,
-    apply_rotary_pos_emb,
+from vllm.model_executor.layers.activation import GeluAndMul
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
 )
-from transformers.models.paligemma.modeling_paligemma import (
-    PaliGemmaForConditionalGeneration,
-)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.siglip import SiglipVisionModel
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
+
+from vllm_omni.diffusion.layers.custom_op import CustomOp
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
@@ -66,6 +77,17 @@ DEFAULT_MAX_TOKEN_LEN = 200  # π0 uses 48
 DEFAULT_NUM_INFERENCE_STEPS = 10
 DEFAULT_IMAGE_RESOLUTION = (224, 224)  # openpi/models/model.py IMAGE_RESOLUTION
 DEFAULT_STATE_NUM_BINS = 256  # openpi PaliGemmaTokenizer.tokenize()
+
+# Checkpoint names → (packed vLLM parameter, shard) in both Gemma towers.
+_PACKED_PARAMS = (
+    (".self_attn.qkv_proj.", ".self_attn.q_proj.", "q"),
+    (".self_attn.qkv_proj.", ".self_attn.k_proj.", "k"),
+    (".self_attn.qkv_proj.", ".self_attn.v_proj.", "v"),
+    (".mlp.gate_up_proj.", ".mlp.gate_proj.", 0),
+    (".mlp.gate_up_proj.", ".mlp.up_proj.", 1),
+)
+_PACKED_SHARDS = {"qkv_proj": {"q", "k", "v"}, "gate_up_proj": {0, 1}}
+_UNUSED_EXPERT_LM_HEAD = "paligemma_with_expert.gemma_expert.lm_head.weight"
 
 # Large negative value to fill masked-out positions in a float attention mask.
 # Matches OpenPI's constant exactly so that numerics line up during parity.
@@ -151,7 +173,7 @@ def prepare_attention_masks_4d(att_2d_masks: torch.Tensor) -> torch.Tensor:
     return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
 
-class Pi05AdaRMSNorm(nn.Module):
+class Pi05AdaRMSNorm(CustomOp):
     """Adaptive RMSNorm conditioned on the flow-matching timestep.
 
     π0 conditions on time by *concatenating* a time embedding onto each action
@@ -165,9 +187,16 @@ class Pi05AdaRMSNorm(nn.Module):
     modulation with a closed gate — matching OpenPI's parameterization.
 
     Note the shape of the unconditioned branch: ``normed * (1 + weight)`` with
-    ``weight`` zero-initialized, which is exactly ``transformers``'
-    ``GemmaRMSNorm``. That equivalence is why only the *expert* norms need
-    replacing here and the PaliGemma prefix can keep stock Gemma layers.
+    ``weight`` zero-initialized, which is exactly vLLM's ``GemmaRMSNorm``. That
+    equivalence is why only the *expert* norms need replacing here and the
+    PaliGemma prefix keeps ``GemmaRMSNorm``.
+
+    vLLM has no conditioned equivalent, so this is a ``CustomOp`` of its own:
+    ``forward_native`` is the eager formula, and on CUDA a conditioned batch-1
+    call on CUDA tensors runs R0's fused Triton kernel (``_rms_norm_kernel``),
+    which differs from it by the order of the variance sum only. Any other
+    call, a compiled one, or a platform without Triton, falls back to
+    ``forward_native``.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6, cond_dim: int | None = None):
@@ -188,7 +217,39 @@ class Pi05AdaRMSNorm(nn.Module):
         var = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
         return x.float() * torch.rsqrt(var + self.eps)
 
-    def forward(
+    def _check_cond(self, cond: torch.Tensor | None) -> None:
+        if cond is None:
+            # A conditioned norm silently falling back to an unconditioned one
+            # would drop the entire timestep signal and still return a
+            # well-shaped, finite tensor.
+            raise ValueError(
+                "Pi05AdaRMSNorm was built with cond_dim="
+                f"{self.cond_dim} but called without an AdaRMS conditioning vector."
+            )
+        if cond.shape[-1] != self.cond_dim:
+            raise ValueError(f"Expected AdaRMS cond dim {self.cond_dim}, got {cond.shape[-1]}")
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        cond: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not HAS_TRITON or not x.is_cuda or self.dense is None or cond is None:
+            return self.forward_native(x, cond)
+        # Under torch.compile inductor fuses the eager formula itself; it cannot
+        # re-emit this kernel, whose source reads ``tldevice``.
+        if torch.compiler.is_compiling():
+            return self.forward_native(x, cond)
+        if cond.shape[0] != 1 or x.shape[0] != 1:
+            return self.forward_native(x, cond)
+        self._check_cond(cond)
+        modulation = _adarms_modulation(self, cond)
+        rows = x.reshape(-1, self.dim)
+        normed = torch.empty_like(rows)
+        _fused_rms_norm(rows, self, normed, modulation=modulation)
+        return normed.view(x.shape), modulation[2 * self.dim :].to(x.dtype)
+
+    def forward_native(
         self,
         x: torch.Tensor,
         cond: torch.Tensor | None = None,
@@ -200,18 +261,7 @@ class Pi05AdaRMSNorm(nn.Module):
             normed = normed * (1.0 + self.weight.float())
             return normed.to(dtype), None
 
-        if cond is None:
-            # A conditioned norm silently falling back to an unconditioned one
-            # would drop the entire timestep signal and still return a
-            # well-shaped, finite tensor.
-            raise ValueError(
-                "Pi05AdaRMSNorm was built with cond_dim="
-                f"{self.cond_dim} but called without an AdaRMS conditioning vector."
-            )
-
-        if cond.shape[-1] != self.cond_dim:
-            raise ValueError(f"Expected AdaRMS cond dim {self.cond_dim}, got {cond.shape[-1]}")
-
+        self._check_cond(cond)
         modulation = self.dense(cond.to(self.dense.weight.dtype))
         if x.ndim == 3:
             # (B, 3*dim) → (B, 1, 3*dim), broadcast across the token axis: the
@@ -337,14 +387,6 @@ class Pi05StepKVWorkspace:
         self.key[layer_idx, :, :, : self.prefix_len].copy_(key)
         self.value[layer_idx, :, :, : self.prefix_len].copy_(value)
 
-    def write_suffix(self, layer_idx: int, key: torch.Tensor, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Write the suffix K/V behind the cached prefix; return the layer's full K/V."""
-        if key.dtype != self.key.dtype:
-            raise TypeError(f"Suffix K/V is {key.dtype}, but the KV workspace holds {self.key.dtype}.")
-        self.key[layer_idx, :, :, self.prefix_len :].copy_(key)
-        self.value[layer_idx, :, :, self.prefix_len :].copy_(value)
-        return self.key[layer_idx], self.value[layer_idx]
-
     def export_prefix(self, row: int, pad_mask: torch.Tensor) -> Pi05RequestPrefixKV:
         """A request-owned copy of row ``row``'s prefix, with its ``(prefix_len,)`` pad mask."""
         return Pi05RequestPrefixKV(
@@ -371,113 +413,342 @@ class Pi05StepKVWorkspace:
         return torch.stack([prefix.pad_mask for prefix in prefixes])
 
 
+def _linear_dtype(linear: nn.Module) -> torch.dtype:
+    """The dtype ``linear`` computes in: its weight's, unless quantization stores the weight narrower.
+
+    A quantized vLLM linear (fp8, say) keeps the activation dtype it was built
+    for in ``params_dtype``; an unquantized one, and ``nn.Linear``, compute in
+    their weight's dtype, which the serving dtype layout may have changed
+    after construction.
+    """
+    weight = linear.weight
+    if weight.dtype in (torch.float32, torch.bfloat16, torch.float16):
+        return weight.dtype
+    return linear.params_dtype
+
+
 def _match(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
-    """Cast ``tensor`` to the dtype ``module``'s weight expects."""
-    return tensor.to(module.weight.dtype) if tensor.dtype != module.weight.dtype else tensor
+    """Cast ``tensor`` to the dtype ``module`` computes in."""
+    dtype = _linear_dtype(module)
+    return tensor.to(dtype) if tensor.dtype != dtype else tensor
 
 
-def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, position_ids, paligemma):
-    """Run one PaliGemma LM layer on the prefix, returning the layer output and
-    the post-RoPE ``(k, v)`` for the suffix pass.
+class Pi05GemmaRotaryEmbedding(nn.Module):
+    """Gemma's RoPE angles: the half-split ``(cos, sin)`` table for each position.
+
+    The same ``inv_freq`` as ``transformers``' ``GemmaRotaryEmbedding``, kept a
+    buffer so the serving dtype layout casts it as it casts that one. Applying
+    the rotation is ``Pi05GemmaAttention.rotary``'s job.
+    """
+
+    def __init__(self, head_dim: int, base: float = 10000.0):
+        super().__init__()
+        exponents = torch.arange(0, head_dim, 2, dtype=torch.int64).float() / head_dim
+        self.register_buffer("inv_freq", 1.0 / (base**exponents), persistent=False)
+
+    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(B, S)`` positions → float32 ``(B, S, head_dim // 2)`` ``cos`` and ``sin``."""
+        freqs = position_ids[..., None].float() * self.inv_freq.float()
+        return freqs.cos(), freqs.sin()
+
+
+class Pi05GemmaAttention(nn.Module):
+    """Gemma self-attention projections on vLLM layers: packed Q/K/V, RoPE and ``o_proj``.
+
+    The attention itself is not here: the prefix pass and the suffix pass
+    attend over different K/V (``Pi05GemmaDecoderLayer`` /
+    ``Pi05ExpertDecoderLayer``). ``quant_config`` reaches the projections; it
+    is ``None`` except in the PaliGemma prefix with quantization enabled.
+    """
+
+    def __init__(self, config, quant_config: QuantizationConfig | None, prefix: str):
+        super().__init__()
+        self.config = config
+        self.head_dim = config.head_dim
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=config.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=config.num_attention_heads,
+            total_num_kv_heads=config.num_key_value_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            input_size=config.num_attention_heads * self.head_dim,
+            output_size=config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+        self.num_heads = self.qkv_proj.num_heads
+        self.num_kv_heads = self.qkv_proj.num_kv_heads
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = 1.0 / math.sqrt(self.head_dim)
+        # Gemma rotates the two halves of each head (NeoX style).
+        self.rotary = RotaryEmbedding(is_neox_style=True)
+
+    def project(
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(B, S, width)`` → post-RoPE ``q`` ``(B, S, heads, head_dim)`` and ``k``, ``v``
+        ``(B, S, kv_heads, head_dim)``. ``cos``/``sin`` are the float32 ``(B, S,
+        head_dim // 2)`` tables, rounded here to the projections' output dtype
+        as ``transformers`` rounds its table.
+
+        The rotary op shares one table across its batch, while π0.5's
+        positions differ per row, so the batch is flattened into the token axis.
+        """
+        batch_size, seq_len = x.shape[:2]
+        qkv, _ = self.qkv_proj(x)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        tokens = batch_size * seq_len
+        cos = cos.reshape(tokens, -1).to(qkv.dtype)
+        sin = sin.reshape(tokens, -1).to(qkv.dtype)
+        # The rotary op dispatches on the platform, and its CUDA kernel takes
+        # CUDA tensors only; tensors elsewhere rotate natively.
+        rotate = self.rotary if x.is_cuda else self.rotary.forward_native
+        q = rotate(q.reshape(1, tokens, self.num_heads, self.head_dim), cos, sin)
+        k = rotate(k.reshape(1, tokens, self.num_kv_heads, self.head_dim), cos, sin)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        return q, k, v
+
+
+class Pi05GemmaMLP(nn.Module):
+    """GeGLU MLP on vLLM layers: packed gate/up projection, ``gelu_tanh(gate) · up``, ``down_proj``."""
+
+    def __init__(self, config, quant_config: QuantizationConfig | None, prefix: str):
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=config.hidden_size,
+            output_sizes=[config.intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            input_size=config.intermediate_size,
+            output_size=config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        if config.hidden_act != "gelu_pytorch_tanh":
+            raise ValueError(f"π0.5's Gemma MLP uses gelu_pytorch_tanh, got {config.hidden_act!r}.")
+        self.act_fn = GeluAndMul(approximate="tanh")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        out, _ = self.down_proj(self.act_fn(gate_up))
+        return out
+
+
+class Pi05GemmaDecoderLayer(nn.Module):
+    """One PaliGemma language-model layer on the prefix.
 
     Identical to π0: the prefix backbone is unchanged in π0.5 (no AdaRMS —
     there is no timestep in the prefix).
     """
-    model = paligemma.model.language_model
-    layer = model.layers[layer_idx]
-    residual = hidden_states
-    x = _match(layer.input_layernorm(hidden_states), layer.self_attn.q_proj)
 
-    hidden_shape = (*x.shape[:-1], -1, layer.self_attn.head_dim)
-    q = layer.self_attn.q_proj(x).view(hidden_shape).transpose(1, 2)
-    k = layer.self_attn.k_proj(x).view(hidden_shape).transpose(1, 2)
-    v = layer.self_attn.v_proj(x).view(hidden_shape).transpose(1, 2)
+    def __init__(self, config, quant_config: QuantizationConfig | None, prefix: str, cond_dim: int | None = None):
+        super().__init__()
+        self.self_attn = Pi05GemmaAttention(config, quant_config, prefix=f"{prefix}.self_attn")
+        self.mlp = Pi05GemmaMLP(config, quant_config, prefix=f"{prefix}.mlp")
+        if cond_dim is None:
+            self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.input_layernorm = Pi05AdaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim)
+            self.post_attention_layernorm = Pi05AdaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim
+            )
 
-    cos, sin = model.rotary_emb(v, position_ids)
-    q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the layer output and its post-RoPE ``(k, v)``, ``(B, kv_heads, S, head_dim)``,
+        which the suffix pass attends over."""
+        attn = self.self_attn
+        residual = hidden_states
+        x = _match(self.input_layernorm(hidden_states), attn.qkv_proj)
 
-    att = _attend(
-        q,
-        k,
-        v,
-        attention_mask,
-        num_kv_groups=layer.self_attn.num_key_value_groups,
-        scaling=1.0 / math.sqrt(layer.self_attn.head_dim),
-    )
-    att = att.transpose(1, 2).reshape(q.shape[0], -1, q.shape[1] * layer.self_attn.head_dim)
+        q, k, v = attn.project(x, cos, sin)
+        k, v = k.transpose(1, 2), v.transpose(1, 2)
+        att = _attend(q.transpose(1, 2), k, v, attention_mask, attn.num_key_value_groups, attn.scaling)
+        att = att.transpose(1, 2).reshape(q.shape[0], q.shape[1], attn.q_size)
 
-    out = layer.self_attn.o_proj(_match(att, layer.self_attn.o_proj)) + residual
-    after_resid = out
-    normed = layer.post_attention_layernorm(out)
-    out = layer.mlp(_match(normed, layer.mlp.up_proj)) + after_resid
-    return out, (k, v)
+        out, _ = attn.o_proj(_match(att, attn.o_proj))
+        out = out + residual
+        after_resid = out
+        normed = self.post_attention_layernorm(out)
+        out = self.mlp(_match(normed, self.mlp.gate_up_proj)) + after_resid
+        return out, k, v
 
 
-def _compute_layer_suffix_only(
-    layer_idx,
-    hidden_states,
-    kv_workspace,
-    attention_mask,
-    position_ids,
-    gemma_expert,
-    adarms_cond,
-):
-    """Run one action-expert layer on the suffix with AdaRMS conditioning.
+class Pi05ExpertDecoderLayer(Pi05GemmaDecoderLayer):
+    """One action-expert layer on the suffix, with AdaRMS conditioning.
 
     This is where π0.5 diverges from π0. Both norms are
     :class:`Pi05AdaRMSNorm` and each returns a gate that scales its sublayer's
-    contribution to the residual stream. ``kv_workspace`` is the
-    :class:`Pi05StepKVWorkspace` holding this layer's prefix K/V; the suffix K/V is
-    written behind it.
+    contribution to the residual stream.
     """
-    layer = gemma_expert.model.layers[layer_idx]
 
-    residual = hidden_states
-    x, gate = layer.input_layernorm(hidden_states, adarms_cond)
-    x = _match(x, layer.self_attn.q_proj)
+    def __init__(self, config, prefix: str, cond_dim: int):
+        super().__init__(config, quant_config=None, prefix=prefix, cond_dim=cond_dim)
 
-    hidden_shape = (*x.shape[:-1], -1, layer.self_attn.head_dim)
-    q = layer.self_attn.q_proj(x).view(hidden_shape).transpose(1, 2)
-    k_suf = layer.self_attn.k_proj(x).view(hidden_shape).transpose(1, 2)
-    v_suf = layer.self_attn.v_proj(x).view(hidden_shape).transpose(1, 2)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        adarms_cond: torch.Tensor,
+        key_slots: torch.Tensor,
+        value_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """``key_slots``/``value_slots`` are this layer's ``[prefix | suffix]`` rows of the
+        :class:`Pi05StepKVWorkspace`, ``(B, kv_heads, prefix_len + suffix_len, head_dim)``:
+        the suffix K/V is written behind the cached prefix, and the layer attends
+        over the whole row rather than over a fresh concatenation."""
+        attn = self.self_attn
+        prefix_len = key_slots.shape[2] - hidden_states.shape[1]
 
-    # RoPE frequencies are shared between PaliGemma and the expert.
-    cos, sin = gemma_expert.model.rotary_emb(v_suf, position_ids)
-    q, k_suf = apply_rotary_pos_emb(q, k_suf, cos, sin, unsqueeze_dim=1)
+        residual = hidden_states
+        x, gate = self.input_layernorm(hidden_states, adarms_cond)
+        x = _match(x, attn.qkv_proj)
 
-    # Attend over [cached prefix K/V | suffix K/V], written in place rather
-    # than concatenated into a new buffer on every step.
-    k, v = kv_workspace.write_suffix(layer_idx, k_suf, v_suf)
+        # RoPE frequencies are shared between PaliGemma and the expert.
+        q, k_suf, v_suf = attn.project(x, cos, sin)
+        key_slots[:, :, prefix_len:].copy_(k_suf.transpose(1, 2))
+        value_slots[:, :, prefix_len:].copy_(v_suf.transpose(1, 2))
 
-    att = _attend(
-        q,
-        k,
-        v,
-        attention_mask,
-        num_kv_groups=layer.self_attn.num_key_value_groups,
-        scaling=1.0 / math.sqrt(layer.self_attn.head_dim),
-    )
-    att = att.transpose(1, 2).reshape(q.shape[0], -1, q.shape[1] * layer.self_attn.head_dim)
+        att = _attend(
+            q.transpose(1, 2), key_slots, value_slots, attention_mask, attn.num_key_value_groups, attn.scaling
+        )
+        att = att.transpose(1, 2).reshape(q.shape[0], q.shape[1], attn.q_size)
 
-    hidden_states = _gated_residual(residual, layer.self_attn.o_proj(_match(att, layer.self_attn.o_proj)), gate)
+        out, _ = attn.o_proj(_match(att, attn.o_proj))
+        hidden_states = _gated_residual(residual, out, gate)
 
-    residual = hidden_states
-    x, gate = layer.post_attention_layernorm(hidden_states, adarms_cond)
-    return _gated_residual(residual, layer.mlp(_match(x, layer.mlp.up_proj)), gate)
+        residual = hidden_states
+        x, gate = self.post_attention_layernorm(hidden_states, adarms_cond)
+        return _gated_residual(residual, self.mlp(_match(x, self.mlp.gate_up_proj)), gate)
+
+
+class Pi05GemmaModel(nn.Module):
+    """A Gemma tower: the PaliGemma language model, or (``cond_dim`` set) the AdaRMS action expert.
+
+    The module names follow ``transformers``' ``GemmaModel`` so the checkpoint
+    keys map one to one, apart from the packed ``qkv_proj`` / ``gate_up_proj``
+    that ``Pi05ForActionPrediction.load_weights`` stacks. ``embed_tokens``
+    exists in the prefix only; the expert embeds no tokens.
+    """
+
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        cond_dim: int | None = None,
+        embed_tokens: bool = True,
+    ):
+        super().__init__()
+        self.config = config
+        if embed_tokens:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+            # As ``GemmaTextScaledWordEmbedding`` scales: a buffer, cast with the others.
+            self.register_buffer("embed_scale", torch.tensor(config.hidden_size**0.5), persistent=False)
+        else:
+            self.embed_tokens = None
+        if cond_dim is None:
+            layers = [
+                Pi05GemmaDecoderLayer(config, quant_config, prefix=f"{prefix}.layers.{index}")
+                for index in range(config.num_hidden_layers)
+            ]
+        else:
+            layers = [
+                Pi05ExpertDecoderLayer(config, prefix=f"{prefix}.layers.{index}", cond_dim=cond_dim)
+                for index in range(config.num_hidden_layers)
+            ]
+        self.layers = nn.ModuleList(layers)
+        if cond_dim is None:
+            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = Pi05AdaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim)
+        self.rotary_emb = Pi05GemmaRotaryEmbedding(config.head_dim, base=getattr(config, "rope_theta", 10000.0))
+
+
+class _SiglipSDPA(nn.Module):
+    """SigLIP's bidirectional multi-head attention as one SDPA call.
+
+    What vLLM's ``vit_torch_sdpa_wrapper`` runs, called directly rather than
+    through its custom op, which is registered for the platform's device only.
+    Takes and returns ``(B, S, heads · head_dim)``.
+    """
+
+    def __init__(self, num_heads: int, head_size: int, scale: float):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = scale
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len = query.shape[:2]
+        heads = (batch_size, seq_len, self.num_heads, self.head_size)
+        q, k, v = (tensor.view(heads).transpose(1, 2) for tensor in (query, key, value))
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=self.scale)
+        return out.transpose(1, 2).reshape(batch_size, seq_len, -1)
+
+
+def _siglip_vision_tower(vision_config) -> SiglipVisionModel:
+    """vLLM's SigLIP, its attention on SDPA.
+
+    SigLIP serves in float32 in both layouts (``_to_bfloat16_for_inference``
+    keeps it there, as LeRobot does), and vLLM picks the ViT attention kernel
+    for the default dtype at construction: FlashAttention under a bfloat16
+    default, which rejects float32, or the Triton kernel, whose TF32 dots move
+    the image features by ~2e-3 relative L2 against ``transformers``. SDPA
+    matches ``transformers`` to float32 rounding. There is no ``model_config``
+    here to carry vLLM's ``mm_encoder_attn_backend`` override, so each layer's
+    attention is replaced by :class:`_SiglipSDPA`.
+    """
+    vision_tower = SiglipVisionModel(vision_config, quant_config=None, prefix="vision_tower")
+    for layer in vision_tower.vision_model.encoder.layers:
+        attn = layer.self_attn.attn
+        layer.self_attn.attn = _SiglipSDPA(attn.num_heads, attn.head_size, attn.scale)
+    return vision_tower
+
+
+class _PaliGemmaProjector(nn.Module):
+    """PaliGemma's image projector: SigLIP width → text width. Never quantized."""
+
+    def __init__(self, vision_width: int, text_width: int):
+        super().__init__()
+        self.linear = nn.Linear(vision_width, text_width, bias=True)
+
+    def forward(self, image_features: torch.Tensor) -> torch.Tensor:
+        return self.linear(image_features)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Fused Triton kernels: the optimized path of the prefix forward and the
-# denoising step
+# Fused Triton kernels: the optimized path of the denoising step
 # ──────────────────────────────────────────────────────────────────────
 # ``Pi05Pipeline`` enables them together with its CUDA graphs (the stage leaves
 # ``enforce_eager`` unset) through ``Pi05ForActionPrediction.enable_fused_kernels``;
-# the eager baseline never runs them. In the prefix, in either dtype, they apply
-# only RoPE and the GELU and leave every reduction to the torch op eager runs,
-# so the prefix K/V every denoising step reads is bit-exact with eager. In the
+# the eager baseline never runs them. The prefix pass runs its eager layers on
+# either path, so the prefix K/V every denoising step reads is the same. In the
 # action expert, whose GEMMs have only ``chunk_size`` rows, they replace whole
 # layers and the output head: in bfloat16 including the GEMMs, in float32
-# around cuBLAS GEMMs. They read every weight in place and write K/V straight
+# around cuBLAS GEMMs. They read every weight in place, the packed vLLM
+# ``qkv_proj`` / ``gate_up_proj`` weights as row blocks, and write K/V straight
 # into the ``Pi05StepKVWorkspace`` slots the eager path copies into.
 #
 # Numerics: each kernel performs the eager path's operations in its order, in
@@ -485,10 +756,10 @@ def _compute_layer_suffix_only(
 # narrower dtype is rounded there too (``_round``), and kernels launch with
 # ``enable_fp_fusion=False`` so no multiply-add is contracted into an FMA that
 # eager does not have (the one it has, in torch's GELU, is spelled out). What
-# still differs, in the action expert, is the order of reductions: GEMM
-# accumulation, the RMS variance and the softmax sums. An elementwise kernel
-# is therefore bit-exact with eager, and the others differ by reduction-order
-# rounding only.
+# still differs is the order of reductions (GEMM accumulation, the RMS variance
+# and the softmax sums) and in RoPE, where the eager rotary kernel may contract
+# its products into FMAs, the last float32 bit. The kernels differ from eager
+# by that rounding only.
 # ``tests/diffusion/models/pi05/test_pi05_fused_kernels.py`` holds each kernel
 # to that.
 
@@ -571,6 +842,7 @@ if HAS_TRITON:
         n_rows,
         n_in,
         x_stride,
+        proj_stride,
         rope_stride,
         kv_stride,
         NUM_HEADS: tl.constexpr,
@@ -587,13 +859,14 @@ if HAS_TRITON:
         query heads, then the key head, then the value head) and one
         ``BLOCK_H`` tile of each half of it, which RoPE pairs. Q is stored
         ``(NUM_HEADS, n_rows, HEAD_DIM)``, K and V to ``(n_rows, HEAD_DIM)`` rows
-        ``kv_stride`` apart: their ``Pi05StepKVWorkspace`` slots.
+        ``kv_stride`` apart: their ``Pi05StepKVWorkspace`` slots. ``COS`` and
+        ``SIN`` are the half-split ``(n_rows, HEAD_DIM // 2)`` tables.
 
         With ``FUSED_GEMM`` the projections are computed here from ``X`` and the
-        weights ``WQ``/``WK``/``WV``. Without it ``WQ``/``WK``/``WV`` are the
-        projections' outputs, ``(n_rows, heads · HEAD_DIM)`` rows ``n_in`` and
-        ``(n_rows, HEAD_DIM)`` rows ``HEAD_DIM`` apart, and only RoPE and the
-        layout run here.
+        row blocks ``WQ``/``WK``/``WV`` of the packed ``qkv_proj`` weight.
+        Without it ``WQ``/``WK``/``WV`` point at the Q, K and V columns of the
+        packed projection's output, rows ``proj_stride`` apart, and only RoPE
+        and the layout run here.
         """
         HALF: tl.constexpr = HEAD_DIM // 2
         SPLITS: tl.constexpr = HALF // BLOCK_H
@@ -618,30 +891,28 @@ if HAS_TRITON:
                 w_hi = tl.load(w + (cols[None, :] + HALF) * n_in + ks[:, None], mask=k_mask[:, None], other=0.0)
                 acc_lo = tl.dot(x, w_lo, acc_lo)
                 acc_hi = tl.dot(x, w_hi, acc_hi)
-            # The projections' outputs, as the eager q/k/v_proj return them.
+            # The projections' outputs, as the eager qkv_proj returns them.
             lo = _round(acc_lo, PROJ_DTYPE)
             hi = _round(acc_hi, PROJ_DTYPE)
         else:
             if head < NUM_HEADS:
-                proj = WQ + head * HEAD_DIM + rows[:, None] * n_in + cols[None, :]
+                proj = WQ + head * HEAD_DIM + rows[:, None] * proj_stride + cols[None, :]
             elif head == NUM_HEADS:
-                proj = WK + rows[:, None] * HEAD_DIM + cols[None, :]
+                proj = WK + rows[:, None] * proj_stride + cols[None, :]
             else:
-                proj = WV + rows[:, None] * HEAD_DIM + cols[None, :]
+                proj = WV + rows[:, None] * proj_stride + cols[None, :]
             lo = tl.load(proj, mask=row_mask, other=0.0).to(tl.float32)
             hi = tl.load(proj + HALF, mask=row_mask, other=0.0).to(tl.float32)
 
         out_lo = rows[:, None] * HEAD_DIM + cols[None, :]
         if head <= NUM_HEADS:
-            # ``q * cos + rotate_half(q) * sin``, each product and the sum
-            # rounded as eager's three tensor ops round them.
+            # The rotary op eager runs (``Pi05GemmaAttention.project``):
+            # computed in float32 from the rounded table, rounded once.
             rope = rows[:, None] * rope_stride + cols[None, :]
-            cos_lo = tl.load(COS + rope, mask=row_mask, other=0.0).to(tl.float32)
-            cos_hi = tl.load(COS + rope + HALF, mask=row_mask, other=0.0).to(tl.float32)
-            sin_lo = tl.load(SIN + rope, mask=row_mask, other=0.0).to(tl.float32)
-            sin_hi = tl.load(SIN + rope + HALF, mask=row_mask, other=0.0).to(tl.float32)
-            rot_lo = _round(_round(lo * cos_lo, PROJ_DTYPE) + _round(-hi * sin_lo, PROJ_DTYPE), PROJ_DTYPE)
-            rot_hi = _round(_round(hi * cos_hi, PROJ_DTYPE) + _round(lo * sin_hi, PROJ_DTYPE), PROJ_DTYPE)
+            cos = tl.load(COS + rope, mask=row_mask, other=0.0).to(tl.float32)
+            sin = tl.load(SIN + rope, mask=row_mask, other=0.0).to(tl.float32)
+            rot_lo = _round(lo * cos - hi * sin, PROJ_DTYPE)
+            rot_hi = _round(hi * cos + lo * sin, PROJ_DTYPE)
             if head < NUM_HEADS:
                 q_out = Q_OUT + head * n_rows * HEAD_DIM + out_lo
                 tl.store(q_out, rot_lo, mask=row_mask)
@@ -833,15 +1104,6 @@ if HAS_TRITON:
         tl.store(OUT + rows[:, None] * out_stride + cols[None, :], out, mask=row_mask & col_mask[None, :])
 
     @triton.jit
-    def _gelu_mul_kernel(GATE, UP, OUT, n, PROJ_DTYPE: tl.constexpr, BLOCK: tl.constexpr):
-        """``gelu_tanh(GATE) · UP`` elementwise: the ``GemmaMLP`` activation."""
-        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < n
-        gate = tl.load(GATE + offs, mask=mask, other=0.0).to(tl.float32)
-        up = tl.load(UP + offs, mask=mask, other=0.0).to(tl.float32)
-        tl.store(OUT + offs, _round(_gelu_tanh(gate), PROJ_DTYPE) * up, mask=mask)
-
-    @triton.jit
     def _final_head_kernel(
         X,
         MOD,
@@ -933,6 +1195,7 @@ def _fused_rms_norm(
     n_rows, n_cols = x.shape
     norm_dtype = torch.promote_types(x.dtype, add.dtype) if add is not None else x.dtype
     adarms = modulation is not None
+    eps = norm.eps if adarms else norm.variance_epsilon
     _rms_norm_kernel[(n_rows,)](
         x,
         add if add is not None else x,
@@ -945,7 +1208,7 @@ def _fused_rms_norm(
         add.stride(0) if add is not None else 0,
         res_out.stride(0) if res_out is not None else 0,
         out.stride(0),
-        norm.eps,
+        eps,
         1.0 / n_cols,
         NORM_DTYPE=_TL_DTYPES[norm_dtype],
         HAS_ADD=add is not None,
@@ -959,29 +1222,31 @@ def _fused_rms_norm(
 
 def _fused_qkv_rope(
     x: torch.Tensor,
-    attn: nn.Module,
+    attn: Pi05GemmaAttention,
     cos: torch.Tensor,
     sin: torch.Tensor,
     q_out: torch.Tensor,
     k_out: torch.Tensor,
     v_out: torch.Tensor,
-    *,
-    triton_gemm: bool = True,
 ) -> None:
-    """Q/K/V projections of ``x`` with RoPE: Q into ``q_out``, K and V into their workspace slots.
+    """The packed Q/K/V projection of ``x`` with RoPE: Q into ``q_out``, K and V into their workspace slots.
 
-    ``triton_gemm=False`` keeps the projections on cuBLAS, as eager runs them.
+    ``cos``/``sin`` are the half-split ``(rows, head_dim // 2)`` tables in the
+    projection's dtype. In float32 the projection stays on cuBLAS, as eager runs it.
     """
     n_rows, n_in = x.shape
     num_heads, _, head_dim = q_out.shape
-    dtype = attn.q_proj.weight.dtype
-    fused_gemm = triton_gemm and _triton_gemms(dtype)
+    dtype = _linear_dtype(attn.qkv_proj)
+    fused_gemm = _triton_gemms(dtype)
     if fused_gemm:
-        weights = (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight)
+        # Row blocks of the packed weight: contiguous, so the kernel reads them in place.
+        weights = attn.qkv_proj.weight.split([attn.q_size, attn.kv_size, attn.kv_size], dim=0)
+        proj_stride = 0
     else:
-        weights = tuple(proj(x[None])[0] for proj in (attn.q_proj, attn.k_proj, attn.v_proj))
-        n_in = weights[0].shape[1]
-    tiles = _tiles("qkv", dtype) if fused_gemm else _EPILOGUE_TILES
+        qkv = attn.qkv_proj(x[None])[0][0]
+        weights = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+        proj_stride = qkv.stride(0)
+    tiles = _tiles("qkv", dtype)
     splits = head_dim // 2 // tiles.block_n
     _qkv_rope_kernel[(triton.cdiv(n_rows, tiles.block_m), (num_heads + 2) * splits)](
         x,
@@ -994,6 +1259,7 @@ def _fused_qkv_rope(
         n_rows,
         n_in,
         x.stride(0),
+        proj_stride,
         cos.stride(0),
         k_out.stride(0),
         NUM_HEADS=num_heads,
@@ -1093,18 +1359,18 @@ def _fused_attention(
 
 def _fused_linear_residual(
     x: torch.Tensor,
-    linear: nn.Linear,
+    linear: RowParallelLinear,
     residual: torch.Tensor,
     out: torch.Tensor,
     gate: torch.Tensor | None = None,
 ) -> None:
     """``out = residual + [gate ·] linear(x)``; ``out`` may be ``residual``."""
     n_rows, n_in = x.shape
-    n_out = linear.out_features
+    n_out = linear.weight.shape[0]
     dtype = linear.weight.dtype
     fused_gemm = _triton_gemms(dtype)
     if not fused_gemm:
-        x = linear(x[None])[0]
+        x = linear(x[None])[0][0]
     tiles = _tiles("linear", dtype)
     _linear_residual_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(n_out, tiles.block_n))](
         x,
@@ -1131,28 +1397,26 @@ def _fused_linear_residual(
     )
 
 
-def _fused_gelu_mul(gate: torch.Tensor, up: torch.Tensor, out: torch.Tensor) -> None:
-    """``out = gelu_tanh(gate) · up`` over contiguous tensors; ``out`` may be ``gate``."""
-    n = gate.numel()
-    block = 2048
-    _gelu_mul_kernel[(triton.cdiv(n, block),)](
-        gate, up, out, n, PROJ_DTYPE=_TL_DTYPES[out.dtype], BLOCK=block, num_warps=4, enable_fp_fusion=False
-    )
+def _fused_linear_gelu_mul(x: torch.Tensor, mlp: Pi05GemmaMLP, out: torch.Tensor) -> None:
+    """``out = gelu_tanh(gate) · up`` of the packed ``gate_up_proj(x)``: the MLP input half.
 
-
-def _fused_linear_gelu_mul(x: torch.Tensor, mlp: nn.Module, out: torch.Tensor) -> None:
-    """``out = act_fn(gate_proj(x)) · up_proj(x)``, the ``GemmaMLP`` input half."""
+    In float32 the GEMM stays on cuBLAS and the activation is the eager
+    ``GeluAndMul`` itself.
+    """
     n_rows, n_in = x.shape
-    n_out = mlp.gate_proj.out_features
-    dtype = mlp.gate_proj.weight.dtype
+    gate_up = mlp.gate_up_proj
+    dtype = gate_up.weight.dtype
     if not _triton_gemms(dtype):
-        _fused_gelu_mul(mlp.gate_proj(x[None]), mlp.up_proj(x[None]), out)
+        out.copy_(mlp.act_fn(gate_up(x[None])[0][0]))
         return
+    n_out = gate_up.weight.shape[0] // 2
+    # Row blocks of the packed weight: contiguous, so the kernel reads them in place.
+    w_gate, w_up = gate_up.weight.split([n_out, n_out], dim=0)
     tiles = _tiles("gelu_linear", dtype)
     _linear_gelu_mul_kernel[(triton.cdiv(n_rows, tiles.block_m), triton.cdiv(n_out, tiles.block_n))](
         x,
-        mlp.gate_proj.weight,
-        mlp.up_proj.weight,
+        w_gate,
+        w_up,
         out,
         n_rows,
         n_out,
@@ -1199,70 +1463,8 @@ def _adarms_modulation(norm: Pi05AdaRMSNorm, adarms_cond: torch.Tensor) -> torch
     return norm.dense(adarms_cond.to(norm.dense.weight.dtype))[0]
 
 
-def _fused_prefix_forward(
-    paligemma: PaliGemmaForConditionalGeneration,
-    inputs_embeds: torch.Tensor,
-    attention_mask: torch.Tensor,
-    position_ids: torch.Tensor,
-    kv_workspace: Pi05StepKVWorkspace,
-) -> torch.Tensor:
-    """``PaliGemmaWithActionExpertPi05.forward``'s prefix pass, batch 1, with fused kernels.
-
-    Bit-exact with the eager pass: every denoising step attends over the
-    prefix K/V and amplifies any rounding difference in it, so the norms,
-    residual adds, GEMMs and attention are the torch ops eager runs. Fused are
-    only RoPE, which writes the layer's K/V straight into ``kv_workspace``, and the
-    GELU. Returns the final norm's output, as the eager pass does;
-    ``inputs_embeds`` is not modified.
-    """
-    lm = paligemma.model.language_model
-    x_in = inputs_embeds[0]
-    seq_len, width = x_in.shape
-    first_attn = lm.layers[0].self_attn
-    proj_dtype = first_attn.q_proj.weight.dtype
-    num_heads = first_attn.config.num_attention_heads
-    head_dim = first_attn.head_dim
-    device = x_in.device
-
-    hidden_states = torch.empty(seq_len, width, dtype=torch.promote_types(x_in.dtype, proj_dtype), device=device)
-    x_normed = torch.empty(seq_len, width, dtype=proj_dtype, device=device)
-    q = torch.empty(num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
-    # Every eager layer builds this same table, in its V projection's dtype.
-    cos, sin = lm.rotary_emb(x_normed, position_ids)
-
-    residual, mlp_out = x_in, None
-    for layer_idx, layer in enumerate(lm.layers):
-        attn = layer.self_attn
-        if mlp_out is None:
-            x_normed.copy_(layer.input_layernorm(residual))
-        else:
-            torch.add(mlp_out, residual, out=hidden_states)
-            x_normed.copy_(layer.input_layernorm(hidden_states))
-            residual = hidden_states
-        key, value = kv_workspace.key[layer_idx, 0, 0], kv_workspace.value[layer_idx, 0, 0]
-        _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[:seq_len], value[:seq_len], triton_gemm=False)
-        att = _attend(
-            q[None],
-            key[None, None, :seq_len],
-            value[None, None, :seq_len],
-            attention_mask,
-            num_kv_groups=attn.num_key_value_groups,
-            scaling=1.0 / math.sqrt(head_dim),
-        )
-        attn_out = attn.o_proj(att.transpose(1, 2).reshape(1, seq_len, num_heads * head_dim))[0]
-        torch.add(attn_out, residual, out=hidden_states)
-        x_normed.copy_(layer.post_attention_layernorm(hidden_states))
-        residual = hidden_states
-        gate = layer.mlp.gate_proj(x_normed[None])
-        _fused_gelu_mul(gate, layer.mlp.up_proj(x_normed[None]), gate)
-        mlp_out = layer.mlp.down_proj(gate)[0]
-
-    torch.add(mlp_out, residual, out=hidden_states)
-    return lm.norm(hidden_states[None])
-
-
 def _fused_denoise_forward(
-    gemma_expert: GemmaForCausalLM,
+    gemma_expert: nn.Module,
     suffix_embs: torch.Tensor,
     attention_mask: torch.Tensor,
     position_ids: torch.Tensor,
@@ -1276,16 +1478,17 @@ def _fused_denoise_forward(
     behind the cached prefix, attention over the whole workspace row, and the
     ``o_proj`` and MLP GEMMs with their gated residuals and GELU; then the final
     AdaRMS norm fused with ``action_out_proj``. In bfloat16 the GEMMs run in
-    Triton with what follows them fused in; in float32 they stay on cuBLAS and
-    only what follows them is fused. Returns ``v_t``.
+    Triton with what follows them fused in, reading the packed vLLM weights in
+    place; in float32 they stay on cuBLAS and only what follows them is fused.
+    Returns ``v_t``.
     """
     expert = gemma_expert.model
     x_in = suffix_embs[0]
     seq_len, width = x_in.shape
-    first_layer = expert.layers[0]
-    proj_dtype = first_layer.self_attn.q_proj.weight.dtype
-    num_heads = first_layer.self_attn.config.num_attention_heads
-    head_dim = first_layer.self_attn.head_dim
+    first_attn = expert.layers[0].self_attn
+    proj_dtype = _linear_dtype(first_attn.qkv_proj)
+    num_heads = first_attn.num_heads
+    head_dim = first_attn.head_dim
     prefix_len = kv_workspace.prefix_len
     n_keys = prefix_len + seq_len
     device = x_in.device
@@ -1295,8 +1498,9 @@ def _fused_denoise_forward(
     q = torch.empty(num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
     scores = torch.empty(num_heads * seq_len, n_keys, dtype=proj_dtype, device=device)
     att = torch.empty(seq_len, num_heads * head_dim, dtype=proj_dtype, device=device)
-    mlp_hidden = torch.empty(seq_len, first_layer.mlp.gate_proj.out_features, dtype=proj_dtype, device=device)
-    cos, sin = expert.rotary_emb(x_normed, position_ids)
+    mlp_hidden = torch.empty(seq_len, expert.config.intermediate_size, dtype=proj_dtype, device=device)
+    cos, sin = expert.rotary_emb(position_ids)
+    cos, sin = cos[0].to(proj_dtype), sin[0].to(proj_dtype)
     mask = attention_mask[0, 0]
 
     residual = x_in
@@ -1306,8 +1510,8 @@ def _fused_denoise_forward(
 
         modulation = _adarms_modulation(layer.input_layernorm, adarms_cond)
         _fused_rms_norm(residual, layer.input_layernorm, x_normed, modulation=modulation)
-        _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[prefix_len:], value[prefix_len:])
-        _fused_attention(q, key, value, mask, 1.0 / math.sqrt(head_dim), scores, att)
+        _fused_qkv_rope(x_normed, attn, cos, sin, q, key[prefix_len:], value[prefix_len:])
+        _fused_attention(q, key, value, mask, attn.scaling, scores, att)
         _fused_linear_residual(att, attn.o_proj, residual, hidden_states, gate=modulation[2 * width :])
         residual = hidden_states
 
@@ -1324,7 +1528,7 @@ def _fused_denoise_forward(
 
 
 def _fused_kernels_serve(backbone: PaliGemmaWithActionExpertPi05, kv_workspace, batch_size: int) -> bool:
-    """Whether a call runs the fused kernels: they are enabled, and it is batch 1
+    """Whether a denoising step runs the fused kernels: they are enabled, and it is batch 1
     on a single-KV-head ``Pi05StepKVWorkspace`` in the action expert's K/V dtype. Any
     other call runs eagerly, which also keeps eager's errors for bad workspaces."""
     return (
@@ -1333,24 +1537,35 @@ def _fused_kernels_serve(backbone: PaliGemmaWithActionExpertPi05, kv_workspace, 
         and isinstance(kv_workspace, Pi05StepKVWorkspace)
         and kv_workspace.batch_size == 1
         and kv_workspace.key.shape[2] == 1
-        and kv_workspace.key.dtype == backbone.gemma_expert.model.layers[0].self_attn.k_proj.weight.dtype
+        and kv_workspace.key.dtype == backbone.gemma_expert.model.layers[0].self_attn.qkv_proj.weight.dtype
     )
+
+
+class _Container(nn.Module):
+    """A plain module holder, so the module paths stay the checkpoint's
+    (``paligemma.model.language_model.*``, ``gemma_expert.model.*``)."""
+
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config
 
 
 class PaliGemmaWithActionExpertPi05(nn.Module):
     """Dual-backbone transformer: PaliGemma (Gemma 2B) + AdaRMS expert (300M).
 
-    Same two-mode dispatch as π0 (``prefix_only`` / ``suffix_only``), with one
-    structural change: after building a stock ``GemmaForCausalLM`` expert, every
-    norm in it is swapped for a :class:`Pi05AdaRMSNorm` carrying a ``dense``
-    conditioning projection.
+    Same two-mode dispatch as π0 (``prefix_only`` / ``suffix_only``). Both
+    Gemma towers are :class:`Pi05GemmaModel`, on vLLM's packed linear layers,
+    ``GemmaRMSNorm`` and ``GeluAndMul``; the vision tower is vLLM's
+    ``SiglipVisionModel``. The one structural difference between the towers is
+    π0.5's: every action-expert norm is a :class:`Pi05AdaRMSNorm` carrying a
+    ``dense`` conditioning projection. The module paths follow the
+    ``transformers`` PaliGemma/Gemma layout the checkpoint was saved from.
 
-    Swapping in place — rather than subclassing ``GemmaModel`` as #4419 does —
-    keeps the module tree, and therefore the checkpoint key layout, identical to
-    the expert's stock layout apart from the norms themselves.
+    ``quant_config`` reaches the PaliGemma language model only: SigLIP, the
+    projector and the action expert always run in the serving dtype.
     """
 
-    def __init__(self, vlm_config, action_expert_config):
+    def __init__(self, vlm_config, action_expert_config, quant_config: QuantizationConfig | None = None):
         super().__init__()
 
         # PaliGemma prefix: identical to π0. It sees no timestep, so no AdaRMS.
@@ -1364,6 +1579,7 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
         vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
         vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
+        vlm_config_hf.text_config.hidden_act = "gelu_pytorch_tanh"
         vlm_config_hf.text_config.dtype = "float32"
         vlm_config_hf.text_config.vocab_size = 257152
         vlm_config_hf.vision_config.intermediate_size = 4304
@@ -1380,58 +1596,51 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
             num_key_value_heads=action_expert_config.num_kv_heads,
             vocab_size=257152,
             hidden_activation="gelu_pytorch_tanh",
+            hidden_act="gelu_pytorch_tanh",
             dtype="float32",
         )
 
-        self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
-        self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
-        # The action expert doesn't embed tokens — it only consumes the
-        # suffix action embeddings we feed in.
-        self.gemma_expert.model.embed_tokens = None
-
         self.adarms_cond_dim = action_expert_config.width
-        self._install_adarms_norms(action_expert_config)
+
+        self.paligemma = _Container(vlm_config_hf)
+        self.paligemma.model = _Container()
+        vision_config = vlm_config_hf.vision_config
+        self.paligemma.model.vision_tower = _siglip_vision_tower(vision_config)
+        self.paligemma.model.multi_modal_projector = _PaliGemmaProjector(
+            vision_config.hidden_size, vlm_config_hf.text_config.hidden_size
+        )
+        self.paligemma.model.language_model = Pi05GemmaModel(
+            vlm_config_hf.text_config, quant_config=quant_config, prefix="language_model"
+        )
+
+        # The action expert doesn't embed tokens — it only consumes the
+        # suffix action embeddings we feed in — and has no LM head.
+        self.gemma_expert = _Container(action_expert_config_hf)
+        self.gemma_expert.model = Pi05GemmaModel(
+            action_expert_config_hf, prefix="gemma_expert", cond_dim=self.adarms_cond_dim, embed_tokens=False
+        )
         # Set by ``Pi05ForActionPrediction.enable_fused_kernels`` on the
         # optimized path; ``False`` is the eager baseline.
         self.fused_kernels = False
 
-    def _install_adarms_norms(self, action_expert_config) -> None:
-        """Replace every action-expert RMSNorm with a conditioned AdaRMS norm."""
-        expert = self.gemma_expert.model
-        eps = getattr(self.gemma_expert.config, "rms_norm_eps", 1e-6)
-        width = action_expert_config.width
-        for layer in expert.layers:
-            layer.input_layernorm = Pi05AdaRMSNorm(width, eps=eps, cond_dim=self.adarms_cond_dim)
-            layer.post_attention_layernorm = Pi05AdaRMSNorm(width, eps=eps, cond_dim=self.adarms_cond_dim)
-        expert.norm = Pi05AdaRMSNorm(width, eps=eps, cond_dim=self.adarms_cond_dim)
-
     def embed_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Encode images with SigLIP vision tower + PaliGemma projector.
 
-        The two steps are run explicitly rather than via
-        ``PaliGemmaModel.get_image_features`` because that helper divides the
-        projector output by ``sqrt(text_hidden_size)``. Being explicit keeps the
-        scale unambiguous and matches π0 exactly (SigLIP is unchanged in π0.5).
+        The projector output is not divided by ``sqrt(text_hidden_size)`` as
+        ``PaliGemmaModel.get_image_features`` divides it: π0 and π0.5 feed it
+        unscaled (SigLIP is unchanged in π0.5).
         """
         # Shapes: pixel_values (B, 3, 224, 224) → SigLIP (B, 256, 1152)
         #                                      → projector (B, 256, 2048)
-        vision_outputs = self.paligemma.model.vision_tower(pixel_values)
-        image_features = vision_outputs.last_hidden_state
+        image_features = self.paligemma.model.vision_tower(pixel_values)
         return self.paligemma.model.multi_modal_projector(image_features)
 
     def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Embed language tokens, returning the ``* sqrt(hidden)``-scaled embedding.
-
-        The scaling location moved across transformers releases: at ≤5.3 the
-        normalizer lives inside ``GemmaModel.forward`` (which we bypass), and at
-        ≥5.4 ``GemmaTextScaledWordEmbedding`` self-applies it. Detect and avoid
-        double-scaling.
-        """
-        embed_tokens = self.paligemma.model.language_model.embed_tokens
-        lang_emb = embed_tokens(tokens)
-        if getattr(embed_tokens, "embed_scale", None) is None:
-            lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
-        return lang_emb
+        """Embed language tokens, returning the ``* sqrt(hidden)``-scaled embedding,
+        scaled as ``GemmaTextScaledWordEmbedding`` scales it."""
+        language_model = self.paligemma.model.language_model
+        embed_tokens = language_model.embed_tokens
+        return embed_tokens(tokens) * language_model.embed_scale.to(embed_tokens.weight.dtype)
 
     def forward(
         self,
@@ -1445,12 +1654,11 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         """Dispatch to prefix_only / suffix_only and return
         ``([prefix_out, suffix_out], past_key_values_or_None)``.
 
-        ``past_key_values`` is a :class:`Pi05StepKVWorkspace` in both modes: prefix_only
-        with ``use_cache`` writes the prefix K/V into it and returns it, and
-        suffix_only reads it. With the fused kernels enabled, prefix_only runs
-        on them (``_fused_prefix_forward``) when it is batch 1.
+        ``past_key_values`` is a :class:`Pi05StepKVWorkspace` in both modes:
+        prefix_only with ``use_cache`` writes the prefix K/V into it and returns
+        it, and suffix_only reads it. The prefix pass always runs these eager
+        layers, also on the optimized path, so its K/V is the same either way.
         """
-        num_layers = self.paligemma.config.text_config.num_hidden_layers
         pali_lm = self.paligemma.model.language_model
         expert_lm = self.gemma_expert.model
 
@@ -1462,26 +1670,9 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
 
         if inputs_embeds[1] is None:
             hidden_states = inputs_embeds[0]
-            if (
-                use_cache
-                and attention_mask is not None
-                and attention_mask.shape[:3] == (1, 1, hidden_states.shape[1])
-                and attention_mask.stride(-1) == 1
-                and _fused_kernels_serve(self, past_key_values, hidden_states.shape[0])
-                and past_key_values.prefix_len == hidden_states.shape[1]
-            ):
-                hidden_states = _fused_prefix_forward(
-                    self.paligemma, hidden_states, attention_mask, position_ids, past_key_values
-                )
-                return [hidden_states, None], past_key_values
-            for layer_idx in range(num_layers):
-                hidden_states, (k, v) = _compute_layer_prefix_only(
-                    layer_idx,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    paligemma=self.paligemma,
-                )
+            cos, sin = pali_lm.rotary_emb(position_ids)
+            for layer_idx, layer in enumerate(pali_lm.layers):
+                hidden_states, k, v = layer(hidden_states, attention_mask, cos, sin)
                 if use_cache:
                     past_key_values.write_prefix(layer_idx, k, v)
             hidden_states = pali_lm.norm(hidden_states)
@@ -1493,15 +1684,19 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
                 "or suffix-only dispatch; got both inputs_embeds populated."
             )
         hidden_states = inputs_embeds[1]
-        for layer_idx in range(num_layers):
-            hidden_states = _compute_layer_suffix_only(
-                layer_idx,
+        suffix_dtype = _linear_dtype(expert_lm.layers[0].self_attn.qkv_proj)
+        if past_key_values.key.dtype != suffix_dtype:
+            raise TypeError(f"Suffix K/V is {suffix_dtype}, but the KV workspace holds {past_key_values.key.dtype}.")
+        cos, sin = expert_lm.rotary_emb(position_ids)
+        for layer_idx, layer in enumerate(expert_lm.layers):
+            hidden_states = layer(
                 hidden_states,
-                past_key_values,
                 attention_mask,
-                position_ids,
-                gemma_expert=self.gemma_expert,
-                adarms_cond=adarms_cond,
+                cos,
+                sin,
+                adarms_cond,
+                past_key_values.key[layer_idx],
+                past_key_values.value[layer_idx],
             )
         hidden_states, _ = expert_lm.norm(hidden_states, adarms_cond)
         return [None, hidden_states], None
@@ -1525,11 +1720,14 @@ class Pi05ForActionPrediction(nn.Module):
       4. Return ``x_0`` as the predicted action chunk.
     """
 
-    def __init__(self, config, quant_config=None, prefix: str = ""):
+    # The blocks ``Pi05Pipeline.setup_compile`` compiles one by one (``regionally_compile``).
+    _repeated_blocks = ["Pi05GemmaDecoderLayer", "Pi05ExpertDecoderLayer"]
+
+    def __init__(self, config, quant_config: QuantizationConfig | None = None, prefix: str = ""):
         super().__init__()
-        # ``quant_config`` is accepted for interface compatibility but unused —
-        # quant_config is not plumbed through; the weight dtype comes from the pipeline.
-        del quant_config
+        # ``quant_config`` reaches the PaliGemma language model's linear layers
+        # only (``PaliGemmaWithActionExpertPi05``); ``None`` serves in the
+        # serving dtype throughout, the default.
         self.config = config
 
         self.action_dim = getattr(config, "max_action_dim", DEFAULT_ACTION_DIM)
@@ -1545,7 +1743,7 @@ class Pi05ForActionPrediction(nn.Module):
         self.expert_width = expert_config.width
 
         # Dual backbone
-        self.paligemma_with_expert = PaliGemmaWithActionExpertPi05(vlm_config, expert_config)
+        self.paligemma_with_expert = PaliGemmaWithActionExpertPi05(vlm_config, expert_config, quant_config)
 
         # Action chunk projections.
         self.action_in_proj = nn.Linear(self.action_dim, self.expert_width)
@@ -1574,7 +1772,7 @@ class Pi05ForActionPrediction(nn.Module):
         SigLIP image tokens plus the ``tokenizer_max_length`` text block.
         """
         text_config = self.paligemma_with_expert.paligemma.config.text_config
-        expert_k_proj = self.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.k_proj
+        expert_qkv_proj = self.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.qkv_proj
         if prefix_len is None:
             vision_config = self.paligemma_with_expert.paligemma.config.vision_config
             tokens_per_image = (vision_config.image_size // vision_config.patch_size) ** 2
@@ -1586,17 +1784,18 @@ class Pi05ForActionPrediction(nn.Module):
             prefix_len=prefix_len,
             suffix_len=self.action_horizon,
             head_dim=text_config.head_dim,
-            dtype=expert_k_proj.weight.dtype,
-            device=expert_k_proj.weight.device,
+            dtype=expert_qkv_proj.weight.dtype,
+            device=expert_qkv_proj.weight.device,
         )
 
     def enable_fused_kernels(self) -> None:
-        """Run the prefix forward and each denoising step through the fused Triton kernels.
+        """Run each denoising step's action expert through the fused Triton kernels.
 
         The optimized path's kernels (``Pi05Pipeline`` enables them together
-        with its CUDA graphs). A call still runs eagerly when it is not batch 1
-        on a single-KV-head ``Pi05StepKVWorkspace``. Raises if the kernels cannot
-        serve this model at all.
+        with its CUDA graphs). The prefix pass keeps its eager layers, so the
+        prefix K/V is the same on either path. A step still runs eagerly when
+        it is not batch 1 on a single-KV-head ``Pi05StepKVWorkspace``. Raises if
+        the kernels cannot serve this model at all.
         """
         problems = []
         if not HAS_TRITON:
@@ -1605,29 +1804,22 @@ class Pi05ForActionPrediction(nn.Module):
             problems.append(f"the model is on {self.action_in_proj.weight.device}, not a CUDA device")
         if self.action_out_proj.bias is None:
             problems.append("action_out_proj has no bias")
-        towers = {
-            "PaliGemma": self.paligemma_with_expert.paligemma.model.language_model,
-            "action expert": self.paligemma_with_expert.gemma_expert.model,
-        }
-        for name, lm in towers.items():
-            config = lm.config
-            if config.num_key_value_heads != 1:
-                problems.append(f"the {name} has {config.num_key_value_heads} KV heads, not 1")
-            if config.hidden_act != "gelu_pytorch_tanh":
-                problems.append(f"the {name} MLP uses {config.hidden_act!r}, not 'gelu_pytorch_tanh'")
-            head_dim = lm.layers[0].self_attn.head_dim
-            proj_dtype = lm.layers[0].self_attn.q_proj.weight.dtype
-            if proj_dtype not in _FUSED_DTYPES:
-                problems.append(f"the {name} runs in {proj_dtype}, not one of {_FUSED_DTYPES}")
-                continue
-            # The tiles that span head_dim unmasked: the RoPE half-tiles after a
-            # cuBLAS projection (the prefix's) and after a Triton one, and with
-            # Triton GEMMs the score reduction and the value columns.
-            spans = [2 * _EPILOGUE_TILES.block_n, 2 * _tiles("qkv", proj_dtype).block_n]
+        expert = self.paligemma_with_expert.gemma_expert.model
+        config = expert.config
+        if config.num_key_value_heads != 1:
+            problems.append(f"the action expert has {config.num_key_value_heads} KV heads, not 1")
+        head_dim = expert.layers[0].self_attn.head_dim
+        proj_dtype = _linear_dtype(expert.layers[0].self_attn.qkv_proj)
+        if proj_dtype not in _FUSED_DTYPES:
+            problems.append(f"the action expert runs in {proj_dtype}, not one of {_FUSED_DTYPES}")
+        else:
+            # The tiles that span head_dim unmasked: the RoPE half-tiles, and
+            # with Triton GEMMs the score reduction and the value columns.
+            spans = [2 * _tiles("qkv", proj_dtype).block_n]
             if _triton_gemms(proj_dtype):
                 spans += [_tiles("scores", proj_dtype).block_k, _tiles("values", proj_dtype).block_n]
             if any(head_dim % span for span in spans):
-                problems.append(f"the {name} head_dim {head_dim} is not a multiple of the kernel tiles {spans}")
+                problems.append(f"the action expert head_dim {head_dim} is not a multiple of the kernel tiles {spans}")
         if problems:
             raise RuntimeError("π0.5's fused kernels cannot run this model: " + "; ".join(problems) + ".")
         self.paligemma_with_expert.fused_kernels = True
@@ -1910,6 +2102,26 @@ class Pi05ForActionPrediction(nn.Module):
         return x_t
 
     # ── Weight loading ───────────────────────────────────────────────
+    def process_weights_after_loading(self) -> None:
+        """Finish every vLLM linear's weights once the checkpoint is in, as the
+        diffusion loader does after loading.
+
+        ``Pi05Pipeline`` loads its own checkpoint inside ``__init__`` and
+        captures its CUDA graphs right after, so this cannot wait for the
+        loader: a graph captured before, say, an fp8 weight is repacked would
+        replay stale storage. The flag it sets makes the loader's own pass skip
+        these layers. Call it once, after ``load_weights``: on some CPUs it
+        repacks an unquantized weight for vLLM's CPU GEMM and drops ``weight``.
+        """
+        for module in self.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if not isinstance(quant_method, QuantizeMethodBase):
+                continue
+            if getattr(module, "_already_called_process_weights_after_loading", False):
+                continue
+            quant_method.process_weights_after_loading(module)
+            module._already_called_process_weights_after_loading = True
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -1920,7 +2132,14 @@ class Pi05ForActionPrediction(nn.Module):
 
         Same remap rules as π0 (strip the ``model.`` prefix, flatten→nested
         PaliGemma submodules, tied ``lm_head`` → ``embed_tokens``, version-robust
-        SigLIP nesting), plus two π0.5-specific ones:
+        SigLIP nesting), plus the ones vLLM's layers and π0.5 need:
+
+          * each Gemma tower's ``q/k/v_proj`` and ``gate/up_proj`` load as
+            shards of the packed ``qkv_proj`` / ``gate_up_proj``, and a packed
+            parameter counts as loaded only once every shard has; SigLIP loads
+            through vLLM's own ``SiglipVisionTransformer.load_weights``.
+          * the action expert's ``lm_head`` is dropped: the expert decodes no
+            tokens, so π0.5 never reads it.
 
           * ``action_time_mlp_{in,out}`` → ``time_mlp_{in,out}``: some
             checkpoints were exported under the π0 parameter names.
@@ -1965,28 +2184,27 @@ class Pi05ForActionPrediction(nn.Module):
 
             return name
 
-        def _fix_vision_tower(name: str) -> str:
-            """Reconcile SigLIP nesting across transformers versions (≤5.3 wraps
-            the encoder in ``vision_tower.vision_model.*``; ≥5.4 flattens it)."""
-            vt = "paligemma_with_expert.paligemma.model.vision_tower."
-            if not name.startswith(vt):
-                return name
-            rest = name[len(vt) :]
-            if name in params_dict or name in buffers_dict:
-                return name
+        _VISION_PREFIX = "paligemma_with_expert.paligemma.model.vision_tower."
+
+        def _vision_model_name(name: str) -> str:
+            """The name inside ``SiglipVisionModel.vision_model``. Reconciles
+            SigLIP nesting across transformers versions (≤5.3 wraps the
+            encoder in ``vision_tower.vision_model.*``; ≥5.4 flattens it)."""
+            rest = name[len(_VISION_PREFIX) :]
             if rest.startswith("vision_model."):
-                candidate = vt + rest[len("vision_model.") :]
-            else:
-                candidate = vt + "vision_model." + rest
-            return candidate if (candidate in params_dict or candidate in buffers_dict) else name
+                return rest[len("vision_model.") :]
+            return rest
 
         loaded = 0
         skipped: list[str] = []
         pi0_shaped: list[str] = []
         filled_params: set = set()
+        vision_weights: list[tuple[str, torch.Tensor]] = []
+        # The packed parameters' shards seen so far; each needs all of them.
+        packed_shards: dict[str, set] = {}
 
         for name, loaded_weight in weights:
-            mapped = _fix_vision_tower(_remap(name))
+            mapped = _remap(name)
 
             # Diagnose π0-shaped keys instead of dropping them quietly.
             is_expert_norm_weight = mapped.startswith(_EXPERT_PREFIX) and (
@@ -1997,8 +2215,24 @@ class Pi05ForActionPrediction(nn.Module):
             if mapped.startswith("state_proj.") or is_expert_norm_weight:
                 pi0_shaped.append(mapped)
                 continue
+            if mapped == _UNUSED_EXPERT_LM_HEAD:
+                continue
+            if mapped.startswith(_VISION_PREFIX):
+                vision_weights.append((_vision_model_name(mapped), loaded_weight))
+                continue
 
-            if mapped in params_dict:
+            packed = None
+            for packed_name, checkpoint_name, shard_id in _PACKED_PARAMS:
+                if checkpoint_name in mapped:
+                    packed = (mapped.replace(checkpoint_name, packed_name), shard_id)
+                    break
+            if packed is not None and packed[0] in params_dict:
+                packed_name, shard_id = packed
+                param = params_dict[packed_name]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded += 1
+                packed_shards.setdefault(packed_name, set()).add(shard_id)
+            elif mapped in params_dict:
                 param = params_dict[mapped]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -2011,23 +2245,19 @@ class Pi05ForActionPrediction(nn.Module):
             else:
                 skipped.append(mapped)
 
-        # LeRobot stores PaliGemma's tied text embedding as lm_head.weight; keep
-        # lm_head filled so the tied-weight state stays consistent.
-        embed_key = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
-        lm_head_key = "paligemma_with_expert.paligemma.lm_head.weight"
-        if embed_key in filled_params and lm_head_key in params_dict and lm_head_key not in filled_params:
-            params_dict[lm_head_key].data.copy_(params_dict[embed_key].data)
-            filled_params.add(lm_head_key)
+        for packed_name, shards in packed_shards.items():
+            if shards == _PACKED_SHARDS[packed_name.rsplit(".", 2)[-2]]:
+                filled_params.add(packed_name)
+
+        if vision_weights:
+            vision_model = self.paligemma_with_expert.paligemma.model.vision_tower.vision_model
+            vision_loaded = vision_model.load_weights(vision_weights)
+            loaded += len(vision_weights)
+            filled_params.update(_VISION_PREFIX + "vision_model." + vision_name for vision_name in vision_loaded)
 
         # Reverse audit: any model param that got no checkpoint tensor at all
         # would be running with random init.
-        missing_params: list[str] = []
-        for pname in params_dict:
-            if pname in filled_params:
-                continue
-            if "rotary_emb" in pname or pname.endswith(".inv_freq"):
-                continue
-            missing_params.append(pname)
+        missing_params = [pname for pname in params_dict if pname not in filled_params]
 
         parts: list[str] = []
         if pi0_shaped:

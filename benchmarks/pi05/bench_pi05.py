@@ -52,6 +52,28 @@ def resolve_checkpoint(path: str) -> str:
     return snapshot_download(repo_id=path, repo_type="model")
 
 
+def enter_standalone_runtime(od_config) -> None:
+    """Set up what a diffusion worker sets up before it builds ``Pi05Pipeline``.
+
+    π0.5 runs on vLLM's layers, which need a current vLLM config (the worker's,
+    so custom ops dispatch as they serve) and a tensor-parallel group, here a
+    single-rank one. Both stay in place until the process exits.
+    """
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import parallel_state
+
+    from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_current_vllm_config(create_diffusion_vllm_config(device, od_config)).__enter__()
+    if not parallel_state.model_parallel_is_initialized():
+        port = os.environ.get("PI05_BENCH_MASTER_PORT", "29581")
+        parallel_state.init_distributed_environment(
+            world_size=1, rank=0, local_rank=0, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
+        )
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size=1)
+
+
 def build_model(checkpoint_dir: str, deploy_config: str, dtype: str, enforce_eager: bool):
     """The model ``Pi05Pipeline`` serves: its dtype layout, KV cache, and with
     ``enforce_eager`` unset its fused kernels and CUDA graphs."""
@@ -66,6 +88,7 @@ def build_model(checkpoint_dir: str, deploy_config: str, dtype: str, enforce_eag
     od_config = OmniDiffusionConfig(
         model=checkpoint_dir, dtype=dtype, model_config=stage["model_config"], enforce_eager=enforce_eager
     )
+    enter_standalone_runtime(od_config)
     # Under the serving dtype as torch's default, as the server's loader builds
     # (and captures) the pipeline.
     with set_default_torch_dtype(od_config.dtype):
@@ -195,7 +218,7 @@ def environment(model, device: str) -> dict:
         # What the built model runs, not what was asked for.
         "path": "eager" if getattr(model, "cuda_graphs", None) is None else "optimized (CUDA graphs + fused kernels)",
         "gemm_weight_dtype": str(
-            model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
+            model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.qkv_proj.weight.dtype
         ),
     }
     if device.startswith("cuda"):

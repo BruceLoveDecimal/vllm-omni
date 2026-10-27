@@ -157,10 +157,11 @@ def _instantiate_vllm_omni(
         relative_exclude_joints=["gripper"] if action_feature_names else [],
         action_feature_names=action_feature_names,
     )
-    model = Pi05ForActionPrediction(cfg)
+    with torch.device(DEVICE):
+        model = Pi05ForActionPrediction(cfg)
     _set_inference_dtype(model, getattr(torch, dtype))
-    model.to(device=DEVICE)
     _load_lerobot_weights(model)
+    model.process_weights_after_loading()
     model.eval()
     return model, cfg
 

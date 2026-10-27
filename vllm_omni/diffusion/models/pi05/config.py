@@ -164,6 +164,11 @@ class Pi05Config:
     # OpenPI handshake metadata from the deploy config. Construction validates
     # it against the resolved checkpoint contract.
     policy_server_config: dict[str, Any] = field(default_factory=dict)
+    # Serving only: regionally ``torch.compile`` the Gemma decoder layers
+    # (``Pi05Pipeline.setup_compile``) before the CUDA graphs capture them. Off
+    # by default: compiling moves the prefix pass's rounding, which every
+    # denoising step reads.
+    torch_compile: bool = False
 
     # Derived from output_features[ACTION].shape; never accepted as a second
     # source of truth in config.json.

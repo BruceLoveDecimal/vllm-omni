@@ -31,6 +31,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from bench_pi05 import enter_standalone_runtime
 
 PROMPTS = ["pick up the red block", "open the drawer", "", "place the cup on the plate and push it left"]
 
@@ -46,7 +47,8 @@ class _CharTokenizer:
 
 
 def build_random_pipeline():
-    """Real widths, two layers per tower, every weight perturbed off its init."""
+    """Real widths, two layers per tower, every weight drawn at random."""
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.pi05 import modeling_pi05
     from vllm_omni.diffusion.models.pi05.config import Pi05Config
     from vllm_omni.diffusion.models.pi05.modeling_pi05 import GemmaVariantConfig, Pi05ForActionPrediction
@@ -69,12 +71,19 @@ def build_random_pipeline():
             "observation.images.right_wrist_0_rgb",
         ],
     )
+    enter_standalone_runtime(OmniDiffusionConfig())
     torch.manual_seed(0)
     model = Pi05ForActionPrediction(config).eval()
-    # Zero-initialized parts would otherwise leave layers inert.
+    # vLLM's layers leave their weights uninitialized for a checkpoint to fill,
+    # and zero-initialized parts would leave layers inert: draw every weight,
+    # around the identity for SigLIP's LayerNorms.
     with torch.no_grad():
         for param in model.parameters():
-            param.add_(torch.randn_like(param) * 0.02)
+            param.copy_(torch.randn_like(param) * 0.02)
+        for module in model.modules():
+            if isinstance(module, torch.nn.LayerNorm):
+                module.weight.add_(1.0)
+    model.process_weights_after_loading()
 
     pipeline = object.__new__(Pi05Pipeline)
     torch.nn.Module.__init__(pipeline)
@@ -100,6 +109,7 @@ def build_checkpoint_pipeline(model: str, deploy_config: str, dtype: str):
     with open(deploy_config, encoding="utf-8") as f:
         (stage,) = yaml.safe_load(f)["stages"]
     od_config = OmniDiffusionConfig(model=model, dtype=dtype, model_config=stage["model_config"], enforce_eager=True)
+    enter_standalone_runtime(od_config)
     with set_default_torch_dtype(od_config.dtype):
         return Pi05Pipeline(od_config=od_config)
 

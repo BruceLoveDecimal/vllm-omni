@@ -251,31 +251,36 @@ def test_reported_deterministic_failing_case_for_regression(pipeline):
 
 
 @pytest.mark.parametrize("num_views", NUM_VIEWS, ids=lambda views: f"views={views}")
-def test_prefix_forward_is_bit_exact(pipeline, num_views):
+def test_prefix_forward_replay_is_bit_exact(pipeline, num_views):
     """Every denoising step attends over the prefix K/V and amplifies any
-    rounding difference in it into the whole chunk, so the fused prefix pass
-    equals the eager one bit for bit: its K/V cache slots and its output."""
+    rounding difference in it into the whole chunk. The prefix pass runs its
+    eager layers on every path, so replayed it equals the eager pass bit for
+    bit: its K/V workspace slots and its output."""
     model = pipeline.model
     images, image_masks, lang_tokens, lang_masks = pipeline.processor.build_model_inputs(
         _robot_obs(pipeline.config, num_views, seed=0)
     )
-    results = []
     with torch.inference_mode():
         embs, pad_masks, att_masks = model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
         prefix_len = embs.shape[1]
-        for fused_kernels in (False, True):
-            kv_workspace = model.new_kv_workspace(1, prefix_len)
-            with _path(model, graphs=None, fused_kernels=fused_kernels):
-                (out, _), _ = model.paligemma_with_expert.forward(
-                    attention_mask=prepare_attention_masks_4d(make_att_2d_masks(pad_masks, att_masks)),
-                    position_ids=torch.cumsum(pad_masks, dim=1) - 1,
-                    past_key_values=kv_workspace,
-                    inputs_embeds=[embs, None],
-                    use_cache=True,
-                )
-            results.append((out, kv_workspace.key[:, :, :, :prefix_len], kv_workspace.value[:, :, :, :prefix_len]))
-    for name, eager, fused in zip(("output", "prefix K", "prefix V"), *results):
-        assert torch.equal(fused, eager), f"fused prefix {name} differs from eager"
+        kwargs = dict(
+            attention_mask=prepare_attention_masks_4d(make_att_2d_masks(pad_masks, att_masks)),
+            position_ids=torch.cumsum(pad_masks, dim=1) - 1,
+            inputs_embeds=[embs, None],
+            use_cache=True,
+        )
+        eager_workspace = model.new_kv_workspace(1, prefix_len)
+        with _path(model, graphs=None, fused_kernels=False):
+            (eager_out, _), _ = model.paligemma_with_expert.forward(past_key_values=eager_workspace, **kwargs)
+        replays_before = model.cuda_graphs.num_replays["prefix_forward"]
+        (replayed_out, _), workspace = model.cuda_graphs.prefix_forward(past_key_values=model.kv_workspace, **kwargs)
+        assert model.cuda_graphs.num_replays["prefix_forward"] == replays_before + 1
+    results = [
+        (eager_out, eager_workspace.key[:, :, :, :prefix_len], eager_workspace.value[:, :, :, :prefix_len]),
+        (replayed_out, workspace.key[:, :, :, :prefix_len], workspace.value[:, :, :, :prefix_len]),
+    ]
+    for name, eager, replayed in zip(("output", "prefix K", "prefix V"), *results):
+        assert torch.equal(replayed, eager), f"replayed prefix {name} differs from eager"
 
 
 def test_cases_differ_from_each_other(outputs):
@@ -298,7 +303,7 @@ def test_cuda_graph_path_replays_every_region(outputs, pipeline):
 
 
 def test_eager_fallback_mixes_with_replayed_regions(outputs, pipeline):
-    """Without the preallocated KV cache, ``sample_actions`` takes a one-off
+    """Without the preallocated KV workspace, ``sample_actions`` takes a one-off
     one, so regions 2 and 3 fall back to eager (still through the fused
     kernels) while region 1 still replays and hands them its graph outputs.
     The chunk must not change."""
@@ -336,7 +341,7 @@ def test_sample_actions_never_syncs_with_the_host(pipeline, path):
 
 
 def test_sample_actions_writes_the_preallocated_kv_workspace(pipeline):
-    """The pipeline allocates the KV cache once at init for the deployed
+    """The pipeline allocates the KV workspace once at init for the deployed
     prefix, and ``sample_actions`` fills every slot of it."""
     model = pipeline.model
     cache = model.kv_workspace
