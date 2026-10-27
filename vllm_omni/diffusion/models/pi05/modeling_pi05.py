@@ -259,15 +259,53 @@ def _attend(query_states, key_states, value_states, attention_mask, num_kv_group
     return torch.matmul(attn_weights, v)
 
 
-class Pi05KVCache:
-    """Preallocated per-layer K/V shared by the prefix pass and every denoising step.
+@dataclass
+class Pi05RequestPrefixKV:
+    """One request's prefix K/V: computed once per observation, read by every
+    denoising step of that request and by no other request.
+
+    ``key`` and ``value`` are ``(num_layers, num_kv_heads, prefix_len,
+    head_dim)``, the post-RoPE K/V of each PaliGemma layer in the action
+    expert's K/V dtype; ``pad_mask`` is the ``(prefix_len,)`` prefix padding
+    mask the denoising steps attend through. The request owns the storage: no
+    :class:`Pi05StepKVWorkspace` or CUDA Graph buffer aliases it, so a later
+    request's prefix pass cannot change it, and it is freed with the request.
+    Nothing carries over to the request's next action chunk, which encodes a
+    new observation.
+    """
+
+    key: torch.Tensor
+    value: torch.Tensor
+    pad_mask: torch.Tensor
+
+    @property
+    def prefix_len(self) -> int:
+        return self.key.shape[2]
+
+
+class Pi05StepKVWorkspace:
+    """The per-layer K/V that one denoising step attends over, for every row of its batch.
 
     ``key`` and ``value`` are ``(num_layers, batch, num_kv_heads, prefix_len +
     suffix_len, head_dim)``. Along the token axis each layer holds ``[prefix |
-    suffix]``: the prefix pass writes the prefix slots once per call, and each
-    denoising step overwrites the suffix slots, so a suffix layer attends over
-    one contiguous view instead of a fresh ``torch.cat`` of the two. The
-    addresses never change, which is what CUDA Graph replay needs.
+    suffix]``: row ``i``'s prefix slots hold the prefix of the request in batch
+    row ``i``, and each denoising step overwrites the suffix slots, so a suffix
+    layer attends over one contiguous view instead of a fresh ``torch.cat`` of
+    the two. The addresses never change, which is what CUDA Graph replay needs.
+
+    The prefix slots are filled one of two ways. ``sample_actions`` runs the
+    prefix pass straight into them (``write_prefix``), since its batch is fixed
+    for the whole call. When the rows of a step change from one step to the
+    next, as they do when requests join and leave a running batch, each request
+    keeps its own :class:`Pi05RequestPrefixKV` (``export_prefix``) and the step
+    copies the current rows' prefixes in first (``load_prefixes``).
+
+    The model owns the workspace, not a request: the suffix slots are scratch,
+    and nothing is written back from the workspace into a request's prefix.
+    Every write is a copy on the current stream, ordered after the GPU work
+    that last read the slots, so the workspace can take the next batch as soon
+    as the host has queued the previous one's reads; a finished or cancelled
+    request leaves nothing behind in it that the next load does not overwrite.
 
     The dtype is the action expert's K/V dtype: writing the prefix K/V casts it
     exactly as the ``.to(k_suf.dtype)`` before the concatenation it replaces.
@@ -302,10 +340,35 @@ class Pi05KVCache:
     def write_suffix(self, layer_idx: int, key: torch.Tensor, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Write the suffix K/V behind the cached prefix; return the layer's full K/V."""
         if key.dtype != self.key.dtype:
-            raise TypeError(f"Suffix K/V is {key.dtype}, but the KV cache holds {self.key.dtype}.")
+            raise TypeError(f"Suffix K/V is {key.dtype}, but the KV workspace holds {self.key.dtype}.")
         self.key[layer_idx, :, :, self.prefix_len :].copy_(key)
         self.value[layer_idx, :, :, self.prefix_len :].copy_(value)
         return self.key[layer_idx], self.value[layer_idx]
+
+    def export_prefix(self, row: int, pad_mask: torch.Tensor) -> Pi05RequestPrefixKV:
+        """A request-owned copy of row ``row``'s prefix, with its ``(prefix_len,)`` pad mask."""
+        return Pi05RequestPrefixKV(
+            key=self.key[:, row, :, : self.prefix_len].clone(),
+            value=self.value[:, row, :, : self.prefix_len].clone(),
+            pad_mask=pad_mask.clone(),
+        )
+
+    def load_prefixes(self, prefixes: list[Pi05RequestPrefixKV]) -> torch.Tensor:
+        """Copy request ``i``'s prefix into row ``i``; return the rows' ``(batch, prefix_len)`` pad masks.
+
+        ``prefixes`` is in batch order, which is the only row identity: a
+        request may sit in another row than it did on its previous step.
+        """
+        if len(prefixes) != self.batch_size:
+            raise ValueError(f"The KV workspace has {self.batch_size} rows, got {len(prefixes)} request prefixes.")
+        for row, prefix in enumerate(prefixes):
+            if prefix.prefix_len != self.prefix_len:
+                raise ValueError(
+                    f"Request prefix {row} has {prefix.prefix_len} tokens, the KV workspace {self.prefix_len}."
+                )
+            self.key[:, row, :, : self.prefix_len].copy_(prefix.key)
+            self.value[:, row, :, : self.prefix_len].copy_(prefix.value)
+        return torch.stack([prefix.pad_mask for prefix in prefixes])
 
 
 def _match(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
@@ -353,7 +416,7 @@ def _compute_layer_prefix_only(layer_idx, hidden_states, attention_mask, positio
 def _compute_layer_suffix_only(
     layer_idx,
     hidden_states,
-    kv_cache,
+    kv_workspace,
     attention_mask,
     position_ids,
     gemma_expert,
@@ -363,8 +426,8 @@ def _compute_layer_suffix_only(
 
     This is where π0.5 diverges from π0. Both norms are
     :class:`Pi05AdaRMSNorm` and each returns a gate that scales its sublayer's
-    contribution to the residual stream. ``kv_cache`` is the
-    :class:`Pi05KVCache` holding this layer's prefix K/V; the suffix K/V is
+    contribution to the residual stream. ``kv_workspace`` is the
+    :class:`Pi05StepKVWorkspace` holding this layer's prefix K/V; the suffix K/V is
     written behind it.
     """
     layer = gemma_expert.model.layers[layer_idx]
@@ -384,7 +447,7 @@ def _compute_layer_suffix_only(
 
     # Attend over [cached prefix K/V | suffix K/V], written in place rather
     # than concatenated into a new buffer on every step.
-    k, v = kv_cache.write_suffix(layer_idx, k_suf, v_suf)
+    k, v = kv_workspace.write_suffix(layer_idx, k_suf, v_suf)
 
     att = _attend(
         q,
@@ -415,7 +478,7 @@ def _compute_layer_suffix_only(
 # action expert, whose GEMMs have only ``chunk_size`` rows, they replace whole
 # layers and the output head: in bfloat16 including the GEMMs, in float32
 # around cuBLAS GEMMs. They read every weight in place and write K/V straight
-# into the ``Pi05KVCache`` slots the eager path copies into.
+# into the ``Pi05StepKVWorkspace`` slots the eager path copies into.
 #
 # Numerics: each kernel performs the eager path's operations in its order, in
 # its dtypes and with its rounding points. A value eager materializes in a
@@ -524,7 +587,7 @@ if HAS_TRITON:
         query heads, then the key head, then the value head) and one
         ``BLOCK_H`` tile of each half of it, which RoPE pairs. Q is stored
         ``(NUM_HEADS, n_rows, HEAD_DIM)``, K and V to ``(n_rows, HEAD_DIM)`` rows
-        ``kv_stride`` apart: their ``Pi05KVCache`` slots.
+        ``kv_stride`` apart: their ``Pi05StepKVWorkspace`` slots.
 
         With ``FUSED_GEMM`` the projections are computed here from ``X`` and the
         weights ``WQ``/``WK``/``WV``. Without it ``WQ``/``WK``/``WV`` are the
@@ -905,7 +968,7 @@ def _fused_qkv_rope(
     *,
     triton_gemm: bool = True,
 ) -> None:
-    """Q/K/V projections of ``x`` with RoPE: Q into ``q_out``, K and V into their cache slots.
+    """Q/K/V projections of ``x`` with RoPE: Q into ``q_out``, K and V into their workspace slots.
 
     ``triton_gemm=False`` keeps the projections on cuBLAS, as eager runs them.
     """
@@ -1141,14 +1204,14 @@ def _fused_prefix_forward(
     inputs_embeds: torch.Tensor,
     attention_mask: torch.Tensor,
     position_ids: torch.Tensor,
-    kv_cache: Pi05KVCache,
+    kv_workspace: Pi05StepKVWorkspace,
 ) -> torch.Tensor:
     """``PaliGemmaWithActionExpertPi05.forward``'s prefix pass, batch 1, with fused kernels.
 
     Bit-exact with the eager pass: every denoising step attends over the
     prefix K/V and amplifies any rounding difference in it, so the norms,
     residual adds, GEMMs and attention are the torch ops eager runs. Fused are
-    only RoPE, which writes the layer's K/V straight into ``kv_cache``, and the
+    only RoPE, which writes the layer's K/V straight into ``kv_workspace``, and the
     GELU. Returns the final norm's output, as the eager pass does;
     ``inputs_embeds`` is not modified.
     """
@@ -1176,7 +1239,7 @@ def _fused_prefix_forward(
             torch.add(mlp_out, residual, out=hidden_states)
             x_normed.copy_(layer.input_layernorm(hidden_states))
             residual = hidden_states
-        key, value = kv_cache.key[layer_idx, 0, 0], kv_cache.value[layer_idx, 0, 0]
+        key, value = kv_workspace.key[layer_idx, 0, 0], kv_workspace.value[layer_idx, 0, 0]
         _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[:seq_len], value[:seq_len], triton_gemm=False)
         att = _attend(
             q[None],
@@ -1203,14 +1266,14 @@ def _fused_denoise_forward(
     suffix_embs: torch.Tensor,
     attention_mask: torch.Tensor,
     position_ids: torch.Tensor,
-    kv_cache: Pi05KVCache,
+    kv_workspace: Pi05StepKVWorkspace,
     adarms_cond: torch.Tensor,
     action_out_proj: nn.Linear,
 ) -> torch.Tensor:
     """The suffix pass and output head of ``denoise_step``, batch 1, with fused kernels.
 
     Per layer: AdaRMS norm, QKV projection + RoPE writing the suffix K/V
-    behind the cached prefix, attention over the whole cache row, and the
+    behind the cached prefix, attention over the whole workspace row, and the
     ``o_proj`` and MLP GEMMs with their gated residuals and GELU; then the final
     AdaRMS norm fused with ``action_out_proj``. In bfloat16 the GEMMs run in
     Triton with what follows them fused in; in float32 they stay on cuBLAS and
@@ -1223,7 +1286,7 @@ def _fused_denoise_forward(
     proj_dtype = first_layer.self_attn.q_proj.weight.dtype
     num_heads = first_layer.self_attn.config.num_attention_heads
     head_dim = first_layer.self_attn.head_dim
-    prefix_len = kv_cache.prefix_len
+    prefix_len = kv_workspace.prefix_len
     n_keys = prefix_len + seq_len
     device = x_in.device
 
@@ -1239,7 +1302,7 @@ def _fused_denoise_forward(
     residual = x_in
     for layer_idx, layer in enumerate(expert.layers):
         attn = layer.self_attn
-        key, value = kv_cache.key[layer_idx, 0, 0], kv_cache.value[layer_idx, 0, 0]
+        key, value = kv_workspace.key[layer_idx, 0, 0], kv_workspace.value[layer_idx, 0, 0]
 
         modulation = _adarms_modulation(layer.input_layernorm, adarms_cond)
         _fused_rms_norm(residual, layer.input_layernorm, x_normed, modulation=modulation)
@@ -1260,17 +1323,17 @@ def _fused_denoise_forward(
     return v_t
 
 
-def _fused_kernels_serve(backbone: PaliGemmaWithActionExpertPi05, kv_cache, batch_size: int) -> bool:
+def _fused_kernels_serve(backbone: PaliGemmaWithActionExpertPi05, kv_workspace, batch_size: int) -> bool:
     """Whether a call runs the fused kernels: they are enabled, and it is batch 1
-    on a single-KV-head ``Pi05KVCache`` in the action expert's K/V dtype. Any
-    other call runs eagerly, which also keeps eager's errors for bad caches."""
+    on a single-KV-head ``Pi05StepKVWorkspace`` in the action expert's K/V dtype. Any
+    other call runs eagerly, which also keeps eager's errors for bad workspaces."""
     return (
         backbone.fused_kernels
         and batch_size == 1
-        and isinstance(kv_cache, Pi05KVCache)
-        and kv_cache.batch_size == 1
-        and kv_cache.key.shape[2] == 1
-        and kv_cache.key.dtype == backbone.gemma_expert.model.layers[0].self_attn.k_proj.weight.dtype
+        and isinstance(kv_workspace, Pi05StepKVWorkspace)
+        and kv_workspace.batch_size == 1
+        and kv_workspace.key.shape[2] == 1
+        and kv_workspace.key.dtype == backbone.gemma_expert.model.layers[0].self_attn.k_proj.weight.dtype
     )
 
 
@@ -1382,7 +1445,7 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         """Dispatch to prefix_only / suffix_only and return
         ``([prefix_out, suffix_out], past_key_values_or_None)``.
 
-        ``past_key_values`` is a :class:`Pi05KVCache` in both modes: prefix_only
+        ``past_key_values`` is a :class:`Pi05StepKVWorkspace` in both modes: prefix_only
         with ``use_cache`` writes the prefix K/V into it and returns it, and
         suffix_only reads it. With the fused kernels enabled, prefix_only runs
         on them (``_fused_prefix_forward``) when it is batch 1.
@@ -1391,10 +1454,10 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         pali_lm = self.paligemma.model.language_model
         expert_lm = self.gemma_expert.model
 
-        if (use_cache or inputs_embeds[1] is not None) and not isinstance(past_key_values, Pi05KVCache):
+        if (use_cache or inputs_embeds[1] is not None) and not isinstance(past_key_values, Pi05StepKVWorkspace):
             raise TypeError(
                 "PaliGemmaWithActionExpertPi05.forward expects past_key_values to be "
-                f"a Pi05KVCache to write (prefix_only) or read (suffix_only); got {type(past_key_values)}"
+                f"a Pi05StepKVWorkspace to write (prefix_only) or read (suffix_only); got {type(past_key_values)}"
             )
 
         if inputs_embeds[1] is None:
@@ -1453,7 +1516,7 @@ class Pi05ForActionPrediction(nn.Module):
     Inference flow:
       1. Embed prefix (images + language, where the language already carries the
          discretized state) → prefix tokens.
-      2. Forward prefix through PaliGemma → layer-wise KV cache.
+      2. Forward prefix through PaliGemma → per-layer prefix K/V in the step KV workspace.
       3. For each denoising step ``t = 1.0, 1-dt, ..., 0``:
          a. Embed the timestep → an AdaRMS conditioning vector.
          b. Embed the suffix (action tokens only).
@@ -1500,12 +1563,12 @@ class Pi05ForActionPrediction(nn.Module):
         # installs a ``Pi05CUDAGraphs`` unless the stage sets ``enforce_eager``.
         self.cuda_graphs: Pi05CUDAGraphs | None = None
         # Allocated once by ``Pi05Pipeline`` after the model reaches its device
-        # and dtype. ``sample_actions`` falls back to a one-off cache when this
+        # and dtype. ``sample_actions`` falls back to a one-off workspace when this
         # is unset or sized for another batch or prefix length.
-        self.kv_cache: Pi05KVCache | None = None
+        self.kv_workspace: Pi05StepKVWorkspace | None = None
 
-    def new_kv_cache(self, batch_size: int, prefix_len: int | None = None) -> Pi05KVCache:
-        """Create a new `Pi05KVCache` object on this model's device, in the expert's K/V dtype.
+    def new_kv_workspace(self, batch_size: int, prefix_len: int | None = None) -> Pi05StepKVWorkspace:
+        """Create a new `Pi05StepKVWorkspace` object on this model's device, in the expert's K/V dtype.
 
         ``prefix_len`` defaults to the deployed prefix: ``max_cameras`` slots of
         SigLIP image tokens plus the ``tokenizer_max_length`` text block.
@@ -1516,7 +1579,7 @@ class Pi05ForActionPrediction(nn.Module):
             vision_config = self.paligemma_with_expert.paligemma.config.vision_config
             tokens_per_image = (vision_config.image_size // vision_config.patch_size) ** 2
             prefix_len = int(self.config.max_cameras) * tokens_per_image + int(self.config.tokenizer_max_length)
-        return Pi05KVCache(
+        return Pi05StepKVWorkspace(
             num_layers=text_config.num_hidden_layers,
             batch_size=batch_size,
             num_kv_heads=text_config.num_key_value_heads,
@@ -1532,7 +1595,7 @@ class Pi05ForActionPrediction(nn.Module):
 
         The optimized path's kernels (``Pi05Pipeline`` enables them together
         with its CUDA graphs). A call still runs eagerly when it is not batch 1
-        on a single-KV-head ``Pi05KVCache``. Raises if the kernels cannot
+        on a single-KV-head ``Pi05StepKVWorkspace``. Raises if the kernels cannot
         serve this model at all.
         """
         problems = []
@@ -1726,6 +1789,64 @@ class Pi05ForActionPrediction(nn.Module):
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         return self.action_out_proj(suffix_out)
 
+    # ── Prefix pass ──────────────────────────────────────────────────
+    def _prefix_pass(
+        self,
+        images: list[torch.Tensor],
+        image_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+    ) -> tuple[torch.Tensor, Pi05StepKVWorkspace]:
+        """Embed the prefix and run it through PaliGemma into the step KV workspace.
+
+        Returns the ``(B, prefix_len)`` prefix pad masks and the workspace whose
+        prefix slots now hold every row's per-layer prefix K/V: ``kv_workspace``
+        when it fits this batch, else a one-off workspace. Both regions run
+        through CUDA graphs when installed; each falls back to its eager call
+        on its own.
+        """
+        graphs = self.cuda_graphs
+        embed_prefix = self.embed_prefix if graphs is None else graphs.embed_prefix
+        prefix_forward = self.paligemma_with_expert.forward if graphs is None else graphs.prefix_forward
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = embed_prefix(images, image_masks, lang_tokens, lang_masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        batch_size, prefix_len = prefix_embs.shape[:2]
+        kv_workspace = self.kv_workspace
+        if kv_workspace is None or not kv_workspace.fits(batch_size, prefix_len):
+            kv_workspace = self.new_kv_workspace(batch_size, prefix_len)
+        _, kv_workspace = prefix_forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=kv_workspace,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return prefix_pad_masks, kv_workspace
+
+    @torch.no_grad()
+    def encode_prefix(
+        self,
+        images: list[torch.Tensor],
+        image_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+    ) -> list[Pi05RequestPrefixKV]:
+        """Encode each row's observation into a prefix K/V its request owns.
+
+        For execution that denoises a changing batch one step at a time: each
+        request keeps its :class:`Pi05RequestPrefixKV` for all of its denoising
+        steps, and a step loads the prefixes of the rows it runs into a
+        :class:`Pi05StepKVWorkspace` (``load_prefixes``) before
+        ``denoise_step``. The prefix pass itself runs exactly as in
+        ``sample_actions``, so the returned K/V are the ones it would attend over.
+        """
+        prefix_pad_masks, kv_workspace = self._prefix_pass(images, image_masks, lang_tokens, lang_masks)
+        return [kv_workspace.export_prefix(row, prefix_pad_masks[row]) for row in range(prefix_pad_masks.shape[0])]
+
     # ── Full action generation ───────────────────────────────────────
     @torch.no_grad()
     def sample_actions(
@@ -1767,33 +1888,13 @@ class Pi05ForActionPrediction(nn.Module):
                     generator=generator,
                 )
 
-        # The three regions below run through CUDA graphs when installed; each
-        # falls back to its eager call on its own.
+        # 1-2. Prefix embedding and forward, into the step KV workspace.
+        prefix_pad_masks, past_key_values = self._prefix_pass(images, image_masks, lang_tokens, lang_masks)
+
+        # 3. Euler-integrated denoising from t=1 down to t=0. Its CUDA graph
+        #    falls back to the eager step on its own, as the prefix regions do.
         graphs = self.cuda_graphs
-        embed_prefix = self.embed_prefix if graphs is None else graphs.embed_prefix
-        prefix_forward = self.paligemma_with_expert.forward if graphs is None else graphs.prefix_forward
         denoise_step = self.denoise_step if graphs is None else graphs.denoise_step
-
-        # 1. Prefix embeddings + mask building.
-        prefix_embs, prefix_pad_masks, prefix_att_masks = embed_prefix(images, image_masks, lang_tokens, lang_masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
-
-        # 2. Forward prefix through PaliGemma LM, writing its per-layer K/V into
-        #    the cache the denoising steps then extend and read.
-        kv_cache = self.kv_cache
-        if kv_cache is None or not kv_cache.fits(bsize, prefix_embs.shape[1]):
-            kv_cache = self.new_kv_cache(bsize, prefix_embs.shape[1])
-        _, past_key_values = prefix_forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=kv_cache,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
-
-        # 3. Euler-integrated denoising from t=1 down to t=0.
         dt = -1.0 / num_steps
         x_t = noise
         for step in range(num_steps):

@@ -977,13 +977,13 @@ def test_sample_actions_routes_each_region_through_cuda_graphs(tiny_model):
 def test_cuda_graph_capture_failure_raises(tiny_model):
     """``enforce_eager=False`` asks for the graph path: a failed capture must
     stop startup rather than silently serve eagerly."""
-    assert tiny_model.kv_cache is None
+    assert tiny_model.kv_workspace is None
     with pytest.raises(RuntimeError, match="enforce_eager"):
         Pi05CUDAGraphs(tiny_model).capture()
 
 
 @pytest.mark.slow
-def test_preallocated_kv_cache_is_rewritten_every_call():
+def test_preallocated_kv_workspace_is_rewritten_every_call():
     """``sample_actions`` writes every K/V slot it reads before reading it, so
     the preallocated cache reproduces a one-off cache bit for bit whatever an
     earlier call left in it."""
@@ -1008,11 +1008,11 @@ def test_preallocated_kv_cache_is_rewritten_every_call():
     other_prompt = torch.ones(1, 200, dtype=torch.long)
     with torch.no_grad():
         one_off = run(prompt)
-        cache = model.new_kv_cache(batch_size=1)
+        cache = model.new_kv_workspace(batch_size=1)
         assert cache.fits(1, 3 * 256 + 200)
         cache.key.fill_(float("nan"))
         cache.value.fill_(float("nan"))
-        model.kv_cache = cache
+        model.kv_workspace = cache
         preallocated = run(prompt)
         other = run(other_prompt)
         after_other = run(prompt)
@@ -1024,12 +1024,98 @@ def test_preallocated_kv_cache_is_rewritten_every_call():
 
 
 @pytest.mark.slow
-def test_forward_requires_a_kv_cache(tiny_model):
+def test_forward_requires_a_kv_workspace(tiny_model):
     backbone = tiny_model.paligemma_with_expert
-    with pytest.raises(TypeError, match="Pi05KVCache"):
+    with pytest.raises(TypeError, match="Pi05StepKVWorkspace"):
         backbone.forward(inputs_embeds=[torch.zeros(1, 4, tiny_model.vlm_width), None], use_cache=True)
-    with pytest.raises(TypeError, match="Pi05KVCache"):
+    with pytest.raises(TypeError, match="Pi05StepKVWorkspace"):
         backbone.forward(inputs_embeds=[None, torch.zeros(1, 4, tiny_model.expert_width)], past_key_values=[])
+
+
+def _gated_tiny_model():
+    """A fresh model whose expert gates are open, so a chunk depends on the prefix K/V.
+
+    AdaRMS ``dense`` is zero-initialized, which closes every expert gate.
+    """
+    model = _tiny_pi05_model().eval()
+    generator = torch.Generator().manual_seed(0)
+    for module in model.modules():
+        if isinstance(module, Pi05AdaRMSNorm) and module.dense is not None:
+            module.dense.weight.data.normal_(std=0.02, generator=generator)
+    return model
+
+
+def _prefix_inputs(prompt_token: int, live_views: int):
+    images = [torch.full((1, 3, 224, 224), 0.1 * index) for index in range(3)]
+    masks = [torch.tensor([index < live_views]) for index in range(3)]
+    lang = torch.full((1, 200), prompt_token, dtype=torch.long)
+    lang_mask = torch.zeros(1, 200, dtype=torch.bool)
+    lang_mask[:, : 20 + prompt_token] = True
+    return images, masks, lang, lang_mask
+
+
+def _denoise_with_prefixes(model, prefixes, noise, num_steps):
+    """``sample_actions``' Euler loop over request prefixes loaded into a step workspace."""
+    workspace = model.new_kv_workspace(len(prefixes), prefixes[0].prefix_len)
+    prefix_pad_masks = workspace.load_prefixes(prefixes)
+    dt = -1.0 / num_steps
+    x_t = noise
+    for step in range(num_steps):
+        time_tensor = torch.full((len(prefixes),), 1.0 + step * dt, dtype=torch.float32)
+        x_t = x_t + dt * model.denoise_step(prefix_pad_masks, workspace, x_t, time_tensor)
+    return x_t
+
+
+@pytest.mark.slow
+def test_request_prefix_kv_is_owned_by_its_request():
+    """A later request's prefix pass rewrites the workspace, not an earlier request's prefix."""
+    model = _gated_tiny_model()
+    model.kv_workspace = model.new_kv_workspace(batch_size=1)
+    with torch.no_grad():
+        (first,) = model.encode_prefix(*_prefix_inputs(prompt_token=3, live_views=1))
+        kept = (first.key.clone(), first.value.clone(), first.pad_mask.clone())
+        (second,) = model.encode_prefix(*_prefix_inputs(prompt_token=5, live_views=2))
+
+    assert first.key.shape == (2, 1, 3 * 256 + 200, 256)
+    assert first.pad_mask.shape == (3 * 256 + 200,)
+    assert first.key.data_ptr() != model.kv_workspace.key.data_ptr()
+    assert torch.equal(first.key, kept[0]) and torch.equal(first.value, kept[1])
+    assert torch.equal(first.pad_mask, kept[2])
+    assert not torch.equal(first.key, second.key)
+    assert not torch.equal(first.pad_mask, second.pad_mask)
+
+
+@pytest.mark.slow
+def test_request_prefixes_in_any_row_order_reproduce_sample_actions():
+    """Loaded into a step workspace, each request's prefix gives the chunk
+    ``sample_actions`` gives that request alone, whichever row it occupies."""
+    model = _gated_tiny_model()
+    requests = [_prefix_inputs(prompt_token=3, live_views=1), _prefix_inputs(prompt_token=5, live_views=3)]
+    noise = torch.randn(2, 4, 8, generator=torch.Generator().manual_seed(7))
+    with torch.no_grad():
+        alone = [
+            model.sample_actions(*inputs, noise=noise[row : row + 1], num_steps=2)
+            for row, inputs in enumerate(requests)
+        ]
+        prefixes = [model.encode_prefix(*inputs)[0] for inputs in requests]
+        in_order = _denoise_with_prefixes(model, prefixes, noise, num_steps=2)
+        swapped = _denoise_with_prefixes(model, prefixes[::-1], noise.flip(0), num_steps=2)
+
+    for row in range(2):
+        torch.testing.assert_close(in_order[row : row + 1], alone[row], rtol=0, atol=1e-5)
+        torch.testing.assert_close(swapped[1 - row : 2 - row], alone[row], rtol=0, atol=1e-5)
+    assert not torch.allclose(alone[0], alone[1])
+
+
+@pytest.mark.slow
+def test_step_workspace_rejects_prefixes_it_cannot_hold(tiny_model):
+    with torch.no_grad():
+        (prefix,) = tiny_model.encode_prefix(*_prefix_inputs(prompt_token=3, live_views=1))
+    workspace = tiny_model.new_kv_workspace(batch_size=2)
+    with pytest.raises(ValueError, match="2 rows, got 1"):
+        workspace.load_prefixes([prefix])
+    with pytest.raises(ValueError, match="tokens"):
+        tiny_model.new_kv_workspace(batch_size=1, prefix_len=prefix.prefix_len - 1).load_prefixes([prefix])
 
 
 @pytest.mark.slow
@@ -1045,16 +1131,16 @@ def test_fused_kernels_are_off_until_enabled_and_need_cuda():
 
 
 @pytest.mark.slow
-def test_fused_kernels_serve_only_batch_one_on_a_single_head_kv_cache(tiny_model):
+def test_fused_kernels_serve_only_batch_one_on_a_single_head_kv_workspace(tiny_model):
     """Calls the kernels do not cover run eagerly even once they are enabled."""
     backbone = tiny_model.paligemma_with_expert
     serve = modeling_pi05._fused_kernels_serve
-    cache = tiny_model.new_kv_cache(batch_size=1)
+    cache = tiny_model.new_kv_workspace(batch_size=1)
     backbone.fused_kernels = True
     try:
         assert serve(backbone, cache, batch_size=1)
         assert not serve(backbone, cache, batch_size=2)
-        assert not serve(backbone, tiny_model.new_kv_cache(batch_size=2), batch_size=2)
+        assert not serve(backbone, tiny_model.new_kv_workspace(batch_size=2), batch_size=2)
         assert not serve(backbone, [], batch_size=1)
         backbone.fused_kernels = False
         assert not serve(backbone, cache, batch_size=1)

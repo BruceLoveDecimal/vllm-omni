@@ -6,7 +6,7 @@
 
 1. the prefix embedding (``embed_prefix``);
 2. the prefix forward pass that writes the per-layer prefix K/V into
-   ``model.kv_cache`` (``paligemma_with_expert.forward`` with prefix inputs);
+   ``model.kv_workspace`` (``paligemma_with_expert.forward`` with prefix inputs);
 3. one denoising step (``denoise_step``), replayed once per step.
 
 One graph per region is enough. Every shape is fixed for a serving instance:
@@ -19,7 +19,7 @@ reads a tensor value on the host, so no captured control flow depends on data.
 The graphs are captured once at init (``Pi05CUDAGraphs.capture``), in replay
 order and into one memory pool. Regions hand data to each other without
 copies: region 1's ``prefix_embs`` output is region 2's static input, its
-``prefix_pad_masks`` output is region 3's, and ``model.kv_cache`` is written by
+``prefix_pad_masks`` output is region 3's, and ``model.kv_workspace`` is written by
 region 2 and extended and read by region 3. A region copies an input into its
 static buffer only when the caller passes a different tensor.
 
@@ -51,7 +51,7 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
-    Pi05KVCache,
+    Pi05StepKVWorkspace,
     make_att_2d_masks,
     prepare_attention_masks_4d,
 )
@@ -100,9 +100,9 @@ class _PrefixForwardGraph:
     position_ids: torch.Tensor
     # Region 1's ``prefix_embs`` output.
     inputs_embeds: torch.Tensor
-    kv_cache: Pi05KVCache
-    # ``([prefix_out, None], kv_cache)``
-    outputs: tuple[list[torch.Tensor | None], Pi05KVCache]
+    kv_workspace: Pi05StepKVWorkspace
+    # ``([prefix_out, None], kv_workspace)``
+    outputs: tuple[list[torch.Tensor | None], Pi05StepKVWorkspace]
 
 
 @dataclass
@@ -110,7 +110,7 @@ class _DenoiseStepGraph:
     graph: torch.cuda.CUDAGraph
     # Region 1's ``prefix_pad_masks`` output.
     prefix_pad_masks: torch.Tensor
-    kv_cache: Pi05KVCache
+    kv_workspace: Pi05StepKVWorkspace
     x_t: torch.Tensor
     timestep: torch.Tensor
     v_t: torch.Tensor
@@ -133,7 +133,7 @@ class Pi05CUDAGraphs:
     def capture(self) -> None:
         """Capture all three regions at the deployed shapes, batch size 1.
 
-        Needs ``model.kv_cache``. Raises on failure: ``enforce_eager=False`` asks
+        Needs ``model.kv_workspace``. Raises on failure: ``enforce_eager=False`` asks
         for the graph path, so a silent eager fallback would hide a slowdown.
         """
         try:
@@ -147,10 +147,10 @@ class Pi05CUDAGraphs:
 
     def _capture(self) -> None:
         model = self._model
-        kv_cache = model.kv_cache
-        if kv_cache is None or kv_cache.batch_size != 1:
-            raise ValueError(f"Capture needs a batch-size-1 model.kv_cache, got {kv_cache!r}.")
-        device = kv_cache.key.device
+        kv_workspace = model.kv_workspace
+        if kv_workspace is None or kv_workspace.batch_size != 1:
+            raise ValueError(f"Capture needs a batch-size-1 model.kv_workspace, got {kv_workspace!r}.")
+        device = kv_workspace.key.device
         config = model.config
         height, width = config.image_resolution
         text_len = int(config.tokenizer_max_length)
@@ -175,13 +175,15 @@ class Pi05CUDAGraphs:
             model.paligemma_with_expert.forward(
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=kv_cache,
+                past_key_values=kv_workspace,
                 inputs_embeds=[prefix_embs, None],
                 use_cache=True,
             )
             x_t = torch.zeros(1, model.action_horizon, model.action_dim, dtype=torch.float32, device=device)
             timestep = torch.ones(1, dtype=torch.float32, device=device)
-            model.denoise_step(prefix_pad_masks=prefix_pad_masks, past_key_values=kv_cache, x_t=x_t, timestep=timestep)
+            model.denoise_step(
+                prefix_pad_masks=prefix_pad_masks, past_key_values=kv_workspace, x_t=x_t, timestep=timestep
+            )
             torch.accelerator.synchronize(device)
 
             # Graphs sharing a pool must replay in the order they were captured,
@@ -199,18 +201,20 @@ class Pi05CUDAGraphs:
                 outputs = model.paligemma_with_expert.forward(
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    past_key_values=kv_cache,
+                    past_key_values=kv_workspace,
                     inputs_embeds=[prefix_embs, None],
                     use_cache=True,
                 )
-            prefix_forward = _PrefixForwardGraph(graph, attention_mask, position_ids, prefix_embs, kv_cache, outputs)
+            prefix_forward = _PrefixForwardGraph(
+                graph, attention_mask, position_ids, prefix_embs, kv_workspace, outputs
+            )
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=pool):
                 v_t = model.denoise_step(
-                    prefix_pad_masks=prefix_pad_masks, past_key_values=kv_cache, x_t=x_t, timestep=timestep
+                    prefix_pad_masks=prefix_pad_masks, past_key_values=kv_workspace, x_t=x_t, timestep=timestep
                 )
-            denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t)
+            denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_workspace, x_t, timestep, v_t)
 
         self._embed_prefix, self._prefix_forward, self._denoise_step = embed_prefix, prefix_forward, denoise_step
 
@@ -260,7 +264,7 @@ class Pi05CUDAGraphs:
         g = self._prefix_forward
         if g is not None and not (
             torch.get_default_dtype() == _CAPTURE_DEFAULT_DTYPE
-            and past_key_values is g.kv_cache
+            and past_key_values is g.kv_workspace
             and use_cache
             and adarms_cond is None
             and inputs_embeds is not None
@@ -299,7 +303,7 @@ class Pi05CUDAGraphs:
         g = self._denoise_step
         if g is not None and not (
             torch.get_default_dtype() == _CAPTURE_DEFAULT_DTYPE
-            and past_key_values is g.kv_cache
+            and past_key_values is g.kv_workspace
             and _matches(prefix_pad_masks, g.prefix_pad_masks)
             and _matches(x_t, g.x_t)
             and _matches(timestep, g.timestep)

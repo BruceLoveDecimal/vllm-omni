@@ -178,8 +178,8 @@ class Pi05Pipeline(nn.Module):
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
         # Sized for one observation, the deployed default (``max_num_seqs: 1``).
-        # A larger batch gets a cache of its own size in ``sample_actions``.
-        self.model.kv_cache = self.model.new_kv_cache(batch_size=1)
+        # A larger batch gets a workspace of its own size in ``sample_actions``.
+        self.model.kv_workspace = self.model.new_kv_workspace(batch_size=1)
         self._install_cuda_graphs(od_config)
 
         self.processor = Pi05Processor(self.config, self.tokenizer, self._device)

@@ -264,16 +264,16 @@ def test_prefix_forward_is_bit_exact(pipeline, num_views):
         embs, pad_masks, att_masks = model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
         prefix_len = embs.shape[1]
         for fused_kernels in (False, True):
-            kv_cache = model.new_kv_cache(1, prefix_len)
+            kv_workspace = model.new_kv_workspace(1, prefix_len)
             with _path(model, graphs=None, fused_kernels=fused_kernels):
                 (out, _), _ = model.paligemma_with_expert.forward(
                     attention_mask=prepare_attention_masks_4d(make_att_2d_masks(pad_masks, att_masks)),
                     position_ids=torch.cumsum(pad_masks, dim=1) - 1,
-                    past_key_values=kv_cache,
+                    past_key_values=kv_workspace,
                     inputs_embeds=[embs, None],
                     use_cache=True,
                 )
-            results.append((out, kv_cache.key[:, :, :, :prefix_len], kv_cache.value[:, :, :, :prefix_len]))
+            results.append((out, kv_workspace.key[:, :, :, :prefix_len], kv_workspace.value[:, :, :, :prefix_len]))
     for name, eager, fused in zip(("output", "prefix K", "prefix V"), *results):
         assert torch.equal(fused, eager), f"fused prefix {name} differs from eager"
 
@@ -307,13 +307,13 @@ def test_eager_fallback_mixes_with_replayed_regions(outputs, pipeline):
     case = (3, None)
     index = CASES.index(case)
 
-    kv_cache = model.kv_cache
+    kv_workspace = model.kv_workspace
     replays_before = graphs.num_replays.copy()
-    model.kv_cache = None
+    model.kv_workspace = None
     try:
         actual = _sample(model, outputs.inputs[case], case[1], seed=index)
     finally:
-        model.kv_cache = kv_cache
+        model.kv_workspace = kv_workspace
 
     assert graphs.num_replays - replays_before == {"embed_prefix": 1}
     assert torch.equal(actual, outputs.fused_eager[case])
@@ -335,11 +335,11 @@ def test_sample_actions_never_syncs_with_the_host(pipeline, path):
             torch.cuda.set_sync_debug_mode("default")
 
 
-def test_sample_actions_writes_the_preallocated_kv_cache(pipeline):
+def test_sample_actions_writes_the_preallocated_kv_workspace(pipeline):
     """The pipeline allocates the KV cache once at init for the deployed
     prefix, and ``sample_actions`` fills every slot of it."""
     model = pipeline.model
-    cache = model.kv_cache
+    cache = model.kv_workspace
     inputs = pipeline.processor.build_model_inputs(_robot_obs(pipeline.config, 3, seed=0))
     with torch.inference_mode():
         prefix_len = model.embed_prefix(*inputs)[0].shape[1]
@@ -348,7 +348,7 @@ def test_sample_actions_writes_the_preallocated_kv_cache(pipeline):
     cache.key.fill_(float("nan"))
     cache.value.fill_(float("nan"))
     _sample_on_device(model, inputs, num_steps=None, seed=0)
-    assert model.kv_cache is cache
+    assert model.kv_workspace is cache
     assert torch.isfinite(cache.key).all() and torch.isfinite(cache.value).all()
 
 
