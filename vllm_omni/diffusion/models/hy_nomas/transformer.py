@@ -173,9 +173,14 @@ class HyNomasTokenRefinerMLP(nn.Module):
 
 
 class HyNomasTextAttnProcessor:
-    def __call__(self, attn, hidden_states, attention_mask=None):
+    def __call__(self, attn, hidden_states, attention_mask=None, packing=None):
         query, key, value = attn.self_attn_qkv(hidden_states).unflatten(-1, (3, attn.heads, -1)).unbind(-3)
-        hidden_states = attn.attention(query, key, value, attn_metadata=AttentionMetadata(attn_mask=attention_mask))
+        hidden_states = attn.attention(
+            query,
+            key,
+            value,
+            attn_metadata=AttentionMetadata(attn_mask=attention_mask, extra=packing if packing is not None else {}),
+        )
         if attention_mask is not None:
             hidden_states = hidden_states * attention_mask[:, :, None, None].to(hidden_states.dtype)
         return attn.self_attn_proj(hidden_states.flatten(-2))
@@ -192,8 +197,8 @@ class HyNomasTextAttention(nn.Module):
         self.attention = _attention(heads, hidden_size // heads, "hy_nomas.text")
         self.processor = self._default_processor_cls()
 
-    def forward(self, hidden_states, attention_mask=None) -> torch.Tensor:
-        return self.processor(self, hidden_states, attention_mask)
+    def forward(self, hidden_states, attention_mask=None, packing=None) -> torch.Tensor:
+        return self.processor(self, hidden_states, attention_mask, packing)
 
 
 class HyNomasTokenRefinerBlock(nn.Module):
@@ -205,11 +210,12 @@ class HyNomasTokenRefinerBlock(nn.Module):
         self.mlp = HyNomasTokenRefinerMLP(hidden_size)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
 
-    def forward(self, hidden_states, temb, attention_mask) -> torch.Tensor:
+    def forward(self, hidden_states, temb, attention_mask, packing=None) -> torch.Tensor:
         attention_gate, mlp_gate = self.adaLN_modulation(temb).chunk(2, dim=-1)
         hidden_states = (
             hidden_states
-            + self.attn(self.norm1(hidden_states).to(hidden_states.dtype), attention_mask) * attention_gate[:, None]
+            + self.attn(self.norm1(hidden_states).to(hidden_states.dtype), attention_mask, packing)
+            * attention_gate[:, None]
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states).to(hidden_states.dtype)) * mlp_gate[:, None]
         return hidden_states
@@ -224,8 +230,9 @@ class HyNomasIndividualTokenRefiner(nn.Module):
         if attention_mask is not None:
             attention_mask = attention_mask.clone().bool()
             attention_mask[:, 0] = True
+        packing = {}
         for block in self.blocks:
-            hidden_states = block(hidden_states, temb, attention_mask)
+            hidden_states = block(hidden_states, temb, attention_mask, packing)
         return hidden_states
 
 
