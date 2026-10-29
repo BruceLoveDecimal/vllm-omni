@@ -241,3 +241,27 @@ CPU contract tests cover:
 GPU validation must additionally exercise real model loading, action input,
 prompt switching, rolling-window replacement, reset, close, finite output
 latents, and exact metadata/request identity.
+
+## Experimental video memory policies
+
+LingBot accepts an opt-in `model_config.video_memory` mapping. The initial
+Deep Sink policy uses `window_frames: 18`, `sink_frames: 9`, and
+`rebase_sink: true`. Units are latent frames; the window includes the current
+chunk. Omitting the mapping preserves the existing paged/direct paths.
+
+The eager policy keeps canonical clean keys at their original temporal RoPE
+positions and rotates only the temporal channels of attention views. Values
+and spatial channels are unchanged. Every noisy forward is read-only; all
+layers and the output projection must succeed before clean history is
+published. The runner owns session policy storage and releases it on close,
+reset, eviction, and failure. Request-mode policy storage is request-local.
+Its conservative device-memory reservation includes canonical rows, pending
+rows, replacement rows, attention views, and position metadata. The legacy
+pool uses minimum geometry and receives no duplicate self-KV writes.
+
+This initial path requires single-rank eager attention and clean commits;
+first-block sharing and last-noisy-step KV reuse are rejected. CPU tests check
+rotation against complex arithmetic, repeated denoising, full-transformer
+legacy parity with rebasing disabled, and transactional publication. These are
+numerical and lifecycle checks, not evidence of checkpoint quality or GPU
+latency improvements.

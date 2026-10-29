@@ -97,6 +97,16 @@ class LingBotDMDBlockRunner:
         frames = condition.shape[2] // patch_frames
         height = condition.shape[3] // patch_height
         width = condition.shape[4] // patch_width
+        memory_config = getattr(self.transformer, "video_memory_config", None)
+        if memory_config is not None:
+            memory = ar.state.video_memory(
+                ar.branch,
+                memory_config,
+                tokens_per_frame=height * width,
+                temporal_dim=self.transformer.config.attention_head_dim
+                - 4 * (self.transformer.config.attention_head_dim // 6),
+            )
+            return LingBotTransformerCache([], ar.cross_attention, memory=memory)
         return LingBotTransformerCache(
             self_attention=ar.state.get_kv_caches(
                 ar.branch,
