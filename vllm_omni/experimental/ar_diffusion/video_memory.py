@@ -8,6 +8,7 @@ may rebase that phase, but never write it back into canonical history.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,14 +24,40 @@ class VideoMemoryConfig:
     retrieval_frames: int = 0
     bank_bytes: int = 0
     rebase_retrieval: bool = False
+    world_keep_ratio: float = 1.0
+    world_score: str = "pairwise_mean"
+    pc_budget_frames: int = 0
+    pc_recent_frames: int = 3
 
     def __post_init__(self) -> None:
-        for name in ("window_frames", "sink_frames", "retrieval_frames", "bank_bytes"):
+        for name in (
+            "window_frames",
+            "sink_frames",
+            "retrieval_frames",
+            "bank_bytes",
+            "pc_budget_frames",
+            "pc_recent_frames",
+        ):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"video_memory.{name} must be a non-negative integer")
         if self.window_frames <= self.sink_frames:
             raise ValueError("video_memory.window_frames must exceed sink_frames")
+        if (
+            isinstance(self.world_keep_ratio, bool)
+            or not isinstance(self.world_keep_ratio, (int, float))
+            or not 0 <= self.world_keep_ratio <= 1
+        ):
+            raise ValueError("video_memory.world_keep_ratio must be in [0,1]")
+        if self.world_score not in ("pairwise_mean", "centroid"):
+            raise ValueError("video_memory.world_score must be pairwise_mean or centroid")
+        if self.world_keep_ratio != 1 and not self.retrieval_frames:
+            raise ValueError("World compression requires retrieval")
+        if self.pc_budget_frames:
+            if not self.sink_frames + self.pc_recent_frames <= self.pc_budget_frames < self.window_frames:
+                raise ValueError("PC budget must fit sink and recent, and be smaller than the window")
+            if self.retrieval_frames:
+                raise ValueError("Combined retrieval and PC is not enabled")
         if self.retrieval_frames and not self.bank_bytes:
             raise ValueError("video_memory retrieval requires a positive bank_bytes limit")
         if self.sink_frames + self.retrieval_frames >= self.window_frames:
@@ -85,6 +112,49 @@ class MemoryRows:
         return MemoryRows(self.key[:, indices], self.value[:, indices], self.positions[indices])
 
 
+def world_compress(rows: MemoryRows, tokens_per_frame: int, keep_ratio: float, score: str) -> MemoryRows:
+    """Anchor + pooled non-anchor selection, independently for each layer.
+
+    pairwise_mean exactly factors mean cosine similarity as normalized keys
+    dotted with the mean *normalized* anchor. centroid reproduces the released
+    code's normalized raw-anchor centroid. Neither materializes T x T scores.
+    """
+    count = rows.positions.numel()
+    if count <= tokens_per_frame or keep_ratio == 1:
+        return rows
+    dtype = torch.float64 if rows.key.dtype == torch.float64 else torch.float32
+    flat = rows.key[0].to(dtype).flatten(1)
+
+    def normalize(x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.normalize(x, dim=-1)
+
+    anchor, candidates = flat[:tokens_per_frame], flat[tokens_per_frame:]
+    center = normalize(anchor).mean(0) if score == "pairwise_mean" else normalize(anchor.mean(0))
+    scores = normalize(candidates) @ center
+    keep = math.ceil((count - tokens_per_frame) * keep_ratio)
+    selected = torch.argsort(scores, stable=True)[:keep].sort().values + tokens_per_frame
+    indices = torch.cat((torch.arange(tokens_per_frame, device=flat.device), selected))
+    return rows.select(indices)
+
+
+def participative_indices(
+    query: torch.Tensor, rows: MemoryRows, *, sink_frames: int, recent_start: int, capacity: int
+) -> torch.Tensor:
+    """Top-C using sum of QK logits, with mandatory sink/recent preservation."""
+    positions = rows.positions
+    indices = torch.arange(positions.numel(), device=positions.device)
+    protected = (positions < sink_frames) | (positions >= recent_start)
+    forced = indices[protected]
+    if forced.numel() > capacity:
+        raise ValueError("PC capacity cannot discard protected sink/recent tokens")
+    candidates = indices[~protected]
+    dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
+    q_sum = query[0].to(dtype).flatten(1).sum(0)
+    scores = rows.key[0, candidates].to(dtype).flatten(1) @ q_sum
+    chosen = torch.argsort(scores, descending=True, stable=True)[: capacity - forced.numel()]
+    return torch.cat((forced, candidates[chosen])).sort().values
+
+
 @dataclass(frozen=True)
 class BankChunk:
     start: int
@@ -133,6 +203,9 @@ class VideoMemory:
         self._closed = False
         self._pending: dict[int, MemoryRows] = {}
         self._seen: set[int] = set()
+        self._selection: dict[int, MemoryRows] = {}
+        self._query_history: dict[int, torch.Tensor] = {}
+        self._pending_queries: dict[int, torch.Tensor] = {}
 
     def set_pose(self, pose: torch.Tensor) -> None:
         """Supply a representative absolute C2W pose in the session coordinate frame."""
@@ -197,7 +270,12 @@ class VideoMemory:
                 rows.value.to(device="cpu", copy=True),
                 rows.positions.to(device="cpu", copy=True),
             )
-            for rows in (self._pending[i] for i in range(self.num_layers))
+            for rows in (
+                world_compress(
+                    self._pending[i], self.tokens_per_frame, self.config.world_keep_ratio, self.config.world_score
+                )
+                for i in range(self.num_layers)
+            )
         )
         chunk = BankChunk(self.next_frame, self._frames, self.pose.clone(), layers)
         if chunk.nbytes > self.config.bank_bytes:
@@ -218,6 +296,10 @@ class VideoMemory:
             raise ValueError("Video memory chunks must be contiguous and nonempty")
         if frames + self.config.sink_frames + self.config.retrieval_frames > self.config.window_frames:
             raise ValueError("Video memory must fit sink and the complete current chunk")
+        if self.config.pc_budget_frames and self.config.pc_recent_frames < frames:
+            raise ValueError("PC recent frames must protect the complete current chunk")
+        original_selection = dict(self._selection)
+        success = False
         self._retrieved = self._retrieve(frames)
         self._active = True
         self._frames = frames
@@ -228,18 +310,29 @@ class VideoMemory:
                 raise RuntimeError("Video memory forward did not execute all layers")
             if commit:
                 replacement = [self._retained(i, self._pending[i]) for i in range(self.num_layers)]
+                queries = dict(self._query_history)
+                for layer, query in self._pending_queries.items():
+                    old = queries.get(layer)
+                    joined = query if old is None else torch.cat((old, query), 1)
+                    queries[layer] = joined[:, -self.config.pc_recent_frames * self.tokens_per_frame :].clone()
                 bank = self._publish_bank()
                 self.history, self.bank = replacement, bank
+                self._query_history = queries
+                self._selection.clear()
                 self.next_frame += frames
                 self.pose = None
+            success = True
         finally:
+            if not success:
+                self._selection = original_selection
+            self._pending_queries.clear()
             self._pending.clear()
             self._seen.clear()
             self._active = False
             self._retrieved = ()
 
     def _retained(self, layer: int, current: MemoryRows) -> MemoryRows:
-        previous = self.history[layer]
+        previous = self._selection.get(layer, self.history[layer])
         if previous is None:
             return current
         rows = MemoryRows(
@@ -271,9 +364,29 @@ class VideoMemory:
             # These slices must own storage: QKV projections otherwise keep Q
             # and the unselected tokens alive after a compression/commit.
             self._pending[layer] = MemoryRows(key.detach().clone(), value.detach().clone(), positions)
-        previous = self.history[layer]
+        previous = self._selection.get(layer, self.history[layer])
+        if self._commit and self.config.pc_budget_frames:
+            self._pending_queries[layer] = query.detach().clone()
         if previous is None:
             return key, value
+        if (
+            self.config.pc_budget_frames
+            and layer not in self._selection
+            and previous.positions.numel() + key.shape[1] >= self.config.window_frames * self.tokens_per_frame
+        ):
+            older_queries = self._query_history.get(layer)
+            recent_queries = query if older_queries is None else torch.cat((older_queries, query), 1)
+            recent_queries = recent_queries[:, -self.config.pc_recent_frames * self.tokens_per_frame :]
+            selected = participative_indices(
+                recent_queries,
+                previous,
+                sink_frames=self.config.sink_frames,
+                recent_start=self.next_frame + self._frames - self.config.pc_recent_frames,
+                capacity=self.config.pc_budget_frames * self.tokens_per_frame - key.shape[1],
+            )
+            previous = previous.select(selected)
+            self._selection[layer] = previous
+
         sink = previous.positions < self.config.sink_frames
         tail_start = max(
             self.config.sink_frames,
@@ -283,11 +396,26 @@ class VideoMemory:
             + self.config.sink_frames
             + self.config.retrieval_frames,
         )
-        keep = sink | (previous.positions >= tail_start)
+        if self.config.pc_budget_frames:
+            tail_start = max(self.config.sink_frames, self.next_frame + self._frames - self.config.pc_recent_frames)
+            keep = torch.ones_like(sink)
+        else:
+            keep = sink | (previous.positions >= tail_start)
         indices = torch.where(keep)[0]
         rows = previous.select(indices)
         if self.config.rebase_sink:
             delta = torch.where(rows.positions < self.config.sink_frames, tail_start - self.config.sink_frames, 0)
+            if self.config.pc_budget_frames:
+                middle = torch.where((rows.positions >= self.config.sink_frames) & (rows.positions < tail_start))[0]
+                middle_frames = math.ceil(middle.numel() / self.tokens_per_frame)
+                sink_shift = max(0, tail_start - middle_frames - self.config.sink_frames)
+                delta = torch.where(rows.positions < self.config.sink_frames, sink_shift, 0)
+                target = (
+                    tail_start
+                    - middle_frames
+                    + torch.arange(middle.numel(), device=key.device) // self.tokens_per_frame
+                )
+                delta[middle] = target - rows.positions[middle]
             history_key = rebase_temporal_keys(rows.key, delta, self.temporal_dim)
         else:
             history_key = rows.key
@@ -312,6 +440,9 @@ class VideoMemory:
         self.history = [None] * self.num_layers
         self._pending.clear()
         self._seen.clear()
+        self._selection.clear()
+        self._query_history.clear()
+        self._pending_queries.clear()
         self.bank.clear()
         self.pose = None
         self._retrieved = ()

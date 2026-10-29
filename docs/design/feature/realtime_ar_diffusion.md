@@ -292,3 +292,34 @@ to the bank. Bank transfers currently run synchronously on the eager worker;
 GPU latency and asynchronous prefetch remain separate validation/optimization
 work. CPU tests cover analytical pose distances, exact attention assembly,
 byte eviction, missing/invalid poses, and failed publication.
+
+### World and participative compression
+
+`world_keep_ratio` defaults to `1.0` (no bank compression). `0.25` preserves
+all anchor-frame tokens and one quarter of pooled non-anchor tokens. A
+three-frame chunk therefore occupies 1.5 frame-equivalents, subject to integer
+rounding. Keys, values and original positions use the same per-layer indices.
+`world_score: pairwise_mean` implements the paper's mean pairwise cosine score
+without constructing a quadratic matrix; `centroid` selects the released
+implementation's raw-anchor-centroid score. These are distinct algorithms.
+Compression occurs once at bank insertion, before CPU transfer. Retrieval
+budgets count actual compressed tokens, allowing more historical chunks in the
+same attention budget. Bank byte accounting includes position/pose metadata.
+
+Set `pc_budget_frames` below `window_frames` to enable Participative Compression;
+`pc_recent_frames` protects the most recent frames including the current chunk.
+For example, a standalone PC experiment can use window/sink/budget/recent
+values `21/10/16/4`. The sink and recent regions must fit inside the budget.
+At window saturation, the first forward of a chunk scores intermediate keys
+using recent clean queries plus the current queries, aggregated as sum-QK
+logits. The resulting per-layer selection remains fixed across that chunk's
+remaining noisy forwards and clean commit. Clean query history is bounded by
+the recent budget. Publication remains transactional. This query-history
+convention is explicit; it is not a claim of bitwise parity with the upstream
+research script's mutable denoising-query buffer.
+
+With `rebase_sink: true`, PC also rebases selected intermediate keys into a
+compact virtual timeline before the recent region. Canonical positions remain
+unchanged. CPU tests compare scoring with full pairwise cosine/QK matrices,
+check low-precision selection, stable ties, exact retained storage size, and
+repeated compression over many windows. Real-weight quality remains unmeasured.
