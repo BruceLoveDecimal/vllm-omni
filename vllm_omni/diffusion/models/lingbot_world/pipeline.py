@@ -1509,6 +1509,7 @@ class LingBotWorldCausalDMDPipeline(
         schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
+        camera_pose: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self._dmd_blocks.generate_block(
             condition=condition,
@@ -1520,6 +1521,7 @@ class LingBotWorldCausalDMDPipeline(
             schedule=schedule,
             generator=generator,
             progress_bar=progress_bar,
+            camera_pose=camera_pose,
         )
 
     def _session_text_caches(
@@ -1714,6 +1716,16 @@ class LingBotWorldCausalDMDPipeline(
                 max_sequence_length=inputs.max_sequence_length,
                 session_state=session_state,
             )
+        retrieval_poses = None
+        memory_config = getattr(self, "_video_memory_config", None)
+        if memory_config is not None and memory_config.retrieval_frames:
+            trajectory = inputs.camera_trajectory
+            if inputs.camera_actions is None:
+                trajectory = CameraTrajectory(
+                    poses=trajectory.poses[: inputs.num_frames], intrinsics=trajectory.intrinsics[: inputs.num_frames]
+                )
+                trajectory = interpolate_camera_trajectory(trajectory, inputs.num_latent_frames)
+            retrieval_poses = trajectory.poses
         generated_blocks: list[torch.Tensor] = []
         total_steps = (inputs.num_latent_frames // block_frames) * len(LINGBOT_DMD_TIMESTEPS)
         first_start_frame = tick.chunk_index * block_frames if tick is not None else 0
@@ -1739,6 +1751,11 @@ class LingBotWorldCausalDMDPipeline(
                         schedule=schedule,
                         generator=inputs.generator,
                         progress_bar=progress_bar,
+                        **(
+                            {"camera_pose": retrieval_poses[local_start_frame + block_frames // 2]}
+                            if retrieval_poses is not None
+                            else {}
+                        ),
                     )
                 )
         generated_latents = torch.cat(generated_blocks, dim=2)
@@ -2106,6 +2123,7 @@ class LingBotWorldCausalDMDPipeline(
                 initial_pitch=float(extra.get("camera_pitch", 0.0)),
             )
             extra["camera_pitch"] = camera_pitch
+            retrieval_pose = action_trajectory.poses[block_frames // 2]
             media_frames = self._chunk_media_frame_count(state, block_frames=block_frames)
             chunk_inputs = replace(
                 inputs,
@@ -2127,6 +2145,7 @@ class LingBotWorldCausalDMDPipeline(
             ):
                 raise ValueError("Cannot use mid-generation camera interaction together with camera_embedding_cache; ")
             trajectory = extra["camera_trajectory_cache"]
+            retrieval_pose = trajectory.poses[start_frame + block_frames // 2]
             camera = extra["camera_embedding_cache"][:, :, start_frame:stop_frame]
             camera_tail = CameraTrajectory(
                 poses=trajectory.poses[stop_frame - 1 : stop_frame].clone(),
@@ -2142,6 +2161,7 @@ class LingBotWorldCausalDMDPipeline(
                     "LingBot camera interaction requires apply_interaction_at_chunk_boundary before prepare_next_chunk."
                 )
             absolute_poses = camera_session.last_absolute_poses
+            retrieval_pose = absolute_poses[block_frames // 2]
             media_frames = self._chunk_media_frame_count(state, block_frames=block_frames)
             num_latent_frames = block_frames
             if int(absolute_poses.shape[0]) != num_latent_frames:
@@ -2179,6 +2199,7 @@ class LingBotWorldCausalDMDPipeline(
             raise ValueError("LingBot World requires the runner-provided torch.Generator.")
         extra["condition"] = condition
         extra["camera"] = camera
+        extra["retrieval_pose"] = retrieval_pose
         # One camera-modulation cache per block: the four probes and the
         # commit below are separate scheduler steps, so the block runner
         # cannot open the reuse window around them the way generate_block
@@ -2245,6 +2266,7 @@ class LingBotWorldCausalDMDPipeline(
             timestep_value=float(schedule[step_in_chunk][0]),
             step_index=step_in_chunk,
             camera_cache=extra["camera_cache"],
+            camera_pose=extra["retrieval_pose"],
         )
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:

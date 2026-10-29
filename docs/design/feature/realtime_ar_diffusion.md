@@ -265,3 +265,30 @@ rotation against complex arithmetic, repeated denoising, full-transformer
 legacy parity with rebasing disabled, and transactional publication. These are
 numerical and lifecycle checks, not evidence of checkpoint quality or GPU
 latency improvements.
+
+### World retrieval
+
+Set `retrieval_frames` and a positive `bank_bytes` in `video_memory` to reserve
+an attention-token budget for retrieved chunks and a separate per-session CPU
+bank byte limit. For example, `window_frames: 18`, `sink_frames: 3`,
+`retrieval_frames: 9`, `bank_bytes: 8589934592`, `rebase_sink: false` gives a
+WorldKV-style split with three recent and three current frames. This example
+is a configuration, not a validated quality preset.
+
+Each successfully committed non-sink chunk is copied once to the CPU bank.
+Entries include canonical K/V, original token positions, and an absolute C2W
+pose. Oldest bank entries are evicted to meet the byte limit; an oversized
+entry is skipped without discarding existing memory. Rank by normalized
+squared translation distance plus rotation geodesic distance, breaking ties
+by insertion order. Exclude sink and recent chunks, then present retrieved
+chunks in chronological order. All layers use the same chunk IDs. Chunk
+midpoint poses preserve a valid rotation matrix; do not average rotation
+matrices or use normalized framewise control deltas for retrieval.
+
+Request, tick, and stepwise paths pass latent-aligned absolute poses through
+the DMD runner. `rebase_retrieval` defaults to false; enabling it changes only
+the temporal phase of the retrieved attention view. Noisy probes cannot write
+to the bank. Bank transfers currently run synchronously on the eager worker;
+GPU latency and asynchronous prefetch remain separate validation/optimization
+work. CPU tests cover analytical pose distances, exact attention assembly,
+byte eviction, missing/invalid poses, and failed publication.

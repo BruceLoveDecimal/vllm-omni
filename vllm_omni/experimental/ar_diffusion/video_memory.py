@@ -20,14 +20,23 @@ class VideoMemoryConfig:
     window_frames: int = 18
     sink_frames: int = 9
     rebase_sink: bool = True
+    retrieval_frames: int = 0
+    bank_bytes: int = 0
+    rebase_retrieval: bool = False
 
     def __post_init__(self) -> None:
-        for name in ("window_frames", "sink_frames"):
+        for name in ("window_frames", "sink_frames", "retrieval_frames", "bank_bytes"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"video_memory.{name} must be a non-negative integer")
         if self.window_frames <= self.sink_frames:
             raise ValueError("video_memory.window_frames must exceed sink_frames")
+        if self.retrieval_frames and not self.bank_bytes:
+            raise ValueError("video_memory retrieval requires a positive bank_bytes limit")
+        if self.sink_frames + self.retrieval_frames >= self.window_frames:
+            raise ValueError("video_memory window must leave room for current frames")
+        if type(self.rebase_retrieval) is not bool:
+            raise ValueError("video_memory.rebase_retrieval must be a bool")
         if type(self.rebase_sink) is not bool:
             raise ValueError("video_memory.rebase_sink must be a bool")
 
@@ -76,6 +85,30 @@ class MemoryRows:
         return MemoryRows(self.key[:, indices], self.value[:, indices], self.positions[indices])
 
 
+@dataclass(frozen=True)
+class BankChunk:
+    start: int
+    frames: int
+    pose: torch.Tensor
+    layers: tuple[MemoryRows, ...]
+
+    @property
+    def nbytes(self) -> int:
+        return self.pose.numel() * self.pose.element_size() + sum(
+            tensor.numel() * tensor.element_size()
+            for rows in self.layers
+            for tensor in (rows.key, rows.value, rows.positions)
+        )
+
+
+def camera_distances(current: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
+    """WorldKV translation/rotation ranking, with finite zero-distance handling."""
+    translation = (candidates[:, :3, 3] - current[:3, 3]).square().sum(-1)
+    relative = candidates[:, :3, :3].transpose(-1, -2) @ current[:3, :3]
+    rotation = torch.acos(((relative.diagonal(dim1=-2, dim2=-1).sum(-1) - 1) / 2).clamp(-1, 1))
+    return translation / translation.max().clamp_min(1e-12) + rotation / rotation.max().clamp_min(1e-12)
+
+
 class VideoMemory:
     """One request/branch's clean history, published only after all layers succeed.
 
@@ -93,10 +126,89 @@ class VideoMemory:
         self.temporal_dim = temporal_dim
         self.history: list[MemoryRows | None] = [None] * num_layers
         self.next_frame = 0
+        self.bank: dict[int, BankChunk] = {}
+        self.pose: torch.Tensor | None = None
+        self._retrieved: tuple[BankChunk, ...] = ()
         self._active = False
         self._closed = False
         self._pending: dict[int, MemoryRows] = {}
         self._seen: set[int] = set()
+
+    def set_pose(self, pose: torch.Tensor) -> None:
+        """Supply a representative absolute C2W pose in the session coordinate frame."""
+        if self._active or self._closed:
+            raise RuntimeError("Set camera pose only between video memory forwards")
+        pose = pose.detach().to(device="cpu", dtype=torch.float64, copy=True)
+        if pose.shape != (4, 4) or not torch.isfinite(pose).all():
+            raise ValueError("Video memory requires a finite 4x4 camera pose")
+        rotation = pose[:3, :3]
+        if (
+            not torch.allclose(rotation.T @ rotation, torch.eye(3, dtype=pose.dtype), atol=1e-4)
+            or not torch.allclose(torch.linalg.det(rotation), torch.tensor(1.0, dtype=pose.dtype), atol=1e-4)
+            or not torch.allclose(pose[3], torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=pose.dtype))
+        ):
+            raise ValueError("Video memory camera pose must be a rigid C2W transform")
+        self.pose = pose
+
+    @property
+    def bank_nbytes(self) -> int:
+        return sum(chunk.nbytes for chunk in self.bank.values())
+
+    def _retrieve(self, frames: int) -> tuple[BankChunk, ...]:
+        if not self.config.retrieval_frames:
+            return ()
+        if self.pose is None:
+            raise ValueError("World retrieval requires an absolute camera pose for every chunk")
+        recent_start = max(
+            self.config.sink_frames,
+            self.next_frame
+            + frames
+            - self.config.window_frames
+            + self.config.sink_frames
+            + self.config.retrieval_frames,
+        )
+        candidates = [
+            chunk
+            for chunk in self.bank.values()
+            if chunk.start >= self.config.sink_frames and chunk.start + chunk.frames <= recent_start
+        ]
+        if not candidates:
+            return ()
+        distances = camera_distances(self.pose, torch.stack([chunk.pose for chunk in candidates]))
+        ranked = torch.argsort(distances, stable=True).tolist()
+        budget = self.config.retrieval_frames * self.tokens_per_frame
+        selected = []
+        for index in ranked:
+            chunk = candidates[index]
+            cost = max(rows.positions.numel() for rows in chunk.layers)
+            if cost <= budget:
+                selected.append(chunk)
+                budget -= cost
+        return tuple(sorted(selected, key=lambda chunk: chunk.start))
+
+    def _publish_bank(self) -> dict[int, BankChunk]:
+        bank = dict(self.bank)
+        if not self.config.retrieval_frames or self.next_frame < self.config.sink_frames:
+            return bank
+        assert self.pose is not None
+        layers = tuple(
+            MemoryRows(
+                rows.key.to(device="cpu", copy=True),
+                rows.value.to(device="cpu", copy=True),
+                rows.positions.to(device="cpu", copy=True),
+            )
+            for rows in (self._pending[i] for i in range(self.num_layers))
+        )
+        chunk = BankChunk(self.next_frame, self._frames, self.pose.clone(), layers)
+        if chunk.nbytes > self.config.bank_bytes:
+            # Do not destroy useful history to insert an entry that cannot fit.
+            return bank
+        bank[chunk.start] = chunk
+        size = sum(entry.nbytes for entry in bank.values())
+        while size > self.config.bank_bytes:
+            oldest = next(iter(bank))
+            size -= bank.pop(oldest).nbytes
+        return bank
 
     @contextmanager
     def forward(self, start_frame: int, frames: int, *, commit: bool) -> Iterator[None]:
@@ -104,8 +216,9 @@ class VideoMemory:
             raise RuntimeError("Video memory is closed or already in a forward")
         if start_frame != self.next_frame or frames <= 0:
             raise ValueError("Video memory chunks must be contiguous and nonempty")
-        if frames + self.config.sink_frames > self.config.window_frames:
+        if frames + self.config.sink_frames + self.config.retrieval_frames > self.config.window_frames:
             raise ValueError("Video memory must fit sink and the complete current chunk")
+        self._retrieved = self._retrieve(frames)
         self._active = True
         self._frames = frames
         self._commit = commit
@@ -115,12 +228,15 @@ class VideoMemory:
                 raise RuntimeError("Video memory forward did not execute all layers")
             if commit:
                 replacement = [self._retained(i, self._pending[i]) for i in range(self.num_layers)]
-                self.history = replacement
+                bank = self._publish_bank()
+                self.history, self.bank = replacement, bank
                 self.next_frame += frames
+                self.pose = None
         finally:
             self._pending.clear()
             self._seen.clear()
             self._active = False
+            self._retrieved = ()
 
     def _retained(self, layer: int, current: MemoryRows) -> MemoryRows:
         previous = self.history[layer]
@@ -132,7 +248,9 @@ class VideoMemory:
             torch.cat((previous.positions, current.positions)),
         )
         sink = self.config.sink_frames * self.tokens_per_frame
-        tail = (self.config.window_frames - self.config.sink_frames) * self.tokens_per_frame
+        tail = (
+            self.config.window_frames - self.config.sink_frames - self.config.retrieval_frames
+        ) * self.tokens_per_frame
         indices = torch.arange(rows.positions.numel(), device=rows.key.device)
         keep = (indices < sink) | (indices >= indices.numel() - tail)
         return rows.select(indices[keep])
@@ -159,7 +277,11 @@ class VideoMemory:
         sink = previous.positions < self.config.sink_frames
         tail_start = max(
             self.config.sink_frames,
-            self.next_frame + self._frames - self.config.window_frames + self.config.sink_frames,
+            self.next_frame
+            + self._frames
+            - self.config.window_frames
+            + self.config.sink_frames
+            + self.config.retrieval_frames,
         )
         keep = sink | (previous.positions >= tail_start)
         indices = torch.where(keep)[0]
@@ -169,10 +291,28 @@ class VideoMemory:
             history_key = rebase_temporal_keys(rows.key, delta, self.temporal_dim)
         else:
             history_key = rows.key
-        return torch.cat((history_key, key), 1), torch.cat((rows.value, value), 1)
+        sink_count = int((rows.positions < self.config.sink_frames).sum())
+        keys, values = [history_key[:, :sink_count]], [rows.value[:, :sink_count]]
+        retrieved_frames = sum(chunk.frames for chunk in self._retrieved)
+        virtual_start = tail_start - retrieved_frames
+        for chunk in self._retrieved:
+            retrieved = chunk.layers[layer]
+            k = retrieved.key.to(key.device)
+            if self.config.rebase_retrieval:
+                delta = torch.full_like(retrieved.positions, virtual_start - chunk.start)
+                k = rebase_temporal_keys(k, delta, self.temporal_dim)
+            keys.append(k)
+            values.append(retrieved.value.to(value.device))
+            virtual_start += chunk.frames
+        keys.extend((history_key[:, sink_count:], key))
+        values.extend((rows.value[:, sink_count:], value))
+        return torch.cat(keys, 1), torch.cat(values, 1)
 
     def close(self) -> None:
         self.history = [None] * self.num_layers
         self._pending.clear()
         self._seen.clear()
+        self.bank.clear()
+        self.pose = None
+        self._retrieved = ()
         self._closed = True
