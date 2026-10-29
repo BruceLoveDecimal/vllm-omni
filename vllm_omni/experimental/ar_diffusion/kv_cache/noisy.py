@@ -50,6 +50,7 @@ class ARDiffusionNoisyKVSpec:
     block_size: int
     max_chunk_tokens: int
     max_history_chunks: int
+    policy_bytes_per_request: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -63,6 +64,8 @@ class ARDiffusionNoisyKVSpec:
             value = getattr(self, name)
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if type(self.policy_bytes_per_request) is not int or self.policy_bytes_per_request < 0:
+            raise ValueError("policy_bytes_per_request must be a non-negative integer")
         if self.max_chunk_tokens % self.block_size != 0:
             raise ValueError("max_chunk_tokens must be a multiple of block_size")
 
@@ -478,8 +481,9 @@ class NoisyKVCache:
             * torch.empty((), dtype=dtype).element_size()
         )
         bytes_all_layers = bytes_per_version * max(1, spec.num_layers)
+        self.policy_reserved_bytes = self.max_batch_size * spec.policy_bytes_per_request
         if available_bytes is not None:
-            budget = int(available_bytes * float(gpu_memory_fraction))
+            budget = int(available_bytes * float(gpu_memory_fraction)) - self.policy_reserved_bytes
             if bytes_all_layers <= 0:
                 raise RuntimeError("invalid NoisyKV geometry: bytes_all_layers <= 0")
             max_by_budget = budget // bytes_all_layers
@@ -508,7 +512,7 @@ class NoisyKVCache:
         self.transport = NoisyKVTransport(self.pool)
         self.resident_peak = 0
         self.bytes_per_version = bytes_per_version
-        self.reserved_bytes = self.capacity * bytes_all_layers
+        self.reserved_bytes = self.capacity * bytes_all_layers + self.policy_reserved_bytes
 
 
 class NoisyKVState:

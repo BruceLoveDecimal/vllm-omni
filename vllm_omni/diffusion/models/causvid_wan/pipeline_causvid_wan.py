@@ -55,6 +55,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
+from vllm_omni.experimental.ar_diffusion.video_memory import VideoMemoryConfig
 
 logger = init_logger(__name__)
 
@@ -119,6 +120,22 @@ class CausVidWanPipeline(nn.Module):
         self.step_replicas = cfg_step_replicas(stage_cfg)
         pp_world = int(getattr(getattr(od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
         self.layer_groups = max(1, pp_world // max(1, self.step_replicas))
+        self._video_memory_config = VideoMemoryConfig.parse(model_cfg.get("video_memory"))
+        if self._video_memory_config is not None:
+            parallel = getattr(od_config, "parallel_config", None)
+            if (
+                not od_config.enforce_eager
+                or self.step_replicas != 1
+                or any(
+                    getattr(parallel, name, 1) != 1
+                    for name in ("tensor_parallel_size", "pipeline_parallel_size", "ulysses_degree", "ring_degree")
+                )
+            ):
+                raise ValueError("CausVid video_memory requires eager single-rank self_forcing")
+            if self._video_memory_config.retrieval_frames:
+                raise ValueError("CausVid has no absolute camera input for WorldKV retrieval")
+            if int(stage_cfg.get("max_batch_size", 1)) != 1:
+                raise ValueError("CausVid video_memory currently requires max_batch_size=1")
         if bool(stage_cfg.get("tiny", False)):
             raise ValueError("CausVidWanPipeline no longer supports tiny=True")
         geo = dict(WAN21_1_3B)
@@ -240,13 +257,26 @@ class CausVidWanPipeline(nn.Module):
 
     def ar_diffusion_noisy_kv_spec(self) -> ARDiffusionNoisyKVSpec:
         local_layers = max(1, self.transformer.local_num_layers)
+        memory = getattr(self, "_video_memory_config", None)
+        policy_bytes = 0
+        if memory is not None:
+            # Reserve the worst case of one temporal patch per chunk. A request
+            # with the same token count may choose a different T/H/W geometry.
+            policy_bytes = memory.reservation_bytes(
+                local_layers,
+                self.max_chunk_tokens,
+                self.transformer.num_heads,
+                self.transformer.head_dim,
+                torch.empty((), dtype=self.od_config.dtype).element_size(),
+            )
         return ARDiffusionNoisyKVSpec(
             num_layers=local_layers,
             num_kv_heads=self.transformer.num_heads,
             head_size=self.transformer.head_dim,
             block_size=self.block_size,
             max_chunk_tokens=self.max_chunk_tokens,
-            max_history_chunks=max(1, self.max_history_chunks),
+            max_history_chunks=1 if memory is not None else max(1, self.max_history_chunks),
+            policy_bytes_per_request=policy_bytes,
         )
 
     @contextmanager
@@ -336,6 +366,10 @@ class CausVidWanPipeline(nn.Module):
             # Default the history window from model max_history_chunks (H is
             # free — an explicit 0 is respected on every topology).
             history = int(self.max_history_chunks or 0)
+        if getattr(self, "_video_memory_config", None) is not None:
+            if "kv_history_chunks" in extra and history != 0:
+                raise ValueError("video_memory owns history; kv_history_chunks must be 0 or omitted")
+            history = 0
         # Topology-derived default: each CausVid topology maps to exactly one
         # ordering (S=1 → self_forcing layer PP; S>1 → latest_kv vertical).
         default_schedule = "self_forcing" if self.step_replicas == 1 else "latest_kv"
@@ -569,9 +603,13 @@ class CausVidWanPipeline(nn.Module):
                 device=device,
                 dtype=dtype,
                 on_finished=on_finished,
+                video_memory=getattr(self, "_video_memory_config", None),
             )
             # DiT tick loop; stream_job decode/send threads overlap on the side.
-            run_cell_pipeline(ctx=ctx, adapter=adapter)
+            try:
+                run_cell_pipeline(ctx=ctx, adapter=adapter)
+            finally:
+                adapter.close()
             if stream_job is not None:
                 video = stream_job.join()
                 if video is not None:

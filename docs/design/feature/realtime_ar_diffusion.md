@@ -323,3 +323,95 @@ compact virtual timeline before the recent region. Canonical positions remain
 unchanged. CPU tests compare scoring with full pairwise cosine/QK matrices,
 check low-precision selection, stable ties, exact retained storage size, and
 repeated compression over many windows. Real-weight quality remains unmeasured.
+
+### Combined policy and CausVid integration
+
+For a combined LingBot experiment, add the following mapping under a stage's
+`model_config` in a copy of the single-GPU eager deployment:
+
+```yaml
+video_memory:
+  window_frames: 18
+  sink_frames: 3
+  retrieval_frames: 3
+  bank_bytes: 1073741824
+  world_keep_ratio: 0.25
+  world_score: pairwise_mean
+  pc_budget_frames: 12
+  pc_recent_frames: 3
+  rebase_sink: true
+  rebase_retrieval: true
+```
+
+The PC budget includes the reserved retrieval budget. Compression is triggered
+when resident history plus the current chunk fills `window_frames -
+retrieval_frames`; sink, recent (including current), and retrieval reservations
+must fit inside `pc_budget_frames`. Exclude any bank chunk overlapping canonical
+PC history in **any** layer. This conservative exclusion makes all layers use
+the same retrieved chunk IDs without repeating retained observations; a chunk
+fully evicted by this step's PC selection becomes eligible on the next chunk.
+When enabled, temporal correction packs retrieved tokens into consecutive
+virtual frames before PC intermediate/recent tokens, and shifts the sink
+before that region. Original bank/history tensors never receive these phases.
+
+CausVid accepts the same mapping for Deep Sink and PC, without pose retrieval.
+Use `causvid_wan_self_forcing.yaml` as the starting point, set `devices: "0"`,
+`pipeline_parallel_size: 1`, keep `enforce_eager: true`, `step_replicas: 1`,
+`max_batch_size: 1`, and remove `kv_history_chunks: 6` from the default sampling
+arguments (or set it to `0`). A configuration for three-frame chunks is:
+
+```yaml
+video_memory:
+  window_frames: 18
+  sink_frames: 3
+  pc_budget_frames: 12
+  pc_recent_frames: 3
+  rebase_sink: true
+```
+
+`WanCell` keeps a request-local transaction open across the real transformer
+layers. Only the clean step publishes history after the output head succeeds.
+The Self-Forcing timetable still runs the clean step, but declares zero legacy
+NoisyKV history readers. The small legacy version pool remains executor-owned;
+the policy has no duplicate writes into it. Policy storage is reserved before
+sizing that pool, and is released on completion or failure. CausVid reserves
+against the largest tokens-per-frame geometry allowed by its fixed chunk-token
+count. Latest-KV/step replicas, layer/tensor/sequence parallelism, CUDA graphs,
+and CausVid pose retrieval are rejected for this initial implementation.
+
+These configurations are experimental starting points. CPU validation covers
+component math and integration, including a 100-frame combined rollout, dense
+attention oracles, real cell scheduling/attention hooks, failure rollback,
+session/branch reset, and memory-budget boundaries. It does not establish
+real-weight video quality, GPU memory peaks, throughput, or realtime deadlines.
+Synchronous bank transfers and eager tensor assembly may add latency. Validate
+those separately before selecting a production preset.
+
+Implementation references: [WorldKV](https://arxiv.org/html/2605.22718v1) and
+[Deep Forcing](https://arxiv.org/html/2512.05081v1). This adapts their memory
+policies to the repository's inference lifecycle; it does not reproduce their
+training procedures or imply that existing checkpoints have been retrained.
+
+CPU reproduction (from the repository root; PyTorch CPU, pytest,
+pytest-asyncio, diffusers and their dependencies; no model download or GPU):
+
+```bash
+python -m pytest --confcutdir=tests/diffusion -o addopts='' \
+  tests/diffusion/ar_diffusion/test_video_*.py \
+  tests/diffusion/models/lingbot_world/test_lingbot_world_attention.py -q
+```
+
+CI-equivalent selection (requires the normal repository test environment,
+including vLLM and pytest-xdist for the root fixtures):
+
+```bash
+python -m pytest tests/diffusion/ar_diffusion/test_video_*.py \
+  tests/diffusion/models/lingbot_world/test_lingbot_world_attention.py \
+  -m 'core_model and cpu' --run-level core_model -q
+```
+
+The new `ar_diffusion/test_video_*.py` modules are included by the existing
+Buildkite ready CPU diffusion lane. Import-light tests replace external runtime
+and codec dependencies with fixture-scoped stubs; they execute the actual
+policy, LingBot transformer, CausVid attention hooks/cell, NoisyKV allocation,
+and session owner code. Full checkpoint/codec/serving integration is separate.

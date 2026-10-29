@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
+from vllm_omni.experimental.ar_diffusion.video_memory import VideoMemoryLayer
 
 logger = init_logger(__name__)
 
@@ -67,7 +68,10 @@ def _wan_self_attn_with_kv(
         query = attn.rotary_embedding(query, freqs_cos, freqs_sin)
         key = attn.rotary_embedding(key, freqs_cos, freqs_sin)
     scale = 1.0 / (attn.head_dim**0.5)
-    if kv_ctx is not None:
+    if isinstance(kv_ctx, VideoMemoryLayer):
+        key, value = kv_ctx.assemble(query, key, value)
+        hidden_states = attn.attn(query, key, value, None).flatten(2, 3).type_as(query)
+    elif kv_ctx is not None:
         inputs = kv_ctx.to_layer_inputs() if hasattr(kv_ctx, "to_layer_inputs") else kv_ctx
         if query.shape[0] == 1:
             out = paged_write_attn(inputs, query[0], key[0], value[0], None, None, scale)

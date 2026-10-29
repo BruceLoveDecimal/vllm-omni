@@ -54,10 +54,12 @@ class VideoMemoryConfig:
         if self.world_keep_ratio != 1 and not self.retrieval_frames:
             raise ValueError("World compression requires retrieval")
         if self.pc_budget_frames:
-            if not self.sink_frames + self.pc_recent_frames <= self.pc_budget_frames < self.window_frames:
-                raise ValueError("PC budget must fit sink and recent, and be smaller than the window")
-            if self.retrieval_frames:
-                raise ValueError("Combined retrieval and PC is not enabled")
+            if not (
+                self.sink_frames + self.pc_recent_frames + self.retrieval_frames
+                <= self.pc_budget_frames
+                < self.window_frames
+            ):
+                raise ValueError("PC budget must fit sink, recent and retrieval, and be smaller than the window")
         if self.retrieval_frames and not self.bank_bytes:
             raise ValueError("video_memory retrieval requires a positive bank_bytes limit")
         if self.sink_frames + self.retrieval_frames >= self.window_frames:
@@ -73,7 +75,9 @@ class VideoMemoryConfig:
             return None
         if not isinstance(value, Mapping):
             raise ValueError("model_config.video_memory must be a mapping")
-        return cls(**value)
+        # Dataclass construction rejects unknown keys; __post_init__ validates
+        # each untyped configuration value before it reaches model execution.
+        return cls(**value)  # type: ignore[arg-type]
 
     def reservation_bytes(self, layers: int, tokens_per_frame: int, heads: int, dim: int, itemsize: int) -> int:
         # Canonical, pending, replacement and attention views can coexist during
@@ -245,6 +249,19 @@ class VideoMemory:
             for chunk in self.bank.values()
             if chunk.start >= self.config.sink_frames and chunk.start + chunk.frames <= recent_start
         ]
+        if self.config.pc_budget_frames:
+            # A sparse PC history may still contain very old frames. Exclude
+            # overlapping bank chunks across ALL layers before camera ranking;
+            # otherwise the same observation can appear twice in attention.
+            candidates = [
+                chunk
+                for chunk in candidates
+                if all(
+                    rows is None
+                    or not bool(((rows.positions >= chunk.start) & (rows.positions < chunk.start + chunk.frames)).any())
+                    for rows in self.history
+                )
+            ]
         if not candidates:
             return ()
         distances = camera_distances(self.pose, torch.stack([chunk.pose for chunk in candidates]))
@@ -309,7 +326,9 @@ class VideoMemory:
             if len(self._seen) != self.num_layers:
                 raise RuntimeError("Video memory forward did not execute all layers")
             if commit:
-                replacement = [self._retained(i, self._pending[i]) for i in range(self.num_layers)]
+                replacement: list[MemoryRows | None] = [
+                    self._retained(i, self._pending[i]) for i in range(self.num_layers)
+                ]
                 queries = dict(self._query_history)
                 for layer, query in self._pending_queries.items():
                     old = queries.get(layer)
@@ -372,7 +391,8 @@ class VideoMemory:
         if (
             self.config.pc_budget_frames
             and layer not in self._selection
-            and previous.positions.numel() + key.shape[1] >= self.config.window_frames * self.tokens_per_frame
+            and previous.positions.numel() + key.shape[1]
+            >= (self.config.window_frames - self.config.retrieval_frames) * self.tokens_per_frame
         ):
             older_queries = self._query_history.get(layer)
             recent_queries = query if older_queries is None else torch.cat((older_queries, query), 1)
@@ -382,7 +402,8 @@ class VideoMemory:
                 previous,
                 sink_frames=self.config.sink_frames,
                 recent_start=self.next_frame + self._frames - self.config.pc_recent_frames,
-                capacity=self.config.pc_budget_frames * self.tokens_per_frame - key.shape[1],
+                capacity=(self.config.pc_budget_frames - self.config.retrieval_frames) * self.tokens_per_frame
+                - key.shape[1],
             )
             previous = previous.select(selected)
             self._selection[layer] = previous
@@ -403,12 +424,19 @@ class VideoMemory:
             keep = sink | (previous.positions >= tail_start)
         indices = torch.where(keep)[0]
         rows = previous.select(indices)
+        retrieved_tokens = sum(chunk.layers[layer].positions.numel() for chunk in self._retrieved)
+        retrieved_frames = math.ceil(retrieved_tokens / self.tokens_per_frame)
+        middle_frames = 0
         if self.config.rebase_sink:
-            delta = torch.where(rows.positions < self.config.sink_frames, tail_start - self.config.sink_frames, 0)
+            delta = torch.where(
+                rows.positions < self.config.sink_frames,
+                max(0, tail_start - retrieved_frames - self.config.sink_frames),
+                0,
+            )
             if self.config.pc_budget_frames:
                 middle = torch.where((rows.positions >= self.config.sink_frames) & (rows.positions < tail_start))[0]
                 middle_frames = math.ceil(middle.numel() / self.tokens_per_frame)
-                sink_shift = max(0, tail_start - middle_frames - self.config.sink_frames)
+                sink_shift = max(0, tail_start - middle_frames - retrieved_frames - self.config.sink_frames)
                 delta = torch.where(rows.positions < self.config.sink_frames, sink_shift, 0)
                 target = (
                     tail_start
@@ -421,17 +449,22 @@ class VideoMemory:
             history_key = rows.key
         sink_count = int((rows.positions < self.config.sink_frames).sum())
         keys, values = [history_key[:, :sink_count]], [rows.value[:, :sink_count]]
-        retrieved_frames = sum(chunk.frames for chunk in self._retrieved)
-        virtual_start = tail_start - retrieved_frames
+        virtual_start = tail_start - middle_frames - retrieved_frames
+        retrieved_offset = 0
         for chunk in self._retrieved:
             retrieved = chunk.layers[layer]
             k = retrieved.key.to(key.device)
             if self.config.rebase_retrieval:
-                delta = torch.full_like(retrieved.positions, virtual_start - chunk.start)
+                target = (
+                    virtual_start
+                    + (retrieved_offset + torch.arange(retrieved.positions.numel(), device=key.device))
+                    // self.tokens_per_frame
+                )
+                delta = target - retrieved.positions.to(key.device)
                 k = rebase_temporal_keys(k, delta, self.temporal_dim)
             keys.append(k)
             values.append(retrieved.value.to(value.device))
-            virtual_start += chunk.frames
+            retrieved_offset += retrieved.positions.numel()
         keys.extend((history_key[:, sink_count:], key))
         values.extend((rows.value[:, sink_count:], value))
         return torch.cat(keys, 1), torch.cat(values, 1)
@@ -447,3 +480,16 @@ class VideoMemory:
         self.pose = None
         self._retrieved = ()
         self._closed = True
+
+
+@dataclass(frozen=True)
+class VideoMemoryLayer:
+    """Cell-local attention context, distinct from paged/NoisyKV inputs."""
+
+    memory: VideoMemory
+    layer: int
+
+    def assemble(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.memory.assemble(self.layer, query, key, value)

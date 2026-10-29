@@ -273,3 +273,17 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 - [Pipeline Parallel](pipeline_parallel.md)
 - Recipe: [`recipes/Physis-AI/CausVid-Wan.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Physis-AI/CausVid-Wan.md)
 - Code: `experimental/ar_diffusion/{cell_schedule,cell_executor,kv_cache/noisy}.py`
+
+## Opt-in clean video memory
+
+With CausVid `model_config.video_memory`, eager single-rank Self-Forcing uses
+request-local clean memory across cell layers. The schedule keeps its clean
+step and sets legacy history readers to zero; an explicitly nonzero
+`kv_history_chunks` is rejected. The default behavior above is unchanged when
+the mapping is absent. `ARDiffusionNoisyKVSpec.policy_bytes_per_request` reserves
+policy storage for every admitted request before the version-pool budget is
+checked; `reserved_bytes` includes both reservations. Completion and failures
+close open cell transactions and release policy history.
+
+See [experimental video memory policies](realtime_ar_diffusion.md#experimental-video-memory-policies)
+for configurations, supported combinations, numerical tests, and limitations.

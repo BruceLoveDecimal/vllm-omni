@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Any
 
 import torch
@@ -13,6 +14,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransformer
 from vllm_omni.experimental.ar_diffusion.cell_executor import CellAdapter
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
+from vllm_omni.experimental.ar_diffusion.video_memory import VideoMemory, VideoMemoryConfig, VideoMemoryLayer
 
 
 class WanCell(CellAdapter):
@@ -28,8 +30,15 @@ class WanCell(CellAdapter):
         seed: int,
         device: torch.device,
         dtype: torch.dtype,
+        video_memory: VideoMemoryConfig | None = None,
         on_finished: Callable[[int, torch.Tensor], None] | None = None,
     ) -> None:
+        self.video_memory_config = video_memory
+        self._memories: dict[str, VideoMemory] = {}
+        self._transactions: dict[str, tuple[int, int, AbstractContextManager]] = {}
+        if video_memory is not None:
+            if transformer.layer_groups != 1 or video_memory.retrieval_frames or latent_shape[0] != 1:
+                raise ValueError("CausVid video memory requires single-rank, single-sequence execution without poses")
         self.transformer = transformer
         self.sampler = sampler
         self.prompt_embeds = prompt_embeds
@@ -93,7 +102,22 @@ class WanCell(CellAdapter):
             latent = self._init_noise(chunk) if stored is None else stored
         return latent, tokens
 
+    def close(self) -> None:
+        for _, _, transaction in self._transactions.values():
+            transaction.__exit__(RuntimeError, RuntimeError("cell execution closed"), None)
+        self._transactions.clear()
+        for memory in self._memories.values():
+            memory.close()
+        self._memories.clear()
+
     def forward(self, tasks, kv_contexts, *, hidden):
+        try:
+            return self._forward(tasks, kv_contexts, hidden=hidden)
+        except BaseException:
+            self.close()
+            raise
+
+    def _forward(self, tasks, kv_contexts, *, hidden):
         if not tasks:
             return hidden
         outs: list[dict[str, torch.Tensor]] = []
@@ -114,12 +138,37 @@ class WanCell(CellAdapter):
                 tokens = tf.embed(latent)
             elif tokens is None:
                 raise RuntimeError(f"cell {(chunk, step, block)} missing hidden_states")
+            if self.video_memory_config is not None:
+                frames = latent.shape[2] // tf.patch_size[0]
+                memory = self._memories.get(req)
+                if memory is None:
+                    memory = VideoMemory(
+                        self.video_memory_config,
+                        num_layers=tf.num_layers,
+                        tokens_per_frame=tf.seq_len_for_latent(tuple(latent.shape)) // frames,
+                        temporal_dim=tf.head_dim - 4 * (tf.head_dim // 6),
+                    )
+                    self._memories[req] = memory
+                if block == tf.start_layer:
+                    if req in self._transactions:
+                        raise RuntimeError("Previous video memory cell forward is incomplete")
+                    transaction = memory.forward(chunk * frames, frames, commit=step == self.num_denoise_steps)
+                    transaction.__enter__()
+                    self._transactions[req] = (chunk, step, transaction)
+                if req not in self._transactions or self._transactions[req][:2] != (chunk, step):
+                    raise RuntimeError("Video memory cell layers must belong to the same chunk and step")
+                kv_ctx = VideoMemoryLayer(memory, block)
             tokens = tf.block(block, tokens, chunk=chunk, step=step_key, latent=latent, timestep=t, kv_ctx=kv_ctx)
             if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
                 live[chunk] = latent
                 outs.append({"latent": latent, "hidden_states": tokens})
                 continue
             pred = tf.unembed(tokens, chunk=chunk, step=step_key, latent=latent, timestep=t)
+            if self.video_memory_config is not None:
+                # Include output projection in the transaction: failed heads
+                # must never publish clean history for subsequent chunks.
+                _, _, transaction = self._transactions.pop(req)
+                transaction.__exit__(None, None, None)
             if step < self.num_denoise_steps:
                 latent = self.sampler.advance(pred, latent, step)
                 if step == self.num_denoise_steps - 1:

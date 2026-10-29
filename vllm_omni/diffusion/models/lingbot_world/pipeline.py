@@ -2161,7 +2161,6 @@ class LingBotWorldCausalDMDPipeline(
                     "LingBot camera interaction requires apply_interaction_at_chunk_boundary before prepare_next_chunk."
                 )
             absolute_poses = camera_session.last_absolute_poses
-            retrieval_pose = absolute_poses[block_frames // 2]
             media_frames = self._chunk_media_frame_count(state, block_frames=block_frames)
             num_latent_frames = block_frames
             if int(absolute_poses.shape[0]) != num_latent_frames:
@@ -2169,6 +2168,7 @@ class LingBotWorldCausalDMDPipeline(
                     "camera interaction must produce exactly one pose per latent frame; "
                     f"got {int(absolute_poses.shape[0])}, expected {num_latent_frames}."
                 )
+            retrieval_pose = absolute_poses[block_frames // 2]
             action_trajectory = camera_trajectory_from_absolute_pose(
                 absolute_poses,
                 width=inputs.width,
@@ -2266,7 +2266,7 @@ class LingBotWorldCausalDMDPipeline(
             timestep_value=float(schedule[step_in_chunk][0]),
             step_index=step_in_chunk,
             camera_cache=extra["camera_cache"],
-            camera_pose=extra["retrieval_pose"],
+            camera_pose=extra.get("retrieval_pose"),
         )
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
@@ -2310,6 +2310,7 @@ class LingBotWorldCausalDMDPipeline(
             ar=self._ar_block_context(extra["ar_cross_attention"]),
             start_frame=int(extra["start_frame"]),
             camera_cache=extra.pop("camera_cache"),
+            camera_pose=extra.get("retrieval_pose"),
         )
         completed_chunk_index = state.chunk_index
         inputs: _LingBotRequestInputs = extra["inputs"]

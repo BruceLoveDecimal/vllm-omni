@@ -18,6 +18,7 @@ def load_memory():
     spec = importlib.util.spec_from_file_location(
         name, Path(__file__).parents[3] / "vllm_omni/experimental/ar_diffusion/video_memory.py"
     )
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     previous = sys.modules.get(name)
     sys.modules[name] = module
