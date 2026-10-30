@@ -431,7 +431,7 @@ def test_combined_long_rollout_deduplicates_and_bounds_all_layers(ratio, rebase)
                 previous = memory._previous(layer)
                 if previous is not None:
                     for chunk in chunks:
-                        assert not torch.isin(chunk.layers[layer].positions, previous.positions).any()
+                        assert not torch.isin(chunk.layers[layer].token_ids, previous.token_ids).any()
                 if chunks:
                     assert all(chunk.start + chunk.frames <= start for chunk in chunks)
         append(memory, start, camera=pose(0))

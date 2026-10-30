@@ -111,9 +111,12 @@ class MemoryRows:
     key: torch.Tensor
     value: torch.Tensor
     positions: torch.Tensor
+    token_ids: torch.Tensor
 
     def select(self, indices: torch.Tensor) -> MemoryRows:
-        return MemoryRows(self.key[:, indices], self.value[:, indices], self.positions[indices])
+        return MemoryRows(
+            self.key[:, indices], self.value[:, indices], self.positions[indices], self.token_ids[indices]
+        )
 
 
 def world_compress(rows: MemoryRows, tokens_per_frame: int, keep_ratio: float, score: str) -> MemoryRows:
@@ -171,7 +174,7 @@ class BankChunk:
         return self.pose.numel() * self.pose.element_size() + sum(
             tensor.numel() * tensor.element_size()
             for rows in self.layers
-            for tensor in (rows.key, rows.value, rows.positions)
+            for tensor in (rows.key, rows.value, rows.positions, rows.token_ids)
         )
 
 
@@ -250,18 +253,20 @@ class VideoMemory:
             if chunk.start >= self.config.sink_frames and chunk.start + chunk.frames <= recent_start
         ]
         if self.config.pc_budget_frames:
-            # A sparse PC history may still contain very old frames. Exclude
-            # overlapping bank chunks across ALL layers before camera ranking;
-            # otherwise the same observation can appear twice in attention.
-            candidates = [
-                chunk
-                for chunk in candidates
-                if all(
-                    rows is None
-                    or not bool(((rows.positions >= chunk.start) & (rows.positions < chunk.start + chunk.frames)).any())
-                    for rows in self.history
-                )
-            ]
+            # PC can retain only part of an old frame. Frame/chunk overlap
+            # must not hide observations that are absent from local history.
+            filtered = []
+            for chunk in candidates:
+                layers = []
+                for layer, rows in enumerate(chunk.layers):
+                    previous = self.history[layer]
+                    if previous is not None:
+                        keep = ~torch.isin(rows.token_ids, previous.token_ids.to("cpu"))
+                        rows = rows.select(torch.where(keep)[0])
+                    layers.append(rows)
+                if any(rows.token_ids.numel() for rows in layers):
+                    filtered.append(BankChunk(chunk.start, chunk.frames, chunk.pose, tuple(layers)))
+            candidates = filtered
         if not candidates:
             return ()
         distances = camera_distances(self.pose, torch.stack([chunk.pose for chunk in candidates]))
@@ -286,6 +291,7 @@ class VideoMemory:
                 rows.key.to(device="cpu", copy=True),
                 rows.value.to(device="cpu", copy=True),
                 rows.positions.to(device="cpu", copy=True),
+                rows.token_ids.to(device="cpu", copy=True),
             )
             for rows in (
                 world_compress(
@@ -364,6 +370,7 @@ class VideoMemory:
             torch.cat((previous.key, current.key), 1),
             torch.cat((previous.value, current.value), 1),
             torch.cat((previous.positions, current.positions)),
+            torch.cat((previous.token_ids, current.token_ids)),
         )
         sink = self.config.sink_frames * self.tokens_per_frame
         tail = (
@@ -388,7 +395,12 @@ class VideoMemory:
         if self._commit:
             # These slices must own storage: QKV projections otherwise keep Q
             # and the unselected tokens alive after a compression/commit.
-            self._pending[layer] = MemoryRows(key.detach().clone(), value.detach().clone(), positions)
+            token_ids = torch.arange(
+                self.next_frame * self.tokens_per_frame,
+                (self.next_frame + self._frames) * self.tokens_per_frame,
+                device=key.device,
+            )
+            self._pending[layer] = MemoryRows(key.detach().clone(), value.detach().clone(), positions, token_ids)
         previous = self._previous(layer)
         if self._commit and self.config.pc_budget_frames:
             self._pending_queries[layer] = query.detach().clone()

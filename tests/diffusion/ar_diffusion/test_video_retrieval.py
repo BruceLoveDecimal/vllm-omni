@@ -176,3 +176,51 @@ def test_ties_are_deterministic_and_sink_recent_never_retrieved():
 def test_invalid_retrieval_config(config):
     with pytest.raises(ValueError):
         vm.VideoMemoryConfig(**config)
+
+
+def test_pc_retrieves_missing_tokens_from_partially_retained_chunk():
+    memory = state(pc_budget_frames=6, pc_recent_frames=2)
+    for start in (0, 2, 4, 6):
+        append(memory, start)
+    chunk = memory.bank[2]
+    # Different layers keep different tokens of the same frame; neither
+    # overlap justifies dropping the complete historical chunk.
+    memory.history = [chunk.layers[0].select(torch.tensor([0])), chunk.layers[1].select(torch.tensor([1, 2]))]
+    memory.set_pose(pose(2))
+    selected = memory._retrieve(2)
+    assert len(selected) == 1 and selected[0].start == 2
+    assert selected[0].layers[0].token_ids.tolist() == [5, 6, 7]
+    assert selected[0].layers[1].token_ids.tolist() == [4, 7]
+    for layer in range(2):
+        retrieved = selected[0].layers[layer]
+        assert not torch.isin(retrieved.token_ids, memory.history[layer].token_ids).any()
+    assert chunk.layers[0].token_ids.tolist() == [4, 5, 6, 7]
+
+
+def test_combined_small_fifo_bank_retrieves_over_long_rollout():
+    config = vm.VideoMemoryConfig(
+        window_frames=18,
+        sink_frames=3,
+        retrieval_frames=3,
+        bank_bytes=4 * (2 * 24 * (2 * 8 * 4 + 16) + 128),
+        world_keep_ratio=0.25,
+        pc_budget_frames=12,
+        pc_recent_frames=3,
+    )
+    memory = vm.VideoMemory(config, num_layers=2, tokens_per_frame=16, temporal_dim=4)
+    generator = torch.Generator().manual_seed(7)
+    hits = 0
+    for start in range(0, 120, 3):
+        data = [torch.randn(1, 48, 1, 8, generator=generator) for _ in range(2)]
+        memory.set_pose(pose())
+        for commit in (False, True):
+            with memory.forward(start, 3, commit=commit):
+                hits += len(memory._retrieved) if not commit else 0
+                for layer, x in enumerate(data):
+                    memory.assemble(layer, x, x, x)
+                    previous = memory._previous(layer)
+                    if previous is not None:
+                        for chunk in memory._retrieved:
+                            assert not torch.isin(chunk.layers[layer].token_ids, previous.token_ids).any()
+        assert len(memory.bank) <= 4
+    assert hits > 0

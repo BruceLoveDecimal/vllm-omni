@@ -312,8 +312,9 @@ For example, a standalone PC experiment can use window/sink/budget/recent
 values `21/10/16/4`. The sink and recent regions must fit inside the budget.
 At window saturation, the first forward of a chunk scores intermediate keys
 using recent clean queries plus the current queries, aggregated as sum-QK
-logits. The resulting per-layer selection remains fixed across that chunk's
-remaining noisy forwards and clean commit. Clean query history is bounded by
+logits. Only the selected token indices remain resident across that chunk's
+remaining noisy forwards and clean commit; selected K/V views are temporary.
+Canonical history remains intact for rollback until successful publication. Clean query history is bounded by
 the recent budget. Publication remains transactional. This query-history
 convention is explicit; it is not a claim of bitwise parity with the upstream
 research script's mutable denoising-query buffer.
@@ -346,10 +347,12 @@ video_memory:
 The PC budget includes the reserved retrieval budget. Compression is triggered
 when resident history plus the current chunk fills `window_frames -
 retrieval_frames`; sink, recent (including current), and retrieval reservations
-must fit inside `pc_budget_frames`. Exclude any bank chunk overlapping canonical
-PC history in **any** layer. This conservative exclusion makes all layers use
-the same retrieved chunk IDs without repeating retained observations; a chunk
-fully evicted by this step's PC selection becomes eligible on the next chunk.
+must fit inside `pc_budget_frames`. Stable absolute token IDs survive both
+compression policies. Each layer removes only bank tokens already present in
+its canonical PC history before chunk ranking and budgeting. All layers use
+the same retrieved chunk IDs, but may retrieve different token subsets.
+Budgeting uses the largest remaining subset across layers. Tokens discarded
+by this step's PC selection become eligible on the next chunk.
 When enabled, temporal correction packs retrieved tokens into consecutive
 virtual frames before PC intermediate/recent tokens, and shifts the sink
 before that region. Original bank/history tensors never receive these phases.

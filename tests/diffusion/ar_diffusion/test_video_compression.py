@@ -17,7 +17,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 def rows(count=12, dtype=torch.float64):
     key = torch.randn(1, count, 2, 8, generator=torch.Generator().manual_seed(71), dtype=dtype)
-    return vm.MemoryRows(key, key + 20, torch.arange(count) // 4)
+    return vm.MemoryRows(key, key + 20, torch.arange(count) // 4, torch.arange(count))
 
 
 @pytest.mark.parametrize("score", ["pairwise_mean", "centroid"])
@@ -50,7 +50,9 @@ def test_paper_and_centroid_scores_are_distinct_not_silently_interchanged():
 
 
 def test_zero_keys_ties_preserve_anchor_and_stable_original_order():
-    source = vm.MemoryRows(torch.zeros(1, 12, 1, 4), torch.arange(48.0).view(1, 12, 1, 4), torch.arange(12) // 4)
+    source = vm.MemoryRows(
+        torch.zeros(1, 12, 1, 4), torch.arange(48.0).view(1, 12, 1, 4), torch.arange(12) // 4, torch.arange(12)
+    )
     output = vm.world_compress(source, 4, 0.25, "pairwise_mean")
     assert torch.equal(output.value, source.value[:, :6])
     assert torch.isfinite(output.key).all()
