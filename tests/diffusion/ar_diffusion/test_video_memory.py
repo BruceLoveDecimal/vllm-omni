@@ -257,3 +257,29 @@ def test_full_lingbot_transformer_matches_legacy_and_rolls_back_head_failure(mon
         with pytest.raises(RuntimeError, match="head failed"):
             model(**{**kwargs, "start_frame": 8}, cache=policy, update_cache=True)
         assert state.history is old and state.next_frame == 8
+
+
+@pytest.mark.parametrize("start", [2, 6])
+def test_publication_concatenates_only_retained_slices(monkeypatch, start):
+    state = memory()
+    for offset in range(0, start, 2):
+        append(state, offset)
+    previous = state.history[0]
+    current = vm.MemoryRows(
+        raw(start),
+        raw(start),
+        torch.arange(start, start + 2).repeat_interleave(2),
+        torch.arange(start * 2, (start + 2) * 2),
+    )
+    ids = torch.cat((previous.token_ids, current.token_ids))
+    keep = torch.cat((torch.arange(min(4, ids.numel())), torch.arange(max(4, ids.numel() - 8), ids.numel())))
+    expected_k = torch.cat((previous.key, current.key), 1)[:, keep]
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("publication must not copy an assembled window again")
+
+    monkeypatch.setattr(vm.MemoryRows, "select", forbidden)
+    result = state._retained(0, current)
+    torch.testing.assert_close(result.key, expected_k)
+    assert torch.equal(result.token_ids, ids[keep])
+    assert result.key.untyped_storage().nbytes() == result.key.numel() * result.key.element_size()

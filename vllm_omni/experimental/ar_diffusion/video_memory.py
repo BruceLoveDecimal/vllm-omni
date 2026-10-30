@@ -426,19 +426,26 @@ class VideoMemory:
         previous = self._previous(layer)
         if previous is None:
             return current
-        rows = MemoryRows(
-            torch.cat((previous.key, current.key), 1),
-            torch.cat((previous.value, current.value), 1),
-            torch.cat((previous.positions, current.positions)),
-            torch.cat((previous.token_ids, current.token_ids)),
+        capacity = (self.config.window_frames - self.config.retrieval_frames) * self.tokens_per_frame
+        previous_capacity = capacity - current.positions.numel()
+        count = previous.positions.numel()
+        if count <= previous_capacity:
+            slices = [slice(None)]
+        else:
+            sink = min(self.config.sink_frames * self.tokens_per_frame, count)
+            tail = previous_capacity - sink
+            slices = [slice(0, sink)]
+            if tail:
+                slices.append(slice(count - tail, count))
+        # Slice before concatenation: never allocate a full old+current window
+        # only to copy it again during truncation. All slices are temporary
+        # views, and the one concatenation per tensor owns exactly retained KV.
+        return MemoryRows(
+            torch.cat([*(previous.key[:, part] for part in slices), current.key], 1),
+            torch.cat([*(previous.value[:, part] for part in slices), current.value], 1),
+            torch.cat([*(previous.positions[part] for part in slices), current.positions]),
+            torch.cat([*(previous.token_ids[part] for part in slices), current.token_ids]),
         )
-        sink = self.config.sink_frames * self.tokens_per_frame
-        tail = (
-            self.config.window_frames - self.config.sink_frames - self.config.retrieval_frames
-        ) * self.tokens_per_frame
-        indices = torch.arange(rows.positions.numel(), device=rows.key.device)
-        keep = (indices < sink) | (indices >= indices.numel() - tail)
-        return rows.select(indices[keep])
 
     def assemble(
         self, layer: int, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
