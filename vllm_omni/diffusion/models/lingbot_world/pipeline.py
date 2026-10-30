@@ -827,6 +827,7 @@ class LingBotWorldCausalDMDPipeline(
                 int(self.transformer.blocks[0].self_attn.num_sp_heads),
                 int(self.transformer.config.attention_head_dim),
                 element_size,
+                chunk_frames=condition_latent_frames,
             )
             # Policy memory owns history; the legacy pool retains only its
             # minimum geometry and never receives duplicate self-KV writes.

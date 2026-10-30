@@ -79,10 +79,50 @@ class VideoMemoryConfig:
         # each untyped configuration value before it reaches model execution.
         return cls(**value)  # type: ignore[arg-type]
 
-    def reservation_bytes(self, layers: int, tokens_per_frame: int, heads: int, dim: int, itemsize: int) -> int:
-        # Canonical, pending, replacement and attention views can coexist during
-        # publication. Include per-token int64 positions, not just K and V.
-        return 4 * layers * self.window_frames * tokens_per_frame * (2 * heads * dim * itemsize + 8)
+    def validate_bank_capacity(
+        self, layers: int, tokens_per_frame: int, heads: int, dim: int, itemsize: int, chunk_frames: int
+    ) -> None:
+        if not self.retrieval_frames:
+            return
+        tokens = tokens_per_frame + math.ceil((chunk_frames - 1) * tokens_per_frame * self.world_keep_ratio)
+        required = 128 + layers * tokens * (2 * heads * dim * itemsize + 16)
+        if self.bank_bytes < required:
+            raise ValueError(
+                f"video_memory.bank_bytes={self.bank_bytes} cannot fit one compressed chunk ({required} bytes)"
+            )
+
+    def reservation_bytes(
+        self,
+        layers: int,
+        tokens_per_frame: int,
+        heads: int,
+        dim: int,
+        itemsize: int,
+        *,
+        chunk_frames: int | None = None,
+    ) -> int:
+        # All-layer owners: canonical + transactional replacement + pending,
+        # retrieved device rows, and old/new/pending query history. Attention
+        # assembly, selection, rebasing and scoring scratch exist one layer at
+        # a time; do not multiply those views by the transformer layer count.
+        chunk = (
+            chunk_frames if chunk_frames is not None else self.window_frames - self.sink_frames - self.retrieval_frames
+        )
+        if self.pc_budget_frames:
+            chunk = min(chunk, self.pc_recent_frames)
+        self.validate_bank_capacity(layers, tokens_per_frame, heads, dim, itemsize, chunk)
+        history = self.window_frames - self.retrieval_frames
+        kv = 2 * heads * dim * itemsize
+        row = kv + 16
+        resident = layers * tokens_per_frame * (2 * history + chunk + self.retrieval_frames) * row
+        if self.pc_budget_frames:
+            resident += layers * tokens_per_frame * (2 * self.pc_recent_frames + chunk) * (kv // 2)
+            resident += layers * history * tokens_per_frame * 8  # frozen indices
+        # Conservative fp32/fp64 scoring and temporal rotation working set,
+        # including concatenation and selection copies. Model activations and
+        # attention backend workspace are accounted by the runner separately.
+        scratch = 8 * self.window_frames * tokens_per_frame * (2 * heads * dim * max(4, itemsize) + 16)
+        return resident + scratch
 
 
 def rebase_temporal_keys(key: torch.Tensor, delta: torch.Tensor, temporal_dim: int) -> torch.Tensor:
@@ -301,9 +341,6 @@ class VideoMemory:
             )
         )
         chunk = BankChunk(self.next_frame, self._frames, self.pose.clone(), layers)
-        if chunk.nbytes > self.config.bank_bytes:
-            # Do not destroy useful history to insert an entry that cannot fit.
-            return bank
         bank[chunk.start] = chunk
         size = sum(entry.nbytes for entry in bank.values())
         while size > self.config.bank_bytes:
@@ -389,6 +426,9 @@ class VideoMemory:
             raise ValueError("Video memory requires matching single-sequence Q/K/V [1,T,H,D]")
         if key.shape[1] != self._frames * self.tokens_per_frame:
             raise ValueError("Current token count does not match video memory geometry")
+        self.config.validate_bank_capacity(
+            self.num_layers, self.tokens_per_frame, key.shape[2], key.shape[3], key.element_size(), self._frames
+        )
         self._seen.add(layer)
         positions = torch.arange(self.next_frame, self.next_frame + self._frames, device=key.device)
         positions = positions.repeat_interleave(self.tokens_per_frame)

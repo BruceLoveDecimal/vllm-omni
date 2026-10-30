@@ -113,11 +113,17 @@ def test_bank_byte_budget_eviction_and_noisy_read_only():
     assert memory.bank_nbytes == 0
 
 
-def test_oversized_entry_does_not_evict_existing_history():
+def test_oversized_entry_fails_before_allocating_or_publishing(monkeypatch):
     memory = state(bank_bytes=1)
-    append(memory, 0)
-    append(memory, 2)
-    assert memory.bank_nbytes == 0
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("compression must not run for an undersized bank")
+
+    monkeypatch.setattr(vm, "world_compress", unexpected)
+    with pytest.raises(ValueError, match="cannot fit one compressed chunk"):
+        append(memory, 0)
+    assert memory.bank_nbytes == 0 and memory.next_frame == 0
+    assert memory.history == [None, None] and not memory._pending
 
 
 def test_bank_is_transactional_and_copies_camera(monkeypatch):
@@ -224,3 +230,33 @@ def test_combined_small_fifo_bank_retrieves_over_long_rollout():
                             assert not torch.isin(chunk.layers[layer].token_ids, previous.token_ids).any()
         assert len(memory.bank) <= 4
     assert hits > 0
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.25, 1.0])
+def test_bank_capacity_exact_boundary_includes_ids_and_pose(ratio):
+    sample = state(world_keep_ratio=ratio)
+    append(sample, 0)
+    append(sample, 2)
+    exact = sample.bank_nbytes
+    config = state(world_keep_ratio=ratio, bank_bytes=exact)
+    config.config.validate_bank_capacity(2, 2, 2, 8, 8, 2)
+    append(config, 0)
+    append(config, 2)
+    assert config.bank_nbytes == exact
+    too_small = state(world_keep_ratio=ratio, bank_bytes=exact - 1)
+    with pytest.raises(ValueError, match="cannot fit"):
+        too_small.config.reservation_bytes(2, 2, 2, 8, 8, chunk_frames=2)
+
+
+def test_real_geometry_rejects_one_gib_bank_and_reserves_layer_local_scratch():
+    config = vm.VideoMemoryConfig(
+        window_frames=18, sink_frames=3, retrieval_frames=3, bank_bytes=1 << 30, world_keep_ratio=0.25
+    )
+    with pytest.raises(ValueError, match="cannot fit"):
+        config.reservation_bytes(40, 1560, 40, 128, 2, chunk_frames=3)
+    pc = vm.VideoMemoryConfig(window_frames=18, sink_frames=3, pc_budget_frames=12, pc_recent_frames=3)
+    reserve = pc.reservation_bytes(40, 1560, 40, 128, 2, chunk_frames=3)
+    old = 4 * 40 * 18 * 1560 * (2 * 40 * 128 * 2 + 8)
+    assert reserve < old
+    # Two histories, pending KV, and query histories are real all-layer owners.
+    assert reserve >= 40 * 1560 * (2 * 18 + 3 + (2 * 3 + 3) / 2) * (2 * 40 * 128 * 2)

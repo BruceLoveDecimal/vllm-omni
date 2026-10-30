@@ -256,7 +256,9 @@ layers and the output projection must succeed before clean history is
 published. The runner owns session policy storage and releases it on close,
 reset, eviction, and failure. Request-mode policy storage is request-local.
 Its conservative device-memory reservation includes canonical rows, pending
-rows, replacement rows, attention views, and position metadata. The legacy
+rows, replacement rows, retrieved device rows, query history and token
+metadata. Attention/rotation/scoring scratch is charged once per active layer,
+not once for every model layer; LingBot supplies its actual chunk size. The legacy
 pool uses minimum geometry and receives no duplicate self-KV writes.
 
 This initial path requires single-rank eager attention and clean commits;
@@ -277,8 +279,10 @@ is a configuration, not a validated quality preset.
 
 Each successfully committed non-sink chunk is copied once to the CPU bank.
 Entries include canonical K/V, original token positions, and an absolute C2W
-pose. Oldest bank entries are evicted to meet the byte limit; an oversized
-entry is skipped without discarding existing memory. Rank by normalized
+pose and stable token IDs. Oldest bank entries are evicted to meet the byte
+limit. A bank that cannot hold one compressed chunk is rejected before
+allocating pending KV or transferring bank rows. Capacity depends on model
+geometry, dtype, chunk size and compression ratio. Rank by normalized
 squared translation distance plus rotation geodesic distance, breaking ties
 by insertion order. Exclude sink and recent chunks, then present retrieved
 chunks in chronological order. All layers use the same chunk IDs. Chunk
@@ -335,7 +339,7 @@ video_memory:
   window_frames: 18
   sink_frames: 3
   retrieval_frames: 3
-  bank_bytes: 1073741824
+  bank_bytes: 8589934592
   world_keep_ratio: 0.25
   world_score: pairwise_mean
   pc_budget_frames: 12
