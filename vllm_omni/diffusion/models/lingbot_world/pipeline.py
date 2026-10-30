@@ -71,6 +71,7 @@ from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload_strategy,
 )
+from vllm_omni.diffusion.offloader.sequential_backend import sequential_offload_component
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -1439,17 +1440,25 @@ class LingBotWorldCausalDMDPipeline(
         layers = scope.lookup(identity)
         if layers is None:
             ticket = scope.begin_build(identity)
-            projected_text = self.transformer.text_embedding(prompt_embeds)
+            # These projections bypass transformer.forward and its offload
+            # hook. Keep weights resident until the lazy K/V iterator finishes.
+            component = (
+                sequential_offload_component(self.transformer)
+                if resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
+                else nullcontext()
+            )
+            with component:
+                projected_text = self.transformer.text_embedding(prompt_embeds)
 
-            def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-                for block in self.transformer.blocks:
-                    cross_attention = block.cross_attn
-                    shape = (cross_attention.num_local_heads, cross_attention.head_dim)
-                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
-                    value = cross_attention.v(projected_text).unflatten(2, shape)
-                    yield key, value
+                def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+                    for block in self.transformer.blocks:
+                        cross_attention = block.cross_attn
+                        shape = (cross_attention.num_local_heads, cross_attention.head_dim)
+                        key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
+                        value = cross_attention.v(projected_text).unflatten(2, shape)
+                        yield key, value
 
-            scope.publish(ticket, layer_kv())
+                scope.publish(ticket, layer_kv())
             layers = scope.lookup(identity)
             assert layers is not None
         return [

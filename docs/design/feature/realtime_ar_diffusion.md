@@ -190,6 +190,11 @@ For LingBot World v2:
 - `lingbot_world/pipeline.py` constructs conditioning, owns small non-KV session state, and
   produces one block plus the standard metadata envelope.
 
+With module offloading, a static text K/V cache miss explicitly activates the
+transformer while projecting text and consuming all per-layer K/V projections.
+These operations bypass the transformer's forward hook. The component scope
+releases weights on success or failure; a cache hit needs no weight activation.
+
 ## Ulysses sequence parallelism
 
 LingBot supports pure Ulysses sequence parallelism for both direct and
