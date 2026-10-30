@@ -195,7 +195,8 @@ def test_real_lingbot_attention_uses_memory_view():
     assert state.history[0].positions.tolist() == [0, 4, 5, 6]
 
 
-def test_full_lingbot_transformer_matches_legacy_and_rolls_back_head_failure(monkeypatch):
+@pytest.mark.parametrize("rebase", [False, True])
+def test_full_lingbot_transformer_matches_legacy_and_rolls_back_head_failure(monkeypatch, rebase):
     from tests.diffusion.models.lingbot_world.test_lingbot_world_attention import _load_module
 
     module = _load_module()
@@ -223,7 +224,7 @@ def test_full_lingbot_transformer_matches_legacy_and_rolls_back_head_failure(mon
         dtype=torch.float32,
     )
     state = vm.VideoMemory(
-        vm.VideoMemoryConfig(window_frames=3, sink_frames=1, rebase_sink=False),
+        vm.VideoMemoryConfig(window_frames=3, sink_frames=1, rebase_sink=rebase),
         num_layers=2,
         tokens_per_frame=4,
         temporal_dim=4,
@@ -244,7 +245,9 @@ def test_full_lingbot_transformer_matches_legacy_and_rolls_back_head_failure(mon
             for commit in (False, False, True):
                 actual = model(**kwargs, cache=policy, update_cache=commit)
                 reference = model(**kwargs, cache=dense, update_cache=commit)
-                torch.testing.assert_close(actual, reference, atol=2e-6, rtol=2e-6)
+                assert torch.isfinite(actual).all()
+                if not rebase or frame < 3:
+                    torch.testing.assert_close(actual, reference, atol=2e-6, rtol=2e-6)
         old = state.history
 
         def fail(*args, **kwargs):
