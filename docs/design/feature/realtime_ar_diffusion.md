@@ -277,6 +277,17 @@ bank byte limit. For example, `window_frames: 18`, `sink_frames: 3`,
 WorldKV-style split with three recent and three current frames. This example
 is a configuration, not a validated quality preset.
 
+Capacity must also cover the time until a chunk leaves the local window.
+For 480×832, 40 layers, 40 heads, head size 128 and BF16, a three-latent-frame
+chunk occupies about 3.57 GiB without compression, or 1.79 GiB at a keep ratio
+of 0.25 (including token metadata). With window/sink/retrieval `18/3/3`, the
+FIFO bank needs four such chunks before the oldest can become eligible.
+An 8 GiB uncompressed bank holds only two and produces no retrieval; 16 GiB
+uncompressed or 8 GiB compressed holds four. These minimum capacities expose
+only the immediately evicted context. Longer revisits need additional bank
+capacity; fitting one chunk is a necessary startup check, not a guarantee of
+useful retrieval coverage.
+
 Each successfully committed non-sink chunk is copied once to the CPU bank.
 Entries include canonical K/V, original token positions, and an absolute C2W
 pose and stable token IDs. Oldest bank entries are evicted to meet the byte
