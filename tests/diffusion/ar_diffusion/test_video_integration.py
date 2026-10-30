@@ -411,6 +411,7 @@ def test_combined_long_rollout_deduplicates_and_bounds_all_layers(ratio, rebase)
         pc_recent_frames=2,
         world_keep_ratio=ratio,
         rebase_sink=rebase,
+        rebase_pc=rebase,
         rebase_retrieval=rebase,
     )
     memory = vm.VideoMemory(config, num_layers=2, tokens_per_frame=2, temporal_dim=4)
@@ -539,7 +540,12 @@ def test_causvid_real_stage_hook_uses_policy_and_restores_context(runtime):
 
 
 @pytest.mark.parametrize("ratio", [0, 0.25, 1])
-def test_combined_attention_matches_explicit_virtual_positions_and_keeps_canonical_keys(ratio):
+@pytest.mark.parametrize("sink_rebase", [False, True])
+@pytest.mark.parametrize("pc_rebase", [False, True])
+@pytest.mark.parametrize("retrieval_rebase", [False, True])
+def test_combined_attention_matches_explicit_virtual_positions_and_keeps_canonical_keys(
+    ratio, sink_rebase, pc_rebase, retrieval_rebase
+):
     config = vm.VideoMemoryConfig(
         window_frames=12,
         sink_frames=2,
@@ -548,8 +554,9 @@ def test_combined_attention_matches_explicit_virtual_positions_and_keeps_canonic
         pc_budget_frames=8,
         pc_recent_frames=2,
         world_keep_ratio=ratio,
-        rebase_sink=True,
-        rebase_retrieval=True,
+        rebase_sink=sink_rebase,
+        rebase_pc=pc_rebase,
+        rebase_retrieval=retrieval_rebase,
     )
     memory = vm.VideoMemory(config, num_layers=2, tokens_per_frame=2, temporal_dim=4)
     checked = 0
@@ -570,10 +577,10 @@ def test_combined_attention_matches_explicit_virtual_positions_and_keeps_canonic
                 recent = rows.positions >= start
                 middle = ~sink & ~recent
                 # Assign independent packed regions ending just before current.
-                middle_frames = (int(middle.sum()) + 1) // 2
+                middle_frames = (int(middle.sum()) + 1) // 2 if pc_rebase else 0
                 count = sum(chunk.layers[layer].positions.numel() for chunk in memory._retrieved)
                 retrieval_frames = (count + 1) // 2
-                sink_start = start - middle_frames - retrieval_frames - 2
+                sink_start = max(0, start - middle_frames - retrieval_frames - 2) if sink_rebase else 0
                 # Sink targets are its original 0,1 plus the shift.
                 parts_k = [absolute_keys(rows.key[:, sink], torch.full_like(rows.positions[sink], sink_start))]
                 parts_v = [rows.value[:, sink]]
@@ -583,12 +590,18 @@ def test_combined_attention_matches_explicit_virtual_positions_and_keeps_canonic
                     target = (
                         start - middle_frames - retrieval_frames + (offset + torch.arange(r.positions.numel())) // 2
                     )
-                    parts_k.append(absolute_keys(r.key, target - r.positions))
+                    parts_k.append(absolute_keys(r.key, target - r.positions) if retrieval_rebase else r.key)
                     parts_v.append(r.value)
                     offset += r.positions.numel()
                 target = start - middle_frames + torch.arange(int(middle.sum())) // 2
                 parts_k.extend(
-                    (absolute_keys(rows.key[:, middle], target - rows.positions[middle]), rows.key[:, recent], current)
+                    (
+                        absolute_keys(rows.key[:, middle], target - rows.positions[middle])
+                        if pc_rebase
+                        else rows.key[:, middle],
+                        rows.key[:, recent],
+                        current,
+                    )
                 )
                 parts_v.extend((rows.value[:, middle], rows.value[:, recent], q))
                 expected_k, expected_v = torch.cat(parts_k, 1), torch.cat(parts_v, 1)

@@ -19,8 +19,9 @@ import torch
 @dataclass(frozen=True)
 class VideoMemoryConfig:
     window_frames: int = 18
-    sink_frames: int = 9
-    rebase_sink: bool = True
+    sink_frames: int = 0
+    rebase_sink: bool = False
+    rebase_pc: bool = False
     retrieval_frames: int = 0
     bank_bytes: int = 0
     rebase_retrieval: bool = False
@@ -64,10 +65,16 @@ class VideoMemoryConfig:
             raise ValueError("video_memory retrieval requires a positive bank_bytes limit")
         if self.sink_frames + self.retrieval_frames >= self.window_frames:
             raise ValueError("video_memory window must leave room for current frames")
-        if type(self.rebase_retrieval) is not bool:
-            raise ValueError("video_memory.rebase_retrieval must be a bool")
-        if type(self.rebase_sink) is not bool:
-            raise ValueError("video_memory.rebase_sink must be a bool")
+        for name, dependency in (
+            ("rebase_sink", "sink_frames"),
+            ("rebase_pc", "pc_budget_frames"),
+            ("rebase_retrieval", "retrieval_frames"),
+        ):
+            value = getattr(self, name)
+            if type(value) is not bool:
+                raise ValueError(f"video_memory.{name} must be a bool")
+            if value and not getattr(self, dependency):
+                raise ValueError(f"video_memory.{name} requires positive {dependency}")
 
     @classmethod
     def parse(cls, value: Mapping[str, object] | None) -> VideoMemoryConfig | None:
@@ -536,23 +543,20 @@ class VideoMemory:
         retrieved_tokens = sum(chunk.layers[layer].positions.numel() for chunk in self._retrieved)
         retrieved_frames = math.ceil(retrieved_tokens / self.tokens_per_frame)
         middle_frames = 0
-        if self.config.rebase_sink:
-            delta = torch.where(
-                rows.positions < self.config.sink_frames,
-                max(0, tail_start - retrieved_frames - self.config.sink_frames),
-                0,
-            )
-            if self.config.pc_budget_frames:
+        if self.config.rebase_sink or self.config.rebase_pc:
+            delta = torch.zeros_like(rows.positions)
+            if self.config.rebase_pc:
                 middle = torch.where((rows.positions >= self.config.sink_frames) & (rows.positions < tail_start))[0]
                 middle_frames = math.ceil(middle.numel() / self.tokens_per_frame)
-                sink_shift = max(0, tail_start - middle_frames - retrieved_frames - self.config.sink_frames)
-                delta = torch.where(rows.positions < self.config.sink_frames, sink_shift, 0)
                 target = (
                     tail_start
                     - middle_frames
                     + torch.arange(middle.numel(), device=key.device) // self.tokens_per_frame
                 )
                 delta[middle] = target - rows.positions[middle]
+            if self.config.rebase_sink:
+                sink_shift = max(0, tail_start - middle_frames - retrieved_frames - self.config.sink_frames)
+                delta = torch.where(rows.positions < self.config.sink_frames, sink_shift, delta)
             history_key = rebase_temporal_keys(rows.key, delta, self.temporal_dim)
         else:
             history_key = rows.key

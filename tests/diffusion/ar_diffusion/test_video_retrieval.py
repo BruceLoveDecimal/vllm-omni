@@ -175,7 +175,7 @@ def test_ties_are_deterministic_and_sink_recent_never_retrieved():
     [
         {"retrieval_frames": -1},
         {"retrieval_frames": 3},
-        {"retrieval_frames": 9, "bank_bytes": 100},
+        {"sink_frames": 9, "retrieval_frames": 9, "bank_bytes": 100},
         {"bank_bytes": True},
     ],
 )

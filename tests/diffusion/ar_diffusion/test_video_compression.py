@@ -114,7 +114,7 @@ def test_pc_selection_frozen_across_denoising_and_bounded_on_long_rollouts():
 
 
 def test_pc_attention_rebases_sparse_top_keys_without_changing_spatial_channels():
-    memory = pc_state()
+    memory = pc_state(rebase_sink=True, rebase_pc=True)
     for start in range(0, 12, 2):
         run_pc_chunk(memory, start)
     with memory.forward(12, 2, commit=False):
@@ -159,8 +159,8 @@ def test_compressed_bank_uses_half_kv_and_per_layer_selection():
         {"world_keep_ratio": 2},
         {"world_keep_ratio": 0.25},
         {"world_score": "unknown"},
-        {"pc_budget_frames": 8},
-        {"pc_budget_frames": 12, "pc_recent_frames": 4},
+        {"sink_frames": 9, "pc_budget_frames": 8},
+        {"sink_frames": 9, "pc_budget_frames": 12, "pc_recent_frames": 4},
         {"pc_budget_frames": 18},
     ],
 )

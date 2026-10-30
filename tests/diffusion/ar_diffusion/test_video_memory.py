@@ -37,7 +37,10 @@ vm = load_memory()
 
 def memory(**kwargs):
     return vm.VideoMemory(
-        vm.VideoMemoryConfig(window_frames=6, sink_frames=2, **kwargs), num_layers=2, tokens_per_frame=2, temporal_dim=4
+        vm.VideoMemoryConfig(window_frames=6, sink_frames=2, **{"rebase_sink": True, **kwargs}),
+        num_layers=2,
+        tokens_per_frame=2,
+        temporal_dim=4,
     )
 
 
@@ -169,7 +172,13 @@ def test_incomplete_duplicate_out_of_order_closed_and_session_isolation():
 
 @pytest.mark.parametrize(
     "config",
-    [{"window_frames": 0}, {"sink_frames": -1}, {"sink_frames": True}, {"window_frames": 9}, {"rebase_sink": 1}],
+    [
+        {"window_frames": 0},
+        {"sink_frames": -1},
+        {"sink_frames": True},
+        {"window_frames": 9, "sink_frames": 9},
+        {"rebase_sink": 1},
+    ],
 )
 def test_invalid_config(config):
     with pytest.raises(ValueError):
@@ -283,3 +292,48 @@ def test_publication_concatenates_only_retained_slices(monkeypatch, start):
     torch.testing.assert_close(result.key, expected_k)
     assert torch.equal(result.token_ids, ids[keep])
     assert result.key.untyped_storage().nbytes() == result.key.numel() * result.key.element_size()
+
+
+def test_empty_policy_disables_all_optional_mechanisms():
+    assert vm.VideoMemoryConfig.parse(None) is None
+    config = vm.VideoMemoryConfig.parse({})
+    assert config == vm.VideoMemoryConfig()
+    assert config.sink_frames == 0
+    assert not config.rebase_sink and not config.rebase_pc and not config.rebase_retrieval
+    assert config.retrieval_frames == config.bank_bytes == config.pc_budget_frames == 0
+    assert config.world_keep_ratio == 1.0
+
+
+@pytest.mark.parametrize("flag", ["rebase_sink", "rebase_pc", "rebase_retrieval"])
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_rebase_flags_require_booleans(flag, value):
+    with pytest.raises(ValueError, match="must be a bool"):
+        vm.VideoMemoryConfig.parse({flag: value})
+
+
+@pytest.mark.parametrize(
+    "settings,dependency",
+    [
+        ({"rebase_sink": True}, "sink_frames"),
+        ({"rebase_pc": True}, "pc_budget_frames"),
+        ({"rebase_retrieval": True}, "retrieval_frames"),
+        ({"world_keep_ratio": 0.25}, "requires retrieval"),
+    ],
+)
+def test_optional_mechanisms_do_not_implicitly_enable_dependencies(settings, dependency):
+    with pytest.raises(ValueError, match=dependency):
+        vm.VideoMemoryConfig.parse(settings)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"sink_frames": 3},
+        {"pc_budget_frames": 12},
+        {"retrieval_frames": 3, "bank_bytes": 100000},
+        {"retrieval_frames": 3, "bank_bytes": 100000, "world_keep_ratio": 0.25},
+    ],
+)
+def test_enabling_selection_does_not_enable_rebasing(settings):
+    config = vm.VideoMemoryConfig.parse(settings)
+    assert not config.rebase_sink and not config.rebase_pc and not config.rebase_retrieval

@@ -249,10 +249,28 @@ latents, and exact metadata/request identity.
 
 ## Experimental video memory policies
 
-LingBot accepts an opt-in `model_config.video_memory` mapping. The initial
-Deep Sink policy uses `window_frames: 18`, `sink_frames: 9`, and
-`rebase_sink: true`. Units are latent frames; the window includes the current
-chunk. Omitting the mapping preserves the existing paged/direct paths.
+LingBot accepts an opt-in `model_config.video_memory` mapping. An empty mapping
+uses a plain 18-frame transactional sliding window: `sink_frames: 0`,
+`retrieval_frames: 0`, `bank_bytes: 0`, `world_keep_ratio: 1`,
+`pc_budget_frames: 0`, and all three rebasing flags false. Units are latent
+frames; the window includes the current chunk. Omitting the mapping preserves
+the existing paged/direct paths, including their model-specific defaults.
+An empty mapping selects the eager memory implementation and is not an alias
+for omitting it.
+
+Enable each mechanism explicitly. `sink_frames` controls retention,
+`rebase_sink` rotates only sink keys, `rebase_pc` rotates only selected PC
+middle-history keys, and `rebase_retrieval` rotates only retrieved keys.
+Rebasing requires a positive corresponding sink, PC or retrieval budget;
+World compression requires retrieval, which requires a positive bank limit.
+Invalid dependencies raise errors rather than enabling another mechanism.
+Transaction publication and rollback always remain active.
+
+Migration: earlier experimental configurations defaulted to nine sink frames
+and sink rebasing, which also rebased PC middle-history keys. To reproduce
+that behavior, explicitly set `sink_frames: 9`, `rebase_sink: true`, and,
+when PC is enabled, `rebase_pc: true`. Configurations that already specify a
+sink count should retain that count.
 
 The eager policy keeps canonical clean keys at their original temporal RoPE
 positions and rotates only the temporal channels of attention views. Values
@@ -275,10 +293,9 @@ latency improvements.
 
 ### Isolating mechanisms in validation
 
-Do not label a configuration with omitted defaults as a single-mechanism
-ablation: `rebase_sink` defaults to true and, with PC enabled, also rebases
-selected middle-history tokens. Explicitly disable both rebasing flags for
-absolute-position controls. Keep the same code revision and transactional
+Use explicit rebasing flags in recorded ablation configurations. All three
+flags default to false and control separate token regions. Absolute-position
+controls leave all three disabled. Keep the same code revision and transactional
 ownership implementation across groups so correctness fixes are not a
 confounding variable.
 
@@ -293,9 +310,11 @@ For a window of 18 latent frames and three-frame chunks, use these controls:
 | Retrieval with World compression | 3 | false | 3 | 0.25 | 0 |
 | PC only | 3 | false | 0 | 1 | 12 |
 | PC with retrieval and World compression | 3 | false | 3 | 0.25 | 12 |
-| Combined with sink/middle rebasing | 3 | true | 3 | 0.25 | 12 |
+| Combined with sink rebasing | 3 | true | 3 | 0.25 | 12 |
 
-All rows above keep `rebase_retrieval: false` and `pc_recent_frames: 3`.
+All rows above keep `rebase_pc: false`, `rebase_retrieval: false` and
+`pc_recent_frames: 3`. Toggle PC middle-history rebasing separately on the PC
+or combined rows to measure its contribution.
 Compare World compression against uncompressed retrieval: it operates on bank
 rows and has no standalone end-to-end mode without retrieval. Compare PC
 against both the 18-frame retention control and a 12-frame fixed-window
@@ -381,7 +400,7 @@ the recent budget. Publication remains transactional. This query-history
 convention is explicit; it is not a claim of bitwise parity with the upstream
 research script's mutable denoising-query buffer.
 
-With `rebase_sink: true`, PC also rebases selected intermediate keys into a
+With `rebase_pc: true`, PC rebases selected intermediate keys into a
 compact virtual timeline before the recent region. Canonical positions remain
 unchanged. CPU tests compare scoring with full pairwise cosine/QK matrices,
 check low-precision selection, stable ties, exact retained storage size, and
@@ -403,6 +422,7 @@ video_memory:
   pc_budget_frames: 12
   pc_recent_frames: 3
   rebase_sink: true
+  rebase_pc: true
   rebase_retrieval: true
 ```
 
@@ -415,9 +435,10 @@ its canonical PC history before chunk ranking and budgeting. All layers use
 the same retrieved chunk IDs, but may retrieve different token subsets.
 Budgeting uses the largest remaining subset across layers. Tokens discarded
 by this step's PC selection become eligible on the next chunk.
-When enabled, temporal correction packs retrieved tokens into consecutive
-virtual frames before PC intermediate/recent tokens, and shifts the sink
-before that region. Original bank/history tensors never receive these phases.
+When all rebasing flags are enabled, temporal correction packs retrieved
+tokens into consecutive virtual frames before PC intermediate/recent tokens,
+and shifts the sink before that region. Each flag can also be enabled alone:
+disabled regions keep their absolute temporal phases. Original bank/history tensors never receive these phases.
 
 CausVid accepts the same mapping for Deep Sink and PC, without pose retrieval.
 Use `causvid_wan_self_forcing.yaml` as the starting point, set `devices: "0"`,
@@ -432,6 +453,7 @@ video_memory:
   pc_budget_frames: 12
   pc_recent_frames: 3
   rebase_sink: true
+  rebase_pc: true
 ```
 
 `WanCell` keeps a request-local transaction open across the real transformer
