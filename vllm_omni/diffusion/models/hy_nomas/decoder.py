@@ -588,14 +588,14 @@ class PixelUMMDecoder(nn.Module):
             )
         return torch.cat(frames, dim=2)
 
-    def _noise_tile(self, latent, seed):
+    def _noise_tile(self, latent, seed, frame_offset=0):
         cached_range = None
         cached_noise = None
 
         def source(first, last, row, column, height, width):
             nonlocal cached_range, cached_noise
             if cached_range != (first, last):
-                cached_noise = self._make_noise(latent, first, last, seed)
+                cached_noise = self._make_noise(latent, first + frame_offset, last + frame_offset, seed)
                 cached_range = (first, last)
             return cached_noise[..., row * 32 : (row + height) * 32, column * 32 : (column + width) * 32]
 
@@ -701,13 +701,20 @@ class PixelUMMDecoder(nn.Module):
 
     @torch.no_grad()
     def _decode_windows(
-        self, latent: torch.Tensor, starts: list[int], seed: int, pad_short: bool = False
+        self, latent: torch.Tensor, starts: list[int], seed: int, pad_short: bool = False, frame_offset: int = 0
     ) -> torch.Tensor:
         latent = latent.to(device=self.device, dtype=self.dtype)
-        return self._predict_x0(latent, self._noise_tile(latent, seed), seed, t_starts=starts, pad_short=pad_short)
+        return self._predict_x0(
+            latent, self._noise_tile(latent, seed, frame_offset), seed, t_starts=starts, pad_short=pad_short
+        )
 
     def create_streaming_decode_session(
-        self, *, to_cpu: bool = True, retain_history: bool = True, generator: torch.Generator | None = None
+        self,
+        *,
+        to_cpu: bool = True,
+        retain_history: bool = True,
+        generator: torch.Generator | None = None,
+        rolling: bool = False,
     ) -> "PixelUMMStreamingDecodeSession":
         """
         Create session state for stable append-only decoding.
@@ -715,20 +722,31 @@ class PixelUMMDecoder(nn.Module):
         Streaming requires one decoder step. Only future-stable pixels are returned
         by push(); finish() emits the withheld final tail. The optional generator
         selects the same absolute-frame noise stream as decode().
+        Rolling mode discards completed prefixes and requires retain_history=False.
         """
         if self.config.num_steps != 1:
             raise ValueError("Streaming PixelUMM decoding requires num_steps=1")
         seed = self.config.seed if generator is None else generator.initial_seed()
-        return PixelUMMStreamingDecodeSession(self, to_cpu=to_cpu, retain_history=retain_history, seed=seed)
+        return PixelUMMStreamingDecodeSession(
+            self, to_cpu=to_cpu, retain_history=retain_history, seed=seed, rolling=rolling
+        )
 
 
 class PixelUMMStreamingDecodeSession:
     """Session-owned stable-prefix decoder; never publishes provisional pixels."""
 
-    def __init__(self, model, *, to_cpu: bool = True, retain_history: bool = True, seed: int = 42):
+    def __init__(
+        self, model, *, to_cpu: bool = True, retain_history: bool = True, seed: int = 42, rolling: bool = False
+    ):
         self.model = model
         self.to_cpu = bool(to_cpu)
         self.retain_history = bool(retain_history)
+        if rolling and retain_history:
+            raise ValueError("rolling decoding requires retain_history=False")
+        self.rolling = bool(rolling)
+        self.buffer_latent_start = 0
+        self.segment_raw_start = 0
+        self.segment_visible_start = 0
         self.window = model.temporal_window_latents
         self.stride = self.window - model.temporal_overlap_latents
         self.temporal_ratio = model.time_compression_ratio
@@ -761,8 +779,8 @@ class PixelUMMStreamingDecodeSession:
         return self.available_latent_frames * self.temporal_ratio
 
     def _segment_raw_visible_spans(self):
-        raw_start = 0
-        visible_start = 0
+        raw_start = self.segment_raw_start
+        visible_start = self.segment_visible_start
         for latent_frames, pixel_frames in zip(self.push_latent_frames, self.push_pixel_frames):
             raw_end = raw_start + latent_frames * self.temporal_ratio
             visible_end = visible_start + pixel_frames
@@ -772,7 +790,7 @@ class PixelUMMStreamingDecodeSession:
 
     def _visible_frames_before_raw(self, raw_end: int) -> int:
         raw_end = max(0, min(int(raw_end), self.available_raw_pixel_frames))
-        visible = 0
+        visible = self.segment_visible_start
         for (
             raw_start,
             raw_visible_end,
@@ -819,7 +837,37 @@ class PixelUMMStreamingDecodeSession:
         if self.model.tail_hold_latents and (not self.final_segment):
             length = self.available_latent_frames
             return [0] if length <= self.window else list(range(0, length, self.stride))
+        if self.rolling and self.available_latent_frames > self.window:
+            first = max(0, (self.committed_raw_pixel_frames // self.temporal_ratio - self.window) // self.stride + 1)
+            tail = self.available_latent_frames - self.window
+            starts = list(range(first * self.stride, tail + 1, self.stride))
+            if not starts or starts[-1] != tail:
+                starts.append(tail)
+            return starts
         return _window_starts(self.available_latent_frames, self.window, self.stride)
+
+    def _trim_completed_prefix(self) -> None:
+        """Release completed latent storage and segment mappings without resetting absolute positions."""
+        if not self.rolling:
+            return
+        assert self.buffer is not None
+        stable_latent = self.committed_raw_pixel_frames // self.temporal_ratio
+        keep = max(0, (stable_latent - self.window) // self.stride + 1) * self.stride
+        keep = min(keep, self.next_window_start)
+        if keep > self.buffer_latent_start:
+            self.buffer = self.buffer[:, :, keep - self.buffer_latent_start :].clone()
+            self.buffer_latent_start = keep
+        count = 0
+        for latent_frames, pixel_frames in zip(self.push_latent_frames, self.push_pixel_frames):
+            raw_end = self.segment_raw_start + latent_frames * self.temporal_ratio
+            if raw_end > self.committed_raw_pixel_frames:
+                break
+            self.segment_raw_start = raw_end
+            self.segment_visible_start += pixel_frames
+            count += 1
+        if count:
+            del self.push_latent_frames[:count]
+            del self.push_pixel_frames[:count]
 
     def _decode_provisional_raw(self) -> torch.Tensor | None:
         """Decode the exact current tail from the raw stable boundary onward."""
@@ -962,12 +1010,17 @@ class PixelUMMStreamingDecodeSession:
                 f"expected_range=[{min_pixel_frames}, {max_pixel_frames}]."
             )
         previous_stable = self.committed_pixel_frames
-        self.buffer = latent.contiguous() if self.buffer is None else torch.cat([self.buffer, latent], dim=2)
+        self.buffer = (
+            (latent.clone() if self.rolling else latent.contiguous())
+            if self.buffer is None
+            else torch.cat([self.buffer, latent], dim=2)
+        )
         self.available_latent_frames += latent_frames
         self.available_pixel_frames += segment_pixel_frames
         self.push_latent_frames.append(latent_frames)
         self.push_pixel_frames.append(segment_pixel_frames)
         stable = self._decode_ready_regular_windows()
+        self._trim_completed_prefix()
         if stable is None or self.committed_pixel_frames <= previous_stable:
             assert self.buffer is not None
             return self.buffer.new_empty((0,))
@@ -976,6 +1029,8 @@ class PixelUMMStreamingDecodeSession:
     @torch.no_grad()
     def finish(self) -> torch.Tensor:
         """Publish the withheld tail and close the append-only timeline."""
+        if self.rolling and not self.final_segment:
+            raise ValueError("rolling finish requires final_segment=True on the closing segment")
         if self.finished:
             raise RuntimeError("PixelUMM streaming decode is already finished.")
         if self.buffer is None:
@@ -996,6 +1051,11 @@ class PixelUMMStreamingDecodeSession:
         self.committed_raw_pixel_frames = self.available_raw_pixel_frames
         self.committed_pixel_frames = self.available_pixel_frames
         self.finished = True
+        if self.rolling:
+            self.buffer = self.buffer[:, :, :0].clone()
+            self.pending = None
+            self.push_latent_frames.clear()
+            self.push_pixel_frames.clear()
         if self.committed_pixel_frames <= previous_stable:
             assert self.buffer is not None
             return self.buffer.new_empty((0,))
@@ -1011,6 +1071,10 @@ class PixelUMMStreamingDecodeSession:
 
     def _decode_windows(self, starts):
         video = self.model._decode_windows(
-            self.buffer, starts, self.seed, pad_short=bool(self.model.tail_hold_latents) and (not self.final_segment)
+            self.buffer,
+            [start - self.buffer_latent_start for start in starts],
+            self.seed,
+            pad_short=bool(self.model.tail_hold_latents) and (not self.final_segment),
+            frame_offset=self.buffer_latent_start,
         )
         return video.cpu() if self.to_cpu else video

@@ -157,6 +157,39 @@ def test_bounded_qk_matches_unsplit_math(monkeypatch):
 
 
 @torch.no_grad()
+def test_native_rolling_stream_preserves_output_and_bounds_state():
+    """Repeated eviction preserves absolute noise, cropped segments and the final tail."""
+    original, native = reference_pair()
+    models = (original, native, native)
+    sessions = [
+        model.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=rolling)
+        for model, rolling in zip(models, (True, True, False))
+    ]
+    generator = torch.Generator().manual_seed(42)
+    chunks = (1, 3, 1, 4) * 4
+    for index, count in enumerate(chunks):
+        latent = torch.randn(1, 32, count, 1, 1, generator=generator)
+        outputs = []
+        for session in sessions:
+            session.final_segment = index == len(chunks) - 1
+            outputs.append(session.push(latent, pixel_frames=count * 4 - index % 4))
+        torch.testing.assert_close(outputs[1], outputs[0], rtol=2e-5, atol=2e-6)
+        torch.testing.assert_close(outputs[1], outputs[2], rtol=0, atol=0)
+        rolling = sessions[1]
+        assert rolling.available_pixel_frames == sessions[0].available_pixel_frames
+        assert rolling.stable_pixel_frames == sessions[0].stable_pixel_frames
+        assert rolling.buffer.shape[2] <= 2 * rolling.window
+        assert rolling.buffer.untyped_storage().nbytes() == rolling.buffer.numel() * rolling.buffer.element_size()
+        assert len(rolling.push_latent_frames) <= 2 * rolling.window
+    assert sessions[1].buffer_latent_start > 0
+    tails = [session.finish() for session in sessions]
+    torch.testing.assert_close(tails[1], tails[0], rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(tails[1], tails[2], rtol=0, atol=0)
+    assert sessions[1].buffer.numel() == 0 and sessions[1].pending is None
+    assert not sessions[1].push_latent_frames and not sessions[1].push_pixel_frames
+
+
+@torch.no_grad()
 def test_local_gqa_matches_reference_visibility(monkeypatch):
     reference = pytest.importorskip("hymm.models.vae.pixelumm_decoder.model")
     original, native = reference_pair(local_attention_tile_pixels=48)

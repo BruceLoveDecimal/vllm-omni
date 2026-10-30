@@ -168,6 +168,12 @@ absolute-frame noise, stable-prefix streaming, per-push frame trimming and final
 tail flush are preserved. There is no separate upstream GQA adapter or
 `decoder_attention_backend` option.
 
+AR sessions also use the native decoder's rolling mode: completed latent
+prefixes and segment mappings are discarded while noise keeps absolute frame
+indices. Closing the session flushes the stable tail and releases decoder state.
+CPU coverage compares repeated eviction against both the pinned rolling
+reference and native decoding with the complete latent history retained.
+
 The decoder remains registered as the `vae` component for model CPU offload.
 Layerwise offload and decoder parallelism remain unsupported. The upstream
 package is still required for the reference DiT, text/camera processing and scheduler.
