@@ -273,6 +273,44 @@ legacy parity with rebasing disabled, and transactional publication. These are
 numerical and lifecycle checks, not evidence of checkpoint quality or GPU
 latency improvements.
 
+### Isolating mechanisms in validation
+
+Do not label a configuration with omitted defaults as a single-mechanism
+ablation: `rebase_sink` defaults to true and, with PC enabled, also rebases
+selected middle-history tokens. Explicitly disable both rebasing flags for
+absolute-position controls. Keep the same code revision and transactional
+ownership implementation across groups so correctness fixes are not a
+confounding variable.
+
+For a window of 18 latent frames and three-frame chunks, use these controls:
+
+| Group | Sink frames | Sink rebasing | Retrieval frames | World keep ratio | PC budget |
+| --- | --- | --- | --- | --- | --- |
+| Sliding window | 0 | false | 0 | 1 | 0 |
+| Sink retention control | 3 | false | 0 | 1 | 0 |
+| Sink rebasing only | 3 | true | 0 | 1 | 0 |
+| Retrieval only | 3 | false | 3 | 1 | 0 |
+| Retrieval with World compression | 3 | false | 3 | 0.25 | 0 |
+| PC only | 3 | false | 0 | 1 | 12 |
+| PC with retrieval and World compression | 3 | false | 3 | 0.25 | 12 |
+| Combined with sink/middle rebasing | 3 | true | 3 | 0.25 | 12 |
+
+All rows above keep `rebase_retrieval: false` and `pc_recent_frames: 3`.
+Compare World compression against uncompressed retrieval: it operates on bank
+rows and has no standalone end-to-end mode without retrieval. Compare PC
+against both the 18-frame retention control and a 12-frame fixed-window
+control, recording actual attention lengths: PC selection is triggered by
+window saturation, so its configured budget is not a per-forward hard cap.
+Separately toggle retrieved-key rebasing when evaluating that mechanism.
+
+For retrieval comparisons, report both equal bank bytes and equal retained
+history coverage; they answer different questions. Verify nonzero retrieval
+and use enough history to present multiple eligible candidates before claiming
+pose selection or long-range revisit benefits. CPU factorial tests verify
+disabled paths, selected canonical K/V, dense attention parity and actual
+retrieval across the rebasing/PC/bank combinations. They do not establish video
+quality, GPU latency or end-to-end isolation of model conditioning.
+
 ### World retrieval
 
 Set `retrieval_frames` and a positive `bank_bytes` in `video_memory` to reserve
