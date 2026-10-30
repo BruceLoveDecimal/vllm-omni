@@ -120,7 +120,7 @@ def test_pc_attention_rebases_sparse_top_keys_without_changing_spatial_channels(
             key, value = memory.assemble(
                 layer, raw(12), absolute_keys(raw(12), torch.arange(12, 14).repeat_interleave(2)), raw(12)
             )
-            selected = memory._selection[layer]
+            selected = memory._previous(layer)
             middle_count = selected.positions.numel() - 4
             middle_frames = math.ceil(middle_count / 2)
             targets = torch.cat(
@@ -165,3 +165,29 @@ def test_compressed_bank_uses_half_kv_and_per_layer_selection():
 def test_invalid_compression_config(config):
     with pytest.raises(ValueError):
         vm.VideoMemoryConfig(**config)
+
+
+def test_pc_freezes_only_indices_and_preserves_history_on_failure():
+    memory = pc_state()
+    for start in (0, 2, 4):
+        run_pc_chunk(memory, start)
+    original = memory.history
+    with memory.forward(6, 2, commit=False):
+        for layer in range(2):
+            memory.assemble(layer, raw(6), raw(6), raw(6))
+    assert memory.history is original
+    for indices in memory._selection.values():
+        assert isinstance(indices, torch.Tensor)
+        assert indices.dtype == torch.int64 and indices.ndim == 1
+        assert indices.untyped_storage().nbytes() == indices.numel() * 8
+    selection = dict(memory._selection)
+    with pytest.raises(RuntimeError, match="head failure"):
+        with memory.forward(6, 2, commit=True):
+            for layer in range(2):
+                memory.assemble(layer, raw(6), raw(6), raw(6))
+            raise RuntimeError("head failure")
+    assert memory.history is original and memory.next_frame == 6
+    assert all(memory._selection[i] is index for i, index in selection.items())
+    run_pc_chunk(memory, 6)
+    assert not memory._selection
+    assert all(row.key.shape[1] == 12 for row in memory.history)

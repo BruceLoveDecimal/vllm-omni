@@ -428,7 +428,7 @@ def test_combined_long_rollout_deduplicates_and_bounds_all_layers(ratio, rebase)
                     raw(start),
                 )
                 assert k.shape == v.shape and k.shape[1] <= config.window_frames * 2
-                previous = memory._selection.get(layer, memory.history[layer])
+                previous = memory._previous(layer)
                 if previous is not None:
                     for chunk in chunks:
                         assert not torch.isin(chunk.layers[layer].positions, previous.positions).any()
@@ -562,7 +562,7 @@ def test_combined_attention_matches_explicit_virtual_positions_and_keeps_canonic
                 q = raw(start)
                 current = absolute_keys(q, torch.arange(start, start + 2).repeat_interleave(2))
                 k, v = memory.assemble(layer, q, current, q)
-                rows = memory._selection.get(layer, memory.history[layer])
+                rows = memory._previous(layer)
                 if rows is None or not memory._retrieved:
                     continue
                 checked += 1

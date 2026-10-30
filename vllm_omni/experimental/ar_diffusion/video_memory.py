@@ -207,7 +207,7 @@ class VideoMemory:
         self._closed = False
         self._pending: dict[int, MemoryRows] = {}
         self._seen: set[int] = set()
-        self._selection: dict[int, MemoryRows] = {}
+        self._selection: dict[int, torch.Tensor] = {}
         self._query_history: dict[int, torch.Tensor] = {}
         self._pending_queries: dict[int, torch.Tensor] = {}
 
@@ -350,8 +350,14 @@ class VideoMemory:
             self._active = False
             self._retrieved = ()
 
+    def _previous(self, layer: int) -> MemoryRows | None:
+        previous = self.history[layer]
+        if previous is not None and layer in self._selection:
+            return previous.select(self._selection[layer])
+        return previous
+
     def _retained(self, layer: int, current: MemoryRows) -> MemoryRows:
-        previous = self._selection.get(layer, self.history[layer])
+        previous = self._previous(layer)
         if previous is None:
             return current
         rows = MemoryRows(
@@ -383,7 +389,7 @@ class VideoMemory:
             # These slices must own storage: QKV projections otherwise keep Q
             # and the unselected tokens alive after a compression/commit.
             self._pending[layer] = MemoryRows(key.detach().clone(), value.detach().clone(), positions)
-        previous = self._selection.get(layer, self.history[layer])
+        previous = self._previous(layer)
         if self._commit and self.config.pc_budget_frames:
             self._pending_queries[layer] = query.detach().clone()
         if previous is None:
@@ -406,7 +412,7 @@ class VideoMemory:
                 - key.shape[1],
             )
             previous = previous.select(selected)
-            self._selection[layer] = previous
+            self._selection[layer] = selected
 
         sink = previous.positions < self.config.sink_frames
         tail_start = max(
@@ -423,7 +429,7 @@ class VideoMemory:
         else:
             keep = sink | (previous.positions >= tail_start)
         indices = torch.where(keep)[0]
-        rows = previous.select(indices)
+        rows = previous if self.config.pc_budget_frames else previous.select(indices)
         retrieved_tokens = sum(chunk.layers[layer].positions.numel() for chunk in self._retrieved)
         retrieved_frames = math.ceil(retrieved_tokens / self.tokens_per_frame)
         middle_frames = 0
