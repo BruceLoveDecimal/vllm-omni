@@ -258,8 +258,9 @@ def test_real_geometry_rejects_one_gib_bank_and_reserves_layer_local_scratch():
     reserve = pc.reservation_bytes(40, 1560, 40, 128, 2, chunk_frames=3)
     old = 4 * 40 * 18 * 1560 * (2 * 40 * 128 * 2 + 8)
     assert reserve < old
-    # Two histories, pending KV, and query histories are real all-layer owners.
-    assert reserve >= 40 * 1560 * (2 * 18 + 3 + (2 * 3 + 3) / 2) * (2 * 40 * 128 * 2)
+    # Worst PC publication holds 14 old + 17 new frames and two query
+    # histories (three KV-equivalent frames); pending rows are consumed.
+    assert reserve >= 40 * 1560 * (14 + 17 + 3) * (2 * 40 * 128 * 2)
 
 
 def test_retrieved_rows_transfer_once_per_chunk_and_clear_on_commit(monkeypatch):
@@ -310,3 +311,38 @@ def test_retrieved_device_cache_invalidated_on_lifecycle_changes(end):
         memory.close()
     assert not memory._device_retrieved and not memory._retrieved
     assert memory._retrieval_frames == 0
+
+
+def test_clean_publication_releases_device_views_and_consumes_pending_transactionally(monkeypatch):
+    memory = state(pc_budget_frames=6, pc_recent_frames=2)
+    for start in range(0, 8, 2):
+        append(memory, start)
+    old_history, old_bank = memory.history, memory.bank
+    publish, retain = memory._publish_bank, memory._retained
+    calls = []
+
+    def checked_publish():
+        assert not memory._device_retrieved
+        assert len(memory._pending) == 2
+        calls.append("bank")
+        return publish()
+
+    def checked_retain(layer, current):
+        assert calls[0] == "bank"
+        assert layer not in memory._pending
+        assert len(memory._pending) == 1 - layer
+        assert memory.history is old_history and memory.bank is old_bank
+        calls.append(layer)
+        if layer == 1:
+            raise RuntimeError("late retention failed")
+        return retain(layer, current)
+
+    monkeypatch.setattr(memory, "_publish_bank", checked_publish)
+    monkeypatch.setattr(memory, "_retained", checked_retain)
+    with pytest.raises(RuntimeError, match="late retention"):
+        append(memory, 8)
+    assert memory.history is old_history and memory.bank is old_bank and memory.next_frame == 8
+    assert not memory._pending and not memory._pending_queries and not memory._device_retrieved
+    monkeypatch.setattr(memory, "_retained", retain)
+    append(memory, 8)
+    assert memory.next_frame == 10

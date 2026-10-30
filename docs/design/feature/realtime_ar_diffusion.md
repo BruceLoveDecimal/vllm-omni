@@ -330,7 +330,10 @@ At window saturation, the first forward of a chunk scores intermediate keys
 using recent clean queries plus the current queries, aggregated as sum-QK
 logits. Only the selected token indices remain resident across that chunk's
 remaining noisy forwards and clean commit; selected K/V views are temporary.
-Canonical history remains intact for rollback until successful publication. Clean query history is bounded by
+Canonical history remains intact for rollback until successful publication.
+After the output head succeeds, retrieved GPU views are released, the CPU bank
+is prepared, and pending KV/query rows are consumed as replacements are built.
+A failed replacement still leaves the previous canonical history and bank intact. Clean query history is bounded by
 the recent budget. Publication remains transactional. This query-history
 convention is explicit; it is not a claim of bitwise parity with the upstream
 research script's mutable denoising-query buffer.

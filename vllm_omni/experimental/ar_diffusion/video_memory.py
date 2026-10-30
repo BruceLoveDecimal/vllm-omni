@@ -111,17 +111,33 @@ class VideoMemoryConfig:
         if self.pc_budget_frames:
             chunk = min(chunk, self.pc_recent_frames)
         self.validate_bank_capacity(layers, tokens_per_frame, heads, dim, itemsize, chunk)
-        history = self.window_frames - self.retrieval_frames
+        capacity = self.window_frames - self.retrieval_frames
+        history = capacity
+        publication = 2 * capacity
+        if self.pc_budget_frames:
+            history = capacity - 1
+            # At saturation PC publishes its smaller budget; otherwise the
+            # joined history is strictly below capacity. An unspecified chunk
+            # size must also cover one-frame forwards.
+            smallest_chunk = chunk if chunk_frames is not None else 1
+            publication = max(
+                2 * capacity - smallest_chunk - 2,
+                history + self.pc_budget_frames - self.retrieval_frames,
+            )
         kv = 2 * heads * dim * itemsize
         row = kv + 16
-        resident = layers * tokens_per_frame * (2 * history + chunk + self.retrieval_frames) * row
+        noisy_or_clean = layers * tokens_per_frame * (history + chunk + self.retrieval_frames) * row
+        publishing = layers * tokens_per_frame * publication * row
         if self.pc_budget_frames:
-            resident += layers * tokens_per_frame * (2 * self.pc_recent_frames + chunk) * (kv // 2)
+            noisy_or_clean += layers * tokens_per_frame * (self.pc_recent_frames + chunk) * (kv // 2)
+            publishing += layers * tokens_per_frame * self.pc_recent_frames * kv
+        resident = max(noisy_or_clean, publishing)
+        if self.pc_budget_frames:
             resident += layers * history * tokens_per_frame * 8  # frozen indices
-        # Conservative fp32/fp64 scoring and temporal rotation working set,
-        # including concatenation and selection copies. Model activations and
-        # attention backend workspace are accounted by the runner separately.
-        scratch = 8 * self.window_frames * tokens_per_frame * (2 * heads * dim * max(4, itemsize) + 16)
+        # Four full-width fp32/fp64 K/V windows bound one layer's gathered
+        # rows, rotation/scoring intermediates and concatenated attention view.
+        # Model activations/backend workspace are charged by the runner.
+        scratch = 4 * self.window_frames * tokens_per_frame * (2 * heads * dim * max(4, itemsize) + 16)
         return resident + scratch
 
 
@@ -391,15 +407,20 @@ class VideoMemory:
             if len(self._seen) != self.num_layers:
                 raise RuntimeError("Video memory forward did not execute all layers")
             if commit:
+                # No attention consumer remains after the output head succeeds.
+                # Publish CPU rows before consuming pending GPU rows, preserving
+                # rollback: canonical history/bank are assigned only at the end.
+                self._clear_retrieval()
+                bank = self._publish_bank()
                 replacement: list[MemoryRows | None] = [
-                    self._retained(i, self._pending[i]) for i in range(self.num_layers)
+                    self._retained(i, self._pending.pop(i)) for i in range(self.num_layers)
                 ]
                 queries = dict(self._query_history)
-                for layer, query in self._pending_queries.items():
+                for layer in tuple(self._pending_queries):
+                    query = self._pending_queries.pop(layer)
                     old = queries.get(layer)
                     joined = query if old is None else torch.cat((old, query), 1)
                     queries[layer] = joined[:, -self.config.pc_recent_frames * self.tokens_per_frame :].clone()
-                bank = self._publish_bank()
                 self.history, self.bank = replacement, bank
                 self._query_history = queries
                 self._selection.clear()
