@@ -158,6 +158,11 @@ class MemoryRows:
             self.key[:, indices], self.value[:, indices], self.positions[indices], self.token_ids[indices]
         )
 
+    def to(self, device: torch.device) -> MemoryRows:
+        return MemoryRows(
+            self.key.to(device), self.value.to(device), self.positions.to(device), self.token_ids.to(device)
+        )
+
 
 def world_compress(rows: MemoryRows, tokens_per_frame: int, keep_ratio: float, score: str) -> MemoryRows:
     """Anchor + pooled non-anchor selection, independently for each layer.
@@ -246,6 +251,8 @@ class VideoMemory:
         self.bank: dict[int, BankChunk] = {}
         self.pose: torch.Tensor | None = None
         self._retrieved: tuple[BankChunk, ...] = ()
+        self._retrieval_frames = 0
+        self._device_retrieved: dict[int, tuple[MemoryRows, ...]] = {}
         self._active = False
         self._closed = False
         self._pending: dict[int, MemoryRows] = {}
@@ -268,7 +275,19 @@ class VideoMemory:
             or not torch.allclose(pose[3], torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=pose.dtype))
         ):
             raise ValueError("Video memory camera pose must be a rigid C2W transform")
+        if self.pose is None or not torch.equal(self.pose, pose):
+            self._clear_retrieval()
         self.pose = pose
+
+    def _clear_retrieval(self) -> None:
+        self._retrieved = ()
+        self._retrieval_frames = 0
+        self._device_retrieved.clear()
+
+    def _retrieved_rows(self, layer: int, device: torch.device) -> tuple[MemoryRows, ...]:
+        if layer not in self._device_retrieved:
+            self._device_retrieved[layer] = tuple(chunk.layers[layer].to(device) for chunk in self._retrieved)
+        return self._device_retrieved[layer]
 
     @property
     def bank_nbytes(self) -> int:
@@ -360,7 +379,10 @@ class VideoMemory:
             raise ValueError("PC recent frames must protect the complete current chunk")
         original_selection = dict(self._selection)
         success = False
-        self._retrieved = self._retrieve(frames)
+        if self._retrieval_frames != frames:
+            self._clear_retrieval()
+            self._retrieved = self._retrieve(frames)
+            self._retrieval_frames = frames
         self._active = True
         self._frames = frames
         self._commit = commit
@@ -391,7 +413,8 @@ class VideoMemory:
             self._pending.clear()
             self._seen.clear()
             self._active = False
-            self._retrieved = ()
+            if not success or commit:
+                self._clear_retrieval()
 
     def _previous(self, layer: int) -> MemoryRows | None:
         previous = self.history[layer]
@@ -509,19 +532,18 @@ class VideoMemory:
         keys, values = [history_key[:, :sink_count]], [rows.value[:, :sink_count]]
         virtual_start = tail_start - middle_frames - retrieved_frames
         retrieved_offset = 0
-        for chunk in self._retrieved:
-            retrieved = chunk.layers[layer]
-            k = retrieved.key.to(key.device)
+        for retrieved in self._retrieved_rows(layer, key.device):
+            k = retrieved.key
             if self.config.rebase_retrieval:
                 target = (
                     virtual_start
                     + (retrieved_offset + torch.arange(retrieved.positions.numel(), device=key.device))
                     // self.tokens_per_frame
                 )
-                delta = target - retrieved.positions.to(key.device)
+                delta = target - retrieved.positions
                 k = rebase_temporal_keys(k, delta, self.temporal_dim)
             keys.append(k)
-            values.append(retrieved.value.to(value.device))
+            values.append(retrieved.value)
             retrieved_offset += retrieved.positions.numel()
         keys.extend((history_key[:, sink_count:], key))
         values.extend((rows.value[:, sink_count:], value))
@@ -536,7 +558,7 @@ class VideoMemory:
         self._pending_queries.clear()
         self.bank.clear()
         self.pose = None
-        self._retrieved = ()
+        self._clear_retrieval()
         self._closed = True
 
 

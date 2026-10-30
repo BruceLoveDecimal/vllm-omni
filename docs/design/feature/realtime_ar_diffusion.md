@@ -292,9 +292,10 @@ matrices or use normalized framewise control deltas for retrieval.
 Request, tick, and stepwise paths pass latent-aligned absolute poses through
 the DMD runner. `rebase_retrieval` defaults to false; enabling it changes only
 the temporal phase of the retrieved attention view. Noisy probes cannot write
-to the bank. Bank transfers currently run synchronously on the eager worker;
-GPU latency and asynchronous prefetch remain separate validation/optimization
-work. CPU tests cover analytical pose distances, exact attention assembly,
+to the bank. Retrieved rows are transferred synchronously once per layer
+and generation chunk, then reused across denoising and clean forwards.
+Commit, failure, pose changes and close invalidate those device views.
+GPU latency and asynchronous prefetch remain separate validation work. CPU tests cover analytical pose distances, exact attention assembly,
 byte eviction, missing/invalid poses, and failed publication.
 
 ### World and participative compression

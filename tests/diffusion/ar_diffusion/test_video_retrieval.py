@@ -260,3 +260,53 @@ def test_real_geometry_rejects_one_gib_bank_and_reserves_layer_local_scratch():
     assert reserve < old
     # Two histories, pending KV, and query histories are real all-layer owners.
     assert reserve >= 40 * 1560 * (2 * 18 + 3 + (2 * 3 + 3) / 2) * (2 * 40 * 128 * 2)
+
+
+def test_retrieved_rows_transfer_once_per_chunk_and_clear_on_commit(monkeypatch):
+    memory = state(rebase_retrieval=True)
+    for start in range(0, 8, 2):
+        append(memory, start)
+    transfers = []
+    original = vm.MemoryRows.to
+
+    def record(rows, device):
+        transfers.append(rows.token_ids.tolist())
+        return original(rows, device)
+
+    monkeypatch.setattr(vm.MemoryRows, "to", record)
+    outputs = []
+    for commit in (False, False, False, True):
+        memory.set_pose(pose(2))
+        with memory.forward(8, 2, commit=commit):
+            for layer in range(2):
+                k, v = memory.assemble(layer, raw(8), raw(8), raw(8))
+                outputs.append((k.clone(), v.clone()))
+    assert len(transfers) == 2  # one chunk, two layers, four forwards
+    for i in range(2, len(outputs)):
+        torch.testing.assert_close(outputs[i], outputs[i % 2])
+    assert not memory._device_retrieved and not memory._retrieved
+    assert memory._retrieval_frames == 0
+
+
+@pytest.mark.parametrize("end", ["failure", "pose", "close"])
+def test_retrieved_device_cache_invalidated_on_lifecycle_changes(end):
+    memory = state()
+    for start in range(0, 8, 2):
+        append(memory, start)
+    memory.set_pose(pose(2))
+    with memory.forward(8, 2, commit=False):
+        for layer in range(2):
+            memory.assemble(layer, raw(8), raw(8), raw(8))
+    assert memory._device_retrieved and memory._retrieved
+    if end == "failure":
+        with pytest.raises(RuntimeError, match="injected"):
+            with memory.forward(8, 2, commit=True):
+                memory.assemble(0, raw(8), raw(8), raw(8))
+                raise RuntimeError("injected")
+        assert memory.next_frame == 8
+    elif end == "pose":
+        memory.set_pose(pose(4))
+    else:
+        memory.close()
+    assert not memory._device_retrieved and not memory._retrieved
+    assert memory._retrieval_frames == 0
