@@ -174,6 +174,27 @@ indices. Closing the session flushes the stable tail and releases decoder state.
 CPU coverage compares repeated eviction against both the pinned rolling
 reference and native decoding with the complete latent history retained.
 
+The native BF16 CUDA path fuses 4096-wide RMSNorm and 128-wide split QK
+normalization/MRoPE. These kernels preserve the ATen reduction order and the
+different rounding points of ordinary and QK normalization. Other dtypes,
+layouts, devices and gradient-enabled execution use the eager implementation.
+The CUDA regression tests require exact agreement with the eager native path;
+this does not establish parity with the reference decoder's attention backend.
+
+Run operator precision/timing comparisons, or add real weights to measure a
+complete 40-frame decoder window. The benchmark compares eager, individual
+fusions and both fusions on identical inputs, outside a profiler:
+
+```bash
+python benchmarks/diffusion/bench_hy_nomas_decoder_norm.py \
+  --warmups 5 --repeats 20 --output microbench.json
+python benchmarks/diffusion/bench_hy_nomas_decoder_norm.py \
+  --model /path/to/Hy-Nomas-Diffusers \
+  --warmups 2 --repeats 3 --output decoder-bench.json
+python -m pytest tests/diffusion/models/hy_nomas/test_decoder_kernels.py \
+  --run-level core_model -q
+```
+
 The decoder remains registered as the `vae` component for model CPU offload.
 Layerwise offload and decoder parallelism remain unsupported. The upstream
 package is still required for the reference DiT, text/camera processing and scheduler.
