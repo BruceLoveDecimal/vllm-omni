@@ -392,15 +392,25 @@ def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
     assert result.output["actions"].shape == (config.chunk_size, 7)
 
 
+class _Block(torch.nn.Module):
+    """A repeated block for ``setup_compile`` to compile."""
+
+
 class _GraphTarget:
     """Stands in for the model: all ``_install_cuda_graphs`` touches are the
-    graph slot and the fused-kernel switch, whose calls ``events`` records."""
+    graph slot and the fused-kernel switch, whose calls ``events`` records,
+    and ``setup_compile`` its one repeated block."""
 
     cuda_graphs = None
+    _repeated_blocks = ["_Block"]
 
     def __init__(self, events: list, fused_kernels_error: Exception | None = None):
         self.events = events
         self.fused_kernels_error = fused_kernels_error
+        self.block = _Block()
+
+    def modules(self):
+        yield self.block
 
     def enable_fused_kernels(self):
         if self.fused_kernels_error is not None:
@@ -409,19 +419,32 @@ class _GraphTarget:
 
 
 def _graph_install_pipeline(
-    device: str, events: list, monkeypatch, fused_kernels_error=None, cuda_graph_decode=True, torch_compile=False
+    device: str,
+    events: list,
+    monkeypatch,
+    fused_kernels_error=None,
+    cuda_graph_decode=True,
+    torch_compile=False,
+    capture_errors=(),
 ):
+    """``capture_errors[i]``, when set, is what the ``i``-th capture raises."""
     from types import SimpleNamespace
 
     from vllm_omni.diffusion.models.pi05 import pipeline_pi05
     from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
 
     # Capture needs a GPU; test_pi05_cuda_graph_parity.py runs the real one.
-    monkeypatch.setattr(Pi05CUDAGraphs, "capture", lambda graphs: events.append("capture"))
-    monkeypatch.setattr(pipeline_pi05.current_omni_platform, "supports_torch_inductor", lambda: True)
+    def fake_capture(graphs):
+        captures = sum(event == "capture" for event in events)
+        events.append("capture")
+        if captures < len(capture_errors) and capture_errors[captures] is not None:
+            raise capture_errors[captures]
+
+    monkeypatch.setattr(Pi05CUDAGraphs, "capture", fake_capture)
 
     def fake_regionally_compile(model, **kwargs):
         events.append(("compile", kwargs))
+        model.block.forward = lambda *args: "compiled"
         return model
 
     monkeypatch.setattr(pipeline_pi05, "regionally_compile", fake_regionally_compile)
@@ -484,21 +507,58 @@ def test_setup_compile_is_off_unless_the_deploy_config_asks(monkeypatch):
     assert events == []
 
 
-def test_torch_compile_captures_the_graphs_after_compiling(monkeypatch):
-    """With ``torch_compile`` the capture moves from init to ``setup_compile``,
-    after the layers are compiled with inductor's own cudagraphs off."""
+def test_torch_compile_recaptures_the_graphs_after_compiling(monkeypatch):
+    """With ``torch_compile`` the graphs are still captured at init, where a
+    failure stops startup, and ``setup_compile`` recaptures them after the
+    layers are compiled with inductor's own cudagraphs off."""
     from types import SimpleNamespace
 
     events: list = []
     pipeline = _graph_install_pipeline("cuda", events, monkeypatch, torch_compile=True)
 
     pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False))
-    assert events == ["enable_fused_kernels"]
+    assert events == ["enable_fused_kernels", "capture"]
+    init_graphs = pipeline.model.cuda_graphs
     pipeline.setup_compile()
 
     options = {"triton.cudagraphs": False, "triton.cudagraph_trees": False}
-    assert events == ["enable_fused_kernels", ("compile", {"dynamic": True, "options": options}), "capture"]
+    assert events == ["enable_fused_kernels", "capture", ("compile", {"dynamic": True, "options": options}), "capture"]
     assert isinstance(pipeline.model.cuda_graphs, Pi05CUDAGraphs)
+    assert pipeline.model.cuda_graphs is not init_graphs
+    assert pipeline.model.block.forward() == "compiled"
+
+
+def test_torch_compile_capture_failure_at_init_stops_startup(monkeypatch):
+    """The init capture is not deferred to ``setup_compile``, whose exceptions
+    the model runner only logs."""
+    from types import SimpleNamespace
+
+    events: list = []
+    error = RuntimeError("capture failed")
+    pipeline = _graph_install_pipeline("cuda", events, monkeypatch, torch_compile=True, capture_errors=(error,))
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False))
+    assert pipeline.model.cuda_graphs is None
+
+
+def test_torch_compile_failure_restores_the_uncompiled_layers_and_graphs(monkeypatch):
+    """A recapture over the compiled layers that fails leaves the
+    ``torch_compile: false`` path serving: the blocks uncompiled, under the
+    graphs captured at init. Nothing propagates for the runner to swallow."""
+    from types import SimpleNamespace
+
+    events: list = []
+    error = RuntimeError("inductor failed")
+    pipeline = _graph_install_pipeline("cuda", events, monkeypatch, torch_compile=True, capture_errors=(None, error))
+
+    pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False))
+    init_graphs = pipeline.model.cuda_graphs
+    pipeline.setup_compile()
+
+    assert events[-1] == "capture"
+    assert pipeline.model.cuda_graphs is init_graphs
+    assert "forward" not in pipeline.model.block.__dict__
 
 
 def test_pipeline_fails_when_the_fused_kernels_cannot_run(monkeypatch):
@@ -1298,6 +1358,18 @@ def test_fused_kernels_are_off_until_enabled_and_need_cuda():
     model = _tiny_pi05_model()
     assert model.paligemma_with_expert.fused_kernels is False
     with pytest.raises(RuntimeError, match="not a CUDA device"):
+        model.enable_fused_kernels()
+    assert model.paligemma_with_expert.fused_kernels is False
+
+
+@pytest.mark.slow
+def test_fused_kernels_refuse_tensor_parallelism():
+    """The bfloat16 kernels run the row-parallel ``o_proj`` / ``down_proj`` on
+    one rank's weight shard without their all-reduce, so a tensor-parallel
+    model must serve eagerly."""
+    model = _tiny_pi05_model()
+    model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.o_proj.tp_size = 2
+    with pytest.raises(RuntimeError, match="tensor-parallel size is 2"):
         model.enable_fused_kernels()
     assert model.paligemma_with_expert.fused_kernels is False
 

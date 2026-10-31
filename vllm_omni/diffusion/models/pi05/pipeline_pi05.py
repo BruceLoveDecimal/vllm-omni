@@ -44,7 +44,6 @@ from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor, observ
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.component_config import resolve_component_quant_config
 
 logger = init_logger(__name__)
@@ -146,6 +145,45 @@ def _to_bfloat16_for_inference(model: Pi05ForActionPrediction) -> None:
     for name, buffer in model.named_buffers():
         if not name.startswith("paligemma_with_expert.") and buffer.is_floating_point():
             buffer.data = buffer.data.to(dtype=torch.float32)
+
+
+# The block attributes ``regionally_compile`` assigns its compiled callable to.
+_COMPILED_ATTRS = ("forward", "_omni_original_forward")
+
+
+def _block_forwards(model: Pi05ForActionPrediction) -> list[tuple[nn.Module, dict[str, Any], list]]:
+    """What ``regionally_compile`` replaces in each of ``model``'s repeated blocks.
+
+    Its instance ``forward`` / ``_omni_original_forward`` attributes (absent
+    for a plain module) and, when a hook registry dispatches the block, the
+    callables its hooks reference; :func:`_restore_block_forwards` puts them back.
+    """
+    blocks = set(model._repeated_blocks)
+    saved = []
+    for module in model.modules():
+        if type(module).__name__ not in blocks:
+            continue
+        attrs = {name: module.__dict__[name] for name in _COMPILED_ATTRS if name in module.__dict__}
+        registry = getattr(module, "_hook_registry", None)
+        fn_refs = [
+            (hook.fn_ref, hook.fn_ref.original_forward)
+            for hook in getattr(registry, "_hooks", {}).values()
+            if getattr(hook, "fn_ref", None) is not None
+        ]
+        saved.append((module, attrs, fn_refs))
+    return saved
+
+
+def _restore_block_forwards(saved: list[tuple[nn.Module, dict[str, Any], list]]) -> None:
+    """Undo ``regionally_compile`` on the blocks :func:`_block_forwards` recorded."""
+    for module, attrs, fn_refs in saved:
+        for name in _COMPILED_ATTRS:
+            if name in attrs:
+                setattr(module, name, attrs[name])
+            else:
+                module.__dict__.pop(name, None)
+        for fn_ref, original_forward in fn_refs:
+            fn_ref.original_forward = original_forward
 
 
 def _set_inference_dtype(model: Pi05ForActionPrediction, dtype: torch.dtype) -> None:
@@ -312,9 +350,14 @@ class Pi05Pipeline(nn.Module):
         CLI, which takes precedence) keeps the eager baseline. Otherwise the
         optimized path is set up here, at init: the fused Triton kernels are
         enabled, and unless ``enable_cuda_graph_decode`` is off the CUDA graphs
-        are captured over them and installed. With ``torch_compile`` the capture
-        waits for ``setup_compile``, so the graphs record the compiled layers.
-        A failure of either raises rather than silently serving eagerly.
+        are captured over them and installed. A failure of either raises here,
+        at pipeline construction, rather than silently serving eagerly.
+
+        With ``torch_compile`` the graphs are still captured here, over the
+        uncompiled layers, and ``setup_compile`` recaptures them over the
+        compiled ones. The model runner turns a ``setup_compile`` exception into
+        a warning, so deferring the only capture there would let a capture
+        failure start a server without its graphs.
         """
         if od_config.enforce_eager:
             logger.info("Pi05Pipeline: enforce_eager is set; sample_actions runs eagerly.")
@@ -335,9 +378,6 @@ class Pi05Pipeline(nn.Module):
         if not self.enable_cuda_graph_decode:
             logger.info("Pi05Pipeline: enable_cuda_graph_decode is off; sample_actions runs without CUDA graphs.")
             return
-        if self.config.torch_compile and current_omni_platform.supports_torch_inductor():
-            logger.info("Pi05Pipeline: torch_compile is set; the CUDA graphs are captured in setup_compile.")
-            return
         self._capture_cuda_graphs()
 
     def _capture_cuda_graphs(self) -> None:
@@ -357,11 +397,17 @@ class Pi05Pipeline(nn.Module):
         Compiles only with the deploy config's ``torch_compile``: the Gemma
         decoder layers, one ``torch.compile`` each (``regionally_compile``;
         ``diffusion_compile_granularity`` has no other granularity to offer
-        here), then captures the CUDA graphs over them. Inductor's own
+        here), then recaptures the CUDA graphs over them. Inductor's own
         cudagraphs stay off under the graphs this pipeline captures, so the
         two never stack. Compilation is lazy and happens in the capture's
         warm-up. The batch-1 denoising step runs the fused kernels, not the
         expert layers, so on the served path compiling changes the prefix pass.
+
+        The runner only logs an exception from here, so this method does not
+        let one leave a half-compiled model behind: if compiling or the
+        recapture fails, the layers are restored uncompiled and the graphs
+        captured over them at init keep serving, which is exactly the
+        ``torch_compile: false`` path.
         """
         if not self.config.torch_compile:
             logger.info("Pi05Pipeline: torch_compile is off in the deploy config; the layers run uncompiled.")
@@ -369,9 +415,17 @@ class Pi05Pipeline(nn.Module):
         compile_kwargs: dict[str, Any] = {"dynamic": self.od_config.diffusion_compile_dynamic}
         if self.enable_cuda_graph_decode:
             compile_kwargs["options"] = {"triton.cudagraphs": False, "triton.cudagraph_trees": False}
-        regionally_compile(self.model, **compile_kwargs)
-        if self.enable_cuda_graph_decode:
-            self._capture_cuda_graphs()
+        uncompiled = _block_forwards(self.model)
+        try:
+            regionally_compile(self.model, **compile_kwargs)
+            if self.model.cuda_graphs is not None:
+                self._capture_cuda_graphs()
+        except Exception:
+            _restore_block_forwards(uncompiled)
+            logger.exception(
+                "Pi05Pipeline: torch_compile failed; the layers run uncompiled%s.",
+                ", under the CUDA graphs captured at init" if self.model.cuda_graphs is not None else "",
+            )
 
     def _load_checkpoint(self, model: Pi05ForActionPrediction) -> None:
         import safetensors.torch

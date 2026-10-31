@@ -28,9 +28,7 @@ reduction:
   accurate one.
 
 The eager ops are π0.5's own modules on vLLM's layers (``Pi05GemmaAttention``,
-``Pi05GemmaMLP``, ``RowParallelLinear``, ``GemmaRMSNorm``) and
-``Pi05AdaRMSNorm.forward_native``: on CUDA ``Pi05AdaRMSNorm`` itself dispatches
-a batch-1 call to the kernel under test.
+``Pi05GemmaMLP``, ``RowParallelLinear``, ``GemmaRMSNorm``, ``Pi05AdaRMSNorm``).
 
 Needs a CUDA GPU; no checkpoint. ``-s`` prints each fused kernel's max absolute
 and relative L2 error against its eager op::
@@ -229,34 +227,13 @@ def test_adarms_norm_matches_pi05_adarms_norm(dtype):
     x = _randn(tokens, width, scale=4.0, seed=10)
     cond = _randn(1, width, seed=11)
 
-    expected = norm.forward_native(x[None], cond)[0][0].to(dtype)
+    expected = norm(x[None], cond)[0][0].to(dtype)
     modulation = M._adarms_modulation(norm, cond)
     actual = torch.empty(tokens, width, dtype=dtype, device=DEVICE)
     M._fused_rms_norm(x, norm, actual, modulation=modulation)
     scale, shift, _ = modulation.chunk(3)
     reference = _rms_norm_reference(x, norm.eps, scale=scale, shift=shift)
     _assert_as_accurate_as_eager(actual, expected, reference, "AdaRMSNorm", "Pi05AdaRMSNorm", dtype, _MODULATION_NOTE)
-
-
-def test_adarms_norm_custom_op_runs_the_kernel_for_batch_one():
-    """On CUDA ``Pi05AdaRMSNorm`` is the kernel for a batch-1 call and its
-    eager formula for any other; both return the same gate."""
-    tokens, width, _ = SHAPES["suffix"]
-    norm = _randomize(M.Pi05AdaRMSNorm(width, cond_dim=width), seed=9).to(DEVICE)
-    x = _randn(1, tokens, width, scale=4.0, seed=10)
-    cond = _randn(1, width, seed=11)
-
-    normed, gate = norm(x, cond)
-    kernel_out = torch.empty(tokens, width, device=DEVICE)
-    M._fused_rms_norm(x[0], norm, kernel_out, modulation=M._adarms_modulation(norm, cond))
-    assert torch.equal(normed[0], kernel_out)
-    eager_normed, eager_gate = norm.forward_native(x, cond)
-    assert torch.equal(gate.expand_as(eager_gate), eager_gate)
-    torch.testing.assert_close(normed, eager_normed)
-
-    batch_x, batch_cond = x.expand(2, -1, -1), cond.expand(2, -1)
-    batch_normed, _ = norm(batch_x, batch_cond)
-    assert torch.equal(batch_normed, norm.forward_native(batch_x, batch_cond)[0])
 
 
 # ── GEMMs with their epilogues ─────────────────────────────────────────
@@ -431,7 +408,7 @@ def test_final_head_matches_norm_and_action_out_proj(dtype):
     x = _randn(tokens, width, scale=4.0, seed=25)
     cond = _randn(1, width, seed=26)
 
-    normed, _ = norm.forward_native(x[None], cond)
+    normed, _ = norm(x[None], cond)
     expected = head(normed.to(head.weight.dtype))[0]
     modulation = M._adarms_modulation(norm, cond)
     scale, shift, _ = modulation.chunk(3)

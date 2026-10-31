@@ -25,7 +25,7 @@ linear layers (``QKVParallelLinear``, ``MergedColumnParallelLinear``,
 ``RowParallelLinear``), ``GemmaRMSNorm`` and ``GeluAndMul``, with the omni
 ``RotaryEmbedding``; SigLIP is vLLM's ``SiglipVisionModel``. Only the
 PaliGemma language model takes a ``quant_config``, and only when one is set.
-The AdaRMS norm vLLM lacks is a ``CustomOp`` of its own.
+The AdaRMS norm vLLM lacks is a module of its own, eager on every path.
 
 The optimized path's fused Triton kernels live here too, next to the eager
 layers they replace; ``Pi05ForActionPrediction.enable_fused_kernels`` switches
@@ -62,7 +62,6 @@ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 if TYPE_CHECKING:
@@ -182,7 +181,7 @@ def prepare_attention_masks_4d(att_2d_masks: torch.Tensor) -> torch.Tensor:
     return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
 
-class Pi05AdaRMSNorm(CustomOp):
+class Pi05AdaRMSNorm(nn.Module):
     """Adaptive RMSNorm conditioned on the flow-matching timestep.
 
     π0 conditions on time by *concatenating* a time embedding onto each action
@@ -200,12 +199,13 @@ class Pi05AdaRMSNorm(CustomOp):
     equivalence is why only the *expert* norms need replacing here and the
     PaliGemma prefix keeps ``GemmaRMSNorm``.
 
-    vLLM has no conditioned equivalent, so this is a ``CustomOp`` of its own:
-    ``forward_native`` is the eager formula, and on CUDA a conditioned batch-1
-    call on CUDA tensors runs R0's fused Triton kernel (``_rms_norm_kernel``),
-    which differs from it by the order of the variance sum only. Any other
-    call, a compiled one, or a platform without Triton, falls back to
-    ``forward_native``.
+    vLLM has no conditioned equivalent, so this module is π0.5's own, and its
+    ``forward`` is the eager formula on every platform and batch size: the
+    eager baseline (``enforce_eager``) and the batched path run no Triton
+    kernel through it. The optimized path's batch-1 denoising step does not
+    call it; ``_fused_denoise_forward`` runs R0's ``_rms_norm_kernel`` on its
+    ``dense`` modulation directly, and falls back to this formula whenever
+    ``_fused_kernels_serve`` declines a step.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6, cond_dim: int | None = None):
@@ -238,27 +238,7 @@ class Pi05AdaRMSNorm(CustomOp):
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected AdaRMS cond dim {self.cond_dim}, got {cond.shape[-1]}")
 
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-        cond: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if not HAS_TRITON or not x.is_cuda or self.dense is None or cond is None:
-            return self.forward_native(x, cond)
-        # Under torch.compile inductor fuses the eager formula itself; it cannot
-        # re-emit this kernel, whose source reads ``tldevice``.
-        if torch.compiler.is_compiling():
-            return self.forward_native(x, cond)
-        if cond.shape[0] != 1 or x.shape[0] != 1:
-            return self.forward_native(x, cond)
-        self._check_cond(cond)
-        modulation = _adarms_modulation(self, cond)
-        rows = x.reshape(-1, self.dim)
-        normed = torch.empty_like(rows)
-        _fused_rms_norm(rows, self, normed, modulation=modulation)
-        return normed.view(x.shape), modulation[2 * self.dim :].to(x.dtype)
-
-    def forward_native(
+    def forward(
         self,
         x: torch.Tensor,
         cond: torch.Tensor | None = None,
@@ -1891,7 +1871,8 @@ class Pi05ForActionPrediction(nn.Module):
         with its CUDA graphs). The prefix pass keeps its eager layers, so the
         prefix K/V is the same on either path. A step still runs eagerly when
         it is not batch 1 on a single-KV-head ``Pi05StepKVWorkspace``. Raises if
-        the kernels cannot serve this model at all.
+        the kernels cannot serve this model at all, including under tensor
+        parallelism (serve that eagerly).
         """
         problems = []
         if not HAS_TRITON:
@@ -1904,6 +1885,13 @@ class Pi05ForActionPrediction(nn.Module):
         config = expert.config
         if config.num_key_value_heads != 1:
             problems.append(f"the action expert has {config.num_key_value_heads} KV heads, not 1")
+        # The bfloat16 kernels run ``o_proj`` and ``down_proj`` as Triton GEMMs
+        # over the weight in place, which under tensor parallelism is one
+        # rank's input shard, and skip ``RowParallelLinear``'s all-reduce: each
+        # rank would add a partial sum to the residual. The eager layers reduce.
+        tp_size = getattr(expert.layers[0].self_attn.o_proj, "tp_size", 1)
+        if tp_size != 1:
+            problems.append(f"the tensor-parallel size is {tp_size}, and the kernels serve one rank only")
         head_dim = expert.layers[0].self_attn.head_dim
         proj_dtype = _linear_dtype(expert.layers[0].self_attn.qkv_proj)
         if proj_dtype not in _FUSED_DTYPES:
