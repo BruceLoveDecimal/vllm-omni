@@ -161,6 +161,11 @@ class PixelUMMRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from .decoder_kernels import rms_norm
+
+        fused = rms_norm(x, self.weight, self.eps)
+        if fused is not None:
+            return fused
         dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -192,6 +197,12 @@ class PixelUMMAttention(nn.Module):
         )
 
     def _prepare_qk(self, tensor, cos, sin, norm_t, norm_hw, dtype):
+        from .decoder_kernels import split_norm_rope
+
+        if dtype == tensor.dtype:
+            fused = split_norm_rope(tensor, cos, sin, norm_t.weight, norm_hw.weight, norm_t.eps)
+            if fused is not None:
+                return fused
         # Bound FP32 intermediates while preserving each token's reduction order.
         batch, tokens, heads, dim = tensor.shape
         chunk = max(1, _QK_CHUNK_INPUT_BYTES // (batch * heads * dim * 4))
