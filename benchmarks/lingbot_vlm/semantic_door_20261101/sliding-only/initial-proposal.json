@@ -1,0 +1,11 @@
+{
+  "raw": "{\n  \"observed_state\": \"closed\",\n  \"identity_preserved\": \"yes\",\n  \"visual_evidence\": \"The white paneled door is fully closed, flush within its frame. The silver lever handle is visible and stationary. No gap or movement indicates an open state.\",\n  \"event_prompt\": \"Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.\"\n}",
+  "seconds": 3.103748746216297,
+  "input_tokens": 637,
+  "parsed": {
+    "observed_state": "closed",
+    "identity_preserved": "yes",
+    "visual_evidence": "The white paneled door is fully closed, flush within its frame. The silver lever handle is visible and stationary. No gap or movement indicates an open state.",
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls."
+  }
+}

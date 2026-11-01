@@ -1,0 +1,556 @@
+[
+  {
+    "step": 0,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": {
+      "raw": "{\n  \"observed_state\": \"closed\",\n  \"identity_preserved\": \"yes\",\n  \"visual_evidence\": \"The white paneled door is fully closed, flush within its frame. The silver lever handle is visible and stationary. No gap or movement indicates an open state.\",\n  \"event_prompt\": \"Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.\"\n}",
+      "seconds": 3.1570599488914013,
+      "input_tokens": 637,
+      "parsed": {
+        "observed_state": "closed",
+        "identity_preserved": "yes",
+        "visual_evidence": "The white paneled door is fully closed, flush within its frame. The silver lever handle is visible and stationary. No gap or movement indicates an open state.",
+        "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls."
+      }
+    },
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-0-fee4043069384071814130de1766618c",
+      "chunk_index": 0,
+      "applied_event_ids": [
+        0
+      ]
+    },
+    "world_seconds": 1.0169668458402157,
+    "frames": 9,
+    "pixels_sha256": "6951153d5337e29e327f8da8001045b48586b7c082f1a1bd5268f38beffd3507",
+    "observation_files": [
+      "chunk-00-frame-00.png",
+      "chunk-00-frame-04.png",
+      "chunk-00-frame-08.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"ajar\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The door is partially open, revealing a dark space beyond, with the door panel still within its frame and visibly swung inward.\"\n}\n```",
+      "seconds": 1.2819715179502964,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "ajar",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The door is partially open, revealing a dark space beyond, with the door panel still within its frame and visibly swung inward."
+      }
+    }
+  },
+  {
+    "step": 1,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-1-d373f5c32cd44126b55312d8e110584a",
+      "chunk_index": 1,
+      "applied_event_ids": [
+        1
+      ]
+    },
+    "world_seconds": 1.2324724905192852,
+    "frames": 12,
+    "pixels_sha256": "7c7603ae4f1bbb99384b77c005fe66e480020e81faa273c04dd762ffb51ce5d8",
+    "observation_files": [
+      "chunk-01-frame-00.png",
+      "chunk-01-frame-06.png",
+      "chunk-01-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"ajar\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door is visibly swung open, revealing a dark space beyond, but the door leaf remains partially in the frame, indicating it is not fully open.\"\n}\n```",
+      "seconds": 1.3908213898539543,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "ajar",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door is visibly swung open, revealing a dark space beyond, but the door leaf remains partially in the frame, indicating it is not fully open."
+      }
+    }
+  },
+  {
+    "step": 2,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-2-d446a24b9ce04c1c93eeafbbebc048e1",
+      "chunk_index": 2,
+      "applied_event_ids": [
+        2
+      ]
+    },
+    "world_seconds": 1.3236114419996738,
+    "frames": 12,
+    "pixels_sha256": "9af64a07183fdcc7f397cbbe8292469804bb9938d12a1f058550df771fca3212",
+    "observation_files": [
+      "chunk-02-frame-00.png",
+      "chunk-02-frame-06.png",
+      "chunk-02-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"ajar\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door is visibly swung open, revealing a dark space beyond, with the door panel still partially covering the opening.\"\n}\n```",
+      "seconds": 1.2625596970319748,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "ajar",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door is visibly swung open, revealing a dark space beyond, with the door panel still partially covering the opening."
+      }
+    }
+  },
+  {
+    "step": 3,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-3-8d9edb5cc49947c885e97c1d9381d057",
+      "chunk_index": 3,
+      "applied_event_ids": [
+        3
+      ]
+    },
+    "world_seconds": 1.3794778659939766,
+    "frames": 12,
+    "pixels_sha256": "2ad7908aca7f435895000c636ed27d7875598658a17bd3307d5c3918c64390de",
+    "observation_files": [
+      "chunk-03-frame-00.png",
+      "chunk-03-frame-06.png",
+      "chunk-03-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"closed\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": false,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door panel fills the frame with no visible opening, indicating it is closed.\"\n}\n```",
+      "seconds": 1.133703175932169,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "closed",
+        "identity_preserved": "yes",
+        "visible_aperture": false,
+        "door_leaf_visible": true,
+        "evidence": "The white door panel fills the frame with no visible opening, indicating it is closed."
+      }
+    }
+  },
+  {
+    "step": 4,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-4-cda9cfa68a5347bdbe09fbfdfa34c2cf",
+      "chunk_index": 4,
+      "applied_event_ids": [
+        4
+      ]
+    },
+    "world_seconds": 1.3431411422789097,
+    "frames": 12,
+    "pixels_sha256": "e47fbf80fba341fe97774abdfe37b8281b246e3ddd8b7e9e5631240d21026715",
+    "observation_files": [
+      "chunk-04-frame-00.png",
+      "chunk-04-frame-06.png",
+      "chunk-04-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"open\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door panel is visibly swung open, revealing a dark space beyond, with the door leaf still in view and the handle clearly visible.\"\n}\n```",
+      "seconds": 1.4148047529160976,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "open",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door panel is visibly swung open, revealing a dark space beyond, with the door leaf still in view and the handle clearly visible."
+      }
+    }
+  },
+  {
+    "step": 5,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-5-502b490889a24c3fb524e6c8263ef93b",
+      "chunk_index": 5,
+      "applied_event_ids": [
+        5
+      ]
+    },
+    "world_seconds": 2.117676466703415,
+    "frames": 12,
+    "pixels_sha256": "5a7ff09c7389a16cd79da29b79d1a39b7687c95ae7c3a6e02d7250a1971c5359",
+    "observation_files": [
+      "chunk-05-frame-00.png",
+      "chunk-05-frame-06.png",
+      "chunk-05-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"open\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door panel is visibly swung open, revealing a clear aperture into the dark space beyond, with the door leaf still in view.\"\n}\n```",
+      "seconds": 1.314320545643568,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "open",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door panel is visibly swung open, revealing a clear aperture into the dark space beyond, with the door leaf still in view."
+      }
+    }
+  },
+  {
+    "step": 6,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-6-4d8e8ed3027948868da49c4376f16bda",
+      "chunk_index": 6,
+      "applied_event_ids": [
+        6
+      ]
+    },
+    "world_seconds": 2.1386323869228363,
+    "frames": 12,
+    "pixels_sha256": "70f3c816bb595a714f6620aaab132f7741cb3d6eea4fca50b99b2141515a22f0",
+    "observation_files": [
+      "chunk-06-frame-00.png",
+      "chunk-06-frame-06.png",
+      "chunk-06-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"closed\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": false,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door panel is fully within its frame, with no visible gap or opening to the space beyond.\"\n}\n```",
+      "seconds": 1.2132210545241833,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "closed",
+        "identity_preserved": "yes",
+        "visible_aperture": false,
+        "door_leaf_visible": true,
+        "evidence": "The white door panel is fully within its frame, with no visible gap or opening to the space beyond."
+      }
+    }
+  },
+  {
+    "step": 7,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-7-b07ddae1919f4bd9aecb935c5a1af6e5",
+      "chunk_index": 7,
+      "applied_event_ids": [
+        7
+      ]
+    },
+    "world_seconds": 2.1876981370151043,
+    "frames": 12,
+    "pixels_sha256": "a14a282bf629b4d1e6acc97e91955346ff354f40dba5982efcbb7d9c82275c6f",
+    "observation_files": [
+      "chunk-07-frame-00.png",
+      "chunk-07-frame-06.png",
+      "chunk-07-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"ajar\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door is visibly swung open, revealing a dark space beyond, with the door leaf still within its frame and handle visible.\"\n}\n```",
+      "seconds": 1.2938655354082584,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "ajar",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door is visibly swung open, revealing a dark space beyond, with the door leaf still within its frame and handle visible."
+      }
+    }
+  },
+  {
+    "step": 8,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-8-386fe064806a4729842f9c79d77b7d6b",
+      "chunk_index": 8,
+      "applied_event_ids": [
+        8
+      ]
+    },
+    "world_seconds": 2.2672578133642673,
+    "frames": 12,
+    "pixels_sha256": "6211e07bc0ecef1aa99eb0a59a71b0f4d7bb2bebcf3b7e1b46939d7d1d9053c3",
+    "observation_files": [
+      "chunk-08-frame-00.png",
+      "chunk-08-frame-06.png",
+      "chunk-08-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"ajar\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door is visibly swung open, revealing a dark space beyond, with the door leaf still partially in the frame.\"\n}\n```",
+      "seconds": 1.2531915381550789,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "ajar",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door is visibly swung open, revealing a dark space beyond, with the door leaf still partially in the frame."
+      }
+    }
+  },
+  {
+    "step": 9,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-9-2bfe2b7dcc5b429e9aeefeedbd553cd4",
+      "chunk_index": 9,
+      "applied_event_ids": [
+        9
+      ]
+    },
+    "world_seconds": 2.090829525142908,
+    "frames": 12,
+    "pixels_sha256": "20011ff2eabeb2a9998bf7e7cbd342f8f3549822b8e06381e13d80b3a2059c0f",
+    "observation_files": [
+      "chunk-09-frame-00.png",
+      "chunk-09-frame-06.png",
+      "chunk-09-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"ajar\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door is partially open, revealing a dark space beyond, with the door leaf still visible and the handle in view.\"\n}\n```",
+      "seconds": 1.2790262512862682,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "ajar",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door is partially open, revealing a dark space beyond, with the door leaf still visible and the handle in view."
+      }
+    }
+  },
+  {
+    "step": 10,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-10-c19fc9cfafdd487cb8062a44c8348b55",
+      "chunk_index": 10,
+      "applied_event_ids": [
+        10
+      ]
+    },
+    "world_seconds": 2.1288783475756645,
+    "frames": 12,
+    "pixels_sha256": "05b6ef2b48a27ad27eabeab9fa5032fc224270c910bc76a646d34f9307d6d4b5",
+    "observation_files": [
+      "chunk-10-frame-00.png",
+      "chunk-10-frame-06.png",
+      "chunk-10-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"ajar\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door is visibly swung open, revealing a dark space behind it, indicating an ajar state.\"\n}\n```",
+      "seconds": 1.2279864959418774,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "ajar",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door is visibly swung open, revealing a dark space behind it, indicating an ajar state."
+      }
+    }
+  },
+  {
+    "step": 11,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-11-72655e4b3b184a928654e4a1468adf79",
+      "chunk_index": 11,
+      "applied_event_ids": [
+        11
+      ]
+    },
+    "world_seconds": 1.9635416194796562,
+    "frames": 12,
+    "pixels_sha256": "97df7778744fa9da8f3ec886195a36f543dce85ea4d21ac4e951b12ee6791e55",
+    "observation_files": [
+      "chunk-11-frame-00.png",
+      "chunk-11-frame-06.png",
+      "chunk-11-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"ajar\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door is visibly swung open, revealing a dark space beyond, with the door panel still within its frame and the handle clearly visible.\"\n}\n```",
+      "seconds": 1.330063246190548,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "ajar",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door is visibly swung open, revealing a dark space beyond, with the door panel still within its frame and the handle clearly visible."
+      }
+    }
+  },
+  {
+    "step": 12,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-12-cc2948a12aa04e61b9128478620b3f17",
+      "chunk_index": 12,
+      "applied_event_ids": [
+        12
+      ]
+    },
+    "world_seconds": 2.064751412719488,
+    "frames": 12,
+    "pixels_sha256": "a78b51e60bce5e555337ea1814433ae5dc83311be6363139b285a163710c8556",
+    "observation_files": [
+      "chunk-12-frame-00.png",
+      "chunk-12-frame-06.png",
+      "chunk-12-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"open\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door panel is swung open, revealing a dark space beyond with a clear aperture, and the same door, handle, and frame are visible as in the reference image.\"\n}\n```",
+      "seconds": 1.4685879088938236,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "open",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door panel is swung open, revealing a dark space beyond with a clear aperture, and the same door, handle, and frame are visible as in the reference image."
+      }
+    }
+  },
+  {
+    "step": 13,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-13-d40b041663bb4bdda15373ad3620df54",
+      "chunk_index": 13,
+      "applied_event_ids": [
+        13
+      ]
+    },
+    "world_seconds": 1.8824442923069,
+    "frames": 12,
+    "pixels_sha256": "45d8575bc2cc46b453095f6a16c482e3bb9ba0b61d97df53cca297921eea13f4",
+    "observation_files": [
+      "chunk-13-frame-00.png",
+      "chunk-13-frame-06.png",
+      "chunk-13-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"closed\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": false,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door panel fills the frame with no visible opening, indicating it is closed.\"\n}\n```",
+      "seconds": 1.1325614899396896,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "closed",
+        "identity_preserved": "yes",
+        "visible_aperture": false,
+        "door_leaf_visible": true,
+        "evidence": "The white door panel fills the frame with no visible opening, indicating it is closed."
+      }
+    }
+  },
+  {
+    "step": 14,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-14-8068b8454a8b4cdb882845d718344c8d",
+      "chunk_index": 14,
+      "applied_event_ids": [
+        14
+      ]
+    },
+    "world_seconds": 2.0144562236964703,
+    "frames": 12,
+    "pixels_sha256": "d545555fd2409f55d6ef302484dbac0bab04e324f759d7aa3c82a46c784b9b42",
+    "observation_files": [
+      "chunk-14-frame-00.png",
+      "chunk-14-frame-06.png",
+      "chunk-14-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"closed\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": false,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door panel fills its frame with no visible opening, indicating it is closed.\"\n}\n```",
+      "seconds": 1.1408577151596546,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "closed",
+        "identity_preserved": "yes",
+        "visible_aperture": false,
+        "door_leaf_visible": true,
+        "evidence": "The white door panel fills its frame with no visible opening, indicating it is closed."
+      }
+    }
+  },
+  {
+    "step": 15,
+    "event_prompt": "Push the central white paneled door open by grasping its silver lever handle and swinging the door leaf outward until it is fully open, revealing the space beyond. Hold it open. Keep the camera stationary and preserve the door's identity, frame, handle, and surrounding wooden walls.",
+    "proposal": null,
+    "proposal_valid": true,
+    "metadata": {
+      "session_id": "123-fixed",
+      "request_id": "ar-123-fixed-15-ba1d660181cd4bf98ae07532a1e348a3",
+      "chunk_index": 15,
+      "applied_event_ids": [
+        15
+      ]
+    },
+    "world_seconds": 1.9694373607635498,
+    "frames": 12,
+    "pixels_sha256": "033aafc5d843914434e65c5c167cb6eda86fabe7882fa3a90519c1b359cfdbff",
+    "observation_files": [
+      "chunk-15-frame-00.png",
+      "chunk-15-frame-06.png",
+      "chunk-15-frame-11.png"
+    ],
+    "blind_judge": {
+      "raw": "```json\n{\n  \"state\": \"ajar\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": true,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door is visibly swung open, revealing a dark space beyond, with the door panel still partially covering the frame.\"\n}\n```",
+      "seconds": 1.2542377598583698,
+      "input_tokens": 820,
+      "parsed": {
+        "state": "ajar",
+        "identity_preserved": "yes",
+        "visible_aperture": true,
+        "door_leaf_visible": true,
+        "evidence": "The white door is visibly swung open, revealing a dark space beyond, with the door panel still partially covering the frame."
+      }
+    }
+  }
+]

@@ -1,0 +1,20 @@
+[
+  {
+    "seed": 42,
+    "identical_initial_prompt": true,
+    "identical_first_chunk": true,
+    "first_different_chunk": 1
+  },
+  {
+    "seed": 123,
+    "identical_initial_prompt": true,
+    "identical_first_chunk": true,
+    "first_different_chunk": 1
+  },
+  {
+    "seed": 2026,
+    "identical_initial_prompt": true,
+    "identical_first_chunk": true,
+    "first_different_chunk": 1
+  }
+]

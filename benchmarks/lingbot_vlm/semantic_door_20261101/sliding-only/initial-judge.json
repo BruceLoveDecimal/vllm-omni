@@ -1,0 +1,12 @@
+{
+  "raw": "```json\n{\n  \"state\": \"closed\",\n  \"identity_preserved\": \"yes\",\n  \"visible_aperture\": false,\n  \"door_leaf_visible\": true,\n  \"evidence\": \"The white door panel fills the entire frame with no visible gap or opening, indicating it is closed.\"\n}\n```",
+  "seconds": 1.2604270800948143,
+  "input_tokens": 512,
+  "parsed": {
+    "state": "closed",
+    "identity_preserved": "yes",
+    "visible_aperture": false,
+    "door_leaf_visible": true,
+    "evidence": "The white door panel fills the entire frame with no visible gap or opening, indicating it is closed."
+  }
+}

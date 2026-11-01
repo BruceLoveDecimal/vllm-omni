@@ -1,0 +1,42 @@
+{
+  "python": "3.12.3 | packaged by Anaconda, Inc. | (main, May  6 2024, 19:46:43) [GCC 11.2.0]",
+  "torch": "2.13.0+cu130",
+  "transformers": "5.14.1",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "source_root": "/root/worldkv-fixes/repo",
+  "source_hashes": {
+    "vllm_omni/diffusion/models/lingbot_world/pipeline.py": "98c9f209dee328d5c8303b41483674e2309e9f91e0dd2892f35497945ef90cf5",
+    "vllm_omni/diffusion/models/lingbot_world/actions.py": "5e526628090104e6a9d77738f68f6ecadc3b7c471148e1558d34291467e31256",
+    "vllm_omni/experimental/ar_diffusion/session.py": "9992aff9b962d1e5ada00d7c84548d799594f02fcb004b986f5ab87b015db6ba",
+    "vllm_omni/experimental/ar_diffusion/streaming_decode.py": "88110b40586c58f101b734719f95315826bf99db7315036e2f26e1b18b4ec36a",
+    "vllm_omni/experimental/ar_diffusion/video_memory.py": "35e2c14147e8ad592cada5bfd0da63abe1fa61686c5e5d7833bb430e3a7fbe3d"
+  },
+  "worldkv_previous_manifest": {
+    "python": "3.12.3 | packaged by Anaconda, Inc. | (main, May  6 2024, 19:46:43) [GCC 11.2.0]",
+    "torch": "2.13.0+cu130",
+    "vllm_imported_version": "0.32.0",
+    "vllm_commit": "g5df63a720",
+    "vllm_module_path": "/root/worldkv-fixes/runtime32/vllm/__init__.py",
+    "transformers": "5.14.1",
+    "diffusers": "0.40.0",
+    "video_memory_sha256": "35e2c14147e8ad592cada5bfd0da63abe1fa61686c5e5d7833bb430e3a7fbe3d",
+    "production_code_commit": "71e2fb962",
+    "original_commit": "20c410f81",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell",
+    "single_gpu": true
+  },
+  "vlm_model": "Qwen/Qwen3-VL-8B-Instruct",
+  "world_model": "lingbot-world-v2-14b-causal-fast-diffusers",
+  "dtype": "bfloat16",
+  "seed": 42,
+  "resolution": [
+    480,
+    320
+  ],
+  "seeds": [
+    42,
+    123,
+    2026
+  ],
+  "source_image_sha256": "8f135af1c5c22cc0351c3010c7e9347858335e5792d8dd0717f56bf8b7d636c0"
+}

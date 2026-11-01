@@ -1,0 +1,94 @@
+{
+  "results": [
+    {
+      "memory": "扩展记忆",
+      "arm": "fixed",
+      "final_success": 0,
+      "n": 3,
+      "any_two_open": 2,
+      "open_endpoint_labels": 10,
+      "total_endpoint_labels": 48,
+      "invalid_judges": 0,
+      "director_open_disagreements": 0,
+      "dynamic_vlm_median_seconds": null,
+      "world_median_seconds": 2.0265781804919243
+    },
+    {
+      "memory": "扩展记忆",
+      "arm": "dynamic",
+      "final_success": 0,
+      "n": 3,
+      "any_two_open": 1,
+      "open_endpoint_labels": 16,
+      "total_endpoint_labels": 48,
+      "invalid_judges": 0,
+      "director_open_disagreements": 12,
+      "dynamic_vlm_median_seconds": 2.6970686204731464,
+      "world_median_seconds": 1.9804940670728683
+    },
+    {
+      "memory": "仅滑窗与 sink",
+      "arm": "fixed",
+      "final_success": 0,
+      "n": 3,
+      "any_two_open": 3,
+      "open_endpoint_labels": 12,
+      "total_endpoint_labels": 48,
+      "invalid_judges": 0,
+      "director_open_disagreements": 0,
+      "dynamic_vlm_median_seconds": null,
+      "world_median_seconds": 1.421504896134138
+    },
+    {
+      "memory": "仅滑窗与 sink",
+      "arm": "dynamic",
+      "final_success": 2,
+      "n": 3,
+      "any_two_open": 3,
+      "open_endpoint_labels": 16,
+      "total_endpoint_labels": 48,
+      "invalid_judges": 0,
+      "director_open_disagreements": 15,
+      "dynamic_vlm_median_seconds": 2.6251619793474674,
+      "world_median_seconds": 1.4337022099643946
+    }
+  ],
+  "pairs": [
+    {
+      "memory": "扩展记忆",
+      "seed": 42,
+      "matched_first_chunk": true,
+      "first_divergent_chunk": 1
+    },
+    {
+      "memory": "扩展记忆",
+      "seed": 123,
+      "matched_first_chunk": true,
+      "first_divergent_chunk": 1
+    },
+    {
+      "memory": "扩展记忆",
+      "seed": 2026,
+      "matched_first_chunk": true,
+      "first_divergent_chunk": 1
+    },
+    {
+      "memory": "仅滑窗与 sink",
+      "seed": 42,
+      "matched_first_chunk": true,
+      "first_divergent_chunk": 1
+    },
+    {
+      "memory": "仅滑窗与 sink",
+      "seed": 123,
+      "matched_first_chunk": true,
+      "first_divergent_chunk": 1
+    },
+    {
+      "memory": "仅滑窗与 sink",
+      "seed": 2026,
+      "matched_first_chunk": true,
+      "first_divergent_chunk": 1
+    }
+  ]
+}
