@@ -3413,3 +3413,46 @@ def test_uint8_frames_match_the_pil_conversion_byte_for_byte() -> None:
     assert frames.dtype == np.uint8 and frames.shape == (5, 8, 8, 3)
     assert frames.flags["C_CONTIGUOUS"]
     np.testing.assert_array_equal(frames, expected)
+
+
+def test_stepwise_prompt_update_rebuilds_text_kv_but_keeps_it_otherwise(monkeypatch) -> None:
+    """A mid-session prompt replaces ``state.prompt_embeds`` only; the text K/V must follow it."""
+    from vllm_omni.diffusion.interaction.modality_handlers.prompt import PromptSession
+
+    module = _load_pipeline_module()
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(num_frames=33)
+    fake = _FakeARState(state.request_id)
+    revisions = []
+    original = pipeline._ar_text_caches
+
+    def recording_text_caches(prompt_embeds, *, invalidate, condition_revision):
+        revisions.append(condition_revision)
+        return original(prompt_embeds, invalidate=invalidate, condition_revision=condition_revision)
+
+    monkeypatch.setattr(pipeline, "_ar_text_caches", recording_text_caches)
+    cross_attention = []
+
+    def run_chunk() -> None:
+        pipeline.prepare_next_chunk(state)
+        cross_attention.append(state.extra["ar_cross_attention"])
+        while not state.chunk_denoise_completed:
+            noise = pipeline.denoise_step(None, states=[state])
+            pipeline.step_scheduler(state, noise)
+        pipeline.post_decode(state)
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, fake):
+        pipeline.prepare_encode(state)
+        run_chunk()
+        # What the prompt handler does at a boundary: new embeddings, new version.
+        state.prompt_embeds = state.prompt_embeds + 1.0
+        state.interaction_sessions["prompt"] = PromptSession(version=1)
+        run_chunk()
+        run_chunk()
+
+    # prepare_encode builds the K/V the first chunk reuses; only the update forces a rebuild.
+    assert revisions[0] == revisions[1]
+    assert revisions[1] != revisions[2]
+    assert revisions[2] == revisions[3]
+    assert cross_attention[1][0].key is not cross_attention[0][0].key
+    assert cross_attention[2][0].key is cross_attention[1][0].key

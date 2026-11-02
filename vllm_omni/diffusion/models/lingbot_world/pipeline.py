@@ -31,6 +31,7 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import insta
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
+from vllm_omni.diffusion.interaction.modality_handlers.prompt import prompt_update_versions
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -575,6 +576,21 @@ def get_lingbot_world_post_process_func(od_config: OmniDiffusionConfig) -> Calla
         }
 
     return post_process_func
+
+
+def _stepwise_text_revision(inputs: _LingBotRequestInputs, state: StepRequestState) -> tuple:
+    """Key of a stepwise session's text K/V.
+
+    A mid-session prompt update replaces ``state.prompt_embeds`` but not
+    ``inputs.prompt``; its version keeps the cached K/V from outliving the
+    embedding it was projected from.
+    """
+    return (
+        inputs.prompt,
+        int(inputs.max_sequence_length),
+        str(cast(torch.Tensor, state.prompt_embeds).dtype),
+        prompt_update_versions([state])[0],
+    )
 
 
 class LingBotWorldCausalDMDPipeline(
@@ -2036,7 +2052,7 @@ class LingBotWorldCausalDMDPipeline(
         self._ar_text_caches(
             prompt_embeds,
             invalidate=False,
-            condition_revision=(inputs.prompt, int(inputs.max_sequence_length), str(prompt_embeds.dtype)),
+            condition_revision=_stepwise_text_revision(inputs, state),
         )
         self._ar_sessions[state.request_id] = _LingBotARSessionState()
         return state
@@ -2158,7 +2174,7 @@ class LingBotWorldCausalDMDPipeline(
         extra["ar_cross_attention"] = self._ar_text_caches(
             cast(torch.Tensor, state.prompt_embeds),
             invalidate=False,
-            condition_revision=(inputs.prompt, int(inputs.max_sequence_length), str(state.prompt_embeds.dtype)),
+            condition_revision=_stepwise_text_revision(inputs, state),
         )
         state.latents = randn_tensor(
             (

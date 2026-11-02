@@ -13,6 +13,7 @@ import torch
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession, SE3DeltaCameraHandler
+from vllm_omni.diffusion.interaction.modality_handlers.lingbot_prompt import LingBotPromptInteractionHandler
 from vllm_omni.diffusion.interaction.modality_handlers.prompt import PromptInteractionHandler, PromptSession
 from vllm_omni.diffusion.interaction.registry import STRUCTURED_HANDLER_REGISTRY
 from vllm_omni.diffusion.interaction.types import (
@@ -45,10 +46,18 @@ class _FakePromptPipeline(InteractionMixin):
 
 
 class _FakeLingBotPipeline(InteractionMixin):
-    """Minimal pipeline stub for LingBot camera registration."""
+    """Minimal pipeline stub for LingBot camera and prompt registration."""
 
     def __init__(self) -> None:
+        self.device = torch.device("cpu")
+        self.transformer = SimpleNamespace(dtype=torch.float32)
+        self.encoded: list[tuple[str, int, torch.dtype]] = []
         self._interaction_coordinator = None
+
+    def encode_prompt(self, prompt: str, *, max_sequence_length: int, dtype: torch.dtype) -> torch.Tensor:
+        # LingBot's own signature: no negative prompt, no CFG, one padded tensor back.
+        self.encoded.append((prompt, max_sequence_length, dtype))
+        return torch.full((1, 4, 2), 2.0, dtype=dtype)
 
     def peek_chunk_media(self, state: StepRequestState) -> ChunkMediaSpec:
         del state
@@ -93,6 +102,31 @@ class TestCoordinatorResolution:
         handler = coordinator.get_handler("camera")
         assert isinstance(handler, SE3DeltaCameraHandler)
         assert handler.lazy_initialize_session is False
+
+    def test_lingbot_prompt_updates_use_its_encoder_and_interpolate(self) -> None:
+        pipeline = _FakeLingBotPipeline()
+        od_config = SimpleNamespace(model_class_name="LingBotWorldCausalDMDPipeline")
+        coordinator = InteractionCoordinator.build(pipeline, od_config)
+        state = _make_state()
+
+        assert isinstance(coordinator.get_handler("prompt"), LingBotPromptInteractionHandler)
+        coordinator.get_handler("prompt").enqueue(
+            state,
+            event_id="open-door",
+            received_at=0.0,
+            payload={"prompt": "the door swings open"},
+            transition_chunks=2,
+        )
+        assert pipeline.encoded == [("the door swings open", 226, torch.float32)]
+
+        session = state.interaction_sessions["prompt"]
+        assert isinstance(session, PromptSession)
+        coordinator.get_handler("prompt").apply_at_chunk_boundary(state, boundary_at=0.0)
+        assert torch.allclose(state.prompt_embeds, torch.full((1, 4, 2), 1.0))
+        coordinator.get_handler("prompt").apply_at_chunk_boundary(state, boundary_at=1.0)
+        assert torch.allclose(state.prompt_embeds, torch.full((1, 4, 2), 2.0))
+        # Each boundary that changed the embeddings bumps the version that keys the text K/V.
+        assert session.version == 2
 
     def test_non_lazy_camera_apply_creates_session_without_enqueue(self) -> None:
         """Camera apply must run before any enqueue to materialize identity poses."""
