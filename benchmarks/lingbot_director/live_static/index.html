@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LingBot Director</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="bar">
+    <h1>LingBot Director</h1>
+    <span id="status" class="pill">未开始</span>
+    <span id="clock" class="muted"></span>
+    <div class="grow"></div>
+    <button id="start">开始</button>
+    <button id="stop" class="ghost">停止</button>
+  </header>
+
+  <main class="layout">
+    <section class="stage">
+      <div id="viewport" class="viewport">
+        <canvas id="screen" width="832" height="480"></canvas>
+        <div id="overlay" class="overlay"></div>
+        <div id="menu" class="menu" hidden></div>
+      </div>
+      <div class="controls">
+        <div class="keys">
+          <span class="key-group">移动 <kbd data-key="w">W</kbd><kbd data-key="a">A</kbd><kbd data-key="s">S</kbd><kbd data-key="d">D</kbd></span>
+          <span class="key-group">视角 <kbd data-key="i">I</kbd><kbd data-key="j">J</kbd><kbd data-key="k">K</kbd><kbd data-key="l">L</kbd></span>
+          <span id="buffer" class="muted"></span>
+        </div>
+        <form id="text-form" class="text-event">
+          <input id="text" placeholder="自定义事件，例如：一群鸟从左侧飞过" autocomplete="off">
+          <button type="submit">发送</button>
+        </form>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <section>
+        <h2>Director 事件卡</h2>
+        <div id="proposals" class="cards"></div>
+      </section>
+      <section>
+        <h2>自定义槽位</h2>
+        <div id="slots" class="cards"></div>
+        <form id="slot-form" class="slot-form">
+          <select id="slot-key"></select>
+          <input id="slot-text" placeholder="登记一个事件" autocomplete="off">
+          <button type="submit">登记</button>
+        </form>
+      </section>
+      <section>
+        <h2>当前事件</h2>
+        <div id="active" class="muted">无</div>
+        <div id="pending"></div>
+        <div id="queue"></div>
+      </section>
+      <section>
+        <h2>世界状态</h2>
+        <p id="scene" class="scene"></p>
+        <ul id="facts" class="facts"></ul>
+      </section>
+      <section>
+        <h2>送入 Pilot 的 Prompt</h2>
+        <p id="prompt" class="prompt"></p>
+      </section>
+      <section>
+        <h2>提示</h2>
+        <ul id="notices" class="notices"></ul>
+      </section>
+    </aside>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
