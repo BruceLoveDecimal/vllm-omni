@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""The Director's VLM roles in the live loop: discover what can happen, then resolve what a trigger causes.
+"""The Director's VLM roles in the live loop: discover what can happen, resolve what a trigger causes,
+and check that it happened.
 
 The Director never runs per frame. It discovers on scene start or a clear
-scene change, refreshes its suggestions every few chunks, and resolves one
-trigger at a time when the user acts.
+scene change, refreshes its suggestions every few chunks, resolves one
+trigger at a time when the user acts, and verifies each event once it has
+played out, before its facts are kept.
 """
 
 from __future__ import annotations
@@ -38,8 +40,21 @@ RESOLVE = (
     "scene evolves from now into the result, step by step, not just the end state; keep the scene, subject "
     "identity and camera, and place any new entity at a plausible entry point. duration_chunks: an integer from 1 "
     "to 6, how many chunks of about 0.75 s the event needs. facts_after: the complete updated list of short "
-    "sentences that must stay true afterwards, starting from the current facts; drop facts the event makes false."
+    "sentences that must stay true afterwards, starting from the current facts; drop facts the event makes false. "
+    'kind: "appearance" if the event changes how the whole scene looks (weather, lighting, time of day, season), '
+    'otherwise "action". success_check: one yes/no question about a single frame that is true only once the '
+    "event has visibly happened. scene_after: the scene sentence rewritten to agree with the result, with anything "
+    "the event makes false removed. edit_instruction: one image-edit instruction that turns the current frame into "
+    "the result."
 )
+
+VERIFY = (
+    "You check whether an event happened in a video world. The images are recent frames in time order; the last "
+    "one is now. Answer the question about the last frame. Return only a JSON object with these keys. verdict: "
+    '"yes" if it is clearly true, "partial" if the change has visibly started but is not complete, "no" '
+    "otherwise. observed: one short sentence on what is actually visible that decides the answer."
+)
+VERDICTS = ("yes", "partial", "no")
 
 
 @dataclass
@@ -58,10 +73,20 @@ class Resolution:
     visual_event: str
     duration_chunks: int
     facts_after: list[str]
+    kind: str
+    success_check: str
+    scene_after: str
+    edit_instruction: str
 
     @property
     def failed_preconditions(self) -> list[str]:
         return [item["condition"] for item in self.preconditions if not item["holds"]]
+
+
+@dataclass
+class Verdict:
+    verdict: str
+    observed: str
 
 
 class DirectorAgent:
@@ -93,4 +118,15 @@ class DirectorAgent:
             visual_event=reply["visual_event"],
             duration_chunks=min(max(int(reply["duration_chunks"]), 1), MAX_DURATION_CHUNKS),
             facts_after=list(reply["facts_after"]),
+            kind="appearance" if reply["kind"] == "appearance" else "action",
+            success_check=reply["success_check"],
+            scene_after=reply["scene_after"],
+            edit_instruction=reply["edit_instruction"],
         )
+
+    async def verify(self, frames: list[np.ndarray], question: str) -> Verdict:
+        reply = await self.vlm.ask_json(VERIFY, frames, f"Question: {question}")
+        verdict = str(reply["verdict"]).lower()
+        if verdict not in VERDICTS:
+            raise ValueError(f"Unexpected verdict {reply['verdict']!r}; expected one of {VERDICTS}.")
+        return Verdict(verdict=verdict, observed=reply["observed"])

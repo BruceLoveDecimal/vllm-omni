@@ -481,7 +481,12 @@ def test_world_session_streams_new_frames_and_sends_controls() -> None:
         await websocket.send(json.dumps({"type": "video.start", "request_id": "r"}))
         cuts = [0, offsets[3], len(media)]
         for number, (start, end) in enumerate(zip(cuts, cuts[1:])):
-            metadata = {"type": "video.chunk_metadata", "kind": "media", "generation_chunk_index": number}
+            metadata = {
+                "type": "video.chunk_metadata",
+                "kind": "media",
+                "generation_chunk_index": number,
+                "started_event_ids": ["e1"] if number == 1 else [],
+            }
             await websocket.send(json.dumps(metadata))
             await websocket.send(media[start:end])
             received.append(json.loads(await websocket.recv()))
@@ -504,6 +509,7 @@ def test_world_session_streams_new_frames_and_sends_controls() -> None:
     all_frames = decode_frames(media)
     assert sum(len(chunk.frames) for chunk in chunks) == len(all_frames) > 0
     assert len(chunks) == 2
+    assert [chunk.started_event_ids for chunk in chunks] == [[], ["e1"]]
     assert received[0] == {"type": "session.start"}
     assert received[1]["interaction"] == {"event_id": "e1", "event": {"prompt": "hold"}, "transition_chunks": 0}
     assert received[2] == {"type": "session.stop"}

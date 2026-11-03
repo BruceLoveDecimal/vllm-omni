@@ -69,10 +69,25 @@ in the shape of LingBot's Director–Pilot harness:
 | Part | Module | What it does |
 | ---- | ------ | ------------ |
 | User input | `live_static/` | WASD/IJKL camera, U/O/F/G Director cards, 1–9 registered slots, clicking an object card, free-text events |
-| Interaction orchestrator | `events.py` | One event queue with priorities (text > object/hotkey/slot > Director), an event lasts its chunk budget, then its facts persist; the chunk prompt is background scene + facts + active event |
-| Director (VLM) | `agent.py` | `discover` on scene start, on a clear scene change and every few chunks; `resolve` one trigger into `target / action / preconditions / visual_event / duration_chunks / facts_after`; a failed precondition rejects the event with a reason |
+| Interaction orchestrator | `events.py` | One event queue with priorities (text > object/hotkey/slot > Director); the chunk prompt is background scene + facts + active event; an event's duration counts from the chunk the server reports its prompt applied (`started_event_ids`), and its facts are kept only after the Director confirms it |
+| Director (VLM) | `agent.py` | `discover` on scene start, on a clear scene change and every few chunks; `resolve` one trigger into `target / action / preconditions / visual_event / duration_chunks / facts_after / kind / success_check / scene_after / edit_instruction`; `verify` answers the event's `success_check` on the latest frames with yes / partial / no; a failed precondition rejects the event with a reason |
 | Event cards | `tracker.py` | SAM keeps each discovered object's box current, with its last box as exemplar, so its card follows it |
 | Pilot | LingBot over `WS /v1/realtime/video` | Prompt and camera updates apply at the next chunk boundary; a segment that reaches its frame budget continues from its last frame |
+
+An event goes `sent → playing → verifying`, then:
+
+- **yes**: its `facts_after` and `scene_after` become the new facts and background.
+- **partial**, the first time: it plays for one more duration.
+- **no**: it retries one rung up. `prompt` switches in scene + facts + event;
+  `rewrite` replaces the scene and facts with the Director's `scene_after` and
+  `facts_after`, so nothing in the prompt contradicts the event; `reanchor`
+  restarts the world from the current frame, edited with `edit_instruction`
+  when `--edit-url` points at an image-edit server. A no on `reanchor` drops the
+  event with a notice and leaves the facts alone.
+
+Events of kind `appearance` (weather, light, time of day) start at `reanchor`:
+on LingBot-World 2.0 causal-fast a mid-session switch from a sunset beach to a
+snowy night changed poses but not the look of the scene.
 
 SAM only selects targets and positions cards; it does not condition the world.
 Mid-session prompts need the LingBot prompt interaction handler on the server

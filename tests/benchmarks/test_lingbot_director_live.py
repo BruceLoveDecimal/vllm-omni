@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from benchmarks.lingbot_director.agent import DirectorAgent, Discovery, Resolution
+from benchmarks.lingbot_director.agent import DirectorAgent, Discovery, Resolution, Verdict
 from benchmarks.lingbot_director.clients import Chunk
 from benchmarks.lingbot_director.events import CameraControl, EventScheduler, WorldEvent
 from benchmarks.lingbot_director.live import LiveSession, scene_difference
@@ -38,7 +38,9 @@ def frame(value: int = 0) -> np.ndarray:
     return np.full((HEIGHT, WIDTH, 3), value, dtype=np.uint8)
 
 
-def event(source: str, prompt: str, *, duration: int = 2, facts: list[str] | None = None) -> WorldEvent:
+def event(
+    source: str, prompt: str, *, duration: int = 2, facts: list[str] | None = None, kind: str = "action"
+) -> WorldEvent:
     return WorldEvent(
         event_id=prompt,
         source=source,
@@ -46,7 +48,21 @@ def event(source: str, prompt: str, *, duration: int = 2, facts: list[str] | Non
         prompt=prompt,
         duration_chunks=duration,
         facts_after=facts or [],
+        kind=kind,
+        success_check=f"Did {prompt}",
+        scene_after="A changed hallway.",
     )
+
+
+def play_out(scheduler: EventScheduler, *, first_chunk: int, carrier: str = "p1") -> WorldEvent:
+    """Send the active event's prompt, apply it on ``first_chunk`` and run it to its check."""
+    scheduler.sent(carrier)
+    chunk = first_chunk
+    played_out = scheduler.on_chunk(chunk, [carrier])
+    while played_out is None:
+        chunk += 1
+        played_out = scheduler.on_chunk(chunk, [])
+    return played_out
 
 
 # ── scheduler and camera ─────────────────────────────────────────────────
@@ -59,14 +75,78 @@ def test_prompt_is_scene_then_facts_then_active_event() -> None:
     assert scheduler.prompt() == "A hallway. The door is open. Birds fly past."
 
 
-def test_event_runs_its_duration_then_leaves_its_facts() -> None:
+def test_duration_counts_from_the_chunk_the_server_applied_the_prompt() -> None:
     scheduler = EventScheduler(scene="A hallway.")
     scheduler.submit(event("object", "The door swings open.", duration=2, facts=["The door is open."]), chunk=0)
-    scheduler.on_chunk(1)
-    assert scheduler.active is not None
-    scheduler.on_chunk(2)
+    scheduler.sent("p1")
+    # Chunks generated before the server reports the prompt do not count toward the event.
+    assert scheduler.on_chunk(1, []) is None
+    assert scheduler.on_chunk(2, ["camera-9"]) is None
+    assert scheduler.active.status == "sent"
+    assert scheduler.on_chunk(3, ["p1"]) is None
+    assert (scheduler.active.status, scheduler.active.applied_chunk) == ("playing", 3)
+    played_out = scheduler.on_chunk(4, [])
+    assert played_out is scheduler.active and played_out.status == "verifying"
+    # Facts wait for the check.
+    assert scheduler.facts == []
+    assert scheduler.on_chunk(5, []) is None
+
+
+def test_confirmed_event_keeps_its_facts_and_scene() -> None:
+    scheduler = EventScheduler(scene="A hallway.")
+    scheduler.submit(event("object", "The door swings open.", facts=["The door is open."]), chunk=0)
+    played_out = play_out(scheduler, first_chunk=1)
+    assert scheduler.settle(played_out, "yes", chunk=3) == "succeeded"
     assert scheduler.active is None
-    assert scheduler.prompt() == "A hallway. The door is open."
+    assert scheduler.prompt() == "A changed hallway. The door is open."
+
+
+def test_failed_checks_climb_the_rungs_then_drop_the_event_without_facts() -> None:
+    scheduler = EventScheduler(scene="A hallway at sunset.")
+    scheduler.facts = ["The lamp is off."]
+    scheduler.submit(event("text", "Snow falls.", facts=["Snow covers the floor."]), chunk=0)
+    assert scheduler.prompt() == "A hallway at sunset. The lamp is off. Snow falls."
+
+    played_out = play_out(scheduler, first_chunk=1, carrier="p1")
+    assert scheduler.settle(played_out, "partial", chunk=2) == "extended"
+    # One extension on the same rung, counted from where it is.
+    assert scheduler.active.status == "playing"
+    played_out = scheduler.on_chunk(3, []) or scheduler.on_chunk(4, [])
+    assert played_out is not None
+    assert scheduler.settle(played_out, "partial", chunk=4) == "rewrite"
+    # The rewrite drops the old scene and facts that contradict the event.
+    assert scheduler.prompt() == "A changed hallway. Snow covers the floor. Snow falls."
+    assert scheduler.awaiting_apply() and not scheduler.active.restart_pending
+
+    played_out = play_out(scheduler, first_chunk=5, carrier="p2")
+    assert scheduler.settle(played_out, "no", chunk=6) == "reanchor"
+    assert scheduler.active.restart_pending
+
+    played_out = play_out(scheduler, first_chunk=7, carrier="segment-3")
+    assert scheduler.settle(played_out, "no", chunk=8) == "failed"
+    assert scheduler.active is None
+    assert scheduler.facts == ["The lamp is off."]
+    assert scheduler.prompt() == "A hallway at sunset. The lamp is off."
+    assert [entry["what"] for entry in scheduler.history] == [
+        "started", "applied", "verifying", "extended", "verifying", "escalated", "applied", "verifying",
+        "escalated", "applied", "verifying", "failed",
+    ]  # fmt: skip
+
+
+def test_appearance_events_start_with_a_restart() -> None:
+    scheduler = EventScheduler(scene="A beach at sunset.")
+    scheduler.submit(event("hotkey", "Snow falls.", kind="appearance"), chunk=0)
+    assert scheduler.active.rung == "reanchor"
+    assert scheduler.active.restart_pending
+
+
+def test_a_check_for_a_replaced_event_is_ignored() -> None:
+    scheduler = EventScheduler(scene="A hallway.")
+    scheduler.submit(event("director", "Rain starts.", facts=["It rains."]), chunk=0)
+    played_out = play_out(scheduler, first_chunk=1)
+    scheduler.submit(event("text", "Birds fly past."), chunk=3)
+    assert scheduler.settle(played_out, "yes", chunk=4) == "stale"
+    assert scheduler.facts == []
 
 
 def test_higher_priority_preempts_and_equal_priority_waits() -> None:
@@ -176,10 +256,26 @@ def test_resolve_clamps_duration_and_reports_failed_preconditions() -> None:
         "visual_event": "A hand presses the handle and pulls the door inward.",
         "duration_chunks": 40,
         "facts_after": ["The door is open."],
+        "kind": "something else",
+        "success_check": "Is the door open?",
+        "scene_after": "A hallway with an open door.",
+        "edit_instruction": "Open the door.",
     }
     resolution = asyncio.run(DirectorAgent(ScriptedVlm([reply])).resolve(frame(), "open the door", scene="", facts=[]))
     assert resolution.duration_chunks == 6
     assert resolution.failed_preconditions == ["handle reachable"]
+    # Anything but an explicit appearance change starts as a prompt-only action.
+    assert resolution.kind == "action"
+
+
+def test_verify_asks_the_events_question_and_rejects_unknown_verdicts() -> None:
+    vlm = ScriptedVlm([{"verdict": "Partial", "observed": "A few flakes."}, {"verdict": "maybe", "observed": ""}])
+    agent = DirectorAgent(vlm)
+    verdict = asyncio.run(agent.verify([frame(), frame()], "Is snow on the sand?"))
+    assert verdict == Verdict(verdict="partial", observed="A few flakes.")
+    assert vlm.requests[0][1:] == (2, "Question: Is snow on the sand?")
+    with pytest.raises(ValueError, match="maybe"):
+        asyncio.run(agent.verify([frame()], "Is snow on the sand?"))
 
 
 # ── the live loop ────────────────────────────────────────────────────────
@@ -192,7 +288,10 @@ class FakeSession:
         self.prompt = prompt
         self.num_chunks = num_chunks
         self.interactions: list[dict[str, Any]] = []
+        # Interactions not yet applied, each with the number of chunks still to generate before it is.
+        self.unapplied: list[list] = []
         self.stopped = False
+        self.yielded = 0
         world.sessions.append(self)
 
     async def __aenter__(self) -> FakeSession:
@@ -202,7 +301,8 @@ class FakeSession:
         return None
 
     async def interact(self, event_id: str, *, prompt=None, camera=None, transition_chunks=None) -> None:
-        self.interactions.append({"prompt": prompt, "camera": camera})
+        self.interactions.append({"event_id": event_id, "prompt": prompt, "camera": camera})
+        self.unapplied.append([event_id, self.world.apply_lag])
 
     async def stop(self) -> None:
         self.stopped = True
@@ -213,14 +313,20 @@ class FakeSession:
             if self.stopped:
                 return
             self.world.generated += 1
-            yield Chunk(index=index, frames=[frame(self.world.generated)])
+            # Like the server, report the interactions this chunk is the first to use.
+            started = [event_id for event_id, wait in self.unapplied if wait == 0]
+            self.unapplied = [[event_id, wait - 1] for event_id, wait in self.unapplied if wait > 0]
+            self.yielded += 1
+            yield Chunk(index=index, frames=[frame(self.world.generated)], started_event_ids=started)
 
 
 class FakeWorld:
-    def __init__(self, *, delay: float = 0.001) -> None:
+    def __init__(self, *, delay: float = 0.001, apply_lag: int = 0) -> None:
         self.sessions: list[FakeSession] = []
         self.generated = 0
         self.delay = delay
+        # Chunks already in flight when an interaction arrives, so it applies that many chunks late.
+        self.apply_lag = apply_lag
 
     async def pace(self) -> None:
         await asyncio.sleep(self.delay)
@@ -230,10 +336,23 @@ class FakeWorld:
 
 
 class FakeAgent:
-    def __init__(self, *, resolve_gate: asyncio.Event | None = None, failed: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        resolve_gate: asyncio.Event | None = None,
+        failed: list[str] | None = None,
+        kind: str = "action",
+        verdicts: list[str] | None = None,
+        facts_after: list[str] | None = None,
+    ) -> None:
         self.discoveries = 0
         self.resolve_gate = resolve_gate
         self.failed = failed or []
+        self.kind = kind
+        # Answers to successive checks; once used up, every check passes.
+        self.verdicts = list(verdicts or [])
+        self.questions: list[str] = []
+        self.facts_after = facts_after
 
     async def discover(self, frames: list[np.ndarray]) -> Discovery:
         self.discoveries += 1
@@ -253,8 +372,26 @@ class FakeAgent:
             preconditions=[{"condition": item, "holds": False} for item in self.failed],
             visual_event=f"EVENT {request}.",
             duration_chunks=2,
-            facts_after=[f"After {request}."],
+            facts_after=[f"After {request}."] if self.facts_after is None else self.facts_after,
+            kind=self.kind,
+            success_check=f"Did {request} happen?",
+            scene_after="",
+            edit_instruction=f"Make {request} visible.",
         )
+
+    async def verify(self, frames: list[np.ndarray], question: str) -> Verdict:
+        self.questions.append(question)
+        verdict = self.verdicts.pop(0) if self.verdicts else "yes"
+        return Verdict(verdict=verdict, observed=f"saw {verdict}")
+
+
+class FakeEditor:
+    def __init__(self) -> None:
+        self.instructions: list[str] = []
+
+    async def edit(self, image: np.ndarray, prompt: str, *, seed: int) -> np.ndarray:
+        self.instructions.append(prompt)
+        return frame(200)
 
 
 class StillTracker(ObjectTracker):
@@ -328,6 +465,77 @@ def test_hotkey_event_plays_for_its_duration_and_leaves_facts() -> None:
 
     asyncio.run(drive(live, script))
     assert sent_prompts(world) == ["Scene 1.", "Scene 1. EVENT rain.", "Scene 1. After rain."]
+    assert live.agent.questions == ["Did rain happen?"]
+
+
+def test_event_waits_for_the_server_to_apply_its_prompt() -> None:
+    world = FakeWorld(apply_lag=2)
+    live, _ = make_live(world, FakeAgent(), segment_chunks=50, discover_every=100)
+
+    async def script(live: LiveSession, inputs: asyncio.Queue) -> None:
+        await until(lambda: live.chunk >= 1)
+        inputs.put_nowait({"type": "hotkey", "key": "f"})
+        await until(lambda: "After rain." in live.scheduler.facts)
+        inputs.put_nowait({"type": "stop"})
+
+    asyncio.run(drive(live, script))
+    history = {entry["what"]: entry["chunk"] for entry in live.scheduler.history}
+    sent = next(entry["chunk"] for entry in live.trace if entry["kind"] == "prompt_sent")
+    # Two chunks were in flight, so the third chunk after sending is the first with the event.
+    assert history["applied"] == sent + 3
+    assert history["verifying"] == history["applied"] + 1
+
+
+def test_unconfirmed_events_escalate_to_a_restart_from_the_edited_frame() -> None:
+    world = FakeWorld()
+    editor = FakeEditor()
+    live, _ = make_live(
+        world,
+        FakeAgent(verdicts=["no", "no", "no"]),
+        segment_chunks=50,
+        discover_every=100,
+        editor=editor,
+    )
+
+    async def script(live: LiveSession, inputs: asyncio.Queue) -> None:
+        await until(lambda: live.chunk >= 1)
+        inputs.put_nowait({"type": "text", "text": "snow falls"})
+        await until(lambda: any(notice["level"] == "failed" for notice in live.notices))
+        inputs.put_nowait({"type": "stop"})
+
+    asyncio.run(drive(live, script))
+    assert live.scheduler.facts == []
+    assert [notice["level"] for notice in live.notices] == ["retry", "retry", "failed"]
+    # Rewrite: the empty scene_after keeps the scene, and facts_after stands in for the facts.
+    rewritten = "Scene 1. After snow falls. EVENT snow falls."
+    assert sent_prompts(world)[:3] == ["Scene 1.", "Scene 1. EVENT snow falls.", rewritten]
+    assert len(world.sessions) == 2
+    assert world.sessions[0].stopped
+    restarted = world.sessions[1]
+    assert restarted.prompt == rewritten
+    assert int(restarted.image[0, 0, 0]) == 200
+    assert editor.instructions == ["Make snow falls visible."]
+    assert sent_prompts(world)[-1] == "Scene 1."
+
+
+def test_appearance_event_restarts_the_world_from_the_current_frame() -> None:
+    world = FakeWorld()
+    live, _ = make_live(world, FakeAgent(kind="appearance"), segment_chunks=50, discover_every=100)
+
+    async def script(live: LiveSession, inputs: asyncio.Queue) -> None:
+        await until(lambda: live.chunk >= 1)
+        inputs.put_nowait({"type": "hotkey", "key": "g"})
+        await until(lambda: "After snow." in live.scheduler.facts)
+        inputs.put_nowait({"type": "stop"})
+
+    asyncio.run(drive(live, script))
+    assert len(world.sessions) == 2
+    first, restarted = world.sessions
+    # The event's prompt goes out in the restart, not as an interaction on the old segment.
+    assert all(item["prompt"] is None for item in first.interactions)
+    assert restarted.prompt == "Scene 1. After snow. EVENT snow."
+    # Without an editor the restart continues from the frame as it is.
+    assert int(restarted.image[0, 0, 0]) == first.yielded
 
 
 def test_failed_preconditions_reject_the_event_with_a_notice() -> None:
@@ -441,3 +649,23 @@ def test_browser_session_streams_frames_and_forwards_inputs(monkeypatch: pytest.
 
     assert header["count"] == 1
     assert header["chunk"] >= 1
+
+
+def test_a_rewrite_that_leaves_the_prompt_unchanged_is_still_sent_and_confirmed() -> None:
+    world = FakeWorld()
+    # No facts and no new scene: the rewritten prompt is the one already playing.
+    live, _ = make_live(world, FakeAgent(verdicts=["no", "yes"], facts_after=[]), segment_chunks=50, discover_every=100)
+
+    async def script(live: LiveSession, inputs: asyncio.Queue) -> None:
+        await until(lambda: live.chunk >= 1)
+        inputs.put_nowait({"type": "text", "text": "a bird lands"})
+        await until(lambda: any(entry["what"] == "succeeded" for entry in live.scheduler.history))
+        inputs.put_nowait({"type": "stop"})
+
+    asyncio.run(drive(live, script))
+    assert sent_prompts(world) == [
+        "Scene 1.",
+        "Scene 1. EVENT a bird lands.",
+        "Scene 1. EVENT a bird lands.",
+        "Scene 1.",
+    ]

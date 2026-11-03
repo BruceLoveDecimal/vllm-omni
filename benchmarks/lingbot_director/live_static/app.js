@@ -20,6 +20,8 @@ const frameQueue = [];
 let pendingChunk = 0;
 // Bitmaps decode asynchronously; chaining keeps them in arrival order.
 let decoding = Promise.resolve();
+const STATUS = { sent: "等待生效", playing: "进行中", verifying: "核验中" };
+const RUNG = { prompt: "提示词", rewrite: "改写场景", reanchor: "重新锚定" };
 let shownChunk = 0;
 let fps = 16;
 
@@ -84,7 +86,7 @@ function renderPanel() {
   const scheduler = state.scheduler;
   const active = scheduler.active;
   document.getElementById("active").textContent = active
-    ? `${active.request}（剩 ${active.remaining} 段，来源 ${active.source}）`
+    ? `${active.request}（${STATUS[active.status] ?? active.status}，${RUNG[active.rung] ?? active.rung}，剩 ${active.remaining} 段，来源 ${active.source}）`
     : "无";
   document.getElementById("pending").replaceChildren(
     ...state.pending.map((item) => textLine("pending", `推理中：${item.request}`))

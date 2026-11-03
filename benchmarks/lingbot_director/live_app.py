@@ -34,7 +34,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarks.lingbot_director.agent import DirectorAgent
-from benchmarks.lingbot_director.clients import SegmentClient, VlmClient, WorldSession, data_url, fit_image
+from benchmarks.lingbot_director.clients import (
+    EditClient,
+    SegmentClient,
+    VlmClient,
+    WorldSession,
+    data_url,
+    fit_image,
+)
 from benchmarks.lingbot_director.live import LiveSession
 from benchmarks.lingbot_director.tracker import ObjectTracker
 from benchmarks.lingbot_world.workload import num_frames_for_chunks
@@ -126,6 +133,8 @@ class Hub:
             publish=self.publish,
             segment_chunks=args.segment_chunks,
             discover_every=args.discover_every,
+            editor=EditClient(self.http, args.edit_url) if args.edit_url else None,
+            edit_seed=args.seed,
         )
         self.task = asyncio.create_task(self._run(self.session))
 
@@ -212,6 +221,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vlm-url", default="http://127.0.0.1:8001")
     parser.add_argument("--vlm-model", default="Qwen/Qwen3.8-27B")
     parser.add_argument("--segment-url", default="http://127.0.0.1:8003")
+    parser.add_argument(
+        "--edit-url",
+        default=None,
+        help="Image-edit server for re-anchoring failed events; without it a re-anchor restarts from the frame as is.",
+    )
     return parser.parse_args(argv)
 
 

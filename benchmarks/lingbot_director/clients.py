@@ -9,7 +9,7 @@ import base64
 import io
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -159,6 +159,8 @@ class SegmentClient:
 class Chunk:
     index: int
     frames: list[np.ndarray]
+    # Interactions whose update first applies to this chunk, as the server reports them.
+    started_event_ids: list[str] = field(default_factory=list)
 
 
 def decode_frames(media: bytes) -> list[np.ndarray]:
@@ -251,7 +253,11 @@ class WorldSession:
                 if pending.get("kind") == "media":
                     # Fragments share one init segment, so decode the whole stream and keep the new frames.
                     frames = await asyncio.to_thread(decode_frames, bytes(media))
-                    yield Chunk(index=int(pending["generation_chunk_index"]), frames=frames[decoded:])
+                    yield Chunk(
+                        index=int(pending["generation_chunk_index"]),
+                        frames=frames[decoded:],
+                        started_event_ids=list(pending.get("started_event_ids") or []),
+                    )
                     decoded = len(frames)
                 pending = None
                 continue
