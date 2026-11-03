@@ -23,8 +23,14 @@ class LingBotPromptInteractionHandler(PromptInteractionHandler):
     @classmethod
     @override
     def from_pipeline(cls, pipeline: Any) -> LingBotPromptInteractionHandler:
-        def encode_prompt(*, prompt: str, max_sequence_length: int, dtype: torch.dtype, **_: Any):
+        def encode_prompt(*, prompt: str, max_sequence_length: int | None, dtype: torch.dtype, **_: Any):
             # The generic handler also passes CFG and batching arguments that LingBot has no use for.
+            if max_sequence_length is None:
+                # A served request leaves the length unset and LingBot then uses its fixed one, as
+                # _parse_request does; the update has to match the length the session started with.
+                from vllm_omni.diffusion.models.lingbot_world.pipeline import _MAX_SEQUENCE_LENGTH
+
+                max_sequence_length = _MAX_SEQUENCE_LENGTH
             return pipeline.encode_prompt(prompt, max_sequence_length=max_sequence_length, dtype=dtype), None
 
         return cls(encode_prompt=encode_prompt, device=pipeline.device, dtype=pipeline.transformer.dtype)

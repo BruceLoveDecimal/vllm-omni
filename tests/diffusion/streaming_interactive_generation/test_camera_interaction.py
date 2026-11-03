@@ -119,6 +119,13 @@ class TestCoordinatorResolution:
         )
         assert pipeline.encoded == [("the door swings open", 226, torch.float32)]
 
+        # A served request leaves the length unset; LingBot's fixed length applies, as in _parse_request.
+        state.sampling.max_sequence_length = None
+        coordinator.get_handler("prompt").enqueue(
+            state, event_id="served", received_at=0.5, payload={"prompt": "served"}, transition_chunks=2
+        )
+        assert pipeline.encoded[-1] == ("served", 512, torch.float32)
+
         session = state.interaction_sessions["prompt"]
         assert isinstance(session, PromptSession)
         coordinator.get_handler("prompt").apply_at_chunk_boundary(state, boundary_at=0.0)
