@@ -24,7 +24,8 @@ MAX_FACTS = 8
 #   rewrite:  the Director's scene_after and facts_after replace the old scene and facts, so nothing in
 #             the prompt still contradicts the event (a sunset scene asked to turn into a snowy night).
 #   reanchor: the world restarts from the current frame, edited toward the event when an editor is set.
-#             A restart drops the cached sink frames that keep pulling the old appearance back.
+#             The restart is an ordinary new session with that frame as its reference image, the same
+#             path a segment takes when it reaches its frame budget; the model and its cache are untouched.
 RUNGS = ("prompt", "rewrite", "reanchor")
 
 
