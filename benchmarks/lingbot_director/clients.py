@@ -52,11 +52,21 @@ def parse_json_reply(text: str) -> dict[str, Any]:
 class VlmClient:
     """OpenAI-compatible vision chat, from ``vllm serve`` or any compatible endpoint."""
 
-    def __init__(self, http: httpx.AsyncClient, base_url: str, model: str, *, temperature: float = 0.1) -> None:
+    def __init__(
+        self,
+        http: httpx.AsyncClient,
+        base_url: str,
+        model: str,
+        *,
+        temperature: float = 0.1,
+        max_tokens: int = 1024,
+    ) -> None:
         self.http = http
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
+        # Qwen3.8 pretty-prints JSON; a four-object discovery took 438 tokens, so 400 cut it off.
+        self.max_tokens = max_tokens
 
     async def ask_json(self, system: str, images: list[np.ndarray], text: str) -> dict[str, Any]:
         content: list[dict[str, Any]] = [
@@ -69,13 +79,16 @@ class VlmClient:
                 "model": self.model,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
                 "temperature": self.temperature,
-                "max_tokens": 400,
+                "max_tokens": self.max_tokens,
                 # Qwen3.8 thinks by default, which would put reasoning in front of the JSON answer.
                 "chat_template_kwargs": {"enable_thinking": False},
             },
         )
         response.raise_for_status()
-        return parse_json_reply(response.json()["choices"][0]["message"]["content"])
+        choice = response.json()["choices"][0]
+        if choice["finish_reason"] == "length":
+            raise RuntimeError(f"VLM reply hit max_tokens={self.max_tokens} before the JSON closed.")
+        return parse_json_reply(choice["message"]["content"])
 
 
 class EditClient:
@@ -159,12 +172,18 @@ def decode_frames(media: bytes) -> list[np.ndarray]:
 class WorldSession:
     """One ``WS /v1/realtime/video`` rollout. Chunks arrive while controls are sent."""
 
+    # The server aborts a session after about 60 s without progress or a ping; a cold
+    # start can take that long before the first chunk.
+    keepalive_seconds = 10.0
+
     def __init__(self, url: str, start_payload: dict[str, Any]) -> None:
         self.url = url
         self.start_payload = start_payload
         self._connection: Any = None
         self._websocket: Any = None
         self._send_lock = asyncio.Lock()
+        self._keepalive: asyncio.Task[None] | None = None
+        self._stop_requested = False
 
     async def __aenter__(self) -> WorldSession:
         from websockets.asyncio.client import connect
@@ -172,10 +191,17 @@ class WorldSession:
         self._connection = connect(self.url, max_size=None, ping_interval=None)
         self._websocket = await self._connection.__aenter__()
         await self._send(self.start_payload)
+        self._keepalive = asyncio.create_task(self._ping())
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
+        self._keepalive.cancel()
         await self._connection.__aexit__(*exc_info)
+
+    async def _ping(self) -> None:
+        while True:
+            await asyncio.sleep(self.keepalive_seconds)
+            await self._send({"type": "session.ping"})
 
     async def _send(self, payload: dict[str, Any]) -> None:
         from websockets.exceptions import ConnectionClosed
@@ -210,6 +236,7 @@ class WorldSession:
         await self._send({"type": "session.interaction", "interaction": interaction})
 
     async def stop(self) -> None:
+        self._stop_requested = True
         await self._send({"type": "session.stop"})
 
     async def chunks(self) -> AsyncIterator[Chunk]:
@@ -234,4 +261,7 @@ class WorldSession:
             elif event["type"] == "error":
                 raise RuntimeError(f"World session failed: {event}")
             elif event["type"] == "session.done":
+                if event.get("stopped") and not self._stop_requested:
+                    # A stall timeout or server-side abort ends the rollout early without an error frame.
+                    raise RuntimeError(f"World stopped the session on its own: {event}")
                 return

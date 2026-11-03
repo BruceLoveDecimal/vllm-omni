@@ -380,7 +380,9 @@ def test_vlm_client_sends_images_as_data_urls() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.update(json.loads(request.content))
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]})
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": '{"ok": true}'}, "finish_reason": "stop"}]}
+        )
 
     async def scenario() -> dict[str, Any]:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
@@ -392,6 +394,21 @@ def test_vlm_client_sends_images_as_data_urls() -> None:
     content = seen["messages"][1]["content"]
     assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
     assert content[1] == {"type": "text", "text": "goal"}
+
+
+def test_vlm_client_reports_a_reply_cut_off_by_max_tokens() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["max_tokens"] == 64
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": '{"scene": "a la'}, "finish_reason": "length"}]}
+        )
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            await VlmClient(http, "http://vlm", "qwen", max_tokens=64).ask_json("sys", [frame_with(OPEN)], "goal")
+
+    with pytest.raises(RuntimeError, match="max_tokens=64"):
+        asyncio.run(scenario())
 
 
 def test_edit_client_posts_multipart_and_restores_the_frame_size() -> None:
@@ -556,7 +573,9 @@ def test_command_line_runs_a_restart_end_to_end(tmp_path: Path, monkeypatch: pyt
             content = {"execute_prompt": "open it", "hold_prompt": "stay open"}
         else:
             content = {"best": 1, "scene_preserved": True}
-        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(content)}}]})
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": json.dumps(content)}, "finish_reason": "stop"}]}
+        )
 
     real_client = httpx.AsyncClient
     monkeypatch.setattr(
@@ -592,3 +611,28 @@ def test_command_line_runs_a_restart_end_to_end(tmp_path: Path, monkeypatch: pyt
     assert starts[1]["image_reference"]["image_url"].startswith("data:image/png;base64,")
     assert len(starts[1]["extra_params"]["camera_action_script"]) == chunks_for_num_frames(starts[1]["num_frames"])
     assert any(event["kind"] == "restart" for event in trace["events"])
+
+
+def test_world_session_pings_and_reports_a_server_side_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stall timeout ends a rollout with a stopped session.done; it must not pass for a normal end."""
+    from websockets.asyncio.server import serve
+
+    monkeypatch.setattr(WorldSession, "keepalive_seconds", 0.01)
+    received: list[str] = []
+
+    async def server(websocket: Any) -> None:
+        received.append(json.loads(await websocket.recv())["type"])
+        await websocket.send(json.dumps({"type": "video.start", "request_id": "r"}))
+        received.append(json.loads(await websocket.recv())["type"])
+        await websocket.send(json.dumps({"type": "session.done", "chunks": 0, "stopped": True}))
+
+    async def scenario() -> None:
+        async with serve(server, "127.0.0.1", 0, max_size=None) as listener:
+            port = listener.sockets[0].getsockname()[1]
+            async with WorldSession(f"ws://127.0.0.1:{port}", {"type": "session.start"}) as session:
+                async for _ in session.chunks():
+                    pass
+
+    with pytest.raises(RuntimeError, match="stopped the session on its own"):
+        asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+    assert received == ["session.start", "session.ping"]
