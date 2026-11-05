@@ -164,6 +164,9 @@ class Pi05Config:
     # OpenPI handshake metadata from the deploy config. Construction validates
     # it against the resolved checkpoint contract.
     policy_server_config: dict[str, Any] = field(default_factory=dict)
+    # Batch sizes to capture CUDA graphs for. ``None`` derives them from the
+    # stage's ``max_num_seqs`` (``cuda_graph_pi05.batch_size_buckets``).
+    cuda_graph_batch_sizes: list[int] | None = None
 
     # Derived from output_features[ACTION].shape; never accepted as a second
     # source of truth in config.json.
@@ -198,6 +201,14 @@ class Pi05Config:
 
         if self.max_cameras < 1:
             raise ValueError(f"max_cameras must be at least 1, got {self.max_cameras!r}.")
+        if self.cuda_graph_batch_sizes is not None:
+            if not self.cuda_graph_batch_sizes or any(
+                not isinstance(size, int) or size < 1 for size in self.cuda_graph_batch_sizes
+            ):
+                raise ValueError(
+                    f"cuda_graph_batch_sizes must be positive integers, got {self.cuda_graph_batch_sizes!r}."
+                )
+            self.cuda_graph_batch_sizes = sorted(set(self.cuda_graph_batch_sizes))
         if self.num_inference_steps < 1:
             # ``dt = -1 / num_steps`` in the Euler loop.
             raise ValueError(f"num_inference_steps must be at least 1, got {self.num_inference_steps!r}.")

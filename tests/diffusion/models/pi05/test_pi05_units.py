@@ -406,13 +406,16 @@ class _GraphTarget:
         self.events.append("enable_fused_kernels")
 
 
-def _graph_install_pipeline(device: str, events: list, monkeypatch, fused_kernels_error=None):
+def _graph_install_pipeline(device: str, events: list, monkeypatch, fused_kernels_error=None, batch_sizes=None):
+    from types import SimpleNamespace
+
     from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
 
     # Capture needs a GPU; test_pi05_cuda_graph_parity.py runs the real one.
     monkeypatch.setattr(Pi05CUDAGraphs, "capture", lambda graphs: events.append("capture"))
     pipeline = object.__new__(Pi05Pipeline)
     pipeline._device = torch.device(device)
+    pipeline.config = SimpleNamespace(cuda_graph_batch_sizes=batch_sizes)
     pipeline.model = _GraphTarget(events, fused_kernels_error)
     return pipeline
 
@@ -440,8 +443,35 @@ def test_pipeline_installs_cuda_graphs_unless_enforce_eager(enforce_eager, devic
 
     assert isinstance(pipeline.model.cuda_graphs, Pi05CUDAGraphs) is installed
     if installed:
-        assert pipeline.model.cuda_graphs.batch_sizes == (1, 2, 4)
+        assert pipeline.model.cuda_graphs.batch_sizes == (1, 2, 3, 4)
     assert events == (["enable_fused_kernels", "capture"] if installed else [])
+
+
+def test_pipeline_captures_the_declared_batch_sizes(monkeypatch):
+    from types import SimpleNamespace
+
+    pipeline = _graph_install_pipeline("cuda", [], monkeypatch, batch_sizes=[1, 4, 8])
+    pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False, max_num_seqs=8))
+    assert pipeline.model.cuda_graphs.batch_sizes == (1, 4, 8)
+
+
+def test_pipeline_rejects_batch_sizes_that_do_not_cover_max_num_seqs(monkeypatch):
+    from types import SimpleNamespace
+
+    pipeline = _graph_install_pipeline("cuda", [], monkeypatch, batch_sizes=[1, 2, 4])
+    with pytest.raises(ValueError, match="max_num_seqs=8"):
+        pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False, max_num_seqs=8))
+    assert pipeline.model.cuda_graphs is None
+
+
+@pytest.mark.parametrize("batch_sizes", [[], [0, 1], [1, 2.0]])
+def test_config_rejects_invalid_cuda_graph_batch_sizes(batch_sizes):
+    with pytest.raises(ValueError, match="cuda_graph_batch_sizes"):
+        Pi05Config(cuda_graph_batch_sizes=batch_sizes)
+
+
+def test_config_sorts_cuda_graph_batch_sizes():
+    assert Pi05Config(cuda_graph_batch_sizes=[8, 1, 4, 4]).cuda_graph_batch_sizes == [1, 4, 8]
 
 
 def test_pipeline_fails_when_the_fused_kernels_cannot_run(monkeypatch):
@@ -977,9 +1007,15 @@ def test_sample_actions_routes_each_region_through_cuda_graphs(tiny_model):
 
 @pytest.mark.parametrize(
     "max_batch_size,expected",
-    [(1, (1,)), (2, (1, 2)), (4, (1, 2, 4)), (6, (1, 2, 4, 6)), (32, (1, 2, 4, 8, 16, 32))],
+    [
+        (1, (1,)),
+        (4, (1, 2, 3, 4)),
+        (8, (1, 2, 3, 4, 5, 6, 7, 8)),
+        (20, (1, 2, 3, 4, 5, 6, 7, 8, 16, 20)),
+        (32, (1, 2, 3, 4, 5, 6, 7, 8, 16, 24, 32)),
+    ],
 )
-def test_batch_size_buckets_are_powers_of_two_up_to_the_max(max_batch_size, expected):
+def test_batch_size_buckets_are_dense_up_to_eight_then_every_eight(max_batch_size, expected):
     assert batch_size_buckets(max_batch_size) == expected
 
 
@@ -991,7 +1027,6 @@ def test_batch_size_buckets_reject_an_empty_batch():
 def test_padded_batch_size_is_the_smallest_bucket_that_holds_the_batch():
     graphs = Pi05CUDAGraphs(_tiny_pi05_model(), batch_sizes=(4, 1, 2))
     assert graphs.batch_sizes == (1, 2, 4)
-    assert graphs.max_batch_size == 4
     assert [graphs.padded_batch_size(size) for size in (1, 2, 3, 4, 5)] == [1, 2, 4, 4, 5]
     # Nothing is captured until ``capture``.
     assert graphs.kv_cache(4) is None
@@ -1034,12 +1069,12 @@ class _BatchSizeRecordingCUDAGraphs(Pi05CUDAGraphs):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("batch_size,expected_calls", [(3, [4]), (4, [4]), (5, [4, 1]), (10, [4, 4, 2])])
-def test_sample_actions_pads_to_a_bucket_and_splits_past_the_largest(tiny_model, batch_size, expected_calls):
-    """With graphs installed, a batch runs at bucket sizes only: padded up to
-    the smallest bucket that holds it, split into the largest bucket first.
+@pytest.mark.parametrize("batch_size,expected_calls", [(2, [2]), (3, [4]), (4, [4]), (5, [5])])
+def test_sample_actions_pads_up_to_a_bucket(tiny_model, batch_size, expected_calls):
+    """With graphs installed, a batch between two buckets is padded up to the
+    larger one; a batch larger than every bucket runs as it is (eagerly).
     Every row still gets its own chunk. Nothing is captured here, so every
-    region falls back to eager at the bucket's size."""
+    region falls back to eager at the size it is given."""
     model = tiny_model.eval()
     generator = torch.Generator().manual_seed(7)
     images = [torch.randn(batch_size, 3, 224, 224, generator=generator) for _ in range(3)]
@@ -1054,7 +1089,7 @@ def test_sample_actions_pads_to_a_bucket_and_splits_past_the_largest(tiny_model,
             images=images, image_masks=masks, lang_tokens=lang, lang_masks=lang_mask, noise=noise, num_steps=2
         )
 
-    graphs = _BatchSizeRecordingCUDAGraphs(model, batch_size_buckets(4))
+    graphs = _BatchSizeRecordingCUDAGraphs(model, (1, 2, 4))
     with torch.no_grad():
         eager = run()
         model.cuda_graphs = graphs

@@ -1776,25 +1776,10 @@ class Pi05ForActionPrediction(nn.Module):
                 )
 
         # The three regions below run through CUDA graphs when installed; each
-        # falls back to its eager call on its own. A batch the graphs have no
-        # bucket for is split into the largest bucket, or padded up to the
-        # smallest bucket that holds it.
+        # falls back to its eager call on its own. A batch between two buckets
+        # is padded up to the larger one; the noise is drawn above, so every
+        # real row keeps its own.
         graphs = self.cuda_graphs
-        if graphs is not None and bsize > graphs.max_batch_size:
-            chunks = []
-            for start in range(0, bsize, graphs.max_batch_size):
-                rows = slice(start, start + graphs.max_batch_size)
-                chunks.append(
-                    self.sample_actions(
-                        images=[image[rows] for image in images],
-                        image_masks=[mask[rows] for mask in image_masks],
-                        lang_tokens=lang_tokens[rows],
-                        lang_masks=lang_masks[rows],
-                        noise=noise[rows],
-                        num_steps=num_steps,
-                    )
-                )
-            return torch.cat(chunks)
         if graphs is not None and graphs.padded_batch_size(bsize) != bsize:
             padded = graphs.padded_batch_size(bsize)
             actions = self.sample_actions(

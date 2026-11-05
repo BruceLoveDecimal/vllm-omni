@@ -17,12 +17,13 @@ region 3 graph replays, since the timestep is a graph input. And no region
 reads a tensor value on the host, so no captured control flow depends on data.
 
 So the batch size is the only graph key. ``Pi05Pipeline`` declares the
-buckets from ``max_num_seqs`` (:func:`batch_size_buckets`: the powers of two
-below it, and itself), and each bucket gets its own three graphs and its own
-``Pi05KVCache``. Bucket 1 uses ``model.kv_cache``. ``sample_actions`` pads a
-batch up to the smallest bucket that holds it and splits one larger than the
-largest bucket, so every row runs on a captured graph and nothing is captured
-on a request.
+buckets: ``cuda_graph_batch_sizes`` from the deploy config, or by default
+:func:`batch_size_buckets` of ``max_num_seqs``. Each bucket gets its own three
+graphs and its own ``Pi05KVCache``; bucket 1 uses ``model.kv_cache``.
+``sample_actions`` pads a batch up to the smallest bucket that holds it, as
+the other graph wrappers in the repository do, and nothing is captured on a
+request. A batch larger than every bucket runs eagerly; the scheduler never
+forms one, since the largest bucket covers ``max_num_seqs``.
 
 The graphs are captured once at init (``Pi05CUDAGraphs.capture``), largest
 bucket first, each bucket in replay order, all into one memory pool. Regions
@@ -138,17 +139,25 @@ class _BucketGraphs:
     denoise_step: _DenoiseStepGraph
 
 
+# Every batch size up to here gets its own bucket; past it, one per this step.
+_DENSE_BUCKET_LIMIT = 8
+
+
 def batch_size_buckets(max_batch_size: int) -> tuple[int, ...]:
-    """The batch sizes to capture for a scheduler that forms batches of up to
-    ``max_batch_size``: the powers of two below it, and itself."""
+    """The default batch sizes to capture for batches of up to ``max_batch_size``.
+
+    Every size up to 8, then every multiple of 8, then ``max_batch_size``
+    itself. A π0.5 row is compute, not launch overhead, so a padding row
+    costs about as much as a real one: padding a batch of 5 to 8 measured
+    slower than running it eagerly. A bucket costs about half a second of
+    capture and a KV cache of its batch size.
+    """
     if max_batch_size < 1:
         raise ValueError(f"max_batch_size must be at least 1, got {max_batch_size}.")
-    buckets = []
-    size = 1
-    while size < max_batch_size:
-        buckets.append(size)
-        size *= 2
-    buckets.append(max_batch_size)
+    buckets = list(range(1, min(max_batch_size, _DENSE_BUCKET_LIMIT) + 1))
+    buckets += range(2 * _DENSE_BUCKET_LIMIT, max_batch_size + 1, _DENSE_BUCKET_LIMIT)
+    if buckets[-1] != max_batch_size:
+        buckets.append(max_batch_size)
     return tuple(buckets)
 
 
@@ -165,10 +174,6 @@ class Pi05CUDAGraphs:
         self.num_replays: Counter[str] = Counter()
 
     # ── Batch-size buckets ───────────────────────────────────────────
-    @property
-    def max_batch_size(self) -> int:
-        return self.batch_sizes[-1]
-
     def padded_batch_size(self, batch_size: int) -> int:
         """The smallest bucket that holds ``batch_size`` rows; ``batch_size``
         itself when it is larger than every bucket."""
@@ -291,6 +296,12 @@ class Pi05CUDAGraphs:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bucket = self._buckets.get(lang_tokens.shape[0])
         if bucket is None:
+            if self._buckets:
+                logger.warning_once(
+                    "π0.5 has no CUDA graph for batch size %d (captured: %s); it runs eagerly.",
+                    lang_tokens.shape[0],
+                    self.batch_sizes,
+                )
             return self._model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
         g = bucket.embed_prefix
         if not (

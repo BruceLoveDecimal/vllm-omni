@@ -292,7 +292,8 @@ class Pi05Pipeline(nn.Module):
         CLI, which takes precedence) keeps the eager baseline. Otherwise the
         optimized path is set up here, at init: the fused Triton kernels are
         enabled, and the CUDA graphs are captured over them and installed, one
-        set per batch-size bucket up to the stage's ``max_num_seqs``. A failure
+        set per batch-size bucket: ``cuda_graph_batch_sizes`` from the deploy
+        config, or by default ``batch_size_buckets(max_num_seqs)``. A failure
         of either raises rather than silently serving eagerly.
         """
         if od_config.enforce_eager:
@@ -311,7 +312,13 @@ class Pi05Pipeline(nn.Module):
                 "π0.5's optimized path needs its fused kernels. Set `enforce_eager: true` in the deploy "
                 "config, or pass --enforce-eager, to serve eagerly."
             ) from exc
-        graphs = Pi05CUDAGraphs(self.model, batch_size_buckets(od_config.max_num_seqs))
+        batch_sizes = self.config.cuda_graph_batch_sizes or batch_size_buckets(od_config.max_num_seqs)
+        if max(batch_sizes) < od_config.max_num_seqs:
+            raise ValueError(
+                f"cuda_graph_batch_sizes {batch_sizes} must cover max_num_seqs={od_config.max_num_seqs}; "
+                "a larger batch would run eagerly."
+            )
+        graphs = Pi05CUDAGraphs(self.model, batch_sizes)
         start = time.perf_counter()
         graphs.capture()
         self.model.cuda_graphs = graphs

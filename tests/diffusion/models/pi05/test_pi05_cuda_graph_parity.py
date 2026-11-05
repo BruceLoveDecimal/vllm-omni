@@ -368,17 +368,17 @@ def test_other_default_dtype_runs_eagerly(pipeline):
 
 def test_batch_size_buckets_are_bit_exact_and_match_rows_served_alone(pipeline):
     """Graphs captured per batch-size bucket (1, 2, 4): a batch of 3 is padded
-    to bucket 4 and a batch of 5 runs as buckets 4 and 1. Each equals the same
+    to bucket 4 and a batch of 4 replays it as it is. Each equals the same
     rows run eagerly at the bucket's size, bit for bit, and matches every row
     served alone at batch 1 within RFC #6867 R2's ``atol=1e-4`` in float32.
     bfloat16 is held to ``TOLERANCE`` while R2's tolerance for it is open."""
     model = pipeline.model
     graphs = Pi05CUDAGraphs(model, batch_sizes=(1, 2, 4))
     graphs.capture()
-    rows = [pipeline.processor.build_model_inputs(_robot_obs(pipeline.config, 3, seed=seed)) for seed in range(5)]
+    rows = [pipeline.processor.build_model_inputs(_robot_obs(pipeline.config, 3, seed=seed)) for seed in range(4)]
     device = rows[0][2].device
     noise = torch.randn(
-        5,
+        4,
         pipeline.config.chunk_size,
         pipeline.config.max_action_dim,
         generator=torch.Generator(device=device).manual_seed(0),
@@ -405,25 +405,25 @@ def test_batch_size_buckets_are_bit_exact_and_match_rows_served_alone(pipeline):
             _pad_rows(lang_masks, batch_size),
         )
 
-    three, five = stack_model_inputs(rows[:3]), stack_model_inputs(rows)
+    three, four = stack_model_inputs(rows[:3]), stack_model_inputs(rows)
     with _path(model, graphs=graphs, fused_kernels=True):
         replays_before = graphs.num_replays.copy()
         bucketed_three = sample(three, noise[:3])
-        bucketed_five = sample(five, noise)
-        alone = torch.cat([sample(rows[index], noise[index : index + 1]) for index in range(5)])
+        bucketed_four = sample(four, noise)
+        alone = torch.cat([sample(rows[index], noise[index : index + 1]) for index in range(4)])
         replays = graphs.num_replays - replays_before
     with _path(model, graphs=None, fused_kernels=True):
         eager_three = sample(padded(three, 4), _pad_rows(noise[:3], 4))[:3]
-        eager_five = torch.cat([sample(stack_model_inputs(rows[:4]), noise[:4]), sample(rows[4], noise[4:5])])
+        eager_four = sample(four, noise)
 
-    # Three calls at buckets 4, 4, 1 and five alone at bucket 1, 10 steps each.
-    assert replays == {"embed_prefix": 8, "prefix_forward": 8, "denoise_step": 80}
+    # Two calls at bucket 4 and four alone at bucket 1, 10 steps each.
+    assert replays == {"embed_prefix": 6, "prefix_forward": 6, "denoise_step": 60}
     assert torch.equal(bucketed_three, eager_three)
-    assert torch.equal(bucketed_five, eager_five)
-    assert torch.equal(bucketed_three, bucketed_five[:3])
+    assert torch.equal(bucketed_four, eager_four)
+    assert torch.equal(bucketed_three, bucketed_four[:3])
 
     max_rel, max_abs = (1e-4, 1e-4) if pipeline._torch_dtype == torch.float32 else TOLERANCE[torch.bfloat16]
-    for name, batched in (("3", bucketed_three), ("5", bucketed_five)):
+    for name, batched in (("3", bucketed_three), ("4", bucketed_four)):
         reference = alone[: batched.shape[0]].double()
         rel = ((batched.double() - reference).norm() / reference.norm()).item()
         abs_diff = (batched.double() - reference).abs().max().item()
