@@ -241,3 +241,84 @@ CPU contract tests cover:
 GPU validation must additionally exercise real model loading, action input,
 prompt switching, rolling-window replacement, reset, close, finite output
 latents, and exact metadata/request identity.
+
+## Experimental Deep Forcing for LingBot World
+
+LingBot accepts an opt-in `model_config.deep_forcing` mapping for the two
+mechanisms of [Deep Forcing](https://arxiv.org/html/2512.05081v1): Deep Sink
+temporal RoPE rebasing and Participative Compression (PC). Omitting the mapping
+preserves the native LingBot sink and paged/direct cache paths. All units are
+latent frames.
+
+LingBot already retains a deep attention sink natively: 9 of its 18 window
+frames, inside the 40–60% range the paper recommends. Deep Forcing therefore
+does not add a second sink-retention control. The mapping inherits the model's
+`sink_size` and sliding window, rejects `sink_frames` and `window_frames`, and
+only enables what the paper adds on top of sink retention:
+
+| Mechanism | Key | Effect |
+| --- | --- | --- |
+| Deep Sink rebasing | `rebase_sink: true` | Rotate sink keys' temporal phase to sit right before attended history |
+| Participative Compression | `pc_budget_frames: N` | When the window would evict, keep sink, recent and the top-scoring history within `N` frames |
+| PC rebasing | `rebase_pc: true` | Pack the PC-selected history into consecutive frames before the recent region |
+
+A mapping that enables neither `rebase_sink` nor `pc_budget_frames` is rejected:
+native sink attention needs no mapping. The paper's Self-Forcing setting keeps
+a 10-frame sink, a 16-frame budget and 4 recent frames in a 21-frame window.
+Scaled to LingBot's 9-frame sink and 18-frame window:
+
+```yaml
+model_config:
+  deep_forcing:
+    rebase_sink: true
+    pc_budget_frames: 15  # sink 9 + recent 4 + 2 frames of selected history
+    pc_recent_frames: 4   # default; includes the 3-frame current chunk
+    rebase_pc: true
+```
+
+Configuration is validated at model load against the 3-frame chunk:
+`sink + pc_recent_frames <= pc_budget_frames < window`, the recent region must
+cover the current chunk, and the window must fit the sink and one chunk.
+
+### Deep Sink
+
+Keys keep their original temporal RoPE phase in storage; each attention view
+rotates only the temporal channels of the sink keys. The shifted sink ends
+right before the earliest attended non-sink frame: the recent tail for the
+sliding window, the packed PC history with `rebase_pc`, or the oldest retained
+PC token without it. The shifted sink therefore never shares a temporal phase
+with attended history. Before the window first fills there is no gap and no
+shift. The paper's Eq. 5 overlaps the sink's last frame with the tail's first
+frame by one frame, and the released code keeps the gap present at the first
+eviction (one chunk); these placements differ by a constant of one to three
+frames.
+
+### Participative Compression
+
+PC runs exactly where the native window would evict a chunk: history plus the
+current chunk no longer fit in the window. The full window is used before that.
+Candidates are history frames outside the sink and the protected recent frames
+(`pc_recent_frames` including the current chunk). They are ranked by the sum
+of raw QK logits over the recent queries and all heads, independently per
+layer. The recent queries are the clean queries of the latest committed frames
+plus the current chunk's queries at its first denoising step, as in the
+released code. The selection is made once per chunk, reused for the remaining
+denoising steps and the clean commit, and kept only on successful publication.
+With LingBot's geometry and the example above, attention spans 18 frames when
+the window is full and 15 right after compression.
+
+`rebase_pc` packs the selected tokens into consecutive virtual frames ending at
+the recent region. The released code instead shifts the whole selected block
+by one uniform delta per chunk; the paper does not pin down the target
+positions.
+
+Only single-rank, single-sequence eager attention with clean-x0 KV commits is
+supported. First-block sharing and last-denoise-step KV reuse are rejected. The
+session reservation includes history, pending commits, query history, frozen
+selection indices and layer-local rotation and scoring scratch; a minimum
+legacy pool remains allocated for runtime geometry. CPU tests check rotation
+against complex arithmetic and LingBot's RoPE layout, dense attention oracles
+for every flag combination, phase separation of the shifted sink, PC timing,
+selection reuse and transactional rollback, and real LingBot attention and
+transformer integration. They are not evidence of video quality or GPU latency.
+This branch does not include WorldKV retrieval or the CausVid integration.

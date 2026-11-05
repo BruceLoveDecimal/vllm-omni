@@ -63,8 +63,11 @@ def test_pc_selection_frozen_across_denoising_and_bounded_on_long_rollouts():
     for start in range(0, 80, 2):
         run_pc_chunk(memory, start)
         assert memory.next_frame == start + 2
-        if start >= 4:
-            assert all(r.positions.numel() <= 12 for r in memory.history)
+        # The window (8 frames) is used in full; PC compresses to the 6-frame
+        # budget only when the next chunk would overflow it.
+        assert all(r.positions.numel() <= 16 for r in memory.history)
+        if start >= 8:
+            assert all(r.positions.numel() >= 12 for r in memory.history)
         for r in memory.history:
             assert r.positions[:4].tolist() == [0, 0, 1, 1]
             assert r.positions[-4:].tolist() == [start, start, start + 1, start + 1]
@@ -114,25 +117,25 @@ def test_invalid_compression_config(config):
 
 def test_pc_freezes_only_indices_and_preserves_history_on_failure():
     memory = pc_state()
-    for start in (0, 2, 4):
+    for start in (0, 2, 4, 6):
         run_pc_chunk(memory, start)
     original = memory.history
-    with memory.forward(6, 2, commit=False):
+    with memory.forward(8, 2, commit=False):
         for layer in range(2):
-            memory.assemble(layer, raw(6), raw(6), raw(6))
-    assert memory.history is original
+            memory.assemble(layer, raw(8), raw(8), raw(8))
+    assert memory.history is original and memory._selection
     for indices in memory._selection.values():
         assert isinstance(indices, torch.Tensor)
         assert indices.dtype == torch.int64 and indices.ndim == 1
         assert indices.untyped_storage().nbytes() == indices.numel() * 8
     selection = dict(memory._selection)
     with pytest.raises(RuntimeError, match="head failure"):
-        with memory.forward(6, 2, commit=True):
+        with memory.forward(8, 2, commit=True):
             for layer in range(2):
-                memory.assemble(layer, raw(6), raw(6), raw(6))
+                memory.assemble(layer, raw(8), raw(8), raw(8))
             raise RuntimeError("head failure")
-    assert memory.history is original and memory.next_frame == 6
+    assert memory.history is original and memory.next_frame == 8
     assert all(memory._selection[i] is index for i, index in selection.items())
-    run_pc_chunk(memory, 6)
+    run_pc_chunk(memory, 8)
     assert not memory._selection
     assert all(row.key.shape[1] == 12 for row in memory.history)

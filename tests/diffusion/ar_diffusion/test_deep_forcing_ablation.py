@@ -124,8 +124,13 @@ def test_attention_matches_explicit_virtual_positions_and_keeps_canonical_keys(s
                 recent = rows.positions >= start
                 middle = ~sink & ~recent
                 middle_frames = (int(middle.sum()) + 1) // 2 if pc_rebase else 0
-                sink_shift = max(0, start - middle_frames - 2) if sink_rebase else 0
                 target = start - middle_frames + torch.arange(int(middle.sum())) // 2
+                # The sink ends right before the earliest attended non-sink frame.
+                if pc_rebase and middle.any():
+                    first = int(target[0])
+                else:
+                    first = int(rows.positions[~sink][0])
+                sink_shift = max(0, first - 2) if sink_rebase else 0
                 expected_k = torch.cat(
                     (
                         absolute_keys(rows.key[:, sink], torch.full_like(rows.positions[sink], sink_shift)),
@@ -145,3 +150,60 @@ def test_attention_matches_explicit_virtual_positions_and_keeps_canonical_keys(s
                 assert torch.equal(old, memory.history[layer].key)
         append(memory, start)
     assert checked > 0
+
+
+def lingbot_like(**kwargs):
+    # LingBot's native 18-frame window and 9-frame sink, with 3-frame chunks.
+    config = df.DeepForcingConfig.parse(kwargs, window_frames=18, sink_frames=9, chunk_frames=3)
+    return df.DeepForcing(config, num_layers=1, tokens_per_frame=1, temporal_dim=4)
+
+
+@pytest.mark.parametrize("pc,pc_rebase", [(False, False), (True, False), (True, True)])
+def test_shifted_sink_never_shares_a_phase_with_attended_history(monkeypatch, pc, pc_rebase):
+    settings = {"rebase_sink": True, "rebase_pc": pc_rebase}
+    if pc:
+        settings["pc_budget_frames"] = 15
+    memory = lingbot_like(**settings)
+    rotated = []
+    original = df.rebase_temporal_keys
+    monkeypatch.setattr(df, "rebase_temporal_keys", lambda k, d, t: (rotated.append(d.clone()), original(k, d, t))[1])
+    shifted = 0
+    for start in range(0, 90, 3):
+        with memory.forward(start, 3, commit=True):
+            x = torch.randn(1, 3, 1, 8, dtype=torch.float64)
+            memory.assemble(0, x, x, x)
+            rows = memory._previous(0)
+        if rows is None:
+            continue
+        if not pc:
+            # The sliding window attends to the sink and the recent tail only.
+            tail_start = max(9, start + 3 - 18 + 9)
+            rows = rows.select(torch.where((rows.positions < 9) | (rows.positions >= tail_start))[0])
+        delta = rotated.pop()
+        # Only the sink (and PC-rebased middle history) is rotated.
+        sink_count = int((rows.positions < 9).sum())
+        assert delta.numel() >= sink_count and (pc_rebase or delta.numel() == sink_count)
+        virtual = rows.positions.clone()
+        virtual[: delta.numel()] += delta
+        sink, rest = virtual[:sink_count], virtual[sink_count:]
+        upper = rest.min() if rest.numel() else torch.tensor(start)
+        assert int(sink.max()) < int(upper), (start, sink.tolist(), rest.tolist())
+        # Contiguous: the sink ends right before the earliest attended frame.
+        assert int(sink.max()) + 1 == int(upper)
+        shifted += int(delta[0] > 0)
+        if not pc or pc_rebase:
+            assert torch.equal(rest, rest.sort().values)
+    assert shifted > 0
+
+
+def test_pc_uses_the_full_window_and_compresses_only_on_overflow():
+    memory = lingbot_like(pc_budget_frames=15)
+    lengths = []
+    for start in range(0, 36, 3):
+        with memory.forward(start, 3, commit=True):
+            x = torch.randn(1, 3, 1, 8)
+            key, _ = memory.assemble(0, x, x, x)
+            lengths.append(key.shape[1])
+    # Native attention grows to the 18-frame window; PC then keeps the
+    # 15-frame budget where the native window would evict a chunk.
+    assert lengths == [3, 6, 9, 12, 15, 18, 15, 18, 15, 18, 15, 18]

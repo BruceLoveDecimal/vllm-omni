@@ -632,10 +632,8 @@ class LingBotWorldCausalDMDPipeline(
         if isinstance(first_block_limit, bool) or not isinstance(first_block_limit, int) or first_block_limit <= 0:
             raise ValueError("model_config.lingbot_first_block_kv_cpu_limit_bytes must be a positive integer.")
         self._first_block_kv_cpu_limit_bytes = first_block_limit if share_first_block else 0
-        from vllm_omni.experimental.ar_diffusion.deep_forcing import DeepForcingConfig
-
-        self._deep_forcing_config = DeepForcingConfig.parse(model_config.get("deep_forcing"))
-        if self._deep_forcing_config is not None:
+        deep_forcing_value = model_config.get("deep_forcing")
+        if deep_forcing_value is not None:
             if not od_config.enforce_eager or reuse_last_step_kv or share_first_block:
                 raise ValueError("deep_forcing requires eager clean commits without first-block sharing")
             if any(
@@ -705,6 +703,17 @@ class LingBotWorldCausalDMDPipeline(
             prefix="transformer",
         )
 
+        from vllm_omni.experimental.ar_diffusion.deep_forcing import DeepForcingConfig
+
+        native = self.transformer.config
+        self._deep_forcing_config = DeepForcingConfig.parse(
+            deep_forcing_value,
+            window_frames=(
+                int(native.local_attn_size) if native.local_attn_size != -1 else int(native.sliding_window_num_frames)
+            ),
+            sink_frames=int(native.sink_size),
+            chunk_frames=int(native.num_frames_per_block),
+        )
         self.transformer.deep_forcing_config = self._deep_forcing_config
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)

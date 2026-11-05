@@ -3,9 +3,9 @@
 """Deep Forcing sink rebasing and participative compression for eager LingBot inference.
 
 Deep Sink temporal rebasing and Participative Compression (PC) are independent
-opt-in policies. Keys in storage always retain their original temporal phase.
-Attention views may rebase that phase, but never write it back into canonical
-history.
+opt-in policies layered on the model's native sink and sliding window. Keys in
+storage always retain their original temporal phase. Attention views may rebase
+that phase, but never write it back into canonical history.
 """
 
 from __future__ import annotations
@@ -20,11 +20,13 @@ import torch
 
 @dataclass(frozen=True)
 class DeepForcingConfig:
+    # window_frames and sink_frames mirror the model's native sliding window
+    # and attention sink; parse() fills them and users cannot set them.
     window_frames: int = 18
     sink_frames: int = 0
     rebase_sink: bool = False
     pc_budget_frames: int = 0
-    pc_recent_frames: int = 3
+    pc_recent_frames: int = 4
     rebase_pc: bool = False
 
     def __post_init__(self) -> None:
@@ -45,14 +47,42 @@ class DeepForcingConfig:
                 raise ValueError(f"deep_forcing.{name} requires positive {dependency}")
 
     @classmethod
-    def parse(cls, value: Mapping[str, object] | None) -> DeepForcingConfig | None:
+    def parse(
+        cls,
+        value: Mapping[str, object] | None,
+        *,
+        window_frames: int,
+        sink_frames: int,
+        chunk_frames: int,
+    ) -> DeepForcingConfig | None:
+        """Layer the opt-in mechanisms on the model's native sink and window.
+
+        Sink retention already exists natively, so the mapping cannot resize
+        it; it only enables what Deep Forcing adds: sink rebasing and PC.
+        """
         if value is None:
             return None
         if not isinstance(value, Mapping):
             raise ValueError("model_config.deep_forcing must be a mapping")
+        native = sorted({"window_frames", "sink_frames"} & set(value))
+        if native:
+            raise ValueError(f"deep_forcing uses the model's native sink and window; remove {native}")
         # Dataclass construction rejects unknown keys; __post_init__ validates
         # each untyped configuration value before it reaches model execution.
-        return cls(**value)  # type: ignore[arg-type]
+        config = cls(window_frames=window_frames, sink_frames=sink_frames, **value)  # type: ignore[arg-type]
+        if not config.rebase_sink and not config.pc_budget_frames:
+            raise ValueError(
+                "deep_forcing must enable rebase_sink or pc_budget_frames; omit it for native sink attention"
+            )
+        config.validate_chunk_frames(chunk_frames)
+        return config
+
+    def validate_chunk_frames(self, chunk_frames: int) -> None:
+        """Reject chunk geometry that could only fail at run time."""
+        if self.sink_frames + chunk_frames > self.window_frames:
+            raise ValueError("Deep Forcing must fit sink and the complete current chunk")
+        if self.pc_budget_frames and self.pc_recent_frames < chunk_frames:
+            raise ValueError("PC recent frames must protect the complete current chunk")
 
     def reservation_bytes(
         self,
@@ -71,16 +101,11 @@ class DeepForcingConfig:
         chunk = chunk_frames if chunk_frames is not None else self.window_frames - self.sink_frames
         if self.pc_budget_frames:
             chunk = min(chunk, self.pc_recent_frames)
-        capacity = self.window_frames
-        history = capacity
-        publication = 2 * capacity
-        if self.pc_budget_frames:
-            history = capacity - 1
-            # At saturation PC publishes its smaller budget; otherwise the
-            # joined history is strictly below capacity. An unspecified chunk
-            # size must also cover one-frame forwards.
-            smallest_chunk = chunk if chunk_frames is not None else 1
-            publication = max(2 * capacity - smallest_chunk - 2, history + self.pc_budget_frames)
+        # History never exceeds the window: PC compresses exactly when the
+        # native window would evict. Publication briefly holds the old and the
+        # replacement history together.
+        history = self.window_frames
+        publication = 2 * history
         kv = 2 * heads * dim * itemsize
         row = kv + 16
         noisy_or_clean = layers * tokens_per_frame * (history + chunk) * row
@@ -181,10 +206,7 @@ class DeepForcing:
             raise RuntimeError("Deep Forcing is closed or already in a forward")
         if start_frame != self.next_frame or frames <= 0:
             raise ValueError("Deep Forcing chunks must be contiguous and nonempty")
-        if frames + self.config.sink_frames > self.config.window_frames:
-            raise ValueError("Deep Forcing must fit sink and the complete current chunk")
-        if self.config.pc_budget_frames and self.config.pc_recent_frames < frames:
-            raise ValueError("PC recent frames must protect the complete current chunk")
+        self.config.validate_chunk_frames(frames)
         original_selection = dict(self._selection)
         success = False
         self._active = True
@@ -277,10 +299,12 @@ class DeepForcing:
             self._pending_queries[layer] = query.detach().clone()
         if previous is None:
             return key, value
+        # PC replaces eviction: it runs only when the full window cannot hold
+        # history plus the current chunk, like the reference implementation.
         if (
             self.config.pc_budget_frames
             and layer not in self._selection
-            and previous.positions.numel() + key.shape[1] >= self.config.window_frames * self.tokens_per_frame
+            and previous.positions.numel() + key.shape[1] > self.config.window_frames * self.tokens_per_frame
         ):
             older_queries = self._query_history.get(layer)
             recent_queries = query if older_queries is None else torch.cat((older_queries, query), 1)
@@ -306,25 +330,34 @@ class DeepForcing:
         else:
             keep = sink | (previous.positions >= tail_start)
         rows = previous if self.config.pc_budget_frames else previous.select(torch.where(keep)[0])
-        middle_frames = 0
-        if self.config.rebase_sink or self.config.rebase_pc:
-            delta = torch.zeros_like(rows.positions)
-            if self.config.rebase_pc:
-                middle = torch.where((rows.positions >= self.config.sink_frames) & (rows.positions < tail_start))[0]
-                middle_frames = math.ceil(middle.numel() / self.tokens_per_frame)
-                target = (
-                    tail_start
-                    - middle_frames
-                    + torch.arange(middle.numel(), device=key.device) // self.tokens_per_frame
-                )
-                delta[middle] = target - rows.positions[middle]
-            if self.config.rebase_sink:
-                sink_shift = max(0, tail_start - middle_frames - self.config.sink_frames)
-                delta = torch.where(rows.positions < self.config.sink_frames, sink_shift, delta)
-            history_key = rebase_temporal_keys(rows.key, delta, self.temporal_dim)
-        else:
-            history_key = rows.key
-        return torch.cat((history_key, key), 1), torch.cat((rows.value, value), 1)
+        if not self.config.rebase_sink and not self.config.rebase_pc:
+            return torch.cat((rows.key, key), 1), torch.cat((rows.value, value), 1)
+        # Rows are chronological: sink, then middle (PC-selected) history, then
+        # recent frames. Only the sink and middle prefix can be rebased.
+        sink_count = int((rows.positions < self.config.sink_frames).sum())
+        rebased = sink_count
+        delta = torch.zeros(rows.positions.numel(), dtype=rows.positions.dtype, device=rows.positions.device)
+        if self.config.rebase_pc:
+            rebased = int((rows.positions < tail_start).sum())
+            middle_count = rebased - sink_count
+            middle_frames = math.ceil(middle_count / self.tokens_per_frame)
+            target = tail_start - middle_frames + torch.arange(middle_count, device=key.device) // self.tokens_per_frame
+            delta[sink_count:rebased] = target - rows.positions[sink_count:rebased]
+        if self.config.rebase_sink:
+            # Place the sink right before the earliest attended non-sink frame,
+            # after PC rebasing when enabled. Anchoring on that frame, not on
+            # the recent region, keeps un-rebased PC history from sharing the
+            # shifted sink's temporal phase.
+            if sink_count < rows.positions.numel():
+                first = int(rows.positions[sink_count] + delta[sink_count])
+            else:
+                first = self.next_frame
+            delta[:sink_count] = max(0, first - self.config.sink_frames)
+        prefix = rebase_temporal_keys(rows.key[:, :rebased], delta[:rebased], self.temporal_dim)
+        return (
+            torch.cat((prefix, rows.key[:, rebased:], key), 1),
+            torch.cat((rows.value, value), 1),
+        )
 
     def close(self) -> None:
         self.history = [None] * self.num_layers

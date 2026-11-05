@@ -296,25 +296,55 @@ def test_publication_concatenates_only_retained_slices(monkeypatch, start):
     assert result.key.untyped_storage().nbytes() == result.key.numel() * result.key.element_size()
 
 
-def test_empty_policy_disables_all_optional_mechanisms():
-    assert df.DeepForcingConfig.parse(None) is None
-    config = df.DeepForcingConfig.parse({})
-    assert config == df.DeepForcingConfig()
-    assert config.sink_frames == config.pc_budget_frames == 0
-    assert not config.rebase_sink and not config.rebase_pc
+# LingBot's native geometry: 18-frame window, 9-frame sink, 3-frame chunks.
+NATIVE = {"window_frames": 18, "sink_frames": 9, "chunk_frames": 3}
+
+
+def test_mapping_layers_mechanisms_on_native_sink_and_window():
+    assert df.DeepForcingConfig.parse(None, **NATIVE) is None
+    config = df.DeepForcingConfig.parse({"rebase_sink": True}, **NATIVE)
+    assert config == df.DeepForcingConfig(window_frames=18, sink_frames=9, rebase_sink=True)
+    assert config.pc_budget_frames == 0 and not config.rebase_pc
+    pc = df.DeepForcingConfig.parse({"pc_budget_frames": 15}, **NATIVE)
+    assert (pc.sink_frames, pc.pc_recent_frames, pc.rebase_sink) == (9, 4, False)
+
+
+def test_mapping_without_a_mechanism_is_rejected():
+    # Native sink attention needs no opt-in mapping; an empty one would only
+    # duplicate it through a second cache implementation.
+    with pytest.raises(ValueError, match="omit it for native sink attention"):
+        df.DeepForcingConfig.parse({}, **NATIVE)
+
+
+@pytest.mark.parametrize("name", ["window_frames", "sink_frames"])
+def test_native_sink_and_window_cannot_be_overridden(name):
+    with pytest.raises(ValueError, match="native sink and window"):
+        df.DeepForcingConfig.parse({name: 3, "rebase_sink": True}, **NATIVE)
 
 
 @pytest.mark.parametrize("name", ["retrieval_frames", "bank_bytes", "world_keep_ratio", "rebase_retrieval"])
 def test_worldkv_keys_are_rejected(name):
     with pytest.raises(TypeError, match=name):
-        df.DeepForcingConfig.parse({name: 1})
+        df.DeepForcingConfig.parse({name: 1}, **NATIVE)
+
+
+@pytest.mark.parametrize(
+    "value,chunk,match",
+    [
+        ({"rebase_sink": True}, 10, "complete current chunk"),
+        ({"pc_budget_frames": 15, "pc_recent_frames": 2}, 3, "protect the complete current chunk"),
+    ],
+)
+def test_parse_rejects_chunk_geometry_before_execution(value, chunk, match):
+    with pytest.raises(ValueError, match=match):
+        df.DeepForcingConfig.parse(value, **{**NATIVE, "chunk_frames": chunk})
 
 
 @pytest.mark.parametrize("flag", ["rebase_sink", "rebase_pc"])
 @pytest.mark.parametrize("value", [1, "true", None])
 def test_rebase_flags_require_booleans(flag, value):
     with pytest.raises(ValueError, match="must be a bool"):
-        df.DeepForcingConfig.parse({flag: value})
+        df.DeepForcingConfig.parse({flag: value, "pc_budget_frames": 15}, **NATIVE)
 
 
 @pytest.mark.parametrize(
@@ -323,10 +353,10 @@ def test_rebase_flags_require_booleans(flag, value):
 )
 def test_optional_mechanisms_do_not_implicitly_enable_dependencies(settings, dependency):
     with pytest.raises(ValueError, match=dependency):
-        df.DeepForcingConfig.parse(settings)
+        df.DeepForcingConfig(**settings)
 
 
 @pytest.mark.parametrize("settings", [{"sink_frames": 3}, {"pc_budget_frames": 12}])
 def test_enabling_selection_does_not_enable_rebasing(settings):
-    config = df.DeepForcingConfig.parse(settings)
+    config = df.DeepForcingConfig(**settings)
     assert not config.rebase_sink and not config.rebase_pc
