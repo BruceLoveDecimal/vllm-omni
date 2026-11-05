@@ -71,6 +71,7 @@ from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload_strategy,
 )
+from vllm_omni.diffusion.offloader.sequential_backend import sequential_offload_component
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -631,6 +632,22 @@ class LingBotWorldCausalDMDPipeline(
         if isinstance(first_block_limit, bool) or not isinstance(first_block_limit, int) or first_block_limit <= 0:
             raise ValueError("model_config.lingbot_first_block_kv_cpu_limit_bytes must be a positive integer.")
         self._first_block_kv_cpu_limit_bytes = first_block_limit if share_first_block else 0
+        from vllm_omni.experimental.ar_diffusion.deep_forcing import DeepForcingConfig
+
+        self._deep_forcing_config = DeepForcingConfig.parse(model_config.get("deep_forcing"))
+        if self._deep_forcing_config is not None:
+            if not od_config.enforce_eager or reuse_last_step_kv or share_first_block:
+                raise ValueError("deep_forcing requires eager clean commits without first-block sharing")
+            if any(
+                getattr(parallel_config, name, 1) != 1
+                for name in (
+                    "tensor_parallel_size",
+                    "ulysses_degree",
+                    "ring_degree",
+                    "pipeline_parallel_size",
+                )
+            ):
+                raise ValueError("deep_forcing currently requires single-rank attention")
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
@@ -687,6 +704,8 @@ class LingBotWorldCausalDMDPipeline(
             quant_config=getattr(od_config, "quantization_config", None),
             prefix="transformer",
         )
+
+        self.transformer.deep_forcing_config = self._deep_forcing_config
 
         scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_files_only)
         _validate_scheduler_config(scheduler_config)
@@ -800,6 +819,20 @@ class LingBotWorldCausalDMDPipeline(
             * int(self.transformer.config.attention_head_dim)
             * element_size
         )
+        memory_config = getattr(self, "_deep_forcing_config", None)
+        memory_bytes = 0
+        if memory_config is not None:
+            memory_bytes = memory_config.reservation_bytes(
+                int(self.transformer.config.num_layers),
+                tokens_per_frame,
+                int(self.transformer.blocks[0].self_attn.num_sp_heads),
+                int(self.transformer.config.attention_head_dim),
+                element_size,
+                chunk_frames=condition_latent_frames,
+            )
+            # Policy memory owns history; the legacy pool retains only its
+            # minimum geometry and never receives duplicate self-KV writes.
+            sink_frames, recent_window_frames = 0, 1
         return ARDiffusionKVCacheSpec(
             num_layers=int(self.transformer.config.num_layers),
             num_kv_heads=int(self.transformer.blocks[0].self_attn.num_sp_heads),
@@ -820,7 +853,8 @@ class LingBotWorldCausalDMDPipeline(
                 ),
             ),
             model_owned_state_bytes_per_session=(
-                condition_bytes_per_session
+                memory_bytes
+                + condition_bytes_per_session
                 + camera_bytes_per_session
                 + 2 * self._condition_encoder_cache_bytes()  # Committed and in-flight histories.
                 + self._streaming_decode_bytes_per_session()
@@ -1406,17 +1440,25 @@ class LingBotWorldCausalDMDPipeline(
         layers = scope.lookup(identity)
         if layers is None:
             ticket = scope.begin_build(identity)
-            projected_text = self.transformer.text_embedding(prompt_embeds)
+            # These projections bypass transformer.forward and its offload
+            # hook. Keep weights resident until the lazy K/V iterator finishes.
+            component = (
+                sequential_offload_component(self.transformer)
+                if resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
+                else nullcontext()
+            )
+            with component:
+                projected_text = self.transformer.text_embedding(prompt_embeds)
 
-            def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-                for block in self.transformer.blocks:
-                    cross_attention = block.cross_attn
-                    shape = (cross_attention.num_local_heads, cross_attention.head_dim)
-                    key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
-                    value = cross_attention.v(projected_text).unflatten(2, shape)
-                    yield key, value
+                def layer_kv() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+                    for block in self.transformer.blocks:
+                        cross_attention = block.cross_attn
+                        shape = (cross_attention.num_local_heads, cross_attention.head_dim)
+                        key = cross_attention.norm_k(cross_attention.k(projected_text)).unflatten(2, shape)
+                        value = cross_attention.v(projected_text).unflatten(2, shape)
+                        yield key, value
 
-            scope.publish(ticket, layer_kv())
+                scope.publish(ticket, layer_kv())
             layers = scope.lookup(identity)
             assert layers is not None
         return [

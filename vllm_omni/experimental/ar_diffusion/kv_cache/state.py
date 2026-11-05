@@ -20,6 +20,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSegmentedKVState
 
 if TYPE_CHECKING:
+    from vllm_omni.experimental.ar_diffusion.deep_forcing import DeepForcing, DeepForcingConfig
     from vllm_omni.experimental.ar_diffusion.kv_cache.manager import (
         ARDiffusionKVCache,
         ARDiffusionRequestAdapter,
@@ -59,7 +60,27 @@ class ARDiffusionKVState:
         self._paged_pending: dict[str, ARDiffusionPagedForwardContext | None] = dict.fromkeys(expected)
         self._closed = False
         self._segments: dict[str, ARDiffusionSegmentedKVState] = {}
+        self._deep_forcing_memories: dict[str, DeepForcing] = {}
         self.conditioning_kv = ConditioningKVScope(kv_cache, session_id, num_layers)
+
+    def deep_forcing(
+        self, kv_branch: str, config: DeepForcingConfig, *, tokens_per_frame: int, temporal_dim: int
+    ) -> DeepForcing:
+        """Return runner-owned policy memory; its capacity is reserved by the model spec."""
+        from vllm_omni.experimental.ar_diffusion.deep_forcing import DeepForcing
+
+        self.adapter(kv_branch)
+        if kv_branch not in self._deep_forcing_memories:
+            self._deep_forcing_memories[kv_branch] = DeepForcing(
+                config,
+                num_layers=self.num_layers,
+                tokens_per_frame=tokens_per_frame,
+                temporal_dim=temporal_dim,
+            )
+        memory = self._deep_forcing_memories[kv_branch]
+        if (memory.config, memory.tokens_per_frame, memory.temporal_dim) != (config, tokens_per_frame, temporal_dim):
+            raise ValueError("Deep Forcing configuration cannot change within a session")
+        return memory
 
     def segmented(self, kv_branch: str) -> ARDiffusionSegmentedKVState:
         """Return this branch's runner-owned exact-token segment state."""
@@ -257,6 +278,9 @@ class ARDiffusionKVState:
         """Release all self- and cross-attention storage owned by this session."""
         if self._closed:
             return
+        for memory in self._deep_forcing_memories.values():
+            memory.close()
+        self._deep_forcing_memories.clear()
         for segments in self._segments.values():
             segments.close()
         self._segments.clear()
@@ -284,6 +308,9 @@ class ARDiffusionKVState:
         if unknown:
             raise KeyError(f"Unknown AR-Diffusion cross-attention caches to keep: {sorted(unknown)}")
         request_ids = {kv_branch: adapter.request_id for kv_branch, adapter in self.adapters.items()}
+        for memory in self._deep_forcing_memories.values():
+            memory.close()
+        self._deep_forcing_memories.clear()
         if keep_cross_attention:
             for segments in self._segments.values():
                 segments.close()
