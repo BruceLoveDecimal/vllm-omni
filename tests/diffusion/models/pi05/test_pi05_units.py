@@ -37,7 +37,7 @@ from vllm_omni.diffusion.models.pi05.config import (
     load_lerobot_norm_stats,
     resolve_excluded_action_indices,
 )
-from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
+from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs, batch_size_buckets
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
     GemmaVariantConfig,
     Pi05AdaRMSNorm,
@@ -436,9 +436,11 @@ def test_pipeline_installs_cuda_graphs_unless_enforce_eager(enforce_eager, devic
     events: list[str] = []
     pipeline = _graph_install_pipeline(device, events, monkeypatch)
 
-    pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=enforce_eager))
+    pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=enforce_eager, max_num_seqs=4))
 
     assert isinstance(pipeline.model.cuda_graphs, Pi05CUDAGraphs) is installed
+    if installed:
+        assert pipeline.model.cuda_graphs.batch_sizes == (1, 2, 4)
     assert events == (["enable_fused_kernels", "capture"] if installed else [])
 
 
@@ -451,7 +453,7 @@ def test_pipeline_fails_when_the_fused_kernels_cannot_run(monkeypatch):
     pipeline = _graph_install_pipeline("cuda", events, monkeypatch, fused_kernels_error=RuntimeError("no Triton"))
 
     with pytest.raises(RuntimeError, match="enforce_eager") as excinfo:
-        pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False))
+        pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False, max_num_seqs=1))
     assert "no Triton" in str(excinfo.value.__cause__)
     assert events == []
     assert pipeline.model.cuda_graphs is None
@@ -971,6 +973,99 @@ def test_sample_actions_routes_each_region_through_cuda_graphs(tiny_model):
 
     assert graphs.calls == ["embed_prefix", "prefix_forward"] + ["denoise_step"] * 3
     assert torch.equal(optimized, eager)
+
+
+@pytest.mark.parametrize(
+    "max_batch_size,expected",
+    [(1, (1,)), (2, (1, 2)), (4, (1, 2, 4)), (6, (1, 2, 4, 6)), (32, (1, 2, 4, 8, 16, 32))],
+)
+def test_batch_size_buckets_are_powers_of_two_up_to_the_max(max_batch_size, expected):
+    assert batch_size_buckets(max_batch_size) == expected
+
+
+def test_batch_size_buckets_reject_an_empty_batch():
+    with pytest.raises(ValueError, match="at least 1"):
+        batch_size_buckets(0)
+
+
+def test_padded_batch_size_is_the_smallest_bucket_that_holds_the_batch():
+    graphs = Pi05CUDAGraphs(_tiny_pi05_model(), batch_sizes=(4, 1, 2))
+    assert graphs.batch_sizes == (1, 2, 4)
+    assert graphs.max_batch_size == 4
+    assert [graphs.padded_batch_size(size) for size in (1, 2, 3, 4, 5)] == [1, 2, 4, 4, 5]
+    # Nothing is captured until ``capture``.
+    assert graphs.kv_cache(4) is None
+
+
+@pytest.mark.parametrize("num_kv_heads,num_kv_groups", [(1, 8), (2, 4), (4, 1)])
+@pytest.mark.parametrize("q_len,kv_len", [(5, 5), (3, 7)])
+def test_attend_matches_attention_over_repeated_kv(num_kv_heads, num_kv_groups, q_len, kv_len):
+    """Folding each KV head's query heads into the row axis computes the same
+    attention as repeating the KV heads to the query head count."""
+    generator = torch.Generator().manual_seed(0)
+    batch, head_dim = 2, 16
+    num_heads = num_kv_heads * num_kv_groups
+    # Strided like the layers' ``.transpose(1, 2)`` projections.
+    q = torch.randn(batch, q_len, num_heads, head_dim, generator=generator).transpose(1, 2)
+    k = torch.randn(batch, num_kv_heads, kv_len, head_dim, generator=generator)
+    v = torch.randn(batch, num_kv_heads, kv_len, head_dim, generator=generator)
+    mask = torch.where(torch.rand(batch, 1, q_len, kv_len + 2, generator=generator) < 0.3, -1e9, 0.0)
+    mask[..., 0] = 0.0
+    scaling = head_dim**-0.5
+
+    actual = modeling_pi05._attend(q, k, v, mask, num_kv_groups=num_kv_groups, scaling=scaling)
+
+    k_rep = k.repeat_interleave(num_kv_groups, dim=1)
+    v_rep = v.repeat_interleave(num_kv_groups, dim=1)
+    weights = torch.softmax(q @ k_rep.transpose(2, 3) * scaling + mask[..., :kv_len], dim=-1)
+    torch.testing.assert_close(actual, weights @ v_rep, rtol=1e-5, atol=1e-6)
+
+
+class _BatchSizeRecordingCUDAGraphs(Pi05CUDAGraphs):
+    """Records the batch size each ``sample_actions`` call embeds."""
+
+    def __init__(self, model, batch_sizes):
+        super().__init__(model, batch_sizes)
+        self.embedded_batch_sizes: list[int] = []
+
+    def embed_prefix(self, images, image_masks, lang_tokens, lang_masks):
+        self.embedded_batch_sizes.append(lang_tokens.shape[0])
+        return super().embed_prefix(images, image_masks, lang_tokens, lang_masks)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("batch_size,expected_calls", [(3, [4]), (4, [4]), (5, [4, 1]), (10, [4, 4, 2])])
+def test_sample_actions_pads_to_a_bucket_and_splits_past_the_largest(tiny_model, batch_size, expected_calls):
+    """With graphs installed, a batch runs at bucket sizes only: padded up to
+    the smallest bucket that holds it, split into the largest bucket first.
+    Every row still gets its own chunk. Nothing is captured here, so every
+    region falls back to eager at the bucket's size."""
+    model = tiny_model.eval()
+    generator = torch.Generator().manual_seed(7)
+    images = [torch.randn(batch_size, 3, 224, 224, generator=generator) for _ in range(3)]
+    masks = [torch.ones(batch_size, dtype=torch.bool), torch.rand(batch_size, generator=generator) < 0.5]
+    masks.append(torch.zeros(batch_size, dtype=torch.bool))
+    lang = torch.randint(0, 100, (batch_size, 200), generator=generator)
+    lang_mask = torch.arange(200)[None] < torch.randint(5, 200, (batch_size, 1), generator=generator)
+    noise = torch.randn(batch_size, 4, 8, generator=generator)
+
+    def run():
+        return model.sample_actions(
+            images=images, image_masks=masks, lang_tokens=lang, lang_masks=lang_mask, noise=noise, num_steps=2
+        )
+
+    graphs = _BatchSizeRecordingCUDAGraphs(model, batch_size_buckets(4))
+    with torch.no_grad():
+        eager = run()
+        model.cuda_graphs = graphs
+        try:
+            bucketed = run()
+        finally:
+            model.cuda_graphs = None
+
+    assert graphs.embedded_batch_sizes == expected_calls
+    assert bucketed.shape == eager.shape
+    torch.testing.assert_close(bucketed, eager, rtol=0, atol=1e-5)
 
 
 @pytest.mark.slow

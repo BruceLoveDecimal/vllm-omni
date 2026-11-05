@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CUDA Graph path for π0.5 ``sample_actions`` (batch size 1).
+"""CUDA Graph path for π0.5 ``sample_actions``, one graph set per batch-size bucket.
 
 ``sample_actions`` has three regions that are captured and replayed separately:
 
@@ -9,25 +9,37 @@
    ``model.kv_cache`` (``paligemma_with_expert.forward`` with prefix inputs);
 3. one denoising step (``denoise_step``), replayed once per step.
 
-One graph per region is enough. Every shape is fixed for a serving instance:
-batch 1, ``max_cameras`` image slots (a missing camera only flips its mask),
+Apart from the batch size, every shape is fixed for a serving instance:
+``max_cameras`` image slots (a missing camera only flips its mask),
 ``image_resolution`` images, a ``tokenizer_max_length`` text block and a
 ``chunk_size`` suffix. The per-request step count only changes how often the
 region 3 graph replays, since the timestep is a graph input. And no region
 reads a tensor value on the host, so no captured control flow depends on data.
 
-The graphs are captured once at init (``Pi05CUDAGraphs.capture``), in replay
-order and into one memory pool. Regions hand data to each other without
-copies: region 1's ``prefix_embs`` output is region 2's static input, its
-``prefix_pad_masks`` output is region 3's, and ``model.kv_cache`` is written by
-region 2 and extended and read by region 3. A region copies an input into its
-static buffer only when the caller passes a different tensor.
+So the batch size is the only graph key. ``Pi05Pipeline`` declares the
+buckets from ``max_num_seqs`` (:func:`batch_size_buckets`: the powers of two
+below it, and itself), and each bucket gets its own three graphs and its own
+``Pi05KVCache``. Bucket 1 uses ``model.kv_cache``. ``sample_actions`` pads a
+batch up to the smallest bucket that holds it and splits one larger than the
+largest bucket, so every row runs on a captured graph and nothing is captured
+on a request.
+
+The graphs are captured once at init (``Pi05CUDAGraphs.capture``), largest
+bucket first, each bucket in replay order, all into one memory pool. Regions
+hand data to each other without copies: region 1's ``prefix_embs`` output is
+region 2's static input, its ``prefix_pad_masks`` output is region 3's, and the
+bucket's KV cache is written by region 2 and extended and read by region 3. A
+region copies an input into its static buffer only when the caller passes a
+different tensor. Buckets share the pool safely because a ``sample_actions``
+call replays one bucket's three regions in capture order and no call
+interleaves with another.
 
 Each region method has the signature of the eager call it replaces and falls
 back to that call when nothing is captured, its inputs differ from the
-captured ones, or torch's default dtype is not the float32 it was captured
-under. The graphs capture whatever the regions run: on the optimized path,
-the fused Triton kernels ``Pi05Pipeline`` enables before capturing. The eager
+captured ones (including a batch size with no bucket), or torch's default
+dtype is not the float32 it was captured under. The graphs capture whatever the regions run: on the optimized path,
+the fused Triton kernels ``Pi05Pipeline`` enables before capturing, which
+serve batch 1; larger buckets capture the eager layers. The eager
 baseline is ``Pi05ForActionPrediction.cuda_graphs is None`` with the fused
 kernels off.
 
@@ -116,30 +128,74 @@ class _DenoiseStepGraph:
     v_t: torch.Tensor
 
 
+@dataclass
+class _BucketGraphs:
+    """The three region graphs of one batch size, and the KV cache they share."""
+
+    kv_cache: Pi05KVCache
+    embed_prefix: _EmbedPrefixGraph
+    prefix_forward: _PrefixForwardGraph
+    denoise_step: _DenoiseStepGraph
+
+
+def batch_size_buckets(max_batch_size: int) -> tuple[int, ...]:
+    """The batch sizes to capture for a scheduler that forms batches of up to
+    ``max_batch_size``: the powers of two below it, and itself."""
+    if max_batch_size < 1:
+        raise ValueError(f"max_batch_size must be at least 1, got {max_batch_size}.")
+    buckets = []
+    size = 1
+    while size < max_batch_size:
+        buckets.append(size)
+        size *= 2
+    buckets.append(max_batch_size)
+    return tuple(buckets)
+
+
 class Pi05CUDAGraphs:
     """Per-region CUDA Graph capture/replay for one ``Pi05ForActionPrediction``."""
 
-    def __init__(self, model: Pi05ForActionPrediction):
+    def __init__(self, model: Pi05ForActionPrediction, batch_sizes: tuple[int, ...] = (1,)):
         # The model owns this object through ``model.cuda_graphs``; a weak
         # reference back keeps that from forming a cycle, so dropping the model
         # frees its GPU memory immediately rather than at the next GC pass.
         self._model = weakref.proxy(model)
-        self._embed_prefix: _EmbedPrefixGraph | None = None
-        self._prefix_forward: _PrefixForwardGraph | None = None
-        self._denoise_step: _DenoiseStepGraph | None = None
+        self.batch_sizes = tuple(sorted(set(batch_sizes)))
+        self._buckets: dict[int, _BucketGraphs] = {}
         self.num_replays: Counter[str] = Counter()
+
+    # ── Batch-size buckets ───────────────────────────────────────────
+    @property
+    def max_batch_size(self) -> int:
+        return self.batch_sizes[-1]
+
+    def padded_batch_size(self, batch_size: int) -> int:
+        """The smallest bucket that holds ``batch_size`` rows; ``batch_size``
+        itself when it is larger than every bucket."""
+        for bucket in self.batch_sizes:
+            if bucket >= batch_size:
+                return bucket
+        return batch_size
+
+    def kv_cache(self, batch_size: int) -> Pi05KVCache | None:
+        """The KV cache the ``batch_size`` bucket was captured with, if captured."""
+        bucket = self._buckets.get(batch_size)
+        if bucket is None:
+            return None
+        return bucket.kv_cache
 
     # ── Capture ──────────────────────────────────────────────────────
     def capture(self) -> None:
-        """Capture all three regions at the deployed shapes, batch size 1.
+        """Capture all three regions at the deployed shapes, for every bucket.
 
-        Needs ``model.kv_cache``. Raises on failure: ``enforce_eager=False`` asks
-        for the graph path, so a silent eager fallback would hide a slowdown.
+        Needs ``model.kv_cache`` (bucket 1's). Raises on failure:
+        ``enforce_eager=False`` asks for the graph path, so a silent eager
+        fallback would hide a slowdown.
         """
         try:
             self._capture()
         except Exception as exc:
-            self._embed_prefix = self._prefix_forward = self._denoise_step = None
+            self._buckets = {}
             raise RuntimeError(
                 "π0.5 CUDA Graph capture failed. Set `enforce_eager: true` in the deploy "
                 "config, or pass --enforce-eager, to serve eagerly."
@@ -150,6 +206,16 @@ class Pi05CUDAGraphs:
         kv_cache = model.kv_cache
         if kv_cache is None or kv_cache.batch_size != 1:
             raise ValueError(f"Capture needs a batch-size-1 model.kv_cache, got {kv_cache!r}.")
+        # Largest first: the smaller buckets then reuse the pool blocks its
+        # temporaries freed.
+        buckets = {}
+        for batch_size in reversed(self.batch_sizes):
+            bucket_cache = kv_cache if batch_size == 1 else model.new_kv_cache(batch_size)
+            buckets[batch_size] = self._capture_bucket(batch_size, bucket_cache)
+        self._buckets = buckets
+
+    def _capture_bucket(self, batch_size: int, kv_cache: Pi05KVCache) -> _BucketGraphs:
+        model = self._model
         device = kv_cache.key.device
         config = model.config
         height, width = config.image_resolution
@@ -159,10 +225,10 @@ class Pi05CUDAGraphs:
         # normal tensors, which callers in either mode may copy into.
         with torch.no_grad(), set_default_torch_dtype(_CAPTURE_DEFAULT_DTYPE):
             # Dummy inputs; only their shapes and dtypes are captured.
-            images = [torch.zeros(1, 3, height, width, device=device) for _ in range(int(config.max_cameras))]
-            image_masks = [torch.ones(1, dtype=torch.bool, device=device) for _ in images]
-            lang_tokens = torch.zeros(1, text_len, dtype=torch.long, device=device)
-            lang_masks = torch.ones(1, text_len, dtype=torch.bool, device=device)
+            images = [torch.zeros(batch_size, 3, height, width, device=device) for _ in range(int(config.max_cameras))]
+            image_masks = [torch.ones(batch_size, dtype=torch.bool, device=device) for _ in images]
+            lang_tokens = torch.zeros(batch_size, text_len, dtype=torch.long, device=device)
+            lang_masks = torch.ones(batch_size, text_len, dtype=torch.bool, device=device)
 
             # Eager warmup, outside capture: lazy initialization and library
             # workspaces. It also builds regions 2 and 3's inputs with the same
@@ -179,13 +245,14 @@ class Pi05CUDAGraphs:
                 inputs_embeds=[prefix_embs, None],
                 use_cache=True,
             )
-            x_t = torch.zeros(1, model.action_horizon, model.action_dim, dtype=torch.float32, device=device)
-            timestep = torch.ones(1, dtype=torch.float32, device=device)
+            x_t = torch.zeros(batch_size, model.action_horizon, model.action_dim, dtype=torch.float32, device=device)
+            timestep = torch.ones(batch_size, dtype=torch.float32, device=device)
             model.denoise_step(prefix_pad_masks=prefix_pad_masks, past_key_values=kv_cache, x_t=x_t, timestep=timestep)
             torch.accelerator.synchronize(device)
 
-            # Graphs sharing a pool must replay in the order they were captured,
-            # which is the order ``sample_actions`` runs the regions in.
+            # Within a bucket, graphs sharing a pool must replay in the order
+            # they were captured, which is the order ``sample_actions`` runs
+            # the regions in.
             pool = current_platform.get_global_graph_pool()
 
             graph = torch.cuda.CUDAGraph()
@@ -212,7 +279,7 @@ class Pi05CUDAGraphs:
                 )
             denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t)
 
-        self._embed_prefix, self._prefix_forward, self._denoise_step = embed_prefix, prefix_forward, denoise_step
+        return _BucketGraphs(kv_cache, embed_prefix, prefix_forward, denoise_step)
 
     # ── Region 1: prefix embedding ───────────────────────────────────
     def embed_prefix(
@@ -222,9 +289,10 @@ class Pi05CUDAGraphs:
         lang_tokens: torch.Tensor,
         lang_masks: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        g = self._embed_prefix
-        if g is None:
+        bucket = self._buckets.get(lang_tokens.shape[0])
+        if bucket is None:
             return self._model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
+        g = bucket.embed_prefix
         if not (
             torch.get_default_dtype() == _CAPTURE_DEFAULT_DTYPE
             and len(images) == len(g.images)
@@ -257,13 +325,16 @@ class Pi05CUDAGraphs:
         use_cache: bool = False,
         adarms_cond: torch.Tensor | None = None,
     ):
-        g = self._prefix_forward
+        g = None
+        if inputs_embeds is not None and inputs_embeds[0] is not None:
+            bucket = self._buckets.get(inputs_embeds[0].shape[0])
+            if bucket is not None:
+                g = bucket.prefix_forward
         if g is not None and not (
             torch.get_default_dtype() == _CAPTURE_DEFAULT_DTYPE
             and past_key_values is g.kv_cache
             and use_cache
             and adarms_cond is None
-            and inputs_embeds is not None
             and inputs_embeds[1] is None
             and _matches(inputs_embeds[0], g.inputs_embeds)
             and _matches(attention_mask, g.attention_mask)
@@ -296,7 +367,10 @@ class Pi05CUDAGraphs:
         x_t: torch.Tensor,
         timestep: torch.Tensor,
     ) -> torch.Tensor:
-        g = self._denoise_step
+        g = None
+        bucket = self._buckets.get(x_t.shape[0])
+        if bucket is not None:
+            g = bucket.denoise_step
         if g is not None and not (
             torch.get_default_dtype() == _CAPTURE_DEFAULT_DTYPE
             and past_key_values is g.kv_cache

@@ -231,32 +231,30 @@ def _gated_residual(residual: torch.Tensor, out: torch.Tensor, gate: torch.Tenso
 # ──────────────────────────────────────────────────────────────────────
 # Dual-backbone: PaliGemma + AdaRMS action expert
 # ──────────────────────────────────────────────────────────────────────
-def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat KV heads for grouped-query attention.
-
-    ``(B, num_kv_heads, S, D) → (B, num_kv_heads * n_rep, S, D)``.
-    """
-    if n_rep == 1:
-        return hidden_states
-    b, nh, s, d = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(b, nh, n_rep, s, d)
-    return hidden_states.reshape(b, nh * n_rep, s, d)
-
-
 def _attend(query_states, key_states, value_states, attention_mask, num_kv_groups, scaling):
     """Manual eager attention: ``softmax(Q Kᵀ · scale + mask) · V``.
+
+    Grouped-query attention without repeating K/V: the ``num_kv_groups`` query
+    heads that share a KV head are folded into the query-row axis, so each KV
+    head's K and V feed one GEMM as they are. Queries are ``(B, H, Q, D)`` and
+    keys/values ``(B, H_kv, S, D)`` with ``H = H_kv · num_kv_groups``; π0.5 has
+    one KV head, so repeating it would copy every layer's K/V eight times.
 
     The mask is sliced to ``key_states.shape[-2]`` so the same
     ``(B, 1, Q, prefix+suffix)`` mask works in both the prefix pass (K length =
     prefix) and the suffix pass (K length = prefix + suffix).
     """
-    k = _repeat_kv(key_states, num_kv_groups)
-    v = _repeat_kv(value_states, num_kv_groups)
-    attn_weights = torch.matmul(query_states, k.transpose(2, 3)) * scaling
+    batch_size, num_heads, q_len, head_dim = query_states.shape
+    num_kv_heads, kv_len = key_states.shape[1], key_states.shape[2]
+    q = query_states.reshape(batch_size, num_kv_heads, num_kv_groups * q_len, head_dim)
+    attn_weights = torch.matmul(q, key_states.transpose(2, 3)) * scaling
+    attn_weights = attn_weights.view(batch_size, num_heads, q_len, kv_len)
     if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask[:, :, :, : k.shape[-2]]
+        attn_weights = attn_weights + attention_mask[:, :, :, :kv_len]
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    return torch.matmul(attn_weights, v)
+    attn_weights = attn_weights.view(batch_size, num_kv_heads, num_kv_groups * q_len, kv_len)
+    out = torch.matmul(attn_weights, value_states)
+    return out.view(batch_size, num_heads, q_len, head_dim)
 
 
 class Pi05KVCache:
@@ -1444,6 +1442,16 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         return [None, hidden_states], None
 
 
+def _pad_rows(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Pad ``tensor`` to ``batch_size`` rows with copies of its first row.
+
+    Rows of ``sample_actions`` never mix, so a padding row only has to be a
+    valid input: a copy of a real row keeps every mask non-empty.
+    """
+    padding = tensor[:1].expand(batch_size - tensor.shape[0], *tensor.shape[1:])
+    return torch.cat([tensor, padding])
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Main π0.5 Model
 # ──────────────────────────────────────────────────────────────────────
@@ -1768,8 +1776,37 @@ class Pi05ForActionPrediction(nn.Module):
                 )
 
         # The three regions below run through CUDA graphs when installed; each
-        # falls back to its eager call on its own.
+        # falls back to its eager call on its own. A batch the graphs have no
+        # bucket for is split into the largest bucket, or padded up to the
+        # smallest bucket that holds it.
         graphs = self.cuda_graphs
+        if graphs is not None and bsize > graphs.max_batch_size:
+            chunks = []
+            for start in range(0, bsize, graphs.max_batch_size):
+                rows = slice(start, start + graphs.max_batch_size)
+                chunks.append(
+                    self.sample_actions(
+                        images=[image[rows] for image in images],
+                        image_masks=[mask[rows] for mask in image_masks],
+                        lang_tokens=lang_tokens[rows],
+                        lang_masks=lang_masks[rows],
+                        noise=noise[rows],
+                        num_steps=num_steps,
+                    )
+                )
+            return torch.cat(chunks)
+        if graphs is not None and graphs.padded_batch_size(bsize) != bsize:
+            padded = graphs.padded_batch_size(bsize)
+            actions = self.sample_actions(
+                images=[_pad_rows(image, padded) for image in images],
+                image_masks=[_pad_rows(mask, padded) for mask in image_masks],
+                lang_tokens=_pad_rows(lang_tokens, padded),
+                lang_masks=_pad_rows(lang_masks, padded),
+                noise=_pad_rows(noise, padded),
+                num_steps=num_steps,
+            )
+            return actions[:bsize]
+
         embed_prefix = self.embed_prefix if graphs is None else graphs.embed_prefix
         prefix_forward = self.paligemma_with_expert.forward if graphs is None else graphs.prefix_forward
         denoise_step = self.denoise_step if graphs is None else graphs.denoise_step
@@ -1783,6 +1820,8 @@ class Pi05ForActionPrediction(nn.Module):
         # 2. Forward prefix through PaliGemma LM, writing its per-layer K/V into
         #    the cache the denoising steps then extend and read.
         kv_cache = self.kv_cache
+        if graphs is not None and bsize != 1:
+            kv_cache = graphs.kv_cache(bsize)
         if kv_cache is None or not kv_cache.fits(bsize, prefix_embs.shape[1]):
             kv_cache = self.new_kv_cache(bsize, prefix_embs.shape[1])
         _, past_key_values = prefix_forward(

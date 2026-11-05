@@ -35,8 +35,10 @@ import yaml
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.models.pi05.modeling_pi05 import make_att_2d_masks, prepare_attention_masks_4d
+from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
+from vllm_omni.diffusion.models.pi05.modeling_pi05 import _pad_rows, make_att_2d_masks, prepare_attention_masks_4d
 from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+from vllm_omni.diffusion.models.pi05.processor_pi05 import stack_model_inputs
 
 pytestmark = [
     pytest.mark.local_model,
@@ -362,3 +364,68 @@ def test_other_default_dtype_runs_eagerly(pipeline):
     with set_default_torch_dtype(torch.bfloat16):
         _sample(model, inputs, num_steps=None, seed=0)
     assert graphs.num_replays == replays_before
+
+
+def test_batch_size_buckets_are_bit_exact_and_match_rows_served_alone(pipeline):
+    """Graphs captured per batch-size bucket (1, 2, 4): a batch of 3 is padded
+    to bucket 4 and a batch of 5 runs as buckets 4 and 1. Each equals the same
+    rows run eagerly at the bucket's size, bit for bit, and matches every row
+    served alone at batch 1 within RFC #6867 R2's ``atol=1e-4`` in float32.
+    bfloat16 is held to ``TOLERANCE`` while R2's tolerance for it is open."""
+    model = pipeline.model
+    graphs = Pi05CUDAGraphs(model, batch_sizes=(1, 2, 4))
+    graphs.capture()
+    rows = [pipeline.processor.build_model_inputs(_robot_obs(pipeline.config, 3, seed=seed)) for seed in range(5)]
+    device = rows[0][2].device
+    noise = torch.randn(
+        5,
+        pipeline.config.chunk_size,
+        pipeline.config.max_action_dim,
+        generator=torch.Generator(device=device).manual_seed(0),
+        device=device,
+    )
+
+    def sample(inputs, row_noise):
+        images, image_masks, lang_tokens, lang_masks = inputs
+        with torch.inference_mode():
+            return model.sample_actions(
+                images=images,
+                image_masks=image_masks,
+                lang_tokens=lang_tokens,
+                lang_masks=lang_masks,
+                noise=row_noise,
+            ).cpu()
+
+    def padded(inputs, batch_size):
+        images, image_masks, lang_tokens, lang_masks = inputs
+        return (
+            [_pad_rows(image, batch_size) for image in images],
+            [_pad_rows(mask, batch_size) for mask in image_masks],
+            _pad_rows(lang_tokens, batch_size),
+            _pad_rows(lang_masks, batch_size),
+        )
+
+    three, five = stack_model_inputs(rows[:3]), stack_model_inputs(rows)
+    with _path(model, graphs=graphs, fused_kernels=True):
+        replays_before = graphs.num_replays.copy()
+        bucketed_three = sample(three, noise[:3])
+        bucketed_five = sample(five, noise)
+        replays = graphs.num_replays - replays_before
+        alone = torch.cat([sample(rows[index], noise[index : index + 1]) for index in range(5)])
+    with _path(model, graphs=None, fused_kernels=True):
+        eager_three = sample(padded(three, 4), _pad_rows(noise[:3], 4))[:3]
+        eager_five = torch.cat([sample(stack_model_inputs(rows[:4]), noise[:4]), sample(rows[4], noise[4:5])])
+
+    # Three calls at buckets 4, 4, 1 and five alone at bucket 1, 10 steps each.
+    assert replays == {"embed_prefix": 8, "prefix_forward": 8, "denoise_step": 80}
+    assert torch.equal(bucketed_three, eager_three)
+    assert torch.equal(bucketed_five, eager_five)
+    assert torch.equal(bucketed_three, bucketed_five[:3])
+
+    max_rel, max_abs = (1e-4, 1e-4) if pipeline._torch_dtype == torch.float32 else TOLERANCE[torch.bfloat16]
+    for name, batched in (("3", bucketed_three), ("5", bucketed_five)):
+        reference = alone[: batched.shape[0]].double()
+        rel = ((batched.double() - reference).norm() / reference.norm()).item()
+        abs_diff = (batched.double() - reference).abs().max().item()
+        print(f"\n{pipeline._torch_dtype} batch {name} vs alone: rel L2 {rel:.3e}, max |diff| {abs_diff:.3e}")
+        assert abs_diff <= max_abs and rel <= max_rel

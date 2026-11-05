@@ -36,7 +36,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi05.config import SUPPORTED_DTYPE_NAMES, Pi05Config
-from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
+from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs, batch_size_buckets
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPrediction
 from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor, observed_camera_keys, stack_model_inputs
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
@@ -178,7 +178,8 @@ class Pi05Pipeline(nn.Module):
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
         # Sized for one observation, the deployed default (``max_num_seqs: 1``).
-        # A larger batch gets a cache of its own size in ``sample_actions``.
+        # Each larger CUDA graph bucket captures a cache of its own size, and
+        # an eager batch gets one in ``sample_actions``.
         self.model.kv_cache = self.model.new_kv_cache(batch_size=1)
         self._install_cuda_graphs(od_config)
 
@@ -290,8 +291,9 @@ class Pi05Pipeline(nn.Module):
         The stage's ``enforce_eager`` (deploy yaml, or ``--enforce-eager`` on the
         CLI, which takes precedence) keeps the eager baseline. Otherwise the
         optimized path is set up here, at init: the fused Triton kernels are
-        enabled, and the CUDA graphs are captured over them and installed. A
-        failure of either raises rather than silently serving eagerly.
+        enabled, and the CUDA graphs are captured over them and installed, one
+        set per batch-size bucket up to the stage's ``max_num_seqs``. A failure
+        of either raises rather than silently serving eagerly.
         """
         if od_config.enforce_eager:
             logger.info("Pi05Pipeline: enforce_eager is set; sample_actions runs eagerly.")
@@ -309,13 +311,14 @@ class Pi05Pipeline(nn.Module):
                 "π0.5's optimized path needs its fused kernels. Set `enforce_eager: true` in the deploy "
                 "config, or pass --enforce-eager, to serve eagerly."
             ) from exc
-        graphs = Pi05CUDAGraphs(self.model)
+        graphs = Pi05CUDAGraphs(self.model, batch_size_buckets(od_config.max_num_seqs))
         start = time.perf_counter()
         graphs.capture()
         self.model.cuda_graphs = graphs
         logger.info(
-            "Pi05Pipeline: captured the sample_actions CUDA graphs over the fused kernels in %.2f s; "
-            "sample_actions runs its optimized path.",
+            "Pi05Pipeline: captured the sample_actions CUDA graphs over the fused kernels for batch sizes %s "
+            "in %.2f s; sample_actions runs its optimized path.",
+            graphs.batch_sizes,
             time.perf_counter() - start,
         )
 
