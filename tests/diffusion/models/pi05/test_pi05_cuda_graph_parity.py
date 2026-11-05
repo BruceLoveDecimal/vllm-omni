@@ -410,8 +410,8 @@ def test_batch_size_buckets_are_bit_exact_and_match_rows_served_alone(pipeline):
         replays_before = graphs.num_replays.copy()
         bucketed_three = sample(three, noise[:3])
         bucketed_five = sample(five, noise)
-        replays = graphs.num_replays - replays_before
         alone = torch.cat([sample(rows[index], noise[index : index + 1]) for index in range(5)])
+        replays = graphs.num_replays - replays_before
     with _path(model, graphs=None, fused_kernels=True):
         eager_three = sample(padded(three, 4), _pad_rows(noise[:3], 4))[:3]
         eager_five = torch.cat([sample(stack_model_inputs(rows[:4]), noise[:4]), sample(rows[4], noise[4:5])])
