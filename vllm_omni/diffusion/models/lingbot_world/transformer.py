@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     from vllm_omni.diffusion.models.lingbot_world.leased_post_attention import Lease
+    from vllm_omni.diffusion.models.lingbot_world.prestp import PreSTPState
 
 
 @dataclass
@@ -323,6 +324,9 @@ class LingBotSelfAttention(nn.Module):
         sink_tokens: int,
         update_cache: bool = True,
         _projection_lease: Lease | None = None,
+        prestp: PreSTPState | None = None,
+        layer_index: int = 0,
+        keep_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Project logical [B, S, D] tokens into TP-local
         # [B, S, num_local_heads, head_dim].
@@ -334,9 +338,15 @@ class LingBotSelfAttention(nn.Module):
         query = query.unflatten(2, (self.num_local_heads, self.head_dim))
         key = key.unflatten(2, (self.num_local_heads, self.head_dim))
         value = value.unflatten(2, (self.num_local_heads, self.head_dim))
+        if prestp is not None:
+            key, value = prestp.update_kv(layer_index, key, value, keep_indices)
         if rotary_emb is not None:
             cos, sin = rotary_emb
-            query = self.rotary_embedding(query, cos, sin)
+            query_cos, query_sin = cos, sin
+            if keep_indices is not None:
+                query_cos = cos.index_select(0, keep_indices)
+                query_sin = sin.index_select(0, keep_indices)
+            query = self.rotary_embedding(query, query_cos, query_sin)
             key = self.rotary_embedding(key, cos, sin)
 
         if self.ulysses_world_size > 1:
@@ -356,6 +366,11 @@ class LingBotSelfAttention(nn.Module):
         if isinstance(cache, ARDiffusionPagedLayerInputs):
             if query.shape[0] != 1:
                 raise RuntimeError("LingBot AR-Diffusion paged attention requires batch_size=1.")
+            if keep_indices is not None:
+                cache = cache._replace(
+                    query_start_loc=cache.query_start_loc.new_tensor([0, query.shape[1]]),
+                    max_query_len=query.shape[1],
+                )
             output = paged_write_attn(
                 cache,
                 query[0],
@@ -642,6 +657,9 @@ class LingBotAttentionBlock(nn.Module):
         update_cache: bool,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         camera_modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prestp: PreSTPState | None = None,
+        layer_index: int = 0,
+        keep_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         batch_size, token_count, dim = hidden_states.shape
         if (
@@ -683,6 +701,9 @@ class LingBotAttentionBlock(nn.Module):
                 rotary_emb=rotary_emb,
                 sink_tokens=sink_tokens,
                 update_cache=update_cache,
+                prestp=prestp,
+                layer_index=layer_index,
+                keep_indices=keep_indices,
                 **projection_kwargs,
             )
             if lease is None:
@@ -1263,6 +1284,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         start_frame: int,
         update_cache: bool,
         camera_modulation_cache: CameraModulationCache | None = None,
+        prestp: PreSTPState | None = None,
     ) -> torch.Tensor:
         if not isinstance(update_cache, bool):
             raise ValueError("update_cache must be a boolean.")
@@ -1333,6 +1355,19 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
         sp_size = self.blocks[0].self_attn.ulysses_world_size
         global_tokens = patched_frames * tokens_per_frame
+        keep_indices = None
+        if prestp is not None:
+            if sp_size != 1 or batch_size != 1:
+                raise ValueError("PreSTP currently requires single-sequence, single-SP execution.")
+            # LingBot's extra t=0 forward defines the history consumed by the
+            # next chunk. Recompute every K/V here; noisy probe projections are
+            # not interchangeable with clean history, even for frozen patches.
+            if not update_cache:
+                keep_indices = prestp.keep_indices()
+                if keep_indices.numel() == global_tokens:
+                    keep_indices = None
+                elif keep_indices.numel() == 0:
+                    return hidden_states.new_zeros(batch_size, self.config.out_channels, frames, height, width)
         hidden_dim = hidden_states.shape[-1]
         rope_dim = rotary_emb[0].shape[-1]
         if global_tokens % sp_size:
@@ -1357,7 +1392,13 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                     "LingBot SP input hooks did not shard all conditioning tensors consistently; "
                     f"expected {local_tokens} tokens per rank. Check SP hook registration and input dimensions."
                 )
-        timestep_projection = self._stage_timestep_projection(timestep_projection)
+        if keep_indices is not None:
+            frame_indices = keep_indices // tokens_per_frame
+            hidden_states = hidden_states.index_select(1, keep_indices)
+            timestep_projection = timestep_projection.index_select(1, frame_indices)
+            timestep_embedding = timestep_embedding.index_select(1, frame_indices)
+        if prestp is None:
+            timestep_projection = self._stage_timestep_projection(timestep_projection)
         rotary_emb = (cosine, sine)
         # Phase 3: each layer receives its own cache entry. Text K/V is passed
         # only when absent; the returned cache is stored for subsequent DMD
@@ -1370,12 +1411,20 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 if camera_modulation is None:
                     camera_modulation = block.camera_modulation(camera_hidden_states)
                     camera_modulation_cache.entries[index] = camera_modulation
+            selected_camera = camera_hidden_states
+            if keep_indices is not None:
+                selected_camera = camera_hidden_states.index_select(1, keep_indices)
+                if camera_modulation is not None:
+                    camera_modulation = tuple(value.index_select(1, keep_indices) for value in camera_modulation)
             hidden_states, cross_cache = block(
                 hidden_states,
                 projected_text if cache.cross_attention[index] is None else None,
                 timestep_projection,
-                camera_hidden_states,
+                selected_camera,
                 camera_modulation=camera_modulation,
+                prestp=prestp,
+                layer_index=index,
+                keep_indices=keep_indices,
                 self_cache=cache.self_attention[index],
                 cross_cache=cache.cross_attention[index],
                 current_start=current_start,
@@ -1392,6 +1441,10 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             tokens_per_frame=tokens_per_frame if sp_size > 1 else None,
             token_offset=get_sp_group().ulysses_rank * (global_tokens // sp_size) if sp_size > 1 else 0,
         )
+        if keep_indices is not None:
+            restored = hidden_states.new_zeros(batch_size, global_tokens, hidden_states.shape[-1])
+            restored.index_copy_(1, keep_indices, hidden_states)
+            hidden_states = restored
         hidden_states = self.sp_output_gather(hidden_states)
         projected_dim = self.config.out_channels * math.prod(self.config.patch_size)
         if sp_size > 1 and hidden_states.shape != (batch_size, global_tokens, projected_dim):

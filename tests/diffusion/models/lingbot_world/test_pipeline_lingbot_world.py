@@ -594,6 +594,17 @@ def test_session_admission_accounts_for_the_streaming_decoder_cache() -> None:
     assert bare.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session == 960 + 384 + 2 * 6_656
 
 
+def test_session_admission_budgets_prestp_state() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    baseline = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+    pipeline._prestp_config = module.PreSTPConfig()
+    pruning = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+    # Two layers of full K/V, two clean blocks plus one boundary frame,
+    # and two boolean masks at one spatial token per frame.
+    assert pruning - baseline == 384 + 7 * 16 * 2 * 2 * 4 + 6
+
+
 @pytest.mark.parametrize("sp_size", [1, 4])
 def test_session_admission_budgets_camera_modulation_per_rank(sp_size: int) -> None:
     pipeline = _pipeline(_load_pipeline_module())
@@ -3242,8 +3253,11 @@ def test_session_text_caches_publish_key_only_after_a_successful_build() -> None
     assert invalidations == [False] and state.text_cache_key == ("A", 512, str(embeds.dtype))
     assert state.text_cache_dirty is False
     # Same inputs: reuse without invalidation.
+    pruning = module.PreSTPState(module.PreSTPConfig())
+    state.prestp = pruning
     caches("A")
     assert invalidations == [False, False]
+    assert state.prestp is pruning
     # Regression (Codex review): B's build fails after invalidating -> no key is
     # left behind, so retrying A must invalidate again instead of consuming
     # partial/mixed K/V.
@@ -3251,6 +3265,7 @@ def test_session_text_caches_publish_key_only_after_a_successful_build() -> None
     with pytest.raises(RuntimeError, match="injected failure"):
         caches("B")
     assert state.text_cache_key is None and state.text_cache_dirty is True
+    assert state.prestp is None
     caches("A")
     assert invalidations[-2:] == [True, True] and state.text_cache_key == ("A", 512, str(embeds.dtype))
     assert state.text_cache_dirty is False

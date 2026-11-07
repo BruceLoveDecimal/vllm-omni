@@ -120,6 +120,14 @@ declares:
 - persistent model-owned CUDA bytes per resident session; and
 - the requested resident-session capacity.
 
+LingBot's opt-in `model_config.lingbot_prestp` experiment additionally retains
+pre-RoPE K/V, clean estimates, and pruning masks per session. Its declared
+model-owned bytes include that storage. Text-conditioning invalidation drops
+the pruning state; reset and close release it with the model session. Dynamic
+token selection is restricted to eager, single-sequence-parallel execution.
+See the [experiment notes](../../../benchmarks/lingbot_world/PRESTP.md) for
+algorithm adaptations and validation limits.
+
 The runner computes:
 
 ```text

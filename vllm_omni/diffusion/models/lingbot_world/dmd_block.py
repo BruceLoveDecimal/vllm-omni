@@ -23,6 +23,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.models.lingbot_world.prestp import PreSTPState
 from vllm_omni.diffusion.models.lingbot_world.transformer import (
     CameraModulationCache,
     LingBotAttentionCache,
@@ -135,6 +136,7 @@ class LingBotDMDBlockRunner:
         timestep_value: float,
         step_index: int,
         camera_cache: CameraModulationCache | None = None,
+        prestp: PreSTPState | None = None,
     ) -> torch.Tensor:
         """Predict flow for one denoise step.
 
@@ -162,6 +164,7 @@ class LingBotDMDBlockRunner:
             start_frame=start_frame,
             update_cache=commit_probe,
             camera_modulation_cache=camera_cache,
+            **({"prestp": prestp} if prestp is not None else {}),
         )
         if flow_prediction.shape != current_latents.shape:
             raise RuntimeError(
@@ -178,6 +181,8 @@ class LingBotDMDBlockRunner:
         *,
         next_sigma: float | None,
         generator: torch.Generator,
+        prestp: PreSTPState | None = None,
+        step_index: int = 0,
     ) -> torch.Tensor:
         """Invert the flow to x0, then re-noise at ``next_sigma``.
 
@@ -189,6 +194,9 @@ class LingBotDMDBlockRunner:
         # estimate at the next sigma; the final step keeps x0 as this
         # block's generated latent.
         x0 = current_latents - sigma * flow_prediction.float()
+        if prestp is not None:
+            clean = prestp.update(prestp.patchify(x0), step_index=step_index)
+            x0 = prestp.unpatchify(clean, x0.shape)
         if next_sigma is None:
             return x0
         noise = randn_tensor(current_latents.shape, generator=generator, device=self.device, dtype=torch.float32)
@@ -205,6 +213,7 @@ class LingBotDMDBlockRunner:
         ar: ARBlockContext | None,
         start_frame: int,
         camera_cache: CameraModulationCache | None = None,
+        prestp: PreSTPState | None = None,
     ) -> None:
         """Write the finished block's clean x0 into KV and commit its pages.
 
@@ -267,6 +276,7 @@ class LingBotDMDBlockRunner:
             start_frame=start_frame,
             update_cache=True,
             camera_modulation_cache=camera_cache,
+            **({"prestp": prestp} if prestp is not None else {}),
         )
         if ar is not None:
             ar.state.commit_paged_context(ar.branch)
@@ -288,6 +298,7 @@ class LingBotDMDBlockRunner:
         schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
+        prestp: PreSTPState | None = None,
     ) -> torch.Tensor:
         """Request mode: all probes of one block, then its commit."""
         block_shape = (1, self.transformer.config.out_channels, *condition.shape[2:5])
@@ -296,6 +307,8 @@ class LingBotDMDBlockRunner:
         # injector is built once per block: one cache for the whole loop, exactly as the stepwise path holds
         # one per block across its separate calls.
         camera_cache = CameraModulationCache()
+        if prestp is not None:
+            prestp.begin_chunk(prestp.patchify(current_latents))
         for step_index, (timestep_value, sigma) in enumerate(schedule):
             flow_prediction = self.probe_step(
                 current_latents=current_latents,
@@ -308,10 +321,17 @@ class LingBotDMDBlockRunner:
                 timestep_value=timestep_value,
                 step_index=step_index,
                 camera_cache=camera_cache,
+                prestp=prestp,
             )
             next_sigma = schedule[step_index + 1][1] if step_index + 1 < len(schedule) else None
             current_latents = self.apply_transition(
-                current_latents, flow_prediction, sigma, next_sigma=next_sigma, generator=generator
+                current_latents,
+                flow_prediction,
+                sigma,
+                next_sigma=next_sigma,
+                generator=generator,
+                prestp=prestp,
+                step_index=step_index,
             )
             progress_bar.update()
         self.commit_block_kv(
@@ -323,5 +343,8 @@ class LingBotDMDBlockRunner:
             ar=ar,
             start_frame=start_frame,
             camera_cache=camera_cache,
+            prestp=prestp,
         )
+        if prestp is not None:
+            prestp.finish_chunk()
         return current_latents

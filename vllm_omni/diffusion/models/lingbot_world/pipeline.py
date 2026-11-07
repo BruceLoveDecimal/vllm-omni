@@ -56,6 +56,7 @@ from vllm_omni.diffusion.models.lingbot_world.camera import (
     resolve_trusted_action_directory,
 )
 from vllm_omni.diffusion.models.lingbot_world.dmd_block import ARBlockContext, LingBotDMDBlockRunner
+from vllm_omni.diffusion.models.lingbot_world.prestp import PreSTPConfig, PreSTPState
 from vllm_omni.diffusion.models.lingbot_world.transformer import (
     CameraModulationCache,
     CausalLingBotWorldTransformer3DModel,
@@ -199,6 +200,7 @@ class _LingBotARSessionState:
     condition_fixed_point: torch.Tensor | None = None
     camera_tail: CameraTrajectory | None = None
     camera_pitch: float = 0.0
+    prestp: PreSTPState | None = None
 
 
 def _positive_finite_flow_shift(value: Any) -> float:
@@ -622,9 +624,20 @@ class LingBotWorldCausalDMDPipeline(
         if not isinstance(reuse_last_step_kv, bool):
             raise ValueError("model_config.lingbot_reuse_last_step_kv must be a bool.")
         self._reuse_last_step_kv = reuse_last_step_kv
+        prestp_options = model_config.get("lingbot_prestp")
+        self._prestp_config = PreSTPConfig(**prestp_options) if prestp_options is not None else None
+        if self._prestp_config is not None:
+            if not od_config.enforce_eager or reuse_last_step_kv:
+                raise ValueError("PreSTP requires eager execution with clean KV commits.")
+            if self._lingbot_leased_post_attention:
+                raise ValueError("PreSTP does not support leased post-attention.")
+            if parallel_config is not None and parallel_config.sequence_parallel_size != 1:
+                raise ValueError("PreSTP currently requires sequence_parallel_size=1.")
         share_first_block = model_config.get("lingbot_share_first_block_kv", False)
         if not isinstance(share_first_block, bool):
             raise ValueError("model_config.lingbot_share_first_block_kv must be a bool.")
+        if share_first_block and self._prestp_config is not None:
+            raise ValueError("PreSTP requires request-local first-block computation.")
         if share_first_block and (reuse_last_step_kv or not od_config.enforce_eager):
             raise ValueError("First-block K/V sharing currently requires eager execution and clean-x0 K/V commits.")
         first_block_limit = model_config.get("lingbot_first_block_kv_cpu_limit_bytes", 4 << 30)
@@ -800,6 +813,14 @@ class LingBotWorldCausalDMDPipeline(
             * int(self.transformer.config.attention_head_dim)
             * element_size
         )
+        prestp_bytes_per_session = 0
+        if self._prestp_config is not None:
+            # Full pre-RoPE K/V plus fp32 clean estimates, boundary reference,
+            # and two boolean masks remain resident between scheduler calls.
+            clean_frame_bytes = int(self.transformer.config.out_channels) * latent_height * latent_width * 4
+            prestp_bytes_per_session = (
+                camera_bytes_per_session + (2 * condition_latent_frames + 1) * clean_frame_bytes + 2 * camera_tokens
+            )
         return ARDiffusionKVCacheSpec(
             num_layers=int(self.transformer.config.num_layers),
             num_kv_heads=int(self.transformer.blocks[0].self_attn.num_sp_heads),
@@ -822,6 +843,7 @@ class LingBotWorldCausalDMDPipeline(
             model_owned_state_bytes_per_session=(
                 condition_bytes_per_session
                 + camera_bytes_per_session
+                + prestp_bytes_per_session
                 + 2 * self._condition_encoder_cache_bytes()  # Committed and in-flight histories.
                 + self._streaming_decode_bytes_per_session()
             ),
@@ -1477,6 +1499,7 @@ class LingBotWorldCausalDMDPipeline(
         schedule: tuple[tuple[float, float], ...],
         generator: torch.Generator,
         progress_bar: TqdmProgressBar[Any],
+        prestp: PreSTPState | None = None,
     ) -> torch.Tensor:
         return self._dmd_blocks.generate_block(
             condition=condition,
@@ -1488,6 +1511,7 @@ class LingBotWorldCausalDMDPipeline(
             schedule=schedule,
             generator=generator,
             progress_bar=progress_bar,
+            prestp=prestp,
         )
 
     def _session_text_caches(
@@ -1511,6 +1535,10 @@ class LingBotWorldCausalDMDPipeline(
         text_key = (prompt, int(max_sequence_length), str(prompt_embeds.dtype))
         previous = session_state.text_cache_key
         invalidate = session_state.text_cache_dirty or (previous is not None and previous != text_key)
+        if invalidate:
+            # Predictions from the previous text condition cannot select which
+            # tokens to skip after an interactive prompt change.
+            session_state.prestp = None
         session_state.text_cache_dirty = True
         session_state.text_cache_key = None
         caches = self._ar_text_caches(prompt_embeds, invalidate=invalidate, condition_revision=text_key)
@@ -1682,6 +1710,14 @@ class LingBotWorldCausalDMDPipeline(
                 max_sequence_length=inputs.max_sequence_length,
                 session_state=session_state,
             )
+        prestp = None
+        if self._prestp_config is not None:
+            if session_state is None:
+                prestp = PreSTPState(self._prestp_config)
+            else:
+                if session_state.prestp is None:
+                    session_state.prestp = PreSTPState(self._prestp_config)
+                prestp = session_state.prestp
         generated_blocks: list[torch.Tensor] = []
         total_steps = (inputs.num_latent_frames // block_frames) * len(LINGBOT_DMD_TIMESTEPS)
         first_start_frame = tick.chunk_index * block_frames if tick is not None else 0
@@ -1707,6 +1743,7 @@ class LingBotWorldCausalDMDPipeline(
                         schedule=schedule,
                         generator=inputs.generator,
                         progress_bar=progress_bar,
+                        **({"prestp": prestp} if prestp is not None else {}),
                     )
                 )
         generated_latents = torch.cat(generated_blocks, dim=2)
@@ -2172,6 +2209,11 @@ class LingBotWorldCausalDMDPipeline(
             device=self.device,
             dtype=torch.float32,
         )
+        if self._prestp_config is not None:
+            if session_state.prestp is None:
+                session_state.prestp = PreSTPState(self._prestp_config)
+            extra["prestp"] = session_state.prestp
+            session_state.prestp.begin_chunk(session_state.prestp.patchify(state.latents))
         state.timesteps = torch.tensor(
             [timestep for timestep, _ in extra["schedule"]],
             device=self.device,
@@ -2213,6 +2255,7 @@ class LingBotWorldCausalDMDPipeline(
             timestep_value=float(schedule[step_in_chunk][0]),
             step_index=step_in_chunk,
             camera_cache=extra["camera_cache"],
+            **({"prestp": extra["prestp"]} if "prestp" in extra else {}),
         )
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any) -> None:
@@ -2233,6 +2276,8 @@ class LingBotWorldCausalDMDPipeline(
             schedule[step_in_chunk][1],
             next_sigma=next_sigma,
             generator=generator,
+            prestp=extra.get("prestp"),
+            step_index=step_in_chunk,
         )
         state.step_in_chunk += 1
         state.step_index = state.step_in_chunk
@@ -2256,7 +2301,10 @@ class LingBotWorldCausalDMDPipeline(
             ar=self._ar_block_context(extra["ar_cross_attention"]),
             start_frame=int(extra["start_frame"]),
             camera_cache=extra.pop("camera_cache"),
+            **({"prestp": extra["prestp"]} if "prestp" in extra else {}),
         )
+        if "prestp" in extra:
+            extra["prestp"].finish_chunk()
         completed_chunk_index = state.chunk_index
         inputs: _LingBotRequestInputs = extra["inputs"]
         # "video" is the payload key the output formatter treats as primary, so
