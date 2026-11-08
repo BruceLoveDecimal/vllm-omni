@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.cosyvoice3 import runtime
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core import flow_prefix_cache
 from vllm_omni.platforms import current_omni_platform
@@ -20,6 +21,7 @@ pytestmark = [
 HEADS, HEAD_DIM, BLOCKS = 2, 64, 6
 
 
+@hardware_test(res={"cuda": ["H100", "RTX5090"]}, num_cards=1)
 @pytest.mark.parametrize("fa_version", [2, 3])
 @torch.inference_mode()
 def test_prefix_attention_matches_reference(monkeypatch, fa_version):
