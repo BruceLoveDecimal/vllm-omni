@@ -32,7 +32,9 @@ def test_prefix_attention_matches_reference(monkeypatch, fa_version):
     torch.manual_seed(0)
     pool = torch.randn((1, 2, BLOCKS, page, HEADS, HEAD_DIM), device=device, dtype=dtype)
     monkeypatch.setattr(
-        flow_prefix_cache, "_ACTIVE_CACHE", SimpleNamespace(kv=pool, estimator=SimpleNamespace(backend=f"fa{fa_version}"))
+        flow_prefix_cache,
+        "_ACTIVE_CACHE",
+        SimpleNamespace(kv=pool, estimator=SimpleNamespace(backend=f"fa{fa_version}")),
     )
     # Segment 0 appends 4 frames to a 16-frame prefix (pages 1, 2); segment 1
     # writes its first 9 frames into page 3.
