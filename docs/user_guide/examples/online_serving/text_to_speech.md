@@ -158,9 +158,11 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Streaming is on by default. On CUDA Hopper GPUs with at least 140 GiB of device memory (H200), serving automatically selects `cosyvoice3_packed_streaming_optimized_standard.yaml` when `nvidia-cuda-mps-control` is available on `PATH`: AR32 / codec32, standard sampling, packed Flow, cached ISTFT, HiFT decode graphs, and local CUDA MPS. No `--hf-overrides` is needed. Other devices and environments without the MPS control tool use `cosyvoice3.yaml` with RAS sampling and AR8 / codec8.
 
-The optimized profile is not a universal hardware configuration. Its packed kernels are Hopper-only; the talker's Model Runner V2 is unsupported on NPU/XPU, and CUDA MPS requires a local NVIDIA GPU and its control tool. Larger batches, 25-frame chunks, and graph allocations also require per-device validation on smaller or slower GPUs. Automatic selection retains the generic profile outside the validated device class; an explicit deploy configuration takes precedence.
+The optimized profile is not a universal hardware configuration. Its packed Flow uses FlashAttention 3 on Hopper and FlashAttention 2 on other CUDA GPUs (set `COSYVOICE3_PACKED_ATTENTION_BACKEND=fa2` or `fa3` to pin one, or `flashinfer` to opt into FlashInfer); the talker's Model Runner V2 is unsupported on NPU/XPU, and CUDA MPS requires a local NVIDIA GPU and its control tool. Larger batches, 25-frame chunks, and graph allocations also require per-device validation on smaller or slower GPUs. Automatic selection retains the generic profile outside the validated device class; an explicit deploy configuration takes precedence.
 
 The H200 default targets streaming throughput at C32/C64. It changes sampling from RAS to standard (temperature 0.7, top-p 0.8, top-k 20, repetition penalty 1.21); output lengths and quality can differ. HiFT captures a recurring exact shape on its third use, which adds latency to that request, and its graph pool needs memory headroom beyond the engine reservations. This profile is not a claim of optimal first-audio latency at low concurrency. Pass `--deploy-config cosyvoice3.yaml` to retain the previous configuration, or `--deploy-config <path>` to select another profile.
+
+Compatibility note: explicitly selecting `cosyvoice3_full_response.yaml` or `cosyvoice3_packed_streaming.yaml` now enables packed Flow, batched HiFT, and GPU F0 on non-Hopper GPUs with supported FA2, where these optimizations previously fell back to stock Flow. This changes memory use and numerical behavior. FA2 serving was validated on a 96 GB RTX PRO 6000 Blackwell and a 32 GiB Ada instance, with Stage 0 using `model_runner: v1` in both cases. Other configurations, including 16/24 GiB cards, need separate validation. If the optimized profile causes memory pressure, pass `--deploy-config cosyvoice3.yaml` to use the generic profile. Pinning `COSYVOICE3_PACKED_ATTENTION_BACKEND` selects an attention backend; it does not reduce the profile's memory requirements.
 
 Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path; use `--deploy-config cosyvoice3.yaml` alongside it when selecting that path on H200.
 
@@ -173,11 +175,12 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
-The packed-streaming profiles preallocate a shared Flow prefix pool:
+With FA2 or FA3, the packed-streaming profiles preallocate a shared Flow prefix pool:
 `cosyvoice3_packed_streaming.yaml` budgets 8 GiB and
 `cosyvoice3_packed_streaming_optimized_standard.yaml` budgets 16 GiB.
 Override `COSYVOICE3_FLOW_PREFIX_CACHE_GIB` in the codec stage's `env` mapping
-of a copied deploy YAML; `0` disables the prefix cache. The budget is rounded
+of a copied deploy YAML; `0` disables the prefix cache. Packed Flow with
+FlashInfer recomputes prefixes. The budget is rounded
 down to whole pages, including one reserved scratch page; a positive budget
 must hold at least two pages. Request completion returns pages to this pool,
 not to the device allocator. Pool exhaustion falls back to full Flow

@@ -32,6 +32,7 @@ from vllm.platforms import current_platform
 
 from ..runtime import cosyvoice3_flow_graph_max
 from .packed_dit import (
+    FA_VERSION,
     _FLOW_GRAPH_MAX_TOTAL,
     _FLOW_GRAPH_SLOTS,
     PackedDiT,
@@ -47,6 +48,7 @@ from .packed_dit import (
 
 logger = init_logger(__name__)
 
+# vLLM's FA2 needs a page size that is a multiple of 16 frames.
 PAGE_FRAMES = 16
 # Page 0 is never handed out: graph padding rows write and read it.
 _SCRATCH_PAGE = 0
@@ -192,7 +194,7 @@ def prefix_attention(
         seqused_k=cache_seqlens,
         block_table=page_table,
         causal=False,
-        fa_version=3,
+        fa_version=FA_VERSION[_ACTIVE_CACHE.estimator.backend],
     )
 
 
@@ -219,7 +221,7 @@ def paged_attention_reference(
     page_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
 ) -> torch.Tensor:
-    """Eager equivalent of FA3's paged varlen attention, for CPU runs."""
+    """Eager equivalent of FlashAttention's paged varlen attention, for CPU runs."""
     page = key_cache.shape[1]
     keys, values = key_cache.flatten(0, 1), value_cache.flatten(0, 1)
     offsets = torch.arange(page, device=q.device)

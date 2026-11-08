@@ -22,11 +22,12 @@ def _tiny_streaming_flow(monkeypatch):
     monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
     # The full-recompute baseline runs the packed path eagerly on CPU, with a
     # page-size-1 reference attention in place of FA3.
+    monkeypatch.setattr(packed_dit, "cosyvoice3_packed_attention_backend", lambda: "fa3")
     monkeypatch.setattr(packed_dit, "native_mish", torch.nn.functional.mish)
     monkeypatch.setattr(
         packed_dit,
-        "packed_fa3",
-        lambda q, k, v, lens, table, cu, _: paged_attention_reference(q, k, v, lens, table, cu),
+        "paged_varlen_attention",
+        lambda q, k, v, lens, table, cu, *_: paged_attention_reference(q, k, v, lens, table, cu),
     )
     config = CosyVoice3Config()
     config.flow["pre_lookahead_layer"]["channels"] = 32
