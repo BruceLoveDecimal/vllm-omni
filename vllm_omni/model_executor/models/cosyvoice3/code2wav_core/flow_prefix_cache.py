@@ -32,9 +32,9 @@ from vllm.platforms import current_platform
 
 from ..runtime import cosyvoice3_flow_graph_max
 from .packed_dit import (
-    FA_VERSION,
     _FLOW_GRAPH_MAX_TOTAL,
     _FLOW_GRAPH_SLOTS,
+    FA_VERSION,
     PackedDiT,
     attn_norm_preserving_eager,
     final_norm_preserving_eager,
