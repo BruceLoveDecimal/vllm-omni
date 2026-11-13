@@ -751,6 +751,39 @@ class MiniMaxH3AdalnProj(nn.Module):
         return tuple(x.chunk(self.expand_ratio, dim=-1))
 
 
+class MiniMaxH3AdalnTable(nn.Module):
+    """Precomputed AdaLN outputs of a distilled schedule, one table row per step.
+
+    An AdaLN-pruned checkpoint stores what ``MiniMaxH3AdalnProj`` returns for
+    each timestep its schedule visits, so the projection and the timestep
+    embedder are gone. ``forward`` takes the table row of every distinct
+    timestep where the projection takes its embedding.
+    """
+
+    def __init__(
+        self,
+        arch: MiniMaxH3DiTArchConfig,
+        *,
+        rows: int,
+        expand_ratio: int,
+        modality_num: int,
+    ) -> None:
+        super().__init__()
+        self.expand_ratio = expand_ratio
+        self.modality_num = modality_num
+        self.hidden_size = arch.hidden_size
+        self.table = nn.Parameter(
+            torch.empty(rows, modality_num, expand_ratio, arch.hidden_size, dtype=_BF16_DTYPE),
+            requires_grad=False,
+        )
+
+    def forward(self, timestep_rows: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """timestep_rows: [M] long -> expand_ratio tensors of [M*modality_num, H]."""
+        x = self.table.index_select(0, timestep_rows)
+        x = x.view(-1, self.expand_ratio * self.hidden_size)
+        return tuple(x.chunk(self.expand_ratio, dim=-1))
+
+
 class MiniMaxH3DiTBlock(nn.Module):
     def __init__(
         self,
@@ -761,6 +794,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         layer_index: int,
         adaln_cache: MiniMaxH3RuntimeAdalnCache | None = None,
         attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
+        adaln_table_rows: int | None = None,
     ) -> None:
         super().__init__()
         self.layer_index = int(layer_index)
@@ -787,15 +821,23 @@ class MiniMaxH3DiTBlock(nn.Module):
             quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.adaln_proj = MiniMaxH3AdalnProj(
-            arch,
-            arch.adaln_out_features,
-            quant_config,
-            expand_ratio=6,
-            modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
-            prefix=f"{prefix}.adaln_proj",
-            adaln_cache=adaln_cache,
-        )
+        if adaln_table_rows is None:
+            self.adaln_proj = MiniMaxH3AdalnProj(
+                arch,
+                arch.adaln_out_features,
+                quant_config,
+                expand_ratio=6,
+                modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
+                prefix=f"{prefix}.adaln_proj",
+                adaln_cache=adaln_cache,
+            )
+        else:
+            self.adaln_proj = MiniMaxH3AdalnTable(
+                arch,
+                rows=adaln_table_rows,
+                expand_ratio=6,
+                modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
+            )
 
     def forward(
         self,
@@ -817,6 +859,7 @@ class MiniMaxH3DiTBlock(nn.Module):
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
+        An AdaLN-pruned block takes its [M] table rows as ``t_emb``.
 
         Each block computes AdaLN parameters once, then applies
         norm1 -> scale/shift -> attention -> gated residual, followed by

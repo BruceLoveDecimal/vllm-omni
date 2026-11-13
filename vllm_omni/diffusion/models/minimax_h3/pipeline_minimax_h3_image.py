@@ -68,6 +68,7 @@ from .denoise_loop import (
     MiniMaxH3DenoiseBranch,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
+from .entropack_checkpoint import EntroPackDiTCheckpoint, EntroPackDiTQuantConfig, entropack_dit_weights
 from .image_resize import resize_lanczos_uint8
 from .image_vae import MiniMaxH3ImageVAE
 from .minimax_h3_transformer import MiniMaxH3DiTModel
@@ -393,7 +394,26 @@ class MiniMaxH3ImagePipeline(
         from vllm_omni.quantization import resolve_component_quant_config
 
         transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
-        self.transformer = MiniMaxH3DiTModel(od_config, quant_config=transformer_quant_config)
+        # A DiffSynth EntroPack package in transformer/ is pre-quantized and
+        # AdaLN-pruned; its own tensors select the per-layer methods.
+        self._entropack_checkpoint = EntroPackDiTCheckpoint.from_transformer_dir(root / "transformer")
+        if self._entropack_checkpoint is None:
+            self.transformer = MiniMaxH3DiTModel(od_config, quant_config=transformer_quant_config)
+        else:
+            if transformer_quant_config is not None:
+                raise ValueError(
+                    "The transformer is a pre-quantized EntroPack package; drop the transformer quantization config"
+                )
+            self.transformer = MiniMaxH3DiTModel(
+                od_config,
+                quant_config=EntroPackDiTQuantConfig(self._entropack_checkpoint),
+                adaln_table_rows=self._entropack_checkpoint.adaln_table_rows,
+            )
+            if self._entropack_checkpoint.adaln_table_rows != self.num_steps + 1:
+                raise ValueError(
+                    f"The EntroPack AdaLN tables hold {self._entropack_checkpoint.adaln_table_rows} rows, "
+                    f"but pdd_config.json lists {self.num_steps} steps plus the reference level"
+                )
         if self.transformer.arch.audio_enabled:
             raise ValueError("MiniMax-H3-Image requires an audio-free DiT (audio_enabled: false)")
 
@@ -523,9 +543,10 @@ class MiniMaxH3ImagePipeline(
             if component in seen:
                 raise ValueError(f"MiniMax-H3-Image weight source {component!r} is not contiguous")
             seen.add(component)
-            names = getattr(self, component).load_weights(
-                (name[len(component) + 1 :], tensor) for name, tensor in group
-            )
+            component_weights = ((name[len(component) + 1 :], tensor) for name, tensor in group)
+            if component == "transformer" and self._entropack_checkpoint is not None:
+                component_weights = entropack_dit_weights(component_weights, rope_theta=self.transformer._rope_theta)
+            names = getattr(self, component).load_weights(component_weights)
             loaded.update(f"{component}.{name}" for name in names)
         self.transformer.post_load_weights()
         steps = self.transformer.final_layer.load_fused_pdd_heads(str(self.pdd_heads_path))

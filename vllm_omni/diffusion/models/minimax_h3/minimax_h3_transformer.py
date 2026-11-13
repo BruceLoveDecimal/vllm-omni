@@ -50,6 +50,7 @@ from .minimax_h3_blocks import (
     _FP32_DTYPE,
     MINIMAX_H3_ADALN_MODALITY_NUM,
     MiniMaxH3AdalnProj,
+    MiniMaxH3AdalnTable,
     MiniMaxH3Attention,
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTBlock,
@@ -534,21 +535,34 @@ class MiniMaxH3FinalLayer(nn.Module):
         *,
         prefix: str,
         adaln_cache: MiniMaxH3RuntimeAdalnCache | None = None,
+        adaln_table_rows: int | None = None,
     ) -> None:
         super().__init__()
         video_patch_dim = arch.latents_dim * arch.patch_size[0] * arch.patch_size[1] * arch.patch_size[2]
+        self.hidden_size = arch.hidden_size
+        self.head_output_sizes = {"video_out": video_patch_dim, "audio_out": arch.audio_latents_dim}
         self.norm = _norm(arch.hidden_size, eps=arch.final_norm_eps)
-        self.adaln_proj = MiniMaxH3AdalnProj(
-            arch,
-            arch.final_adaln_out_features,
-            quant_config,
-            expand_ratio=2,
-            modality_num=1,
-            prefix=f"{prefix}.adaln_proj",
-            adaln_cache=adaln_cache,
-        )
+        if adaln_table_rows is None:
+            self.adaln_proj = MiniMaxH3AdalnProj(
+                arch,
+                arch.final_adaln_out_features,
+                quant_config,
+                expand_ratio=2,
+                modality_num=1,
+                prefix=f"{prefix}.adaln_proj",
+                adaln_cache=adaln_cache,
+            )
+        else:
+            self.adaln_proj = MiniMaxH3AdalnTable(arch, rows=adaln_table_rows, expand_ratio=2, modality_num=1)
         self.pdd_steps = arch.pdd_steps
-        if arch.pdd_steps is not None:
+        if adaln_table_rows is not None:
+            # An AdaLN-pruned checkpoint serves its distilled schedule through
+            # the fused PDD heads only and ships no base output head.
+            if arch.pdd_steps is not None or arch.audio_enabled:
+                raise ValueError("an AdaLN-pruned MiniMax-H3 DiT is an audio-free fused-PDD checkpoint")
+            self.video_out = None
+            self.audio_out = None
+        elif arch.pdd_steps is not None:
             from .pdd import PDD_STEPS, MiniMaxH3PDDOutput
 
             if type(arch.pdd_steps) is not int or arch.pdd_steps != PDD_STEPS:
@@ -605,15 +619,15 @@ class MiniMaxH3FinalLayer(nn.Module):
             raise ValueError(f"MiniMax-H3 PDD heads must hold exactly {sorted(expected)}, got {sorted(heads)}")
         steps = int(heads["video_out.weight"].shape[0])
         for name in names:
-            projection = getattr(self, name)
+            output_size = self.head_output_sizes[name]
             for suffix, shape in (
-                ("weight", (steps, projection.output_size, projection.input_size)),
-                ("bias", (steps, projection.output_size)),
+                ("weight", (steps, output_size, self.hidden_size)),
+                ("bias", (steps, output_size)),
             ):
                 key = f"{name}.{suffix}"
                 if steps == 0 or tuple(heads[key].shape) != shape:
                     raise ValueError(f"MiniMax-H3 PDD {key} must have shape {shape}, got {tuple(heads[key].shape)}")
-                heads[key] = heads[key].to(device=projection.weight.device, dtype=_FP32_DTYPE)
+                heads[key] = heads[key].to(device=self.norm.weight.device, dtype=_FP32_DTYPE)
         self.fused_pdd_heads = heads
         return steps
 
@@ -780,8 +794,12 @@ class MiniMaxH3DiTModel(nn.Module):
         *,
         diffusers_weights: bool | None = None,
         attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
+        adaln_table_rows: int | None = None,
     ) -> None:
         super().__init__()
+        # Set for an AdaLN-pruned checkpoint: its blocks read precomputed AdaLN
+        # tables of this many rows instead of projecting a timestep embedding.
+        self.adaln_table_rows = adaln_table_rows
         tf_config = od_config.tf_model_config
         config_mapping = tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config)
         # The native MiniMax-H3 Hub snapshot advertises the Diffusers
@@ -898,10 +916,12 @@ class MiniMaxH3DiTModel(nn.Module):
             quant_config=quant_config,
             prefix="condition_proj",
         )
-        self.time_embedder = MiniMaxH3TimeEmbedder(
-            arch,
-            prefix="time_embedder",
-        )
+        self.time_embedder = None
+        if adaln_table_rows is None:
+            self.time_embedder = MiniMaxH3TimeEmbedder(
+                arch,
+                prefix="time_embedder",
+            )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
@@ -917,6 +937,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     layer_index=i,
                     adaln_cache=self.adaln_cache,
                     attention_cls=attention_cls,
+                    adaln_table_rows=adaln_table_rows,
                 )
                 for i in range(arch.num_layers)
             ]
@@ -933,6 +954,7 @@ class MiniMaxH3DiTModel(nn.Module):
             quant_config,
             prefix="final_layer",
             adaln_cache=self.adaln_cache,
+            adaln_table_rows=adaln_table_rows,
         )
         self._mark_missing_params_required()
 
@@ -1244,10 +1266,11 @@ class MiniMaxH3DiTModel(nn.Module):
         local_span: tuple[int, int],
         num_requests: int = 1,
         global_positions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Build this rank's packed multimodal embedding rows.
 
         Returns (decoder_input [S_local, H] bf16, t_emb [M, t_dim] fp32).
+        An AdaLN-pruned model has no timestep embedder and returns no t_emb.
 
         ``num_requests`` defaults to a single packed request so callers that
         pre-date the continuous-batching change (e.g. TeaCache's extractor
@@ -1332,8 +1355,27 @@ class MiniMaxH3DiTModel(nn.Module):
             audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
         )
 
+        if self.time_embedder is None:
+            return embeddings, None
         t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
+
+    def _adaln_table_timestep_rows(self, unique_timesteps: torch.Tensor, pdd_step: int | None) -> torch.Tensor:
+        """The AdaLN table row of each distinct timestep of one packed request.
+
+        Row ``i`` belongs to distilled step ``i`` and the last row to the
+        clean-reference level. ``unique_timesteps`` is sorted, and the
+        reference level lies above every denoising timestep.
+        """
+        num_steps = self.adaln_table_rows - 1
+        if pdd_step is None or not 0 <= pdd_step < num_steps:
+            raise ValueError(f"an AdaLN-pruned DiT serves pdd_step 0..{num_steps - 1}, got {pdd_step!r}")
+        num_timesteps = unique_timesteps.numel()
+        if num_timesteps > 2:
+            raise ValueError(f"an AdaLN-pruned DiT takes one target and one reference timestep, got {num_timesteps}")
+        rows = torch.full((num_timesteps,), num_steps, dtype=torch.long, device=unique_timesteps.device)
+        rows[0] = pdd_step
+        return rows
 
     def create_reference_kv_state(
         self,
@@ -1504,6 +1546,8 @@ class MiniMaxH3DiTModel(nn.Module):
             local_span=local_span,
             global_positions=(compact_local_positions if compact_reference and local_len != seq_len else None),
         )
+        if self.adaln_table_rows is not None:
+            t_emb = self._adaln_table_timestep_rows(unique_timesteps.view(-1).to(device), pdd_step)
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         inverse_indices = inverse_indices.to(device)
@@ -1593,7 +1637,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 packed_total=seq_len,
                 num_requests=num_requests,
             )
-        if getattr(self, "adaln_cache", None) is not None:
+        if getattr(self, "adaln_cache", None) is not None and self.adaln_table_rows is None:
             self.adaln_cache.prepare(t_emb)
 
         for block_index, block in enumerate(self.blocks):
