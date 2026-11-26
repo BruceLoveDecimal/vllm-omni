@@ -209,9 +209,7 @@ class HaloLocalAttentionPlan:
                 dist.P2POp(dist.isend, send_kv, dist.get_global_rank(process_group, peer.rank), group=process_group)
             )
         for peer in self.recv_peers:
-            recv_kv = torch.empty(
-                (2, batch * peer.tokens_per_batch, kv_heads, dim), dtype=key.dtype, device=key.device
-            )
+            recv_kv = torch.empty((2, batch * peer.tokens_per_batch, kv_heads, dim), dtype=key.dtype, device=key.device)
             recv_bufs.append(recv_kv)
             ops.append(
                 dist.P2POp(dist.irecv, recv_kv, dist.get_global_rank(process_group, peer.rank), group=process_group)

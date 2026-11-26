@@ -135,9 +135,7 @@ def _window_worker(rank, world_size, rendezvous):
         assert fast_positions == positions
         fast_parallel.decoder.fail = rank == world_size - 1
         fast_session = fast_parallel.create_streaming_decode_session()
-        expect_collective_error(
-            lambda: fast_session.push(chunks[2]), "injected window failure|another decode rank"
-        )
+        expect_collective_error(lambda: fast_session.push(chunks[2]), "injected window failure|another decode rank")
         fast_parallel.decoder.fail = False
 
         for steps in (1, 2):
@@ -449,5 +447,8 @@ def _halo_and_hybrid_worker(rank, world_size, rendezvous):
 def test_halo_and_hybrid_parallel_matches_serial(tmp_path, monkeypatch, world_size):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4]))
     mp.spawn(
-        _halo_and_hybrid_worker, args=(world_size, (tmp_path / "halo-rendezvous").as_uri()), nprocs=world_size, join=True
+        _halo_and_hybrid_worker,
+        args=(world_size, (tmp_path / "halo-rendezvous").as_uri()),
+        nprocs=world_size,
+        join=True,
     )

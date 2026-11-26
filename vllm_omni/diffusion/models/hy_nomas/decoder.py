@@ -407,7 +407,9 @@ class PixelUMMDecoderModel(nn.Module):
                 return cached
         with torch.inference_mode(False), torch.no_grad():
             cos, sin = mrope_tables(self.arch, grid, device)
-            layout = local_attention_layout(grid, self.local_attention_tile, device) if self.local_attention_tile else None
+            layout = (
+                local_attention_layout(grid, self.local_attention_tile, device) if self.local_attention_tile else None
+            )
             perm = None
             inverse = None
             neighborhoods = None
@@ -589,7 +591,13 @@ class PixelUMMDecoderModel(nn.Module):
                 peer_global = dist.get_global_rank(process_group, box.rank)
                 ops.append(dist.P2POp(dist.isend, local_video, peer_global, group=process_group))
                 buf = torch.empty(
-                    (batch, 3, frames * TUBELET[0], (box.latent_h1 - box.latent_h0) * 32, (box.latent_w1 - box.latent_w0) * 32),
+                    (
+                        batch,
+                        3,
+                        frames * TUBELET[0],
+                        (box.latent_h1 - box.latent_h0) * 32,
+                        (box.latent_w1 - box.latent_w0) * 32,
+                    ),
                     dtype=local_video.dtype,
                     device=local_video.device,
                 )
@@ -601,7 +609,13 @@ class PixelUMMDecoderModel(nn.Module):
                     continue
                 peer_global = dist.get_global_rank(process_group, box.rank)
                 buf = torch.empty(
-                    (batch, 3, frames * TUBELET[0], (box.latent_h1 - box.latent_h0) * 32, (box.latent_w1 - box.latent_w0) * 32),
+                    (
+                        batch,
+                        3,
+                        frames * TUBELET[0],
+                        (box.latent_h1 - box.latent_h0) * 32,
+                        (box.latent_w1 - box.latent_w0) * 32,
+                    ),
                     dtype=local_video.dtype,
                     device=local_video.device,
                 )
