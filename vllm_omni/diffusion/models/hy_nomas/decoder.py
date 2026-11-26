@@ -37,7 +37,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.activation import SiluAndMul
-from vllm_omni.diffusion.models.hy_nomas.decoder_attention import packed_local_attention
+from vllm_omni.diffusion.models.hy_nomas.decoder_attention import (
+    choose_halo_grid,
+    packed_local_attention,
+    plan_halo_local_attention,
+)
 from vllm_omni.diffusion.models.hy_nomas.decoder_kernels import apply_mrope, split_norm_rope
 
 # Ported from jiaxiangc/diffusers at 12722ef11acf8e335f96cfd4faea17de78cd8909.
@@ -111,7 +115,24 @@ def unpatchify(tokens: torch.Tensor, grid: tuple[int, int, int]) -> torch.Tensor
 
 def mrope_tables(arch: PixelUMMArchitecture, grid: tuple[int, int, int], device) -> tuple[torch.Tensor, torch.Tensor]:
     """cos/sin [1, T*H*W, 1, head_dim] for a T/H/W-ordered grid, laid out [T | H | W]."""
-    axes = [torch.arange(size, device=device) for size in grid]
+    return mrope_tables_region(arch, grid[0], 0, grid[1], 0, grid[2], device)
+
+
+def mrope_tables_region(
+    arch: PixelUMMArchitecture,
+    frames: int,
+    h_start: int,
+    h_end: int,
+    w_start: int,
+    w_end: int,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """cos/sin [1, T*h_local*w_local, 1, head_dim] using global T/H/W coordinates."""
+    axes = (
+        torch.arange(frames, device=device),
+        torch.arange(h_start, h_end, device=device),
+        torch.arange(w_start, w_end, device=device),
+    )
     positions = torch.meshgrid(*axes, indexing="ij")
     thetas = (arch.rope_theta_t, arch.rope_theta_hw, arch.rope_theta_hw)
     cos_parts, sin_parts = [], []
@@ -250,7 +271,9 @@ class PixelUMMAttention(nn.Module):
             skip_sequence_parallel=True,
         )
 
-    def forward(self, hidden_states, cos, sin, neighborhoods=None, packed=None) -> torch.Tensor:
+    def forward(
+        self, hidden_states, cos, sin, neighborhoods=None, packed=None, *, halo_plan=None, halo_group=None
+    ) -> torch.Tensor:
         batch, count, _ = hidden_states.shape
         dim = self.arch.head_dim
         qkv, _ = self.qkv_proj(hidden_states)
@@ -266,7 +289,9 @@ class PixelUMMAttention(nn.Module):
         key = prepare_qk(key, cos, sin, self.k_norm_t, self.k_norm_hw, sections, value.dtype)
         # Keep K/V compressed through neighborhood gathering. The shared backend
         # selects fused GQA where supported and owns the equal-head fallback.
-        if packed is not None:
+        if halo_plan is not None:
+            output = halo_plan(self.attention, query, key, value, halo_group)
+        elif packed is not None:
             # One varlen call reads every tile's neighborhood (decoder_attention.py).
             output = packed(self.attention, query, key, value)
         elif neighborhoods is None:
@@ -310,9 +335,19 @@ class PixelUMMBlock(nn.Module):
         self.mlp = PixelUMMMLP(arch, prefix=f"{prefix}.mlp")
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, neighborhoods=None, packed=None
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        neighborhoods=None,
+        packed=None,
+        *,
+        halo_plan=None,
+        halo_group=None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.input_norm(x), cos, sin, neighborhoods, packed)
+        x = x + self.attn(
+            self.input_norm(x), cos, sin, neighborhoods, packed, halo_plan=halo_plan, halo_group=halo_group
+        )
         return x + self.mlp(self.post_attn_norm(x))
 
 
@@ -351,6 +386,7 @@ class PixelUMMDecoderModel(nn.Module):
         self.final_norm = RMSNorm(hidden, eps=arch.rms_norm_eps)
         self.head = PixelUMMHead(hidden, prefix=f"{prefix}.head")
         self._plan_cache: OrderedDict[tuple, tuple] = OrderedDict()
+        self._halo_plan_cache: OrderedDict[tuple, tuple] = OrderedDict()
 
     def _get_forward_plan(
         self,
@@ -420,6 +456,147 @@ class PixelUMMDecoderModel(nn.Module):
                 tokens = tokens[:, inverse]
         # The source runs the head after leaving autocast (forward_features returns first).
         return unpatchify(self.head(tokens), grid)
+
+    def _get_halo_plan(
+        self,
+        grid: tuple[int, int, int],
+        batch: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        process_group: dist.ProcessGroup,
+    ):
+        world_size = dist.get_world_size(process_group)
+        rank = dist.get_rank(process_group)
+        attention = self.layers[0].attn.attention
+        backend = getattr(attention, "attn_backend", None)
+        cacheable = not torch.is_grad_enabled()
+        key = (grid, self.local_attention_tile, world_size, rank, batch, dtype, device, id(backend))
+        if cacheable:
+            cached = self._halo_plan_cache.get(key)
+            if cached is not None:
+                self._halo_plan_cache.move_to_end(key)
+                return cached
+        with torch.inference_mode(False), torch.no_grad():
+            built = plan_halo_local_attention(
+                grid=grid,
+                tile=self.local_attention_tile,
+                latent_token_grid=LATENT_TOKEN_GRID,
+                world_size=world_size,
+                rank=rank,
+                batch=batch,
+                dtype=dtype,
+                device=device,
+                attention=attention,
+            )
+            if built is None:
+                return None
+            my_box, boxes, perm, inverse, halo_attn = built
+            cos, sin = mrope_tables_region(
+                self.arch, grid[0], my_box.token_h0, my_box.token_h1, my_box.token_w0, my_box.token_w1, device
+            )
+            cos = cos[:, perm].contiguous()
+            sin = sin[:, perm].contiguous()
+        plan = (my_box, boxes, cos, sin, perm, inverse, halo_attn)
+        if cacheable:
+            self._halo_plan_cache[key] = plan
+            if len(self._halo_plan_cache) > self._PLAN_CACHE_MAXSIZE:
+                self._halo_plan_cache.popitem(last=False)
+        return plan
+
+    def forward_halo(
+        self,
+        latent: torch.Tensor,
+        xt: torch.Tensor,
+        *,
+        process_group: dist.ProcessGroup,
+        output_rank: int = 0,
+        all_ranks: bool = False,
+    ) -> torch.Tensor | None:
+        """Exact intra-window Spatial-Tile Halo-SP forward across ``process_group``."""
+        if latent.ndim != 5 or latent.shape[1] != LATENT_CHANNELS:
+            raise ValueError(f"expected DCAE latent [B,{LATENT_CHANNELS},L,h,w], got {tuple(latent.shape)}")
+        batch, _, frames, height, width = latent.shape
+        pixel_shape = (batch, 3, frames * TUBELET[0], height * 32, width * 32)
+        if tuple(xt.shape) != pixel_shape:
+            raise ValueError(f"xt {tuple(xt.shape)} != expected {pixel_shape}")
+        dtype = latent.dtype
+        grid = (frames, height * LATENT_TOKEN_GRID, width * LATENT_TOKEN_GRID)
+        plan = self._get_halo_plan(grid, batch, dtype, latent.device, process_group)
+        if plan is None:
+            return None
+        my_box, boxes, cos, sin, perm, inverse, halo_attn = plan
+        lh0, lh1, lw0, lw1 = my_box.latent_h0, my_box.latent_h1, my_box.latent_w0, my_box.latent_w1
+        local_h = lh1 - lh0
+        local_w = lw1 - lw0
+        local_grid = (frames, local_h * LATENT_TOKEN_GRID, local_w * LATENT_TOKEN_GRID)
+        latent_local = latent[:, :, :, lh0:lh1, lw0:lw1].contiguous()
+        xt_local = xt[:, :, :, lh0 * 32 : lh1 * 32, lw0 * 32 : lw1 * 32].contiguous()
+        if dtype in (torch.bfloat16, torch.float16):
+            context = torch.autocast(device_type=latent.device.type, dtype=dtype)
+        else:
+            context = nullcontext()
+        with context:
+            tokens, _ = self.embed(patchify(xt_local.to(dtype)))
+            condition, _ = self.cond_proj(latent_local.to(dtype).permute(0, 2, 3, 4, 1))
+            condition = condition.view(
+                batch, frames, local_h, local_w, LATENT_TOKEN_GRID, LATENT_TOKEN_GRID, self.arch.hidden_size
+            )
+            condition = condition.permute(0, 1, 2, 4, 3, 5, 6).reshape(batch, -1, self.arch.hidden_size)
+            tokens = tokens + condition.to(tokens.device)
+            tokens = tokens[:, perm]
+            for layer in self.layers:
+                tokens = layer(tokens, cos, sin, halo_plan=halo_attn, halo_group=process_group)
+            tokens = self.final_norm(tokens)
+            tokens = tokens[:, inverse]
+        local_video = unpatchify(self.head(tokens), local_grid).contiguous()
+
+        rank = dist.get_rank(process_group)
+        receives = all_ranks or rank == output_rank
+        ops: list[dist.P2POp] = []
+        recv_bufs: dict[int, torch.Tensor] = {}
+        if all_ranks:
+            for box in boxes:
+                if box.rank == rank:
+                    continue
+                peer_global = dist.get_global_rank(process_group, box.rank)
+                ops.append(dist.P2POp(dist.isend, local_video, peer_global, group=process_group))
+                buf = torch.empty(
+                    (batch, 3, frames * TUBELET[0], (box.latent_h1 - box.latent_h0) * 32, (box.latent_w1 - box.latent_w0) * 32),
+                    dtype=local_video.dtype,
+                    device=local_video.device,
+                )
+                recv_bufs[box.rank] = buf
+                ops.append(dist.P2POp(dist.irecv, buf, peer_global, group=process_group))
+        elif receives:
+            for box in boxes:
+                if box.rank == rank:
+                    continue
+                peer_global = dist.get_global_rank(process_group, box.rank)
+                buf = torch.empty(
+                    (batch, 3, frames * TUBELET[0], (box.latent_h1 - box.latent_h0) * 32, (box.latent_w1 - box.latent_w0) * 32),
+                    dtype=local_video.dtype,
+                    device=local_video.device,
+                )
+                recv_bufs[box.rank] = buf
+                ops.append(dist.P2POp(dist.irecv, buf, peer_global, group=process_group))
+        else:
+            destination = dist.get_global_rank(process_group, output_rank)
+            ops.append(dist.P2POp(dist.isend, local_video, destination, group=process_group))
+
+        if ops:
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
+        if not receives:
+            return None
+        full_video = torch.empty(pixel_shape, dtype=local_video.dtype, device=local_video.device)
+        full_video[:, :, :, lh0 * 32 : lh1 * 32, lw0 * 32 : lw1 * 32] = local_video
+        for box in boxes:
+            if box.rank == rank:
+                continue
+            full_video[:, :, :, box.latent_h0 * 32 : box.latent_h1 * 32, box.latent_w0 * 32 : box.latent_w1 * 32] = (
+                recv_bufs[box.rank]
+            )
+        return full_video
 
 
 def _frame_seed(seed: int, index: int) -> int:
@@ -653,6 +830,7 @@ class PixelUMMDecoder(nn.Module):
         self._decode_group: dist.ProcessGroup | None = None
         self._decode_error_status: torch.Tensor | None = None
         self._decode_output_rank = 0
+        self._decode_mode = "window"
         self._decode_validate_inputs = True
 
     def configure_distributed_decode(
@@ -660,6 +838,7 @@ class PixelUMMDecoder(nn.Module):
         process_group: dist.ProcessGroup,
         *,
         output_rank: int = 0,
+        mode: str = "window",
         validate_inputs: bool = True,
     ) -> None:
         """Configure collective decoding on the supplied group."""
@@ -667,6 +846,8 @@ class PixelUMMDecoder(nn.Module):
             raise RuntimeError("PixelUMM window decoding requires torch.distributed")
         if process_group is None:
             raise ValueError("PixelUMM window decoding requires an explicit process group")
+        if mode not in ("window", "halo", "hybrid"):
+            raise ValueError(f"PixelUMM decode mode must be window, halo, or hybrid, got {mode!r}")
         size = dist.get_world_size(process_group)
         if size <= 1:
             raise ValueError("PixelUMM window decoding requires more than one rank")
@@ -676,6 +857,7 @@ class PixelUMMDecoder(nn.Module):
         self._decode_error_status = torch.empty(1, dtype=torch.int32, device=self.device)
         self._decode_group = process_group
         self._decode_output_rank = output_rank
+        self._decode_mode = mode
         self._decode_validate_inputs = bool(validate_inputs)
 
     def _is_output_rank(self) -> bool:
@@ -932,7 +1114,7 @@ class PixelUMMDecoder(nn.Module):
             pending: dict[int, list[torch.Tensor | None]] = {}
             next_window = 0
 
-            def _compute_task(task_index: int) -> torch.Tensor:
+            def _prepare_task_inputs(task_index: int) -> tuple[torch.Tensor, torch.Tensor]:
                 temporal, row, column = tasks[task_index]
                 start = t_starts[temporal]
                 real = latent[:, :, start : start + length, row : row + tile_h, column : column + tile_w]
@@ -942,13 +1124,26 @@ class PixelUMMDecoder(nn.Module):
                     tile = pad_noise[:, :, offset : offset + fill, row : row + tile_h, column : column + tile_w]
                     real = torch.cat([real, tile.to(real.dtype)], dim=2)
                 noise = xt_source(start, start + length, row, column, tile_h, tile_w)
-                out = self.decoder(real.contiguous(), noise.contiguous()).contiguous()
+                return real.contiguous(), noise.contiguous()
+
+            def _compute_task(task_index: int) -> torch.Tensor:
+                real, noise = _prepare_task_inputs(task_index)
+                out = self.decoder(real, noise).contiguous()
                 if tuple(out.shape) != idle_shape or out.dtype != self.dtype or out.device != latent.device:
                     raise RuntimeError("PixelUMM window output does not match the distributed tensor contract")
                 return out
 
-            def _merge_round(round_first: int, round_outputs: list[torch.Tensor] | None) -> None:
+            def _merge_task_output(task_index: int, output: torch.Tensor) -> None:
                 nonlocal next_window
+                temporal, tile = divmod(task_index, len(spatial))
+                pending.setdefault(temporal, [None] * len(spatial))[tile] = output
+                while next_window in pending and all(t is not None for t in pending[next_window]):
+                    tiles = pending.pop(next_window)
+                    blender.add(self._merge_tiles(tiles, rows, columns), (t_starts[next_window] - t_starts[0]) * 4)
+                    del tiles
+                    next_window += 1
+
+            def _merge_round(round_first: int, round_outputs: list[torch.Tensor] | None) -> None:
                 with self._strict_guard("window merge"):
                     if receives:
                         assert round_outputs is not None
@@ -956,86 +1151,124 @@ class PixelUMMDecoder(nn.Module):
                             task_index = round_first + source_rank
                             if task_index >= len(tasks):
                                 break
-                            temporal, tile = divmod(task_index, len(spatial))
-                            pending.setdefault(temporal, [None] * len(spatial))[tile] = output
-                        while next_window in pending and all(tile is not None for tile in pending[next_window]):
-                            tiles = pending.pop(next_window)
-                            blender.add(
-                                self._merge_tiles(tiles, rows, columns), (t_starts[next_window] - t_starts[0]) * 4
-                            )
-                            del tiles
-                            next_window += 1
+                            _merge_task_output(task_index, output)
 
-            if all_ranks:
-                for first in range(0, len(tasks), size):
-                    index = first + rank
-                    with self._decode_guard("window computation"):
-                        if index < len(tasks):
-                            local = _compute_task(index)
-                        else:
-                            local = torch.empty(idle_shape, device=latent.device, dtype=self.dtype)
-                        gathered = [torch.empty_like(local) for _ in range(size)]
-                    dist.all_gather(gathered, local, group=self._decode_group)
-                    _merge_round(first, gathered)
-                    del gathered, local
+            def _can_use_halo() -> bool:
+                if not hasattr(self.decoder, "forward_halo"):
+                    return False
+                tile_tok = getattr(self.decoder, "local_attention_tile", 0)
+                if tile_tok <= 0 or tile_tok % LATENT_TOKEN_GRID != 0:
+                    return False
+                tiles_h = math.ceil((tile_h * LATENT_TOKEN_GRID) / tile_tok)
+                tiles_w = math.ceil((tile_w * LATENT_TOKEN_GRID) / tile_tok)
+                return choose_halo_grid(tiles_h, tiles_w, size) is not None
+
+            def _run_halo_tasks(start_idx: int, end_idx: int) -> None:
+                for task_index in range(start_idx, end_idx):
+                    with self._decode_guard("halo window computation"):
+                        real, noise = _prepare_task_inputs(task_index)
+                        out = self.decoder.forward_halo(
+                            real,
+                            noise,
+                            process_group=self._decode_group,
+                            output_rank=self._decode_output_rank,
+                            all_ranks=all_ranks,
+                        )
+                        if receives:
+                            if out is None or tuple(out.shape) != idle_shape or out.dtype != self.dtype:
+                                raise RuntimeError(
+                                    "PixelUMM halo output does not match the distributed tensor contract"
+                                )
+                    with self._strict_guard("window merge"):
+                        if receives:
+                            assert out is not None
+                            _merge_task_output(task_index, out)
+
+            use_halo = self._decode_mode in ("halo", "hybrid") and _can_use_halo()
+            if self._decode_mode == "halo" and use_halo:
+                window_task_count = 0
+                halo_start_idx = 0
+            elif self._decode_mode == "hybrid" and use_halo:
+                window_task_count = (len(tasks) // size) * size
+                halo_start_idx = window_task_count
             else:
-                # Overlap round k compute with round k-1 P2P transfer, skipping idle ranks.
-                in_flight: tuple[list[dist.Work], int, list[torch.Tensor] | None, torch.Tensor | None] | None = None
-                try:
-                    for first in range(0, len(tasks), size):
-                        active_count = min(size, len(tasks) - first)
+                window_task_count = len(tasks)
+                halo_start_idx = len(tasks)
+
+            if window_task_count > 0:
+                if all_ranks:
+                    for first in range(0, window_task_count, size):
                         index = first + rank
-                        compute_error: Exception | None = None
-                        local = None
-                        try:
-                            if index < len(tasks):
+                        with self._decode_guard("window computation"):
+                            if index < window_task_count:
                                 local = _compute_task(index)
-                        except Exception as exc:
-                            compute_error = exc
-                        prev_merge: tuple[int, list[torch.Tensor] | None] | None = None
+                            else:
+                                local = torch.empty(idle_shape, device=latent.device, dtype=self.dtype)
+                            gathered = [torch.empty_like(local) for _ in range(size)]
+                        dist.all_gather(gathered, local, group=self._decode_group)
+                        _merge_round(first, gathered)
+                        del gathered, local
+                else:
+                    # Overlap round k compute with round k-1 P2P transfer, skipping idle ranks.
+                    in_flight: tuple[list[dist.Work], int, list[torch.Tensor] | None, torch.Tensor | None] | None = None
+                    try:
+                        for first in range(0, window_task_count, size):
+                            active_count = min(size, window_task_count - first)
+                            index = first + rank
+                            compute_error: Exception | None = None
+                            local = None
+                            try:
+                                if index < window_task_count:
+                                    local = _compute_task(index)
+                            except Exception as exc:
+                                compute_error = exc
+                            prev_merge: tuple[int, list[torch.Tensor] | None] | None = None
+                            if in_flight is not None:
+                                prev_reqs, prev_first, prev_outputs, _prev_local = in_flight
+                                for req in prev_reqs:
+                                    req.wait()
+                                prev_merge = (prev_first, prev_outputs)
+                                in_flight = None
+                            with self._decode_guard("window computation"):
+                                if compute_error is not None:
+                                    raise compute_error
+                            reqs: list[dist.Work] = []
+                            round_outputs: list[torch.Tensor] | None = None
+                            if receives:
+                                round_outputs = [None] * active_count  # type: ignore[list-item]
+                                ops: list[dist.P2POp] = []
+                                for source_rank in range(active_count):
+                                    if source_rank == rank:
+                                        assert local is not None
+                                        round_outputs[source_rank] = local
+                                    else:
+                                        buf = torch.empty(idle_shape, device=latent.device, dtype=self.dtype)
+                                        round_outputs[source_rank] = buf
+                                        peer_global = dist.get_global_rank(self._decode_group, source_rank)
+                                        ops.append(dist.P2POp(dist.irecv, buf, peer_global, group=self._decode_group))
+                                if ops:
+                                    reqs = dist.batch_isend_irecv(ops)
+                            elif rank < active_count:
+                                assert local is not None
+                                reqs = dist.batch_isend_irecv(
+                                    [dist.P2POp(dist.isend, local, destination, group=self._decode_group)]
+                                )
+                            in_flight = (reqs, first, round_outputs, local)
+                            if prev_merge is not None:
+                                _merge_round(prev_merge[0], prev_merge[1])
                         if in_flight is not None:
                             prev_reqs, prev_first, prev_outputs, _prev_local = in_flight
                             for req in prev_reqs:
                                 req.wait()
-                            prev_merge = (prev_first, prev_outputs)
                             in_flight = None
-                        with self._decode_guard("window computation"):
-                            if compute_error is not None:
-                                raise compute_error
-                        reqs: list[dist.Work] = []
-                        round_outputs: list[torch.Tensor] | None = None
-                        if receives:
-                            round_outputs = [None] * active_count  # type: ignore[list-item]
-                            ops: list[dist.P2POp] = []
-                            for source_rank in range(active_count):
-                                if source_rank == rank:
-                                    assert local is not None
-                                    round_outputs[source_rank] = local
-                                else:
-                                    buf = torch.empty(idle_shape, device=latent.device, dtype=self.dtype)
-                                    round_outputs[source_rank] = buf
-                                    peer_global = dist.get_global_rank(self._decode_group, source_rank)
-                                    ops.append(dist.P2POp(dist.irecv, buf, peer_global, group=self._decode_group))
-                            if ops:
-                                reqs = dist.batch_isend_irecv(ops)
-                        elif rank < active_count:
-                            assert local is not None
-                            reqs = dist.batch_isend_irecv(
-                                [dist.P2POp(dist.isend, local, destination, group=self._decode_group)]
-                            )
-                        in_flight = (reqs, first, round_outputs, local)
-                        if prev_merge is not None:
-                            _merge_round(prev_merge[0], prev_merge[1])
-                    if in_flight is not None:
-                        prev_reqs, prev_first, prev_outputs, _prev_local = in_flight
-                        for req in prev_reqs:
-                            req.wait()
-                        in_flight = None
-                        _merge_round(prev_first, prev_outputs)
-                finally:
-                    if in_flight is not None:
-                        for req in in_flight[0]:
-                            req.wait()
+                            _merge_round(prev_first, prev_outputs)
+                    finally:
+                        if in_flight is not None:
+                            for req in in_flight[0]:
+                                req.wait()
+
+            if halo_start_idx < len(tasks):
+                _run_halo_tasks(halo_start_idx, len(tasks))
             result = None
             with self._strict_guard("window finalization"):
                 if receives:

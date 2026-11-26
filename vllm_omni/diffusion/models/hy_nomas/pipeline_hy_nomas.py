@@ -168,10 +168,10 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     if custom.keys() - allowed:
         raise ValueError(f"Unsupported Hy-Nomas custom_pipeline_args: {sorted(custom.keys() - allowed)}")
     decoder_mode = custom.get("decoder_parallel_mode", "none")
-    if decoder_mode not in ("none", "window"):
-        raise ValueError("Hy-Nomas decoder_parallel_mode must be none or window.")
-    if decoder_mode == "window" and parallel.ulysses_degree <= 1:
-        raise ValueError("Hy-Nomas window decoder parallelism requires more than one Ulysses rank.")
+    if decoder_mode not in ("none", "window", "halo", "hybrid"):
+        raise ValueError("Hy-Nomas decoder_parallel_mode must be none, window, halo, or hybrid.")
+    if decoder_mode != "none" and parallel.ulysses_degree <= 1:
+        raise ValueError("Hy-Nomas distributed decoder parallelism requires more than one Ulysses rank.")
     HyNomasARConfig.from_args(custom)
     if config.step_execution and not config.streaming_output:
         raise ValueError("Hy-Nomas step execution requires streaming_output=true.")
@@ -305,12 +305,18 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         self._sp_error_status = (
             torch.empty(1, dtype=torch.int32, device=next(self.vae.parameters()).device) if self.sp_size > 1 else None
         )
-        if self.decoder_parallel_mode == "window":
+        if self.decoder_parallel_mode != "none":
             group = get_sp_group().ulysses_group
             if dist.get_global_rank(group, 0) != 0:
                 raise ValueError("Hy-Nomas decoder output rank must match the executor's global rank 0.")
-            self.vae.configure_distributed_decode(group, output_rank=0, validate_inputs=False)
-            logger.info("Hy-Nomas PixelUMM window decoding enabled with SP%d and output rank 0.", self.sp_size)
+            self.vae.configure_distributed_decode(
+                group, output_rank=0, mode=self.decoder_parallel_mode, validate_inputs=False
+            )
+            logger.info(
+                "Hy-Nomas PixelUMM %s decoding enabled with SP%d and output rank 0.",
+                self.decoder_parallel_mode,
+                self.sp_size,
+            )
         self.s_ratio = self.vae.spatial_compression_ratio
         self.patch_size = self.transformer.patch_size
         self.in_channels = self.transformer.config.in_channels
@@ -481,7 +487,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             spatial * (noise_frames * self.in_channels + decoder_frames * self.transformer.config.out_channels) * 2
         )
         model_bytes += config.height * config.width * 3 * 4 * (4 * decoder_frames)
-        if self.decoder_parallel_mode == "window":
+        if self.decoder_parallel_mode != "none":
             # Reserve space for gathered tensors and tiles awaiting merging.
             ys, xs, tile_h, tile_w = self.vae._tile_grid(config.height // self.s_ratio, config.width // self.s_ratio)
             tile_bytes = 3 * (4 * window) * (tile_h * self.s_ratio) * (tile_w * self.s_ratio) * 2
@@ -1024,7 +1030,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 with self._decoder_guard("PixelUMM preparation"):
                     stack.enter_context(self._component_context(self.vae))
                     if (
-                        self.decoder_parallel_mode == "window"
+                        self.decoder_parallel_mode != "none"
                         and session.decoder.committed_pixel_frames != session.emitted_frames
                     ):
                         raise RuntimeError("Hy-Nomas decoder and session frame positions disagree.")
@@ -1043,7 +1049,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 video = self._to_host(frames)
             else:
                 video = np.empty((0, session.height, session.width, 3), dtype=np.uint8)
-            if self.decoder_parallel_mode == "window":
+            if self.decoder_parallel_mode != "none":
                 committed = session.decoder.committed_pixel_frames - session.emitted_frames
                 expected = committed if self._decoder_is_output_rank() else 0
                 if committed < 0 or len(video) != expected:
@@ -1086,7 +1092,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             pixel_frames=chunk.pixel_frames,
             finish=state.request_denoise_completed and state.extra["hy_nomas_finish"],
         )
-        if self.decoder_parallel_mode == "window":
+        if self.decoder_parallel_mode != "none":
             session.emitted_frames = session.decoder.committed_pixel_frames
         else:
             session.emitted_frames += len(video)
@@ -1197,7 +1203,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                         result = DiffusionOutput()
             except Exception as exc:
                 error = exc
-            if self.decoder_parallel_mode == "window":
+            if self.decoder_parallel_mode != "none":
                 self._check_sp_error(error, "offline PixelUMM decoding")
             elif error is not None:
                 raise error

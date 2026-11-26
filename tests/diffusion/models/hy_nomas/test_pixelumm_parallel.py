@@ -328,3 +328,84 @@ def test_window_parallel_matches_serial_and_recovers(tmp_path, monkeypatch, worl
 def test_window_parallel_larger_groups(tmp_path, monkeypatch, world_size):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4]))
     mp.spawn(_window_worker, args=(world_size, (tmp_path / "rendezvous").as_uri()), nprocs=world_size, join=True)
+
+
+def _make_local_attn_decoder(*, num_steps=1):
+    model = PixelUMMDecoder(
+        hidden_size=16,
+        intermediate_size=32,
+        num_layers=2,
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=8,
+        local_attention_tile_pixels=32,
+        seed=7,
+        num_steps=num_steps,
+        temporal_window_latents=4,
+        temporal_overlap_latents=2,
+        decoder_tile_pixels=0,
+        decoder_tile_overlap_pixels=0,
+    ).eval()
+    generator = torch.Generator().manual_seed(19)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.02)
+    return model
+
+
+def _halo_and_hybrid_worker(rank, world_size, rendezvous):
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=world_size, timeout=timedelta(seconds=120)
+    )
+    try:
+        torch.set_num_threads(1)
+        config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+        with pytest.MonkeyPatch.context() as patch, set_current_vllm_config(config):
+            patch.setattr(
+                "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+                lambda *_args, **_kwargs: default_unquantized_gemm,
+            )
+            patch.setattr(
+                "vllm_omni.diffusion.attention.selector._cached_get_backend_cls",
+                lambda *_args, **_kwargs: SDPABackend,
+            )
+            init_distributed_environment(world_size=world_size, rank=rank, local_rank=rank, backend="gloo")
+            initialize_model_parallel(sequence_parallel_size=world_size, ulysses_degree=world_size, backend="gloo")
+            try:
+                with set_forward_context(vllm_config=config):
+                    torch.manual_seed(23)
+                    # 4x6 latent cells -> 8x12 tokens -> 4x6 local-attention tiles (tile=2 tokens).
+                    latent = torch.randn(1, 32, 8, 4, 6)
+                    baseline = _make_local_attn_decoder(num_steps=1)
+                    expected_offline = baseline.decode(latent).sample
+                    expected_stream, expected_positions = run_stream(baseline, [latent[:, :, :5], latent[:, :, 5:]])
+
+                    for mode in ("halo", "hybrid"):
+                        parallel = _make_local_attn_decoder(num_steps=1)
+                        parallel.configure_distributed_decode(dist.group.WORLD, mode=mode, validate_inputs=False)
+                        actual_offline = parallel.decode(latent).sample
+                        if rank == 0:
+                            torch.testing.assert_close(actual_offline, expected_offline, rtol=1e-5, atol=1e-5)
+                        else:
+                            assert actual_offline.numel() == 0
+
+                        actual_stream, actual_positions = run_stream(parallel, [latent[:, :, :5], latent[:, :, 5:]])
+                        assert actual_positions == expected_positions
+                        if rank == 0:
+                            for part, ref in zip(actual_stream, expected_stream):
+                                torch.testing.assert_close(part, ref, rtol=1e-5, atol=1e-5)
+                        else:
+                            assert all(part.numel() == 0 for part in actual_stream)
+            finally:
+                destroy_model_parallel()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.core_model
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_halo_and_hybrid_parallel_matches_serial(tmp_path, monkeypatch, world_size):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4]))
+    mp.spawn(
+        _halo_and_hybrid_worker, args=(world_size, (tmp_path / "halo-rendezvous").as_uri()), nprocs=world_size, join=True
+    )
