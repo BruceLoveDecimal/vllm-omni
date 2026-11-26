@@ -529,26 +529,54 @@ class PixelUMMDecoderModel(nn.Module):
         local_h = lh1 - lh0
         local_w = lw1 - lw0
         local_grid = (frames, local_h * LATENT_TOKEN_GRID, local_w * LATENT_TOKEN_GRID)
-        latent_local = latent[:, :, :, lh0:lh1, lw0:lw1].contiguous()
-        xt_local = xt[:, :, :, lh0 * 32 : lh1 * 32, lw0 * 32 : lw1 * 32].contiguous()
-        if dtype in (torch.bfloat16, torch.float16):
-            context = torch.autocast(device_type=latent.device.type, dtype=dtype)
-        else:
-            context = nullcontext()
-        with context:
-            tokens, _ = self.embed(patchify(xt_local.to(dtype)))
-            condition, _ = self.cond_proj(latent_local.to(dtype).permute(0, 2, 3, 4, 1))
-            condition = condition.view(
-                batch, frames, local_h, local_w, LATENT_TOKEN_GRID, LATENT_TOKEN_GRID, self.arch.hidden_size
+        # Every layer exchanges halo K/V with peers. A local failure must not
+        # skip those exchanges, or peers would wait on transfers that never
+        # come; finish the communication with placeholders, then raise.
+        launched = 0
+
+        def _mark_launched() -> None:
+            nonlocal launched
+            launched += 1
+
+        def _tracked_halo(attention, query, key, value, group):
+            return halo_attn(attention, query, key, value, group, on_launch=_mark_launched)
+
+        error: Exception | None = None
+        local_video: torch.Tensor | None = None
+        try:
+            latent_local = latent[:, :, :, lh0:lh1, lw0:lw1].contiguous()
+            xt_local = xt[:, :, :, lh0 * 32 : lh1 * 32, lw0 * 32 : lw1 * 32].contiguous()
+            if dtype in (torch.bfloat16, torch.float16):
+                context = torch.autocast(device_type=latent.device.type, dtype=dtype)
+            else:
+                context = nullcontext()
+            with context:
+                tokens, _ = self.embed(patchify(xt_local.to(dtype)))
+                condition, _ = self.cond_proj(latent_local.to(dtype).permute(0, 2, 3, 4, 1))
+                condition = condition.view(
+                    batch, frames, local_h, local_w, LATENT_TOKEN_GRID, LATENT_TOKEN_GRID, self.arch.hidden_size
+                )
+                condition = condition.permute(0, 1, 2, 4, 3, 5, 6).reshape(batch, -1, self.arch.hidden_size)
+                tokens = tokens + condition.to(tokens.device)
+                tokens = tokens[:, perm]
+                for layer in self.layers:
+                    tokens = layer(tokens, cos, sin, halo_plan=_tracked_halo, halo_group=process_group)
+                tokens = self.final_norm(tokens)
+                tokens = tokens[:, inverse]
+            local_video = unpatchify(self.head(tokens), local_grid).contiguous()
+        except Exception as exc:
+            error = exc
+            del exc
+            # K/V take the latent dtype: autocast for half precision, fp32 weights otherwise.
+            for _ in range(launched, len(self.layers)):
+                halo_attn.exchange_placeholder(
+                    batch, self.arch.num_kv_heads, self.arch.head_dim, dtype, latent.device, process_group
+                )
+            local_video = torch.zeros(
+                (batch, 3, frames * TUBELET[0], local_h * 32, local_w * 32),
+                dtype=self.head.linear.weight.dtype,
+                device=latent.device,
             )
-            condition = condition.permute(0, 1, 2, 4, 3, 5, 6).reshape(batch, -1, self.arch.hidden_size)
-            tokens = tokens + condition.to(tokens.device)
-            tokens = tokens[:, perm]
-            for layer in self.layers:
-                tokens = layer(tokens, cos, sin, halo_plan=halo_attn, halo_group=process_group)
-            tokens = self.final_norm(tokens)
-            tokens = tokens[:, inverse]
-        local_video = unpatchify(self.head(tokens), local_grid).contiguous()
 
         rank = dist.get_rank(process_group)
         receives = all_ranks or rank == output_rank
@@ -586,6 +614,8 @@ class PixelUMMDecoderModel(nn.Module):
         if ops:
             for req in dist.batch_isend_irecv(ops):
                 req.wait()
+        if error is not None:
+            raise error
         if not receives:
             return None
         full_video = torch.empty(pixel_shape, dtype=local_video.dtype, device=local_video.device)
@@ -1113,6 +1143,14 @@ class PixelUMMDecoder(nn.Module):
             idle_shape = (latent.shape[0], 3, length * 4, tile_h * 32, tile_w * 32)
             pending: dict[int, list[torch.Tensor | None]] = {}
             next_window = 0
+            # Merging runs only on receiving ranks. A merge failure is held
+            # until the next decode guard, where every rank sees it, so one
+            # rank cannot leave its peers waiting in a later collective.
+            merge_error: Exception | None = None
+
+            def _raise_merge_error() -> None:
+                if merge_error is not None:
+                    raise merge_error
 
             def _prepare_task_inputs(task_index: int) -> tuple[torch.Tensor, torch.Tensor]:
                 temporal, row, column = tasks[task_index]
@@ -1144,14 +1182,18 @@ class PixelUMMDecoder(nn.Module):
                     next_window += 1
 
             def _merge_round(round_first: int, round_outputs: list[torch.Tensor] | None) -> None:
-                with self._strict_guard("window merge"):
-                    if receives:
-                        assert round_outputs is not None
-                        for source_rank, output in enumerate(round_outputs):
-                            task_index = round_first + source_rank
-                            if task_index >= len(tasks):
-                                break
-                            _merge_task_output(task_index, output)
+                nonlocal merge_error
+                if not receives or merge_error is not None:
+                    return
+                try:
+                    assert round_outputs is not None
+                    for source_rank, output in enumerate(round_outputs):
+                        task_index = round_first + source_rank
+                        if task_index >= len(tasks):
+                            break
+                        _merge_task_output(task_index, output)
+                except Exception as exc:
+                    merge_error = exc
 
             def _can_use_halo() -> bool:
                 if not hasattr(self.decoder, "forward_halo"):
@@ -1165,8 +1207,12 @@ class PixelUMMDecoder(nn.Module):
 
             def _run_halo_tasks(start_idx: int, end_idx: int) -> None:
                 for task_index in range(start_idx, end_idx):
-                    with self._decode_guard("halo window computation"):
+                    with self._decode_guard("halo window preparation"):
+                        _raise_merge_error()
                         real, noise = _prepare_task_inputs(task_index)
+                    # forward_halo completes every halo exchange even when local
+                    # computation fails, so peers reach this guard together.
+                    with self._decode_guard("halo window computation"):
                         out = self.decoder.forward_halo(
                             real,
                             noise,
@@ -1179,10 +1225,7 @@ class PixelUMMDecoder(nn.Module):
                                 raise RuntimeError(
                                     "PixelUMM halo output does not match the distributed tensor contract"
                                 )
-                    with self._strict_guard("window merge"):
-                        if receives:
-                            assert out is not None
-                            _merge_task_output(task_index, out)
+                    _merge_round(task_index, [out] if receives else None)
 
             use_halo = self._decode_mode in ("halo", "hybrid") and _can_use_halo()
             if self._decode_mode == "halo" and use_halo:
@@ -1200,6 +1243,7 @@ class PixelUMMDecoder(nn.Module):
                     for first in range(0, window_task_count, size):
                         index = first + rank
                         with self._decode_guard("window computation"):
+                            _raise_merge_error()
                             if index < window_task_count:
                                 local = _compute_task(index)
                             else:
@@ -1232,6 +1276,7 @@ class PixelUMMDecoder(nn.Module):
                             with self._decode_guard("window computation"):
                                 if compute_error is not None:
                                     raise compute_error
+                                _raise_merge_error()
                             reqs: list[dist.Work] = []
                             round_outputs: list[torch.Tensor] | None = None
                             if receives:
@@ -1270,7 +1315,10 @@ class PixelUMMDecoder(nn.Module):
             if halo_start_idx < len(tasks):
                 _run_halo_tasks(halo_start_idx, len(tasks))
             result = None
-            with self._strict_guard("window finalization"):
+            # Always synchronized: it reports deferred merge failures, and
+            # multistep decoding enters another collective after it.
+            with self._decode_guard("window finalization"):
+                _raise_merge_error()
                 if receives:
                     if pending or next_window != len(t_starts):
                         raise RuntimeError("PixelUMM window decode left incomplete windows")

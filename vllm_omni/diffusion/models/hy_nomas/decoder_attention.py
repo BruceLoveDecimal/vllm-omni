@@ -12,7 +12,7 @@ others keep the per-tile path.
 """
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -189,6 +189,7 @@ class HaloLocalAttentionPlan:
         key: torch.Tensor,
         value: torch.Tensor,
         process_group: dist.ProcessGroup,
+        on_launch: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         batch, count, heads, dim = query.shape
         kv_heads = key.shape[2]
@@ -216,7 +217,58 @@ class HaloLocalAttentionPlan:
                 dist.P2POp(dist.irecv, recv_kv, dist.get_global_rank(process_group, peer.rank), group=process_group)
             )
         reqs = dist.batch_isend_irecv(ops) if ops else []
+        if on_launch is not None:
+            on_launch()
+        try:
+            return self._attend(attention, query, key, value, k_flat, v_flat, reqs, send_bufs, recv_bufs)
+        except BaseException:
+            # Complete this layer's exchange even when local attention fails,
+            # so peers do not wait on transfers that never finish.
+            for req in reqs:
+                req.wait()
+            raise
 
+    def exchange_placeholder(
+        self,
+        batch: int,
+        kv_heads: int,
+        dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        process_group: dist.ProcessGroup,
+    ) -> None:
+        """Perform one layer's halo exchange with zero K/V after a local failure.
+
+        The sizes match ``__call__``; the received values are discarded.
+        """
+        ops: list[dist.P2POp] = []
+        for peer in self.send_peers:
+            send_kv = torch.zeros((2, peer.token_index.numel(), kv_heads, dim), dtype=dtype, device=device)
+            ops.append(
+                dist.P2POp(dist.isend, send_kv, dist.get_global_rank(process_group, peer.rank), group=process_group)
+            )
+        for peer in self.recv_peers:
+            recv_kv = torch.empty((2, batch * peer.tokens_per_batch, kv_heads, dim), dtype=dtype, device=device)
+            ops.append(
+                dist.P2POp(dist.irecv, recv_kv, dist.get_global_rank(process_group, peer.rank), group=process_group)
+            )
+        for req in dist.batch_isend_irecv(ops) if ops else []:
+            req.wait()
+
+    def _attend(
+        self,
+        attention: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        k_flat: torch.Tensor,
+        v_flat: torch.Tensor,
+        reqs: list,
+        send_bufs: list[torch.Tensor],
+        recv_bufs: list[torch.Tensor],
+    ) -> torch.Tensor:
+        batch, _, _, dim = query.shape
+        kv_heads = key.shape[2]
         # 2. Compute interior neighborhoods while halo K/V is in flight.
         interior_out: torch.Tensor | None = None
         if self.n_interior > 0:

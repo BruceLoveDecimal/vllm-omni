@@ -380,9 +380,17 @@ def _halo_and_hybrid_worker(rank, world_size, rendezvous):
                     expected_offline = baseline.decode(latent).sample
                     expected_stream, expected_positions = run_stream(baseline, [latent[:, :, :5], latent[:, :, 5:]])
 
+                    halo_calls = {"halo": 0, "hybrid": 0}
                     for mode in ("halo", "hybrid"):
                         parallel = _make_local_attn_decoder(num_steps=1)
                         parallel.configure_distributed_decode(dist.group.WORLD, mode=mode, validate_inputs=False)
+                        forward_halo = parallel.decoder.forward_halo
+
+                        def counted_forward_halo(*args, _mode=mode, _forward=forward_halo, **kwargs):
+                            halo_calls[_mode] += 1
+                            return _forward(*args, **kwargs)
+
+                        parallel.decoder.forward_halo = counted_forward_halo
                         actual_offline = parallel.decode(latent).sample
                         if rank == 0:
                             torch.testing.assert_close(actual_offline, expected_offline, rtol=1e-5, atol=1e-5)
@@ -396,6 +404,40 @@ def _halo_and_hybrid_worker(rank, world_size, rendezvous):
                                 torch.testing.assert_close(part, ref, rtol=1e-5, atol=1e-5)
                         else:
                             assert all(part.numel() == 0 for part in actual_stream)
+                        assert halo_calls[mode] > 0
+
+                        # A rank-local failure inside a halo layer must surface on
+                        # every rank instead of leaving peers in a halo exchange.
+                        mlp = parallel.decoder.layers[1].mlp
+                        original_mlp = mlp.forward
+
+                        def failing_mlp(*args, **kwargs):
+                            raise RuntimeError("injected halo failure")
+
+                        if rank == world_size - 1:
+                            mlp.forward = failing_mlp
+                        expect_collective_error(
+                            lambda: parallel.decode(latent), "injected halo failure|another decode rank"
+                        )
+                        mlp.forward = original_mlp
+
+                        # A merge failure on the output rank must not strand peers in
+                        # the next window or halo collective.
+                        def failing_merge(*args, **kwargs):
+                            raise RuntimeError("injected merge failure")
+
+                        if rank == 0:
+                            parallel._merge_tiles = failing_merge
+                        expect_collective_error(
+                            lambda: parallel.decode(latent), "injected merge failure|another decode rank"
+                        )
+                        if rank == 0:
+                            del parallel._merge_tiles
+
+                        # The group stays usable after both failures.
+                        recovered = parallel.decode(latent).sample
+                        if rank == 0:
+                            torch.testing.assert_close(recovered, expected_offline, rtol=1e-5, atol=1e-5)
             finally:
                 destroy_model_parallel()
     finally:
