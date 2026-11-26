@@ -1013,7 +1013,7 @@ class OmniStreamingVideoOutputHandler:
             gen_params.streaming_max_output_bytes = request.streaming_pacing.max_output_bytes
             gen_params.streaming_idle_timeout_s = request.streaming_pacing.idle_timeout_s
         vp = request.resolve_video_params()
-        input_image = await self._decode_image_reference(request)
+        input_image = await self._decode_image_reference(request, max_images=self._max_image_references())
         if input_image is not None:
             prompt["multi_modal_data"] = {"image": input_image}
 
@@ -1063,12 +1063,55 @@ class OmniStreamingVideoOutputHandler:
         self._apply_lora(request.lora, gen_params)
         return prompt, gen_params, vp
 
+    def _max_image_references(self) -> int:
+        """Largest ordered ``image_reference`` list the served diffusion model accepts (1 if unknown)."""
+        from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+        from vllm_omni.entrypoints.openai.serving_video import _stage_diffusion_model_class_name
+
+        engine_client = getattr(self, "_engine_client", None)
+        get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
+        od_config = get_od_config() if callable(get_od_config) else getattr(engine_client, "od_config", None)
+        names = [getattr(od_config, "model_class_name", None)]
+        names.extend(_stage_diffusion_model_class_name(stage) for stage in getattr(self, "_stage_configs", None) or ())
+        limits = [
+            metadata.max_multimodal_image_inputs
+            for metadata in (get_diffusion_model_metadata(name) for name in names if name)
+            if metadata.supports_multimodal_inputs and metadata.max_multimodal_image_inputs
+        ]
+        return max(limits, default=1)
+
     @staticmethod
-    async def _decode_image_reference(request: VideoGenerationRequest) -> Image.Image | None:
+    async def _decode_image_reference(
+        request: VideoGenerationRequest, *, max_images: int = 1
+    ) -> Image.Image | list[Image.Image] | None:
+        """Decode the session's image reference, or an ordered list for models that accept several."""
+        image_reference = request.image_reference
+        if isinstance(image_reference, list):
+            if max_images <= 1:
+                raise HTTPException(
+                    HTTPStatus.BAD_REQUEST.value, detail="image_reference must be a single image reference."
+                )
+            if not 1 <= len(image_reference) <= max_images:
+                raise HTTPException(
+                    HTTPStatus.BAD_REQUEST.value,
+                    detail=f"image_reference must list between 1 and {max_images} images.",
+                )
+            images = []
+            for index, item in enumerate(image_reference):
+                try:
+                    media_data = await decode_input_reference(item, None, None)
+                except InvalidInputReferenceError as exc:
+                    raise HTTPException(
+                        HTTPStatus.BAD_REQUEST.value, detail=f"image_reference[{index}]: {exc}"
+                    ) from exc
+                if not isinstance(media_data, Image.Image):
+                    raise HTTPException(
+                        HTTPStatus.BAD_REQUEST.value,
+                        detail=f"image_reference[{index}] must resolve to an image.",
+                    )
+                images.append(media_data)
+            return images
         try:
-            image_reference = request.image_reference
-            if isinstance(image_reference, list):
-                raise InvalidInputReferenceError("image_reference must be a single image reference.")
             media_data = await decode_input_reference(
                 image_reference,
                 None,
@@ -1263,6 +1306,12 @@ class OmniStreamingVideoOutputHandler:
             **(
                 {"coalesced_event_ids": stream_metadata["coalesced_event_ids"]}
                 if stream_metadata.get("coalesced_event_ids")
+                else {}
+            ),
+            # Model-specific per-chunk facts (e.g. TaoMate-R1's LoRA bank), forwarded verbatim.
+            **(
+                {"model": dict(stream_metadata["model"])}
+                if kind == "media" and isinstance(stream_metadata.get("model"), dict)
                 else {}
             ),
         }

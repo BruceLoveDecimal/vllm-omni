@@ -212,6 +212,9 @@ class LoRAManager:
         self._closed = False
         self._fixed_adapter = getattr(pipeline, "diffusion_lora_fixed_adapter", False) is True
         self._fixed_adapter_request: LoRARequest | None = None
+        # A fixed-adapter pipeline may ship several pinned banks (role -> request)
+        # and choose the active one itself; see _fixed_bank_paths().
+        self._fixed_bank_requests: dict[str, LoRARequest] = {}
         self._scale_in_epilogue = getattr(pipeline, "diffusion_lora_scale_in_epilogue", False) is True
         if lora_application == "merged" and (self._fixed_adapter or self._scale_in_epilogue):
             raise ValueError("Generic merged LoRA does not support a pipeline's fixed-adapter specialization")
@@ -225,7 +228,22 @@ class LoRAManager:
         )
 
         try:
-            if lora_path is not None:
+            bank_paths = self._fixed_bank_paths(lora_path) if lora_path is not None else None
+            if bank_paths:
+                logger.info("Loading %d fixed LoRA banks from %s: %s", len(bank_paths), lora_path, sorted(bank_paths))
+                # Every bank stays registered and pinned; the cache must hold them all.
+                self.max_cached_adapters = max(self.max_cached_adapters, len(bank_paths))
+                for role, bank_path in bank_paths.items():
+                    request = LoRARequest(
+                        lora_name=f"static:{role}",
+                        lora_int_id=stable_lora_int_id(bank_path),
+                        lora_path=bank_path,
+                    )
+                    self.add_adapter(request)
+                    self.pin_adapter(request.lora_int_id)
+                    self._fixed_bank_requests[role] = request
+                self.set_active_adapter(self._fixed_request(), 1.0)
+            elif lora_path is not None:
                 logger.info("Loading LoRA during initialization from %s with scale %.2f", lora_path, lora_scale)
                 init_request = LoRARequest(
                     lora_name="static",
@@ -255,8 +273,37 @@ class LoRAManager:
                 raise ValueError("Merged LoRA uses a global policy; generate without a LoRARequest")
             return
         if self._fixed_adapter:
-            request, scale = self._fixed_adapter_request, 1.0
+            request, scale = self._fixed_request(), 1.0
         self.set_active_adapter(request, scale)
+
+    def _fixed_bank_paths(self, lora_path: str) -> dict[str, str] | None:
+        """Banks a fixed-adapter pipeline derives from ``--lora-path``, or None for a single adapter.
+
+        A pipeline opts in with ``diffusion_lora_fixed_banks(lora_path) ->
+        {role: adapter_dir}`` and ``diffusion_lora_active_bank() -> role``.
+        """
+        resolve = getattr(self.pipeline, "diffusion_lora_fixed_banks", None)
+        if not self._fixed_adapter or not callable(resolve):
+            return None
+        if not callable(getattr(self.pipeline, "diffusion_lora_active_bank", None)):
+            raise ValueError("A pipeline with fixed LoRA banks must define diffusion_lora_active_bank()")
+        banks = resolve(lora_path)
+        if not banks:
+            raise ValueError(f"{type(self.pipeline).__name__} found no LoRA banks under {lora_path}")
+        paths = {str(role): str(path) for role, path in dict(banks).items()}
+        if len(set(paths.values())) != len(paths):
+            raise ValueError("Fixed LoRA banks must use distinct adapter paths")
+        return paths
+
+    def _fixed_request(self) -> LoRARequest | None:
+        """The fixed adapter a request runs with: the single static adapter or the pipeline's active bank."""
+        if not self._fixed_bank_requests:
+            return self._fixed_adapter_request
+        role = str(self.pipeline.diffusion_lora_active_bank())
+        request = self._fixed_bank_requests.get(role)
+        if request is None:
+            raise ValueError(f"Unknown fixed LoRA bank {role!r}; registered banks: {sorted(self._fixed_bank_requests)}")
+        return request
 
     def set_request_adapters(
         self,
@@ -1826,6 +1873,8 @@ class LoRAManager:
             self.reset_merged_adapter()
             return True
         if self._fixed_adapter_request is not None and adapter_id == self._fixed_adapter_request.lora_int_id:
+            return False
+        if any(adapter_id == request.lora_int_id for request in self._fixed_bank_requests.values()):
             return False
 
         logger.info("Removing adapter: id=%d", adapter_id)

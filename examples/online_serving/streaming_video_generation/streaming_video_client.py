@@ -200,7 +200,9 @@ def build_session_start(args: argparse.Namespace) -> dict[str, Any]:
         "prompt": args.prompt,
     }
 
-    _maybe_set(payload, "image_reference", args.image_reference)
+    references = args.image_reference or []
+    # One reference keeps the single-object form; repeated flags send an ordered list.
+    _maybe_set(payload, "image_reference", references[0] if len(references) == 1 else references or None)
     _maybe_set(payload, "negative_prompt", args.negative_prompt)
     _maybe_set(payload, "width", args.width)
     _maybe_set(payload, "height", args.height)
@@ -607,6 +609,7 @@ async def stream_video(args: argparse.Namespace) -> None:
                         f"total_bytes={total_bytes} "
                         f"total_frames={decoded_total if decoded_total is not None else 'unknown'} "
                         f"total_elapsed={total_elapsed:.2f}s"
+                        + (f" model={json.dumps(metadata['model'], sort_keys=True)}" if metadata.get("model") else "")
                     )
                     continue
 
@@ -728,8 +731,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-reference",
         type=_image_reference,
+        action="append",
         default=None,
-        help="First frame for image-conditioned models: a local image path or an http(s) URL.",
+        help=(
+            "Image reference: a local image path or an http(s) URL. Repeat for models that take an ordered "
+            "list (the first is <Picture 1>); a single reference is the first frame of image-conditioned models."
+        ),
     )
     parser.add_argument("--negative-prompt", default=None, help="Negative prompt")
     parser.add_argument("--num-inference-steps", type=int, default=None, help="Number of diffusion steps")

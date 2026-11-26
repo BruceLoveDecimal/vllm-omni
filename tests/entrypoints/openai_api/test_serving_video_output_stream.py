@@ -1804,6 +1804,73 @@ def test_chunk_metadata_preserves_engine_pacing_fields():
     assert metadata["pacing"] == pacing
 
 
+def test_chunk_metadata_forwards_model_facts_on_media_chunks_only():
+    facts = {"name": "taomate_r1", "chunk_index": 2, "lora_bank": "warm", "clean_commit": False}
+    media = OmniStreamingVideoOutputHandler._build_chunk_metadata(
+        request_id="req", kind="media", byte_length=8, num_frames=34, stream_metadata={"model": facts}
+    )
+    assert media["model"] == facts
+    trailer = OmniStreamingVideoOutputHandler._build_chunk_metadata(
+        request_id="req", kind="trailer", byte_length=8, num_frames=0, stream_metadata={"model": facts}
+    )
+    assert "model" not in trailer
+    plain = OmniStreamingVideoOutputHandler._build_chunk_metadata(
+        request_id="req", kind="media", byte_length=8, num_frames=34, stream_metadata={"model": "not-a-dict"}
+    )
+    assert "model" not in plain
+
+
+def _image_url(width: int, height: int, color: tuple[int, int, int]) -> str:
+    import base64
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), color).save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+class TestStreamingOrderedImageReferences:
+    """Ordered image_reference lists reach multi_modal_data.image only for multi-image models."""
+
+    @staticmethod
+    def _handler(model_class_name: str | None) -> OmniStreamingVideoOutputHandler:
+        handler = object.__new__(OmniStreamingVideoOutputHandler)
+        handler._engine_client = SimpleNamespace(
+            default_sampling_params_list=[], od_config=SimpleNamespace(model_class_name=model_class_name)
+        )
+        handler._stage_configs = None
+        return handler
+
+    async def test_multi_image_model_keeps_reference_order(self):
+        request = VideoGenerationRequest(
+            prompt="<Picture 1> holds <Picture 2>",
+            image_reference=[
+                {"image_url": _image_url(6, 4, (255, 0, 0))},
+                {"image_url": _image_url(4, 6, (0, 0, 255))},
+            ],
+        )
+        prompt, _, _ = await self._handler("TaoMateR1Pipeline")._build_prompt_and_sampling_params(request)
+        images = prompt["multi_modal_data"]["image"]
+        assert [image.size for image in images] == [(6, 4), (4, 6)]
+        assert images[0].getpixel((0, 0))[:3] == (255, 0, 0)
+        assert images[1].getpixel((0, 0))[:3] == (0, 0, 255)
+
+    async def test_single_image_model_rejects_a_list(self):
+        request = VideoGenerationRequest(prompt="p", image_reference=[{"image_url": _image_url(4, 4, (0, 0, 0))}] * 2)
+        with pytest.raises(HTTPException) as excinfo:
+            await self._handler("TaoMateH3Pipeline")._build_prompt_and_sampling_params(request)
+        assert excinfo.value.status_code == HTTPStatus.BAD_REQUEST.value
+        assert "single image reference" in str(excinfo.value.detail)
+
+    async def test_list_longer_than_the_model_limit_is_rejected(self):
+        request = VideoGenerationRequest(prompt="p", image_reference=[{"image_url": _image_url(4, 4, (0, 0, 0))}] * 10)
+        with pytest.raises(HTTPException) as excinfo:
+            await self._handler("TaoMateR1Pipeline")._build_prompt_and_sampling_params(request)
+        assert "between 1 and 9" in str(excinfo.value.detail)
+
+
 @pytest.mark.asyncio
 async def test_interaction_event_id_is_bounded_before_queueing(mocker: MockerFixture):
     from vllm_omni.entrypoints.openai.serving_video_output_stream import _SessionProgress

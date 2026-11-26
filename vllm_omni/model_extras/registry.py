@@ -298,6 +298,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "MiniMaxH3ModularPipeline",
         )
     },
+    # TaoMate-R1 resizes each ordered reference to a 2048-pixel short edge itself.
+    "TaoMateR1Pipeline": {
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
+    },
     # PAN 2 scales and center crops the first frame to the requested size itself.
     "PAN2ModularPipeline": {
         "reference_image_size_resolver": _always_preserve_reference_image_size,

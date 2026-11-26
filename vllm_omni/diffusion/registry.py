@@ -209,6 +209,11 @@ _DIFFUSION_MODELS = {
         "pipeline",
         "TaoMateH3Pipeline",
     ),
+    "TaoMateR1Pipeline": (
+        "taomate_r1",
+        "pipeline",
+        "TaoMateR1Pipeline",
+    ),
     "ABotWorldCausalPipeline": (
         "abot_world",
         "pipeline_abot_world",
@@ -567,6 +572,7 @@ _NO_CACHE_ACCELERATION = {
     "Sam3VideoModel",
     "LingBotWorldCausalDMDPipeline",
     "TaoMateH3Pipeline",
+    "TaoMateR1Pipeline",
     # PDD release: one fused output head per step, nothing to cache or skip.
     "MiniMaxH3ImagePipeline",
     "CausVidWanPipeline",
@@ -815,6 +821,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
     "TaoMateH3Pipeline": "get_taomate_h3_post_process_func",
+    "TaoMateR1Pipeline": "get_taomate_r1_post_process_func",
     "ABotWorldCausalPipeline": "get_abot_world_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
