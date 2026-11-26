@@ -309,7 +309,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             group = get_sp_group().ulysses_group
             if dist.get_global_rank(group, 0) != 0:
                 raise ValueError("Hy-Nomas decoder output rank must match the executor's global rank 0.")
-            self.vae.configure_distributed_decode(group, output_rank=0)
+            self.vae.configure_distributed_decode(group, output_rank=0, validate_inputs=False)
             logger.info("Hy-Nomas PixelUMM window decoding enabled with SP%d and output rank 0.", self.sp_size)
         self.s_ratio = self.vae.spatial_compression_ratio
         self.patch_size = self.transformer.patch_size

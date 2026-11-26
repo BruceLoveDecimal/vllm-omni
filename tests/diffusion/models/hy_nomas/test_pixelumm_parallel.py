@@ -127,6 +127,19 @@ def _window_worker(rank, world_size, rendezvous):
         assert all(value.item() > 0 for value in all_calls)
         assert sum(value.item() for value in all_calls) == baseline.decoder.calls
 
+        # Fast-path mode (validate_inputs=False) must stay bit-exact and skip redundant checks.
+        fast_parallel = make_decoder()
+        fast_parallel.configure_distributed_decode(dist.group.WORLD, validate_inputs=False)
+        fast_actual, fast_positions = run_stream(fast_parallel, chunks)
+        assert_output_matches(rank, fast_actual, expected)
+        assert fast_positions == positions
+        fast_parallel.decoder.fail = rank == world_size - 1
+        fast_session = fast_parallel.create_streaming_decode_session()
+        expect_collective_error(
+            lambda: fast_session.push(chunks[2]), "injected window failure|another decode rank"
+        )
+        fast_parallel.decoder.fail = False
+
         for steps in (1, 2):
             baseline = make_decoder(num_steps=steps)
             parallel = make_decoder(num_steps=steps)
