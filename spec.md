@@ -4,7 +4,9 @@
 > 调研基线：vLLM-Omni `0f55c39`（`claude/beautiful-darwin-kzlvuv`），上游
 > `TaoLiveAIGC/TaoMate-H3@fac1a44`，`TaoLiveAIGC/TaoMate-R1@377b70c`，
 > `MiniMaxAI/MiniMax-H3@12253298`。
-> 所有"上游行为"均来自源码阅读，**未在 GPU 上复现**（本环境无 GPU，且 Ref2VA 基座约 144 GB，超出磁盘配额）。
+> 所有"上游行为"均来自源码阅读，**未在 GPU 上复现**。
+> 权重**不落盘**：网络结构通过 HTTP Range 只读取远端 safetensors 头部获得（每个 LoRA bank 约 43 KB，每个 DiT 分片约 4 KB），
+> 另外只下载了 JSON 配置文件。
 
 ## 0. 任务来源与认领状态
 
@@ -21,20 +23,20 @@
   KV 管理仍留在 `vllm_omni/experimental/ar_diffusion`，所以本 spec 直接复用 TaoMate-H3 当前的 AR-Diffusion 路径。
   若 Task 1/2 先合入并改动 `SupportsStepExecution` / chunk executor 接口，需要相应 rebase。
 
-## 1. 已下载与核验的产物
+## 1. 产物与网络结构（仅元数据，未下载权重）
 
-### 1.1 TaoMate-R1 权重（已下载）
+### 1.1 TaoMate-R1 LoRA
 
-本地路径：`/home/user/hf/TaoMate-R1`（仓库外；容器回收后会丢失）。
+只读取了远端文件的 safetensors 头部，权重文件未下载。
 
 ```text
 TaoMate-R1/
 ├── config.json        {"model_variant":"Ref2VA","rank":128,"alpha":128,
 │                       "banks":{"cold":"cold/adapter_model.safetensors","warm":"warm/adapter_model.safetensors"}}
 ├── cold/config.json   {"rank":128,"alpha":128}
-├── cold/adapter_model.safetensors   2,480,973,992 B  sha256 b15738e9…6a6160（与 HF LFS oid 一致）
+├── cold/adapter_model.safetensors   2,480,973,992 B  LFS sha256 b15738e9…6a6160
 ├── warm/config.json   {"rank":128,"alpha":128}
-├── warm/adapter_model.safetensors   2,480,973,992 B  sha256 46bb9915…f80af（与 HF LFS oid 一致）
+├── warm/adapter_model.safetensors   2,480,973,992 B  LFS sha256 46bb9915…f80af
 ├── README.md / LICENSE (MiniMax H3 Community License) / NOTICE
 ```
 
@@ -52,18 +54,46 @@ safetensors 头部检查（两个 bank 相同）：
 每个 bank 子目录也满足 `_read_adapter_config()` 的约定（`config.json` 含 `rank`/`alpha`）。
 因此 `prepare_taomate_lora(bank_dir, …)` 可以**逐 bank 直接复用**，无需新的 key 映射。
 
-### 1.2 MiniMax-H3 Ref2VA 基座（只下载了元数据）
+### 1.2 MiniMax-H3 Ref2VA 基座
 
-- 元数据路径：`/home/user/hf/MiniMax-H3-meta`，包括 `Ref2VA/**/*.json|yaml|py`、`docs/`、`README.md`。
+- 只读取了 JSON 配置和 13 个 DiT 分片的 safetensors 头部，未下载权重。
 - 体积：Ref2VA 分区约 144 GB，其中 transformer 66.3 GB、text_encoder 66.7 GB、video_vae 10.4 GB、audio_vae 0.6 GB。
-  本环境磁盘配额约 60 GB，所以**未下载权重**。GPU 机器上的下载命令：
-  `hf download MiniMaxAI/MiniMax-H3 --include "model_index.json" "Ref2VA/*" --local-dir MiniMax-H3`。
 - `Ref2VA/model_index.json`：`_minimax_h3.partition = "ref2va"`，`tasks = ["ref2va"]`，`sigma_shift_scales = {video: 12, audio: 3}`。
-- `Ref2VA/transformer/config.json` 与 `FL2VA/transformer/config.json` 的结构**逐字段一致**：
-  hidden 5376、50 层、56 头 × 128、`latents_dim` 24、`audio_latents_dim` 32、token_refiner 2 层。
-  只是权重不同，所以 `MiniMaxH3DiTModel` 与 TaoMate 的 LoRA target 无需改动。
+- `Ref2VA/transformer/config.json` 与 `FL2VA/transformer/config.json` 逐字段一致。两者的 535 个参数名集合也完全相同，只是权重不同。
+  因此 `MiniMaxH3DiTModel` 与 TaoMate 的 LoRA target 无需改动。
 
-### 1.3 上游参考实现（已 clone）
+### 1.3 网络结构（由远端头部和配置得出）
+
+**DiT `MiniMaxH3DiTModel`**（Ref2VA）：535 个张量，约 33.12 B 参数。522 个为 BF16；
+`video/audio_patch_proj`、`final_layer.video/audio_out`、`time_embedder.*`、`rope.inv_freq` 等 13 个为 F32。
+
+| 模块 | 形状（out, in） | 说明 |
+|---|---|---|
+| `video_patch_proj` | [5376, 96] | 24 通道 × patch (1,2,2) → hidden 5376 |
+| `audio_patch_proj` | [5376, 32] | 32 维音频 latent |
+| `condition_proj` | [5376, 5120] | Qwen3-VL 隐状态 5120 → 5376 |
+| `time_embedder.proj_in/out` | [5376, 256] / [2688, 5376] | timestep 256 → 5376 → 2688 |
+| `token_refiner.blocks.{0,1}` | 与 DiT block 相同的 attn/mlp，无 adaln | 文本 refiner；带 `final_norm` |
+| `blocks.{0..49}.attn.qkv_proj` | [21504, 5376] | 21504 = 3 × 56 头 × 128 |
+| `blocks.N.attn.out_proj` | [5376, 7168] | 注意力内维 7168 = 56 × 128（≠ hidden 5376） |
+| `blocks.N.attn.q_norm/k_norm` | [128] | per-head QK norm |
+| `blocks.N.mlp.fc1` / `fc2` | [28672, 5376] / [5376, 14336] | 门控 FFN：28672 = 2 × 14336 |
+| `blocks.N.adaln_proj.linear` | [96768, 2688] | 96768 = 18 × 5376 的逐 token 调制 |
+| `blocks.N.norm1/norm2` | [5376] | |
+| `final_layer.adaln_proj` / `video_out` / `audio_out` | [10752, 2688] / [96, 5376] / [32, 5376] | 输出头 |
+
+**LoRA 与 DiT 的对应关系**：两个 bank 各有 208 个 target，即 (50 DiT + 2 refiner) × {qkv, out, fc1, fc2}。
+逐个核对，A 的形状为 `[128, in]`、B 的形状为 `[out, 128]`，与对应 Linear 的 0 处不匹配，每个 bank 0.62 B 参数。
+`adaln_proj`、`condition_proj`、patch/time/final 层**不在 LoRA 范围内**。
+
+**文本编码器**：`Qwen3VLForConditionalGeneration`。语言部分 64 层、hidden 5120、64 头、8 KV 头、FFN 25600，BF16，共 66.7 GB。
+视觉部分 27 层、hidden 1152、patch 16、`spatial_merge_size` 2、`temporal_patch_size` 2，输出 5120。
+processor 的 `merge_size` 为 2，像素范围 `shortest_edge` 65536 到 `longest_edge` 16777216（以像素面积计）。
+
+**VAE**：video VAE 为 `MiniMaxH3VideoVAE`，24 个 latent 通道，clip 长度 17，tile 256，最小 overlap 64。
+audio VAE 为 `MiniMaxH3AudioVAE`，32 个 latent 通道，2 声道，32 kHz。两者都与 TaoMate-H3 使用的 FL2VA 组件同类。
+
+### 1.4 上游参考实现（已 clone）
 
 `/home/user/upstream/TaoMate-H3@fac1a44`，`src/taomate_h3/ref2av/`，共 702 行：
 
@@ -348,10 +378,21 @@ FP8 / USP2 版本留到后续 PR。
 
 ## 8. 复现调研环境
 
+本次调研**未下载任何权重**。结构信息可按以下方式复现，只读取 safetensors 头部：
+
+```python
+# 读取远端 safetensors 头部：前 8 字节为小端 u64 头长度，随后是 JSON 头
+import json, struct, urllib.request
+def header(url):
+    get = lambda a, b: urllib.request.urlopen(urllib.request.Request(url, headers={"Range": f"bytes={a}-{b}"})).read()
+    n = struct.unpack("<Q", get(0, 7))[0]
+    return json.loads(get(8, 8 + n - 1))
+```
+
+需要在 GPU 机器上运行时再下载：
+
 ```bash
-# 权重（已校验 sha256，见 §1.1）
 hf download TaoLiveAIGC/TaoMate-R1 --revision 377b70c6116c5381ddbae542f0ee3e1517c8d30c --local-dir models/TaoMate-R1
 hf download MiniMaxAI/MiniMax-H3 --include "model_index.json" "Ref2VA/*" --local-dir models/MiniMax-H3   # ~144 GB
-# 上游参考实现
 git clone https://github.com/TaoLiveAIGC/TaoMate-H3 && git -C TaoMate-H3 checkout fac1a44
 ```
