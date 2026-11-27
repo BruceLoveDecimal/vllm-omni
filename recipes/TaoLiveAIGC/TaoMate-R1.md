@@ -95,6 +95,32 @@ curl --fail-with-body --silent --show-error http://localhost:8000/v1/videos \
 model. Poll the returned job and download `/v1/videos/{id}/content` as with other video
 models.
 
+## Single-GPU smoke
+
+This capacity profile checks that the model loads and generates on one GPU. It is not
+the release configuration and does not reproduce the release outputs.
+
+- FP8 per-channel DiT linears.
+- A 480x864 canvas.
+- References resized to a 768-pixel short edge.
+- The Qwen3-VL text encoder streamed from host memory.
+
+On one GPU the clean K/V history and attention staging keep all 56 heads, about
+1.4 MB per token across the 50 layers. Use an H200-class 141 GB card and host memory
+for the offloaded encoder.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve /path/to/MiniMax-H3/Ref2VA --omni --trust-remote-code \
+  --deploy-config vllm_omni/deploy/taomate_r1_1gpu_smoke.yaml \
+  --lora-path /path/to/TaoMate-R1 --port 8000 \
+  --diffusion-offload-config '{"mode":"layer","components":["text_encoder"]}' \
+  --stage-init-timeout 1800 --init-timeout 2100
+```
+
+The default request is three chunks (107 frames), which covers both banks and the
+terminal chunk. `taomate_r1_1gpu_realtime_smoke.yaml` serves the same profile over
+`/v1/realtime/video`.
+
 ## Deployment controls
 
 These keys live under the stage's `model_config`.
@@ -106,6 +132,7 @@ These keys live under the stage's `model_config`.
 | `taomate_r1_default_frames` | 240 | Frame budget when a request names none; aligns to 243 frames (seven chunks). |
 | `taomate_r1_max_frames` | 1440 | Longest accepted session. Positions beyond the release's typical lengths are untested. |
 | `taomate_r1_warmup_chunks` | 3 | Chunks in the startup rollout. |
+| `taomate_r1_reference_short_edge` | 2048 | Reference resize short edge, a multiple of 32 in [256, 4096]. Values other than 2048 depart from the release and only serve capacity smoke tests. |
 | `taomate_r1_dump_latents_dir` | unset | Parity debugging: the output rank saves each chunk's final video/audio rows to `<dir>/<session>/chunk_<i>.pt`. Adds a device-to-host copy per chunk. |
 
 The TaoMate decoder and logging controls keep their TaoMate-H3 names because the

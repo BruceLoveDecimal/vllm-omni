@@ -86,7 +86,13 @@ from .chunks import (
     compact_chunk_layout,
     plan_session,
 )
-from .conditioning import build_encoder_inputs, extract_reference_images, resize_references
+from .conditioning import (
+    REFERENCE_SHORT_EDGE,
+    build_encoder_inputs,
+    extract_reference_images,
+    resize_references,
+    validate_reference_short_edge,
+)
 from .lora import read_taomate_r1_banks
 
 logger = init_logger(__name__)
@@ -270,6 +276,18 @@ class TaoMateR1Pipeline(TaoMateH3Pipeline):
         if not 0 < self._r1_default_frames <= self._r1_max_frames:
             raise ValueError("taomate_r1_default_frames must be positive and at most taomate_r1_max_frames")
         # Three chunks visit the cold bank, the warm bank and the terminal (commit-free) chunk.
+        # The release resizes references to a 2048-pixel short edge; a smaller
+        # edge only serves single-GPU capacity smoke tests (fewer condition rows).
+        self._r1_reference_short_edge = validate_reference_short_edge(
+            model_config.get("taomate_r1_reference_short_edge", REFERENCE_SHORT_EDGE)
+        )
+        if self._r1_reference_short_edge != REFERENCE_SHORT_EDGE:
+            logger.warning(
+                "TaoMate-R1 references resized to a %d-pixel short edge instead of the release's %d; "
+                "outputs will not match the release",
+                self._r1_reference_short_edge,
+                REFERENCE_SHORT_EDGE,
+            )
         self._r1_warmup_chunks = int(model_config.get("taomate_r1_warmup_chunks", 3))
         if self._r1_warmup_chunks < 1:
             raise ValueError("taomate_r1_warmup_chunks must be at least 1")
@@ -490,7 +508,7 @@ class TaoMateR1Pipeline(TaoMateH3Pipeline):
                     f"TaoMate-R1 generates synchronized audio/video at {VIDEO_FPS} fps; {name} must be {VIDEO_FPS}"
                 )
         prompt_text, multi_modal_data = self._extract_prompt(state.prompt)
-        images = resize_references(extract_reference_images(multi_modal_data))
+        images = resize_references(extract_reference_images(multi_modal_data), self._r1_reference_short_edge)
         height = int(getattr(sampling, "height", None) or self._tm_default_height)
         width = int(getattr(sampling, "width", None) or self._tm_default_width)
         try:

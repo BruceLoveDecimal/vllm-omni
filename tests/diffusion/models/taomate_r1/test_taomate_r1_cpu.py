@@ -152,6 +152,13 @@ def test_compact_layout_rejects_a_mismatched_canvas() -> None:
 
 
 def test_reference_size_follows_the_release_rule() -> None:
+    from vllm_omni.diffusion.models.taomate_r1.conditioning import resize_references, validate_reference_short_edge
+
+    assert [image.size for image in resize_references([Image.new("RGB", (1024, 1536))], 768)] == [(768, 1152)]
+    assert validate_reference_short_edge(768) == 768
+    for bad in (100, 770, 8192):
+        with pytest.raises(ValueError, match="multiple of 32"):
+            validate_reference_short_edge(bad)
     assert reference_size(1024, 1536) == (2048, 3072)
     assert reference_size(1080, 1920) == (2048, 3648)
     assert reference_size(777, 513) == (3104, 2048)

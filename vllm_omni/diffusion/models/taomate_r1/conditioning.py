@@ -61,8 +61,19 @@ def extract_reference_images(multi_modal_data: Mapping[str, Any] | None) -> list
     return images
 
 
-def resize_references(images: Sequence[Image.Image]) -> list[Image.Image]:
-    return [image.convert("RGB").resize(reference_size(*image.size), Image.Resampling.LANCZOS) for image in images]
+def resize_references(images: Sequence[Image.Image], short_edge: int = REFERENCE_SHORT_EDGE) -> list[Image.Image]:
+    """Release resize of every reference; a smaller ``short_edge`` trades fidelity for memory."""
+    return [
+        image.convert("RGB").resize(reference_size(*image.size, short_edge), Image.Resampling.LANCZOS)
+        for image in images
+    ]
+
+
+def validate_reference_short_edge(value: int) -> int:
+    value = int(value)
+    if value < 256 or value > 4096 or value % REFERENCE_MULTIPLE:
+        raise ValueError(f"taomate_r1_reference_short_edge must be a multiple of 32 in [256, 4096], got {value}")
+    return value
 
 
 def condition_labels(count: int) -> list[tuple[str, int]]:
@@ -113,4 +124,5 @@ __all__ = [
     "extract_reference_images",
     "reference_size",
     "resize_references",
+    "validate_reference_short_edge",
 ]
