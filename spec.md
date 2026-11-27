@@ -189,7 +189,9 @@ audio VAE 为 `MiniMaxH3AudioVAE`，32 个 latent 通道，2 声道，32 kHz。�
   首段 39 帧，之后每 10 latent 出 34 帧，保留 5 帧 overlap，最后 flush。与 R1 的 chunk 几何**完全一致**，可原样复用（满足验收标准 3）。
 - `TaoMateH3StreamingAttention`（`taomate_h3/attention.py`）的语义与上游 `CleanHistoryAttention` 一致：
   condition 只看 condition，media 看 `[condition | 持久 clean AV | current]`，padding 输出 0。
-  只需让 `StreamContext.condition_rows` 覆盖 text **和** reference anchor 行。
+  `condition_rows` / `media_rows` 由 pipeline 构造 `StreamContext` 时传入，注意力层本身不区分 text 与参考。
+  因此 **attention 无需修改**：R1 的 pipeline 把 text 行和 reference anchor 行一起作为 `condition_rows` 传入即可。
+  segmented KV 的 staging 在 `prepare_layer_views` 时按需增长，大量参考行不需要预留固定容量。
 - `TaoMateKVHistory`（`taomate_h3/kv_cache.py`）的 sink + 最近 2 段保留策略与 R1 一致。R1 不调用 `drop_audio_history()`。
 - `prepare_taomate_lora`（`taomate_h3/lora.py:62`）逐 bank 复用，见 §1.1。
 - MiniMax-H3 共享件：`minimax_h3_packed_sequence_ref2va_blocks`（`minimax_h3/packed_sequence.py:341`）；
@@ -213,7 +215,7 @@ vllm_omni/deploy/taomate_r1_usp4_realtime.yaml                      （USP8 可�
 recipes/TaoLiveAIGC/TaoMate-R1.md
 tests/diffusion/models/taomate_r1/…
 
-修改（注册与 API）：
+修改（注册）：
 vllm_omni/diffusion/registry.py          "TaoMateR1Pipeline": ("taomate_r1", "pipeline", "TaoMateR1Pipeline")；
                                           与 TaoMate-H3 一样加入不做 cache 加速的列表；注册 post_process_func
 vllm_omni/config/pipeline_registry.py    "taomate_r1": TAOMATE_R1_PIPELINE（不设 default_deploy_config_name，
@@ -221,12 +223,41 @@ vllm_omni/config/pipeline_registry.py    "taomate_r1": TAOMATE_R1_PIPELINE（不
 vllm_omni/diffusion/model_metadata.py    TaoMateR1Pipeline: supports_multimodal_inputs=True,
                                           max_multimodal_image_inputs=9, final_output_type="video",
                                           attention_mask_free=True
-vllm_omni/entrypoints/openai/serving_video_output_stream.py   realtime 支持有序多参考（§4.6）
 docs/models/supported_models.md、recipes/README.md
 ```
 
-公共逻辑尽量**从 `taomate_h3` 导入**，不要复制。如果某个函数需要参数化（例如 attention 的 condition 行来源、
-KV history 是否允许清音频），在 `taomate_h3` 内做最小的参数化修改，并保持 TaoMate-H3 测试全绿。
+公共逻辑**从 `taomate_h3` 导入**，不要复制：streaming attention、`TaoMateH3DiTModel`、`TaoMateKVHistory`、
+流式解码器、`prepare_taomate_lora`、`local_embed_plan`。共享代码的改动只有 §4.8 列出的三处。
+
+### 4.8 共享代码改动（实现后共五处）
+
+开发中又发现两处必须改的共享代码，表中 #4、#5 为新增：
+
+- **#4（`model_extras`）**：`/v1/videos` 默认会把参考图缩放到输出画布，破坏上游"短边 2048、保持宽高比"的规则。
+- **#5（示例客户端）**：现有流式示例客户端无法发送多张参考图。
+
+| # | 文件 | 改动 | 原因 | 对现有模型的影响 |
+|---|---|---|---|---|
+| 1 | `vllm_omni/lora/manager.py` | 固定 adapter 模式支持**一组 bank**。<br>pipeline 声明 `diffusion_lora_fixed_banks(lora_path) -> {role: path}`，<br>manager 启动时逐个加载并钉住，`max_cached_adapters` 至少放大到 bank 数。<br>此后每次选择 adapter 时，调用 `pipeline.diffusion_lora_active_bank()` 决定激活哪个。 | 现有固定模式只有一个 `static` adapter，且 worker 每步都调用 `set_request_adapters` 把它切回来。<br>pipeline 自行切到 warm 会在下一步被覆盖（`manager.py:228-260`、`diffusion_worker.py:1327`）。 | 未声明 bank 的 pipeline 走原路径，行为不变。 |
+| 2 | `vllm_omni/entrypoints/openai/serving_video_output_stream.py` | 模型 metadata 允许多图（`max_multimodal_image_inputs > 1`）时，realtime 接受有序 `image_reference` 列表，<br>按顺序放入 `multi_modal_data["image"]`。 | 验收 1 需要 realtime 传两张图，目前收到列表会报错。 | 单图模型仍然拒绝列表，错误信息不变。 |
+| 3 | 同上，`_build_chunk_metadata` | 新增通用透传键 `model`：pipeline 在 `metadata["stream"]["model"]` 放一个 dict，原样转发到 `video.chunk_metadata`。 | 目前只转发固定白名单字段，模型自定义字段到不了客户端。<br>R1 用它报告每个 chunk 的 `lora_bank` 和 `clean_commit`（验收 2）。 | 新增可选键，未设置时输出不变。 |
+| 4 | `vllm_omni/model_extras/registry.py` | `TaoMateR1Pipeline` 声明 `reference_image_size_resolver = always`（与 MiniMax-H3 相同）。 | 否则 `/v1/videos` 会先把参考图拉伸到 768x1344。 | 仅新增 R1 条目。 |
+| 5 | `examples/online_serving/streaming_video_generation/streaming_video_client.py` | `--image-reference` 可重复；只给一次时仍发送单个对象，给多次时发送有序列表；打印 chunk metadata 中的 `model`。 | 验收 1 需要从客户端发送两张有序图片。 | 单次使用时行为不变。 |
+
+**不需要修改**：streaming attention（condition 行由 pipeline 传入，见 §3）、AR-Diffusion 引擎和 tick protocol、
+segmented KV、`TaoMateKVHistory`（R1 不调用 `drop_audio_history`）、流式解码器。
+
+### 4.9 TaoMate-R1 不使用的 TaoMate-H3 机制
+
+实现时**不要**把下列机制搬到 R1：
+
+- audio teacher（`audio_teacher.py`）：R1 联合生成音频，student 的音频速度直接用于 Euler 更新。
+- prompt 中途交互（`TaoMateH3PromptInteractionHandler`、hold/fallback prompt）：R1 会话内 prompt 固定；收到 interaction 要拒绝。
+- 5 秒窗口滚动与 phase 重定时（`geometry.request_plan`、`packed.taomate_phase_packed_layout`）：R1 用整段序列 gather。
+- 音频历史定期清空（`audio_kv_reset_requests`）。
+- 跨 phase 的 clean video 统计量重归一化（`renorm_clean_video_rows`）：上游 R1 没有这一步。
+- merged 权重 bank（`MergedStudentWeights`）：首版不支持，`lora_merge` 配置项不提供。
+- `student_forward_kwargs` 快路径：它假设参考行的 timestep 等于 `t_video`，而 R1 的参考行固定为 0.999，必须走 `branch.forward_kwargs`。
 
 ### 4.2 加载
 
@@ -235,17 +266,27 @@ KV history 是否允许清音频），在 `taomate_h3` 内做最小的参数化�
   并且 `banks` 中恰好有 `cold`、`warm`。对每个 bank 调用 `prepare_taomate_lora(root/bank_dir_of(banks[role]))`。
 - 注意力类替换与 TaoMate-H3 相同（`TaoMateH3DiTModel` / streaming attention）。
 
-### 4.3 bank 切换（两种方案，建议先 A 后测）
+### 4.3 bank 切换：manager 的固定 bank 组
 
-- **A. 复用 `DiffusionLoRAManager`（推荐首版）**：把 cold、warm 注册成两个 `LoRARequest`（固定 `lora_int_id`），
-  要求 `max_cpu_loras ≥ 2`。在 chunk 边界调用 `set_active_adapter(cold|warm)`。
-  每次切换会重新绑定 slot 0（约 1.24 GB 的 H2D 拷贝），并调用 `invalidate_denoise_graphs`。
-  每个会话只切换两次：开场切到 cold，chunk 1 切到 warm。改动最小，与 TaoMate-H3 的 manager 用法一致。
-  `_load_diffusion_lora_adapter` 需要按 `lora_request` 返回对应 bank 的 `LoRAModel`。
-- **B. 双 bank 常驻 sidecar**：仿照上游 `BankedLinear`，每层同时持有两组 A/B，只切换指针。
-  每 rank 多占约 1.24 GB 显存，切换零拷贝，CUDA graph 也可以按 bank 分别 capture。
-  如果 A 在 chunk 1 上的切换延迟或首包抖动不可接受，再在 manager 内实现 B（不要绕开 manager）。
-- 每个 bank 缓存一次 refined text（`refine_prompt_embeds` 须在对应 bank 激活后执行）。
+现有限制（已核对代码）：TaoMate 系列声明 `diffusion_lora_fixed_adapter = True`。
+这种模式下 manager 只从 `--lora-path` 加载一个名为 `static` 的 adapter 并钉住（`lora/manager.py:228-237`）。
+step 执行时 worker 每一步都调用 `set_request_adapters`（`diffusion_worker.py:1327`），固定模式会强制换回 `static`（`manager.py:257`）。
+所以"注册两个 LoRARequest、pipeline 自己切换"的做法不成立。
+
+方案（共享改动 #1，见 §4.8）：
+
+- pipeline 新增两个钩子：
+  - `diffusion_lora_fixed_banks(lora_path) -> dict[str, str]`：返回 `{"cold": <root>/cold, "warm": <root>/warm}`，路径取自根 `config.json` 的 `banks`。
+  - `diffusion_lora_active_bank() -> str`：返回当前 chunk 应使用的 bank。
+- manager 初始化时，若 pipeline 声明了 bank 组：
+  - 每个 bank 建一个 `LoRARequest(lora_name="static:<role>", lora_int_id=stable_lora_int_id(path))`，加载并 `pin_adapter`。
+  - `max_cached_adapters` 至少放大到 bank 数。
+  - `remove_adapter` 不移除任何固定 bank。
+- 固定模式下选择 adapter 时，改为激活 `banks[pipeline.diffusion_lora_active_bank()]`。worker 每步调用时 bank 未变则直接跳过（`_is_active_at_scale`）。
+- `_load_diffusion_lora_adapter` 按 `lora_request.lora_path` 匹配 bank，返回 `load_weights` 阶段由 `prepare_taomate_lora` 准备好的对应 `LoRAModel`。
+- 切换代价：manager 只有一个 GPU slot，切换时重新绑定 A/B（每 rank 约 1.24 GB 的 H2D）。每个会话切换两次：开场切到 cold，chunk 1 切到 warm。
+  如果实测 chunk 1 的延迟抖动不可接受，再在 manager 内实现双 slot 常驻（不绕开 manager）。
+- 每个 bank 缓存一次 refined text：`refine_prompt_embeds` 必须在对应 bank 激活后执行。
 
 ### 4.4 Step execution 契约（AR-Diffusion engine）
 
@@ -262,8 +303,9 @@ KV 容量估算：retained 包含 sink（chunk 0 video，12 latent）、最近 2
 pending 为 1 个 chunk。以 768x1344 为例，sink 有 12×1008 行，单 chunk 约 1.0–1.2 万行。
 staging 还要加上 **condition 行数（text + 全部参考 anchor）**。该值依赖参考的 VAE latent 尺寸，必须在 GPU 上实测后写进 spec。
 
-可观测性：每个 chunk 在 `ARDiffusionChunkMetadata` 或 chunk metadata 中带上 `lora_bank` 与 `clean_commit: bool`。
-这样验收标准 2 可以从客户端直接断言，不需要读服务端日志。
+可观测性：每个 chunk 在 `metadata["stream"]["model"]` 中带上 `{"name": "taomate_r1", "lora_bank": …, "clean_commit": …}`，
+经共享改动 #3 出现在客户端的 `video.chunk_metadata.model` 中。验收标准 2 因此可以从客户端直接断言，不需要读服务端日志。
+`ARDiffusionChunkMetadata` 和 tick protocol 不变。
 
 ### 4.5 RNG 与数值对齐
 
@@ -277,13 +319,12 @@ staging 还要加上 **condition 行数（text + 全部参考 anchor）**。该�
 但 realtime 的 `_decode_image_reference`（`serving_video_output_stream.py:1067`）**收到 list 会直接拒绝**。
 而且 `_build_prompt_and_sampling_params` 只透传单张 image。
 
-改动：
+v1 范围：**只支持图片参考**（1–9 张，顺序即 `<Picture i>` 编号），满足验收 1。
 
 1. 当模型 metadata 的 `max_multimodal_image_inputs > 1` 时，realtime 接受有序 `image_reference` 列表，
-   按顺序解码为 `multi_modal_data["image"] = [img1, img2, …]`。单模型（单图）时保持现有行为和错误信息不变。
-2. （可选，v1.1）`video_reference` 列表映射到 `multi_modal_data["video"]`。
-   如需 image/video **交错**顺序，增加显式字段（例如 `extra_params.reference_order: ["image","video","image"]`），
-   由 R1 conditioning 按此生成 `condition_labels`。无该字段时按"先 image 后 video"处理，与 `/v1/videos` 的 H3 语义一致。
+   按顺序解码为 `multi_modal_data["image"] = [img1, img2, …]`。单图模型保持现有行为和错误信息不变。
+2. 视频参考在 v1 中明确拒绝。原因：上游的视频预处理（24 fps、短边 768、截取会话总帧数、丢弃音轨、`frames[::12]` 采样）
+   与仓库内 H3 的 `prepare_reference_videos` 不同，需要单独实现和对齐。image/video 交错顺序也留到后续版本。
 3. `session.start` 上限为 4 MiB（`_MAX_START_MESSAGE_SIZE`）。base64 大图可能超限，recipe 中建议使用 URL 或压缩后的图片。
 4. 不注册 interaction handler；R1 会话中发来的 `session.interaction` 应被明确拒绝。
 
@@ -328,9 +369,10 @@ FP8 / USP2 版本留到后续 PR。
 1. **PR-1 模型（request 模式 + parity）**：`taomate_r1/*`、注册、deploy（`step_execution: false` 的 full-request 变体）、CPU 单测、GPU parity 脚本。
    输出与上游 `latents.pt` 对比。标题示例：`[Model] TaoMate-R1: Ref2VA opening/continuation LoRA banks`。
 2. **PR-2 realtime**：step execution、流式 A/V 解码、realtime 有序多参考（§4.6）、realtime deploy、recipe、supported_models、e2e 测试（覆盖三条验收）。
-3. **PR-3 优化（可选）**：方案 B 双 bank 常驻；**condition K/V 按 bank 缓存**。
-   condition 只 attend 自身，且其 timestep 固定（cond aug 0.999 / text），理论上在同一 bank 内跨 step、跨 chunk 不变。
-   需先在 GPU 上验证 AdaLN 调制不依赖 step timestep，再考虑复用 `MiniMaxH3ReferenceKVTier2State`。另外还有 CUDA graph 和 FP8。
+3. **PR-3 优化（可选）**：manager 双 slot 常驻（去掉 chunk 1 的 H2D）；**参考 anchor 行的 K/V 按 bank 缓存**；CUDA graph 和 FP8。
+   注意：只有参考 anchor 行的 timestep 固定为 0.999。text 行的 timestep 跟随 `t_video` 每步变化（`fill_timesteps`），
+   其 AdaLN 调制随之变化，所以 **text 行的 K/V 不能跨 step 缓存**。
+   而且 condition 是整体自注意力，text 与参考行互相 attend，只缓存参考行 K/V 也需要先在 GPU 上验证数值等价。
 
 每个 PR 提交前跑 `precheck-pr` skill。新模型参照 `add-diffusion-model` skill，recipe 参照 `add-recipe` skill，测试分级参照 `vllm-omni-test` skill。
 **不要新增模型专属的 Python example**，客户端复用 `examples/online_serving/streaming_video_generation/streaming_video_client.py`。
@@ -367,14 +409,18 @@ FP8 / USP2 版本留到后续 PR。
 
 1. **参考分辨率 2048**：上游先把图片缩放到短边 2048 再做 VAE 编码，condition 行数可能很大，而且每次 forward 都要重算。
    需在 GPU 上确认 anchor latent 尺寸，以及 `encode_images` 内部是否还会再缩放。这会决定 KV staging 大小和 PR-3 condition 缓存的收益。
-2. **交错顺序**：现有 API 的 image/video 是两个独立列表，交错顺序需要新字段。v1 可以先只支持 image-only（满足验收 1）。
+2. **视频参考与交错顺序**：v1 只支持图片（§4.6）。视频参考需要按上游重新实现预处理；交错顺序需要新的 API 字段。
 3. **参考视频音频**：上游忽略参考视频的音轨。不能直接复用 H3 的 `prepare_encoder_inputs`，因为它会加入 `<Audio j>`；需要 R1 自己的 conditioning。
 4. **会话定长**：RoPE 和 cond-noise 依赖总时长，`session.start` 必须给出 `num_frames`。超过训练分布的长时长效果未知。
 5. **TP 差异**：上游以 TP2 验证，本接入用 TP=1 的纯 Ulysses，数值只能容差对齐。
-6. **bank 切换开销**：方案 A 在 chunk 1 前有一次约 1.24 GB 的 H2D，会影响第 2 个 chunk 的延迟，需要实测。
+6. **bank 切换开销**：单 GPU slot 下，chunk 1 前有一次约 1.24 GB 的 H2D，会影响第 2 个 chunk 的延迟，需要实测。
+   manager 的固定 bank 组改动（§4.8 #1）属于共享 LoRA 代码，需要 LoRA 模块的 code owner 评审。
 7. **许可**：权重与上游代码均为 MiniMax H3 Community License。从上游移植的代码需要保留其 "Modified for … Licensed under …" 头注释（见上游 `conditioning.py`）。
    合入前需要维护者确认是否可以按 Apache-2.0 仓库的惯例引用。
 8. **与 Task 1/2 的接口漂移**：chunk 执行迁入 main diffusion 后，`SupportsStepExecution` 的钩子名可能变化。PR-2 需要跟进。
+9. **逐 chunk 音频解码的右侧上下文**：上游在全部 chunk 完成后一次性解码音频。
+   流式解码在 chunk 边界只能看到约 8 个 latent 的右侧上下文（`StreamingAudioDecoder` 默认 24），边界附近的样本可能与离线解码略有差异。
+   GPU 对齐时需要单独比较音频：latent 应一致，波形允许边界处有小差异。
 
 ## 8. 复现调研环境
 
