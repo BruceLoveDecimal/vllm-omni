@@ -381,9 +381,25 @@ class HyNomasTransformer(nn.Module):
             self._step_rope_cache.move_to_end(rope_key)
             return self._step_rope_cache[rope_key]
         axes, theta = self.config.rope_axes_dim, self.config.rope_theta
-        tables = rotary_tables((frames, height, width), axes, theta, time_offset=gfc, device=compute_device)
+        token_range = None
         if self.sp_size > 1:
-            tables = tuple(torch.chunk(value, self.sp_size, 0)[rank].clone() for value in tables)
+            # The pipeline requires the per-frame token count to divide by the Ulysses degree, so each rank owns an
+            # equal contiguous slice; build only that slice instead of the whole table on every rank.
+            local = frames * height * width // self.sp_size
+            token_range = (rank * local, (rank + 1) * local)
+        if compute_device is None:
+            # Every Ulysses worker inherits an intra-op pool sized for the whole machine, so this small CPU table
+            # oversubscribes the cores and takes hundreds of milliseconds; one thread builds it in a few.
+            threads = torch.get_num_threads()
+            torch.set_num_threads(1)
+            try:
+                tables = rotary_tables((frames, height, width), axes, theta, time_offset=gfc, token_range=token_range)
+            finally:
+                torch.set_num_threads(threads)
+        else:
+            tables = rotary_tables(
+                (frames, height, width), axes, theta, time_offset=gfc, device=compute_device, token_range=token_range
+            )
         tables = (tables[0].to(device=target_device), tables[1].to(device=target_device))
         self._lru_put(self._step_rope_cache, rope_key, tables)
         return tables

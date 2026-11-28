@@ -147,7 +147,12 @@ class SingleTokenRefiner(nn.Module):
         return self.individual_token_refiner(self.input_embedder(x), condition, mask)
 
 
-def rotary_tables(sizes, dimensions, theta, *, time_offset=0, device=None):
+def rotary_tables(sizes, dimensions, theta, *, time_offset=0, device=None, token_range=None):
+    """Return the (cos, sin) rows for the flattened (frames, height, width) grid.
+
+    ``token_range=(start, end)`` returns only those rows. Every value is computed elementwise from its own position,
+    so the rows equal the same rows of the full table, at a fraction of the cost.
+    """
     # Preserve device-local first-segment tables and CPU offset tables thereafter.
     start = (time_offset, 0, 0)
     axes = [torch.linspace(a, a + n, n + 1, dtype=torch.float32, device=device)[:n] for a, n in zip(start, sizes)]
@@ -155,7 +160,10 @@ def rotary_tables(sizes, dimensions, theta, *, time_offset=0, device=None):
     cosines, sines = [], []
     for axis, dim in zip(grid, dimensions):
         frequencies = 1.0 / (theta ** (torch.arange(0, dim, 2, device=axis.device).float() / dim))
-        angles = torch.outer(axis.reshape(-1), frequencies)
+        positions = axis.reshape(-1)
+        if token_range is not None:
+            positions = positions[token_range[0] : token_range[1]]
+        angles = torch.outer(positions, frequencies)
         cosines.append(angles.cos().repeat_interleave(2, dim=1))
         sines.append(angles.sin().repeat_interleave(2, dim=1))
     return torch.cat(cosines, dim=1), torch.cat(sines, dim=1)
